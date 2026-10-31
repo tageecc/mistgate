@@ -101,7 +101,7 @@ func TestBillPaginatesCDTLayoutsAndRejectsIncompleteSnapshots(t *testing.T) {
 	var requests int
 	a := fakeAliyun(t, func(p url.Values) (string, int) {
 		requests++
-		if p.Get("IsHideZeroCharge") != "false" || p.Get("IsBillingItem") != "true" || p.Get("PipCode") != "cdt" {
+		if p.Get("IsHideZeroCharge") != "false" || p.Get("IsBillingItem") != "true" || p.Get("PipCode") != "cdt" || p.Get("ProductCode") != "cdt" || p.Get("Granularity") != "MONTHLY" {
 			t.Fatal("missing bill scope")
 		}
 		if p.Get("NextToken") == "" {

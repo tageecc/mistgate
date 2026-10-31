@@ -1,0 +1,15 @@
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ram:CreateAccessKey",
+        "ram:ListAccessKeys"
+      ],
+      "Resource": [
+        "acs:ram:*:ACCOUNT_ID:user/mistgate-usage"
+      ]
+    }
+  ]
+}

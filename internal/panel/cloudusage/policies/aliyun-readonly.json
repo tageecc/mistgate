@@ -1,0 +1,29 @@
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ecs:DescribeInstances",
+        "ecs:DescribeInstanceMonitorData"
+      ],
+      "Resource": [
+        "acs:ecs:REGION_ID:ACCOUNT_ID:instance/INSTANCE_ID"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "bssapi:DescribeInstanceBill"
+      ],
+      "Resource": [
+        "*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "bssapi:ProductCode": "cdt"
+        }
+      }
+    }
+  ]
+}
