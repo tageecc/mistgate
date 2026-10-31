@@ -7,7 +7,19 @@ import { cx } from "@/lib/cx";
 // gradient under each, two dashed gridlines, a hover guide with a dot. Colours and fill strengths come from
 // CSS variables (index.css), which is how the light theme gets its calmer fills.
 
-export type ChartLine = { key: string; values: readonly number[]; tone: "accent" | "them"; width: number };
+export type ChartLine = { key: string; values: readonly number[]; defined?: readonly boolean[]; tone: "accent" | "them"; width: number };
+
+/** Missing observations split a line; they are never plotted as zero or bridged. */
+export function chartRuns(length: number, defined?: readonly boolean[]): number[][] {
+  const runs: number[][] = [];
+  let run: number[] = [];
+  for (let i = 0; i < length; i++) {
+    if (!defined || defined[i]) run.push(i);
+    else if (run.length) { runs.push(run); run = []; }
+  }
+  if (run.length) runs.push(run);
+  return runs;
+}
 
 const W = 600;
 const PAD = 4;
@@ -92,10 +104,13 @@ function Plot({
         ))}
         {n > 1 &&
           lines.map((l, k) => {
-            const d = smoothPath(xs, l.values.map(yOf));
             return (
               <g key={l.key}>
-                <path d={`${d} L${W},${height} L0,${height} Z`} fill={`url(#${uid}-${k})`} />
+                {chartRuns(n, l.defined).map((run) => {
+                  const d = smoothPath(run.map((i) => xs[i]!), run.map((i) => yOf(l.values[i]!)));
+                  if (run.length === 1) return <circle key={run[0]} cx={xs[run[0]!]!} cy={yOf(l.values[run[0]!]!)} r={2} fill={tone(l.tone)} />;
+                  return <g key={run[0]}>
+                <path d={`${d} L${xs[run.at(-1)!]},${height} L${xs[run[0]!]},${height} Z`} fill={`url(#${uid}-${k})`} />
                 <path
                   d={d}
                   fill="none"
@@ -104,6 +119,8 @@ function Plot({
                   strokeLinecap="round"
                   vectorEffect="non-scaling-stroke"
                 />
+                </g>;
+                })}
               </g>
             );
           })}
@@ -115,7 +132,7 @@ function Plot({
           style={{ left: `${(hover / (n - 1)) * 100}%` }}
         />
       )}
-      {primary && n > 0 && (
+      {primary && n > 0 && (!primary.defined || primary.defined[dotAt]) && (
         // an HTML dot: inside the stretched SVG a circle would turn into an ellipse
         <span
           aria-hidden
@@ -153,6 +170,8 @@ export function ChartCard({
   at,
   legend,
   label,
+  summary,
+  footer,
 }: {
   title: ReactNode;
   /** With a tone: a tinted chip before the title. */
@@ -171,6 +190,8 @@ export function ChartCard({
   /** Legend for point i (null = nothing hovered). */
   legend: (i: number | null) => Legend[];
   label: string;
+  summary?: ReactNode;
+  footer?: ReactNode;
 }) {
   const [hover, setHover] = useState<number | null>(null);
   const n = lines[0]?.values.length ?? 0;
@@ -190,6 +211,7 @@ export function ChartCard({
           <span className="text-xs text-muted">{head.when}</span>
           <span className="font-mono text-2xl leading-[1.1] font-bold tracking-[-0.04em]">{head.main}</span>
         </div>
+        {summary}
         <ul className="flex flex-wrap gap-x-3.5 gap-y-1 pb-[3px] text-xs text-muted">
           {legend(i).map((l) => (
             <li key={l.key} className="flex items-center gap-1.5">
@@ -218,6 +240,7 @@ export function ChartCard({
           </div>
         </div>
       </div>
+      {footer}
     </section>
   );
 }

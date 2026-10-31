@@ -109,6 +109,9 @@ var tokenProcedures = map[string]int{
 // stepUpProcedures lists exactly the procedures whose handlers call RequireStepUp. A token cannot call them
 // directly (none is TokenAccessDirect); through MCP they run only inside an approved plan.
 var stepUpProcedures = map[string]bool{
+	adminv1connect.CloudUsageServiceSaveCloudAccountProcedure:           true,
+	adminv1connect.CloudUsageServiceDisconnectCloudAccountProcedure:     true,
+	adminv1connect.CloudUsageServiceBindCloudResourceProcedure:          true,
 	adminv1connect.AuthServiceBeginAddPasskeyProcedure:                  true,
 	adminv1connect.AuthServiceRemovePasskeyProcedure:                    true,
 	adminv1connect.AuthServiceEndSessionProcedure:                       true, // another session

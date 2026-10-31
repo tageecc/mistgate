@@ -5,6 +5,9 @@ import { en, type MessageKey } from "@/i18n/en";
 // Audit actions are open-ended strings written by the panel ("login", "node.retire", ...). Known ones get a
 // sentence in the UI language; an unknown one is shown as it is, so a new module never leaves a blank row.
 const keys: Record<string, MessageKey> = {
+  cloud_account_saved: "cloud.audit.saved",
+  cloud_account_disconnected: "cloud.audit.disconnected",
+  cloud_resource_saved: "cloud.audit.resource",
   setup: "audit.setup",
   login: "audit.login",
   login_password: "audit.login_password",

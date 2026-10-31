@@ -1,3 +1,4 @@
+import { CloudUsageService } from "@/gen/mistgate/admin/v1/cloud_usage_pb";
 import { Code, ConnectError, createClient } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
 import { AuthService } from "@/gen/mistgate/admin/v1/auth_pb";
@@ -39,6 +40,7 @@ const transport = createConnectTransport({
   interceptors: [versionInterceptor],
 });
 
+export const cloudUsage = createClient(CloudUsageService, transport);
 export const auth = createClient(AuthService, transport);
 export const backups = createClient(BackupService, transport);
 export const instance = createClient(InstanceService, transport);

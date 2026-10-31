@@ -1,0 +1,96 @@
+syntax = "proto3";
+
+package mistgate.admin.v1;
+
+// Optional cloud usage integration. Owner session only; no API tokens or MCP.
+// Writes require step-up. Credentials are write-only and never leave the panel.
+// Cloud measurements do not participate in user quotas, node health or desired state.
+service CloudUsageService {
+  rpc ListCloudAccounts(ListCloudAccountsRequest) returns (ListCloudAccountsResponse);
+  rpc SaveCloudAccount(SaveCloudAccountRequest) returns (SaveCloudAccountResponse);
+  rpc DisconnectCloudAccount(DisconnectCloudAccountRequest) returns (DisconnectCloudAccountResponse);
+  rpc GetCloudUsage(GetCloudUsageRequest) returns (GetCloudUsageResponse);
+  rpc BindCloudResource(BindCloudResourceRequest) returns (BindCloudResourceResponse);
+}
+
+message CloudAccount {
+  string id = 1;
+  string name = 2;
+  string provider = 3;
+  string account_id = 4;
+  bool connected = 5;
+  bool billing_enabled = 6;
+  bool reconnect = 7;
+}
+
+message ListCloudAccountsRequest {}
+message ListCloudAccountsResponse {
+  repeated CloudAccount accounts = 1;
+}
+
+message SaveCloudAccountRequest {
+  // Empty creates an account; reconnecting must verify the same cloud account id.
+  string id = 1;
+  string name = 2;
+  string provider = 3;
+  // Both empty retains the encrypted credentials of an existing connected account.
+  string access_key_id = 4;
+  string access_key_secret = 5;
+  bool billing_enabled = 6;
+}
+message SaveCloudAccountResponse {
+  CloudAccount account = 1;
+}
+
+message DisconnectCloudAccountRequest {
+  string id = 1;
+}
+message DisconnectCloudAccountResponse {}
+
+message CloudResource {
+  string account_id = 1;
+  string region = 2;
+  string instance_id = 3;
+  // A private reminder threshold, never a vendor allowance or a hard limit. Zero disables it.
+  uint64 threshold_bytes = 4 [jstype = JS_NUMBER];
+  string threshold_amount = 5;
+  string threshold_currency = 6;
+}
+
+message GetCloudUsageRequest {
+  string node_id = 1;
+  // YYYY-MM in the provider's billing timezone; empty selects this month.
+  string month = 2;
+}
+message GetCloudUsageResponse {
+  CloudResource resource = 1;
+  string account_name = 2;
+  string month = 3;
+  bool has_usage = 4;
+  uint64 outbound_bytes = 5 [jstype = JS_NUMBER];
+  repeated CloudUsageDay days = 6;
+  // End of the latest observed interval, not the time the API request finished.
+  int64 observed_through_unix = 7 [jstype = JS_NUMBER];
+  bool partial = 8;
+  int64 observed_from_unix = 9 [jstype = JS_NUMBER];
+  bool has_cost = 10;
+  // Exact decimal from the vendor bill, in currency. Never inferred from monitoring.
+  string billed_amount = 11;
+  string currency = 12;
+  bool threshold_reached = 13;
+  // Last successful bill refresh; bills may lag behind monitoring.
+  int64 billed_through_unix = 14 [jstype = JS_NUMBER];
+}
+message CloudUsageDay {
+  string date = 1;
+  uint64 outbound_bytes = 2 [jstype = JS_NUMBER];
+  bool has_usage = 3;
+  bool partial = 4;
+}
+
+message BindCloudResourceRequest {
+  string node_id = 1;
+  // Absent unlinks the resource; historical measurements remain.
+  CloudResource resource = 2;
+}
+message BindCloudResourceResponse {}

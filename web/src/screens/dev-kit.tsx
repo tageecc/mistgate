@@ -9,6 +9,7 @@ import { TwinPanel, twinPlanKey, type Egress } from "@/screens/profiles/twin";
 import { WherePanel } from "@/screens/profiles/where";
 import { groupsQuery } from "@/screens/users/rpc";
 import { AccentPicker } from "@/components/accent-picker";
+import { CloudUsageKit } from "./dev-kit-cloud";
 import { Avatar, Card, Chip, Kbd, PageTitle, SectionLabel } from "@/components/ui/bits";
 import { Button } from "@/components/ui/button";
 import { IconButton } from "@/components/ui/icon-button";
@@ -286,7 +287,7 @@ export default function DevKit() {
   const [replay, setReplay] = useState(0);
   const [linkDemo, setLinkDemo] = useState<"pw" | "plain" | "awg" | "nothing" | null>(null);
   // ?only=dns|edge|node|health|users|subs|approvals|fleet: one kit alone, for its screenshots
-  const only = { dns: DnsLinkKit, edge: EdgeKit, node: NodeDemos, health: HealthWarpKit, users: UsersKit, subs: SubsKit, approvals: ProfileApprovalsKit, fleet: FleetKit }[
+  const only = { cloud: CloudUsageKit, dns: DnsLinkKit, edge: EdgeKit, node: NodeDemos, health: HealthWarpKit, users: UsersKit, subs: SubsKit, approvals: ProfileApprovalsKit, fleet: FleetKit }[
     new URLSearchParams(location.search).get("only") ?? ""
   ];
   if (only) {

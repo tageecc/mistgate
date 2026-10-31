@@ -1,3 +1,4 @@
+import { NodeCloudUsage } from "./cloud-usage";
 import { SectionLabel } from "@/components/ui/bits";
 import type { IconName, Tone } from "@/components/ui/icons";
 import { NodeStatus } from "@/gen/mistgate/admin/v1/common_pb";
@@ -89,6 +90,7 @@ export function OverviewTab({ data, ways }: { data: Plain<GetNodeResponse>; ways
         <p className="-mt-1 text-xs text-muted">{offline && node.lastSeenUnix > 0 ? t("node.m.offline", { time: fmt.stamp(node.lastSeenUnix) }) : t("node.m.none")}</p>
       )}
       <NodeTraffic nodeId={node.id} />
+      <NodeCloudUsage nodeId={node.id} />
       {ways && node.status !== NodeStatus.RETIRED && <WaysStrip data={data} w={ways} />}
 
       <div className="grid items-start gap-3.5 md:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)]">

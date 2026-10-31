@@ -1,3 +1,4 @@
+import { ru as cloudRu } from "./cloud-usage";
 import type { CoreMessages, Messages } from "./en";
 import { ru as opsRu } from "./ops";
 import { ru as profilesRu } from "./profiles";
@@ -275,4 +276,4 @@ const core: CoreMessages = {
   "field.reality.target_kind.invalid_enum": "Сайт этой ноды или другой сайт",
 };
 
-export const ru: Messages = { ...core, ...opsRu, ...usersRu, ...securityRu, ...profilesRu, ...subsRu, ...healthRu, ...updatesRu, ...awgRu, ...warpRu, ...integrationsRu, ...telegramRu, ...portsRu, ...editionRu, ...decoyRu, ...countryRu, ...connectionsRu, ...journalRu, ...relayRu, ...waysRu };
+export const ru: Messages = { ...cloudRu, ...core, ...opsRu, ...usersRu, ...securityRu, ...profilesRu, ...subsRu, ...healthRu, ...updatesRu, ...awgRu, ...warpRu, ...integrationsRu, ...telegramRu, ...portsRu, ...editionRu, ...decoyRu, ...countryRu, ...connectionsRu, ...journalRu, ...relayRu, ...waysRu };

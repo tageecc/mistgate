@@ -10,6 +10,7 @@ import (
 	"github.com/mistgate/mistgate/internal/panel/access"
 	"github.com/mistgate/mistgate/internal/panel/backup"
 	"github.com/mistgate/mistgate/internal/panel/clientprobe"
+	"github.com/mistgate/mistgate/internal/panel/cloudusage"
 	"github.com/mistgate/mistgate/internal/panel/fleet"
 	"github.com/mistgate/mistgate/internal/panel/httpserver"
 	nodeprovision "github.com/mistgate/mistgate/internal/panel/provision"
@@ -203,11 +204,13 @@ func (k *core) baseHTTP() httpserver.Config {
 // the person's page.
 func (k *core) adminConfig(parts subParts, prov *nodeprovision.Service, bkp *backup.Service, forward bool) httpserver.Config {
 	cfg := k.baseHTTP()
+	k.cloud = cloudusage.New(cloudusage.Config{Store: k.st, Vault: k.vlt, StepUp: k.authSvc.RequireStepUp, Log: k.log, Now: k.c.Clock, Edge: k.edge})
 	subSvc := subs.NewService(k.st, parts.cache, k.reg, parts.brand, parts.dns, k.log)
 	subSvc.NotifyWith(k.fl) // a switch to STRICT revokes the shared devices
 	// The kl!ck reports: the owner's switch (it rides with the subscription settings, hence their cache) and the counts.
 	probe := clientprobe.New(clientprobe.Config{Store: k.st, StepUp: k.authSvc.RequireStepUp, Invalidate: parts.cache.Invalidate, Log: k.log, Now: k.c.Clock})
 	for _, h := range []func() (string, http.Handler){
+		func() (string, http.Handler) { return k.cloud.Handler() },
 		func() (string, http.Handler) { return k.fl.NodeHandler() },
 		func() (string, http.Handler) { return k.fl.FleetHandler() },
 		k.acc.ProfileHandler, k.acc.UserHandler, k.acc.GroupHandler, k.acc.DeviceHandler, k.acc.AwgHandler, k.acc.RelayHandler, subSvc.Handler, parts.dns.Handler,
@@ -288,6 +291,7 @@ func (k *core) finish(cfg httpserver.Config, prov *nodeprovision.Service, bkp *b
 	if jobs {
 		p.BackgroundJobs = backgroundJobs(k.c, jobServices{fleet: k.fl, access: k.acc, health: k.hl, blocklist: k.bl, probe: k.cp,
 			cheburcheck: k.cc, bsbord: k.bs, update: k.upd, backup: bkp, telegram: k.tg, provision: prov, store: k.st, log: k.log})
+		p.BackgroundJobs = append(p.BackgroundJobs, BackgroundJob{Name: "cloud-usage", Run: k.cloud.Run})
 	}
 	return p, nil
 }

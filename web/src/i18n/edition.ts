@@ -2,10 +2,11 @@
 // (internal/panel/edition); the admin says so in these words instead of showing a button that does nothing. English is the
 // source of truth: `ru` is type-checked against it. The admin speaks «ты». Never rename an id: the server sends them.
 /** The feature ids MeResponse.unavailable carries (internal/panel/edition). */
-export const editionFeatures = ["backups", "mcp", "health_checks", "agent_updates", "agent_logs", "panel_update", "decoy_own", "tspu_probe"] as const;
+export const editionFeatures = ["backups", "mcp", "health_checks", "agent_updates", "agent_logs", "panel_update", "decoy_own", "tspu_probe", "cloud_usage"] as const;
 export type EditionFeature = (typeof editionFeatures)[number];
 
 export const en = {
+  "edition.feature.cloud_usage": "Cloud traffic",
   // the sentence for the refusal "unavailable_in_edition: feature=<id>" (src/lib/errors.ts) and the lead of every notice; {feature} is one of the names below
   "err.unavailable_in_edition": "Not available in the Cloudflare edition yet: {feature}.",
   "edition.feature.backups": "Backups",
@@ -21,6 +22,7 @@ export const en = {
 };
 
 export const ru: typeof en = {
+  "edition.feature.cloud_usage": "Облачный трафик",
   "err.unavailable_in_edition": "Пока недоступно в Cloudflare-версии: {feature}.",
   "edition.feature.backups": "Резервные копии",
   "edition.feature.mcp": "MCP и API-токены",
@@ -35,6 +37,7 @@ export const ru: typeof en = {
 
 // Simplified Chinese has one plural form: write a message without "|" (a leftover "a|b" shows the last form).
 export const zh: typeof en = {
+  "edition.feature.cloud_usage": "云流量",
   "err.unavailable_in_edition": "Cloudflare 版暂不支持：{feature}。",
   "edition.feature.backups": "备份",
   "edition.feature.mcp": "MCP 和 API 令牌",

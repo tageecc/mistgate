@@ -34,6 +34,7 @@ var edgeTickJobs = map[string]string{
 
 // edgeDeferred describes background-job functions that stay VPS-only; a job can also have an edge phase above.
 var edgeDeferred = map[string]string{
+	"cloud-usage": "Cloud usage collection is VPS-only.",
 	"fleet":          "event-driven Run, local sessions, closeAll and recomputeAll remain VPS-only",
 	"health":         "client-eye checker and periodic UDP port rechecks",
 	"updates":        "installing a panel binary remains an edge deploy operation",
@@ -46,6 +47,7 @@ var edgeDeferred = map[string]string{
 // "unavailable" (internal/panel/edition). A test keeps the two lists in step, so a job cannot be deferred without the
 // admin saying so, nor a feature be listed with nothing behind it.
 var edgeDeferredFeatures = map[string][]string{
+	"cloud-usage": {edition.CloudUsage},
 	"fleet":          {edition.AgentLogs},
 	"health":         {edition.HealthChecks},
 	"updates":        {edition.PanelUpdate},

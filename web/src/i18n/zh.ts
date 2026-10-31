@@ -1,3 +1,4 @@
+import { zh as cloudZh } from "./cloud-usage";
 import type { CoreMessages, Messages } from "./en";
 import { zh as opsZh } from "./ops";
 import { zh as profilesZh } from "./profiles";
@@ -271,4 +272,4 @@ const core: CoreMessages = {
   "field.reality.target_kind.invalid_enum": "本节点站点或其他站点",
 };
 
-export const zh: Messages = { ...core, ...opsZh, ...usersZh, ...securityZh, ...profilesZh, ...subsZh, ...healthZh, ...updatesZh, ...awgZh, ...warpZh, ...integrationsZh, ...telegramZh, ...portsZh, ...editionZh, ...decoyZh, ...countryZh, ...connectionsZh, ...journalZh, ...relayZh, ...waysZh };
+export const zh: Messages = { ...cloudZh, ...core, ...opsZh, ...usersZh, ...securityZh, ...profilesZh, ...subsZh, ...healthZh, ...updatesZh, ...awgZh, ...warpZh, ...integrationsZh, ...telegramZh, ...portsZh, ...editionZh, ...decoyZh, ...countryZh, ...connectionsZh, ...journalZh, ...relayZh, ...waysZh };

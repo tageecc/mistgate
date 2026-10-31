@@ -19,6 +19,7 @@ import (
 	"github.com/mistgate/mistgate/internal/panel/blocklist"
 	"github.com/mistgate/mistgate/internal/panel/bsbord"
 	"github.com/mistgate/mistgate/internal/panel/cheburcheck"
+	"github.com/mistgate/mistgate/internal/panel/cloudusage"
 	"github.com/mistgate/mistgate/internal/panel/countryprobe"
 	"github.com/mistgate/mistgate/internal/panel/countryreach"
 	"github.com/mistgate/mistgate/internal/panel/dns"
@@ -173,6 +174,7 @@ func (p subParts) mux(b base, acc *access.Service) http.Handler {
 // core is the wiring the roles share (wireCore): the services that call into each other, and the callbacks between them.
 // Only the public Worker does without it: it builds the fleet and access it needs on their own.
 type core struct {
+	cloud *cloudusage.Service
 	base
 	authSvc *auth.Service
 	tg      *telegram.Service

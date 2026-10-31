@@ -1,3 +1,4 @@
+import { en as cloudEn } from "./cloud-usage";
 // English is the source of truth: ru.ts is type-checked against this shape.
 // Use {name} placeholders for values; no hard-coded text in components. A message with several forms
 // separated by "|" is a plural (see tn() in index.ts).
@@ -285,7 +286,7 @@ const core = {
 
 export type CoreMessages = typeof core;
 export { core as coreEn };
-export const en = { ...core, ...opsEn, ...usersEn, ...securityEn, ...profilesEn, ...subsEn, ...healthEn, ...updatesEn, ...awgEn, ...warpEn, ...integrationsEn, ...telegramEn, ...portsEn, ...editionEn, ...decoyEn, ...countryEn, ...connectionsEn, ...journalEn, ...relayEn, ...waysEn };
+export const en = { ...cloudEn, ...core, ...opsEn, ...usersEn, ...securityEn, ...profilesEn, ...subsEn, ...healthEn, ...updatesEn, ...awgEn, ...warpEn, ...integrationsEn, ...telegramEn, ...portsEn, ...editionEn, ...decoyEn, ...countryEn, ...connectionsEn, ...journalEn, ...relayEn, ...waysEn };
 
 export type Messages = typeof en;
 export type MessageKey = keyof Messages;

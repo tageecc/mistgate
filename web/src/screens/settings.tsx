@@ -1,3 +1,6 @@
+import { CloudAccountsPage } from "./settings-pages/cloud-accounts";
+import { useIsOwner } from "@/lib/updates";
+import { useEdition } from "@/lib/edition";
 import { Link, Navigate, Outlet, useParams } from "@tanstack/react-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { PageTitle } from "@/components/ui/bits";
@@ -23,6 +26,7 @@ export const pages = [
   { id: "admins", label: "settings.admins" },
   { id: "domains", label: "settings.domains" },
   { id: "backups", label: "settings.backups" },
+  { id: "cloud", label: "cloud.accounts" },
 ] as const satisfies readonly { id: string; label: MessageKey }[];
 
 type PageId = (typeof pages)[number]["id"];
@@ -37,6 +41,8 @@ const fades = {
 };
 
 export function SettingsLayout() {
+  const cloudVisible = useIsOwner();
+  const cloudUnavailable = useEdition().off("cloud_usage");
   const t = useT();
   const { section } = useParams({ strict: false });
   const nav = useRef<HTMLElement>(null);
@@ -73,7 +79,7 @@ export function SettingsLayout() {
           style={{ maskImage: fades[fade] }}
           className="no-scrollbar relative flex max-w-full flex-none gap-0.5 overflow-x-auto md:w-[180px] md:flex-col"
         >
-          {pages.map((p) => (
+          {pages.filter((p) => p.id !== "cloud" || (cloudVisible && !cloudUnavailable)).map((p) => (
             <Link
               key={p.id}
               data-page={p.id}
@@ -116,6 +122,8 @@ export function SettingsPage() {
       return <AdminsPage />;
     case "domains":
       return <DomainsPage />;
+    case "cloud":
+      return <CloudAccountsPage />;
     case "backups":
       return <BackupsPage />;
   }

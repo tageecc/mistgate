@@ -1,3 +1,4 @@
+import { CloudResourceCard } from "./cloud-resource";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { useMemo, useState, type FormEvent, type ReactNode } from "react";
@@ -78,6 +79,7 @@ export function ServerTab({ data }: { data: Plain<GetNodeResponse> }) {
         </div>
         <div className="flex min-w-0 flex-col gap-3.5">
           <SSHAccessCard nodeId={node.id} />
+          <CloudResourceCard nodeId={node.id} />
           {!retired && <DecoyCard node={node} />}
           {!retired && <AwgBackendCard data={data} />}
           <HostPanel data={data} />

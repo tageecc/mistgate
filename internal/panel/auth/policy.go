@@ -23,6 +23,11 @@ const (
 // request; a procedure that is not listed here needs the owner (fail closed), and TestEveryProcedureHasAPolicy
 // fails until a new RPC is given a level on purpose. The public procedures (publicProcedures) bypass it.
 var procedureLevels = map[string]level{
+	adminv1connect.CloudUsageServiceListCloudAccountsProcedure:      levelOwner,
+	adminv1connect.CloudUsageServiceSaveCloudAccountProcedure:       levelOwner,
+	adminv1connect.CloudUsageServiceDisconnectCloudAccountProcedure: levelOwner,
+	adminv1connect.CloudUsageServiceGetCloudUsageProcedure:          levelOwner,
+	adminv1connect.CloudUsageServiceBindCloudResourceProcedure:      levelOwner,
 	// AuthService: own account.
 	adminv1connect.AuthServiceMeProcedure:               levelRead,
 	adminv1connect.AuthServiceListPasskeysProcedure:     levelRead,
