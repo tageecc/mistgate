@@ -28,8 +28,8 @@ export function cloudError(error: unknown, t: T) {
   return t(keys[ConnectError.from(error).rawMessage] ?? "cloud.failed");
 }
 
-export function cloudMonths(now = new Date()) {
-  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit" }).formatToParts(now);
+export function cloudMonths(provider = "aliyun", now = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: provider === "aws_lightsail" ? "UTC" : "Asia/Shanghai", year: "numeric", month: "2-digit" }).formatToParts(now);
   const year = Number(parts.find((p) => p.type === "year")!.value);
   const month = Number(parts.find((p) => p.type === "month")!.value);
   return Array.from({ length: 12 }, (_, i) => new Date(Date.UTC(year, month - 1 - i, 1)).toISOString().slice(0, 7));

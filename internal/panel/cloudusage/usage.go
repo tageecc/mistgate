@@ -17,15 +17,17 @@ func (s *Service) GetCloudUsage(ctx context.Context, req *connect.Request[adminv
 	if err := s.guard(ctx, false); err != nil {
 		return nil, err
 	}
-	start, end, err := monthBounds(req.Msg.Month, s.cfg.Now())
-	if err != nil {
-		return nil, invalid()
-	}
-	out := &adminv1.GetCloudUsageResponse{Month: start.Format("2006-01")}
+	out := &adminv1.GetCloudUsageResponse{}
 	var id string
 	var created int64
 	r := &adminv1.CloudResource{}
-	err = s.cfg.Store.R.QueryRowContext(ctx, `SELECT r.id,r.account_id,r.region,r.instance_id,r.created_at,b.threshold_bytes,b.threshold_amount,b.threshold_currency,a.name FROM cloud_usage_binding b JOIN cloud_usage_resource r ON r.id=b.resource_id JOIN cloud_usage_account a ON a.id=r.account_id WHERE b.node_id=?`, req.Msg.NodeId).Scan(&id, &r.AccountId, &r.Region, &r.InstanceId, &created, &r.ThresholdBytes, &r.ThresholdAmount, &r.ThresholdCurrency, &out.AccountName)
+	err := s.cfg.Store.R.QueryRowContext(ctx, `SELECT r.id,r.account_id,r.region,r.instance_id,r.created_at,b.threshold_bytes,b.threshold_amount,b.threshold_currency,a.name,a.provider,r.allowance_gb FROM cloud_usage_binding b JOIN cloud_usage_resource r ON r.id=b.resource_id JOIN cloud_usage_account a ON a.id=r.account_id WHERE b.node_id=?`, req.Msg.NodeId).Scan(&id, &r.AccountId, &r.Region, &r.InstanceId, &created, &r.ThresholdBytes, &r.ThresholdAmount, &r.ThresholdCurrency, &out.AccountName, &out.Provider, &out.AllowanceGb)
+	zone := providerZone(out.Provider)
+	start, end, monthErr := monthBounds(req.Msg.Month, s.cfg.Now(), zone)
+	if monthErr != nil {
+		return nil, invalid()
+	}
+	out.Month = start.Format("2006-01")
 	if errors.Is(err, sql.ErrNoRows) {
 		return connect.NewResponse(out), nil
 	}
@@ -33,7 +35,7 @@ func (s *Service) GetCloudUsage(ctx context.Context, req *connect.Request[adminv
 		return nil, failure(err)
 	}
 	out.Resource = r
-	rows, err := s.cfg.Store.R.QueryContext(ctx, `SELECT interval_end,outbound_bytes FROM cloud_usage_sample WHERE resource_id=? AND interval_end>? AND interval_end<=? ORDER BY interval_end`, id, start.Unix(), end.Unix())
+	rows, err := s.cfg.Store.R.QueryContext(ctx, `SELECT interval_end,outbound_bytes,inbound_bytes FROM cloud_usage_sample WHERE resource_id=? AND interval_end>? AND interval_end<=? ORDER BY interval_end`, id, start.Unix(), end.Unix())
 	if err != nil {
 		return nil, failure(err)
 	}
@@ -43,17 +45,23 @@ func (s *Service) GetCloudUsage(ctx context.Context, req *connect.Request[adminv
 	for rows.Next() {
 		var t int64
 		var bytes uint64
-		if err = rows.Scan(&t, &bytes); err != nil {
+		var inbound sql.NullInt64
+		if err = rows.Scan(&t, &bytes, &inbound); err != nil {
 			break
 		}
-		date := time.Unix(t-1, 0).In(billingZone).Format("2006-01-02")
+		if out.Provider == "aws_lightsail" && !inbound.Valid {
+			continue
+		}
+		date := time.Unix(t-1, 0).In(zone).Format("2006-01-02")
 		if days[date] == nil {
 			days[date] = &adminv1.CloudUsageDay{Date: date, HasUsage: true}
 		}
 		days[date].OutboundBytes += bytes
+		days[date].InboundBytes += uint64(inbound.Int64)
 		counts[date]++
 		count++
 		out.OutboundBytes += bytes
+		out.InboundBytes += uint64(inbound.Int64)
 		out.HasUsage = true
 		if out.ObservedFromUnix == 0 {
 			out.ObservedFromUnix = t - samplePeriod
@@ -84,6 +92,10 @@ func (s *Service) GetCloudUsage(ctx context.Context, req *connect.Request[adminv
 		out.Days = append(out.Days, point)
 	}
 	out.ThresholdReached = r.ThresholdBytes > 0 && out.OutboundBytes >= r.ThresholdBytes
+	if out.Provider == "aws_lightsail" {
+		out.ThresholdReached = r.ThresholdBytes > 0 && out.OutboundBytes+out.InboundBytes >= r.ThresholdBytes
+		return connect.NewResponse(out), nil
+	}
 	var bills string
 	err = s.cfg.Store.R.QueryRowContext(ctx, `SELECT entries,fetched_at FROM cloud_usage_bill WHERE account_id=? AND month=?`, r.AccountId, out.Month).Scan(&bills, &out.BilledThroughUnix)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {

@@ -30,12 +30,12 @@ type Config struct {
 }
 
 type Service struct {
-	cfg      Config
-	provider provider
-	initErr  error
-	kick     chan struct{}
-	mu       sync.Mutex
-	active   map[string]context.CancelFunc
+	cfg       Config
+	providers map[string]provider
+	initErr   error
+	kick      chan struct{}
+	mu        sync.Mutex
+	active    map[string]context.CancelFunc
 }
 
 func New(c Config) *Service {
@@ -45,7 +45,7 @@ func New(c Config) *Service {
 	if c.Log == nil {
 		c.Log = slog.Default()
 	}
-	s := &Service{cfg: c, provider: newAliyun(), kick: make(chan struct{}, 1), active: map[string]context.CancelFunc{}}
+	s := &Service{cfg: c, providers: map[string]provider{"aliyun": newAliyun(), "aws_lightsail": newLightsail()}, kick: make(chan struct{}, 1), active: map[string]context.CancelFunc{}}
 	if c.Edge {
 		s.initErr = errors.New("VPS edition required")
 	} else {
@@ -183,7 +183,8 @@ func (s *Service) SaveCloudAccount(ctx context.Context, req *connect.Request[adm
 	}
 	m := req.Msg
 	name := strings.TrimSpace(m.Name)
-	if name == "" || len(name) > 120 || m.Provider != "aliyun" || len(m.AccessKeyId) > 256 || len(m.AccessKeySecret) > 256 {
+	p, supported := s.providers[m.Provider]
+	if name == "" || len(name) > 120 || !supported || (m.Provider != "aliyun" && m.BillingEnabled) || len(m.AccessKeyId) > 256 || len(m.AccessKeySecret) > 256 {
 		return nil, invalid()
 	}
 	a := account{ID: m.Id, Name: name, Provider: m.Provider, Billing: m.BillingEnabled}
@@ -191,6 +192,9 @@ func (s *Service) SaveCloudAccount(ctx context.Context, req *connect.Request[adm
 		old, err := s.account(ctx, a.ID)
 		if err != nil {
 			return nil, failure(err)
+		}
+		if old.Provider != a.Provider {
+			return nil, invalid()
 		}
 		a.AccountID = old.AccountID
 		a.Sealed = old.Sealed
@@ -203,7 +207,7 @@ func (s *Service) SaveCloudAccount(ctx context.Context, req *connect.Request[adm
 		c := credentials{strings.TrimSpace(m.AccessKeyId), strings.TrimSpace(m.AccessKeySecret)}
 		ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
 		defer cancel()
-		id, err := s.provider.Identity(ctx, c)
+		id, err := p.Identity(ctx, c)
 		if err != nil {
 			return nil, failure(err)
 		}
@@ -284,7 +288,15 @@ func (s *Service) BindCloudResource(ctx context.Context, req *connect.Request[ad
 		}
 	} else {
 		r := m.Resource
-		if !regionPattern.MatchString(r.Region) || !instancePattern.MatchString(r.InstanceId) || r.ThresholdBytes > 1<<50 {
+		a, err := s.account(ctx, r.AccountId)
+		if err != nil {
+			return nil, failure(err)
+		}
+		validInstance := instancePattern.MatchString(r.InstanceId)
+		if a.Provider == "aws_lightsail" {
+			validInstance = lightsailName.MatchString(r.InstanceId)
+		}
+		if !regionPattern.MatchString(r.Region) || !validInstance || r.ThresholdBytes > 1<<50 || (a.Provider != "aliyun" && r.ThresholdAmount != "") {
 			return nil, invalid()
 		}
 		if r.ThresholdAmount != "" {
@@ -304,17 +316,17 @@ func (s *Service) BindCloudResource(ctx context.Context, req *connect.Request[ad
 			s.audit(ctx, "cloud_resource_saved", m.NodeId)
 			return connect.NewResponse(&adminv1.BindCloudResourceResponse{}), nil
 		}
-		a, err := s.account(ctx, r.AccountId)
-		if err != nil {
-			return nil, failure(err)
-		}
 		c, err := s.open(a)
 		if err != nil {
 			return nil, failure(err)
 		}
 		ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
 		defer cancel()
-		i, err := s.provider.Instance(ctx, c, r.Region, r.InstanceId)
+		p, ok := s.providers[a.Provider]
+		if !ok {
+			return nil, invalid()
+		}
+		i, err := p.Instance(ctx, c, r.Region, r.InstanceId)
 		if err != nil {
 			return nil, failure(err)
 		}
@@ -330,7 +342,7 @@ func (s *Service) BindCloudResource(ctx context.Context, req *connect.Request[ad
 			return nil, connect.NewError(connect.CodeAborted, errors.New("cloud_changed"))
 		}
 		var resourceID string
-		err = tx.QueryRowContext(ctx, `INSERT INTO cloud_usage_resource(id,account_id,region,instance_id,created_at) VALUES(?,?,?,?,?) ON CONFLICT(account_id,region,instance_id) DO UPDATE SET created_at=excluded.created_at RETURNING id`, store.NewID("csr_"), a.ID, r.Region, r.InstanceId, i.CreatedAt.Unix()).Scan(&resourceID)
+		err = tx.QueryRowContext(ctx, `INSERT INTO cloud_usage_resource(id,account_id,region,instance_id,created_at,allowance_gb) VALUES(?,?,?,?,?,?) ON CONFLICT(account_id,region,instance_id) DO UPDATE SET created_at=excluded.created_at,allowance_gb=excluded.allowance_gb RETURNING id`, store.NewID("csr_"), a.ID, r.Region, r.InstanceId, i.CreatedAt.Unix(), i.AllowanceGB).Scan(&resourceID)
 		if err == nil {
 			_, err = tx.ExecContext(ctx, `INSERT INTO cloud_usage_binding(node_id,resource_id,threshold_bytes,threshold_amount,threshold_currency) VALUES(?,?,?,?,?) ON CONFLICT(node_id) DO UPDATE SET resource_id=excluded.resource_id,threshold_bytes=excluded.threshold_bytes,threshold_amount=excluded.threshold_amount,threshold_currency=excluded.threshold_currency`, m.NodeId, resourceID, r.ThresholdBytes, r.ThresholdAmount, r.ThresholdCurrency)
 		}

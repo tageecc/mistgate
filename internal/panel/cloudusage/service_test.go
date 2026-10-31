@@ -73,7 +73,7 @@ func newEnv(t *testing.T) *testEnv {
 		t.Fatal(e.s.initErr)
 	}
 	e.f = &fakeProvider{identity: "1234567890123456", created: time.Date(2026, 10, 1, 0, 0, 0, 0, billingZone)}
-	e.s.provider = e.f
+	e.s.providers["aliyun"] = e.f
 	e.exec(t, `INSERT INTO node(id,name,address,created_at) VALUES('nod_one','one','192.0.2.1',1),('nod_two','two','192.0.2.2',1)`)
 	return e
 }
@@ -251,7 +251,7 @@ func TestCollectorIdempotentCorrectedAndWindowBounded(t *testing.T) {
 		}
 		var out []sample
 		for ts := start.Unix() + 600; ts <= end.Unix(); ts += 600 {
-			out = append(out, sample{ts, corrected})
+			out = append(out, sample{End: ts, Bytes: corrected})
 		}
 		return out, nil
 	}
@@ -309,7 +309,7 @@ func TestUsageMonthBoundaryZeroMissingAndTrailingGap(t *testing.T) {
 	a := e.save(t)
 	e.bind(t, a)
 	boundary := e.f.created.Unix()
-	e.points(t, sample{boundary, 999}, sample{boundary + 600, 0}, sample{boundary + 1200, 250})
+	e.points(t, sample{End: boundary, Bytes: 999}, sample{End: boundary + 600, Bytes: 0}, sample{End: boundary + 1200, Bytes: 250})
 	got := e.get(t, "2026-10")
 	if !got.HasUsage || got.OutboundBytes != 250 || !got.Partial || !got.Days[0].Partial || got.Days[1].HasUsage {
 		t.Fatalf("gap/boundary handling: %+v", got)
@@ -373,7 +373,7 @@ func TestSnapshotContainsExtensionAndReopensWithoutExtensionMigration(t *testing
 	e := newEnv(t)
 	a := e.save(t)
 	e.bind(t, a)
-	e.points(t, sample{e.f.created.Unix() + 600, 12})
+	e.points(t, sample{End: e.f.created.Unix() + 600, Bytes: 12})
 	snapshot := filepath.Join(t.TempDir(), "snapshot.db")
 	if err := e.s.cfg.Store.SnapshotDatabase(e.ctx, snapshot); err != nil {
 		t.Fatal(err)
@@ -398,7 +398,7 @@ func TestSnapshotContainsExtensionAndReopensWithoutExtensionMigration(t *testing
 	if c, err := s.open(restoredAccount); err != nil || c.Secret != "test-access-secret" {
 		t.Fatal("restored credential unreadable")
 	}
-	e.exec(t, `INSERT INTO cloud_usage_schema(version_id,is_applied) VALUES(2,1)`)
+	e.exec(t, `INSERT INTO cloud_usage_schema(version_id,is_applied) VALUES(3,1)`)
 	if err := migrate(e.ctx, e.s.cfg.Store); err == nil {
 		t.Fatal("accepted future extension schema")
 	}

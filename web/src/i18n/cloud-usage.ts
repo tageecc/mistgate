@@ -1,4 +1,12 @@
 export const en = {
+  "cloud.aws": "AWS Lightsail",
+  "cloud.instanceName": "Instance name",
+  "cloud.total": "Monthly in + out",
+  "cloud.allowance": "Plan allowance",
+  "cloud.allowanceHint": "Shared by plans of the same size in the same region. Not the remaining allowance.",
+  "cloud.directions": "In {received} · Out {sent}",
+  "cloud.thresholdTotal": "In + out · GB",
+
   "cloud.audit.saved": "updated a cloud account",
   "cloud.audit.disconnected": "disconnected a cloud account",
   "cloud.audit.resource": "updated cloud resource settings",
@@ -47,6 +55,14 @@ export const en = {
   "cloud.bound": "This instance is linked to another node.",
 };
 export const zh: typeof en = {
+  "cloud.aws": "AWS Lightsail",
+  "cloud.instanceName": "实例名称",
+  "cloud.total": "月度入站 + 出站",
+  "cloud.allowance": "套餐月额度",
+  "cloud.allowanceHint": "同地域同套餐共享，并非剩余额度。",
+  "cloud.directions": "入站 {received} · 出站 {sent}",
+  "cloud.thresholdTotal": "入站 + 出站 · GB",
+
   "cloud.audit.saved": "更新了云账号", "cloud.audit.disconnected": "断开了云账号", "cloud.audit.resource": "更新了云资源设置",
   "cloud.accounts": "云账号", "cloud.title": "云流量", "cloud.add": "添加账号", "cloud.edit": "编辑",
   "cloud.name": "名称", "cloud.provider": "厂商", "cloud.aliyun": "阿里云", "cloud.keyId": "AccessKey ID", "cloud.keySecret": "AccessKey Secret",
@@ -61,6 +77,14 @@ export const zh: typeof en = {
   "cloud.invalid": "请检查账号和实例。", "cloud.exists": "该账号已连接。", "cloud.bound": "该实例已关联其他节点。",
 };
 export const ru: typeof en = {
+  "cloud.aws": "AWS Lightsail",
+  "cloud.instanceName": "Имя инстанса",
+  "cloud.total": "Входящий + исходящий за месяц",
+  "cloud.allowance": "Лимит тарифа",
+  "cloud.allowanceHint": "Общий для тарифов одного размера в одном регионе. Не остаток лимита.",
+  "cloud.directions": "Входящий {received} · Исходящий {sent}",
+  "cloud.thresholdTotal": "Входящий + исходящий · GB",
+
   "cloud.audit.saved": "обновил(а) облачный аккаунт", "cloud.audit.disconnected": "отключил(а) облачный аккаунт", "cloud.audit.resource": "обновил(а) настройки облачного ресурса",
   "cloud.accounts": "Облачные аккаунты", "cloud.title": "Облачный трафик", "cloud.add": "Добавить аккаунт", "cloud.edit": "Изменить",
   "cloud.name": "Название", "cloud.provider": "Провайдер", "cloud.aliyun": "Alibaba Cloud", "cloud.keyId": "AccessKey ID", "cloud.keySecret": "AccessKey Secret",

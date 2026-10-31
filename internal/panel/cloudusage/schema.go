@@ -26,7 +26,7 @@ func migrate(ctx context.Context, st *store.Store) error {
 		if err := st.R.QueryRowContext(ctx, `SELECT coalesce(max(version_id),0) FROM cloud_usage_schema WHERE is_applied=1`).Scan(&version); err != nil {
 			return err
 		}
-		if version > 1 {
+		if version > 2 {
 			return errors.New("cloud usage schema is newer than this binary")
 		}
 	}

@@ -21,7 +21,7 @@ vi.mock("@/lib/edition", () => ({ useEdition: () => ({ off: () => edge }) }));
 
 const account = { id: "cld_example", name: "Personal", provider: "aliyun", accountId: "1234567890123456", connected: true, billingEnabled: true, reconnect: false };
 function data(over: Partial<CloudUsage> = {}): CloudUsage { return {
-  accountName: "Personal", month: cloudMonths()[0]!, hasUsage: true, outboundBytes: 0, days: [{ date: "2026-10-01", outboundBytes: 0, hasUsage: true, partial: false }], observedThroughUnix: 1790784600, observedFromUnix: 1790784000,
+  provider: "aliyun", inboundBytes: 0, allowanceGb: 0, accountName: "Personal", month: cloudMonths()[0]!, hasUsage: true, outboundBytes: 0, days: [{ date: "2026-10-01", outboundBytes: 0, hasUsage: true, partial: false, inboundBytes: 0 }], observedThroughUnix: 1790784600, observedFromUnix: 1790784000,
   partial: false, hasCost: true, billedAmount: "0", currency: "CNY", thresholdReached: false, billedThroughUnix: 1790784600,
   resource: { accountId: account.id, region: "ap-southeast-1", instanceId: "i-example123", thresholdBytes: 0, thresholdAmount: "", thresholdCurrency: "CNY" }, ...over,
 }; }
@@ -45,7 +45,24 @@ async function type(el: HTMLInputElement, value: string) { await act(async () =>
 
 describe("cloud usage", () => {
   it("splits gaps without zero fill or connecting across them", () => { expect(chartRuns(7, [true,true,false,true,false,false,true])).toEqual([[0,1],[3],[6]]); expect(chartRuns(0)).toEqual([]); expect(chartRuns(3)).toEqual([[0,1,2]]); });
-  it("uses the billing month at the UTC+8 boundary", () => { expect(cloudMonths(new Date("2026-10-31T16:01:00Z")).slice(0,2)).toEqual(["2026-11","2026-10"]); expect(cloudMoney("0","CNY","en-US")).not.toBe("—"); });
+  it("uses the billing month at the UTC+8 boundary", () => { expect(cloudMonths("aliyun", new Date("2026-10-31T16:01:00Z")).slice(0,2)).toEqual(["2026-11","2026-10"]); expect(cloudMoney("0","CNY","en-US")).not.toBe("—"); });
+  it("keeps AWS on UTC and shows the plan separately from combined traffic", async () => {
+    expect(cloudMonths("aws_lightsail", new Date("2026-10-31T16:01:00Z"))[0]).toBe("2026-10");
+    await mount(<CloudUsageCard data={data({ provider: "aws_lightsail", outboundBytes: 3e9, inboundBytes: 7e9, allowanceGb: 2048, hasCost: false })} onMonthChange={() => {}} />);
+    expect(host.textContent).toContain("10 GB"); expect(host.textContent).toContain("In 7 GB · Out 3 GB");
+    expect(host.textContent).toContain(en["cloud.allowance"]); expect(host.textContent).not.toContain(en["cloud.billed"]);
+    expect(host.textContent).not.toContain("remaining");
+  });
+  it("uses the Lightsail instance name and only a traffic threshold", async () => {
+    const aws = { ...account, provider: "aws_lightsail", billingEnabled: false };
+    qc.setQueryData(cloudAccountsQuery().queryKey,[aws]); qc.setQueryData(cloudUsageQuery("n").queryKey,data({ provider: "aws_lightsail" }));
+    await mount(<CloudResourceCard nodeId="n"/>);
+    expect(host.textContent).toContain(en["cloud.instanceName"]); expect(host.textContent).not.toContain(en["cloud.thresholdCost"]);
+    const inputs = host.querySelectorAll<HTMLInputElement>('input[type="number"]'); expect(inputs.length).toBe(1);
+    await type(inputs[0]!,"1800");
+    await act(async () => { host.querySelector("form")!.dispatchEvent(new Event("submit",{bubbles:true,cancelable:true})); }); await settle();
+    expect(api.bindCloudResource).toHaveBeenCalledWith(expect.objectContaining({resource:expect.objectContaining({thresholdBytes:1800000000000n,thresholdAmount:"",thresholdCurrency:""})}));
+  });
   it("distinguishes known zero from absent values", async () => {
     await mount(<CloudUsageCard data={data()} onMonthChange={() => {}} />);
     expect(host.textContent).toContain("0 B"); expect(host.textContent).toContain(cloudMoney("0","CNY","en-US"));

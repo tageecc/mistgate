@@ -96,6 +96,10 @@ func (s *Service) current(ctx context.Context, a account) bool {
 }
 
 func (s *Service) collectAccount(ctx context.Context, a account) error {
+	p, ok := s.providers[a.Provider]
+	if !ok {
+		return errData
+	}
 	if !s.current(ctx, a) {
 		return nil
 	}
@@ -119,12 +123,12 @@ func (s *Service) collectAccount(ctx context.Context, a account) error {
 	if a.Billing && s.cfg.Now().Unix()-a.BillAttempt >= int64(6*time.Hour/time.Second) {
 		// Advance the attempt even after refusal; repeated page loads never hammer the bill API.
 		s.cfg.Store.W.ExecContext(ctx, `UPDATE cloud_usage_account SET bill_attempt=? WHERE id=? AND revision=?`, s.cfg.Now().Unix(), a.ID, a.Revision)
-		month, _, _ := monthBounds("", s.cfg.Now())
+		month, _, _ := monthBounds("", s.cfg.Now(), providerZone(a.Provider))
 		for _, m := range []string{month.Format("2006-01"), month.AddDate(0, -1, 0).Format("2006-01")} {
 			if !s.current(ctx, a) {
 				return nil
 			}
-			entries, e := s.provider.Bill(ctx, c, a.AccountID, m)
+			entries, e := p.Bill(ctx, c, a.AccountID, m)
 			if e != nil {
 				failed = errors.Join(failed, e)
 				if errors.Is(e, errCredentials) {
@@ -143,6 +147,10 @@ func (s *Service) collectAccount(ctx context.Context, a account) error {
 }
 
 func (s *Service) collectResource(ctx context.Context, a account, c credentials, r resource) error {
+	p, ok := s.providers[a.Provider]
+	if !ok {
+		return errData
+	}
 	now := s.cfg.Now()
 	// Leave one interval for the provider to finish. All windows use the same 10-minute grid.
 	end := (now.Unix()/samplePeriod - 1) * samplePeriod
@@ -156,7 +164,7 @@ func (s *Service) collectResource(ctx context.Context, a account, c credentials,
 			return nil
 		}
 		until := min(start+399*samplePeriod, end)
-		points, err := s.provider.Usage(ctx, c, r.Region, r.InstanceID, time.Unix(start, 0), time.Unix(until, 0))
+		points, err := p.Usage(ctx, c, r.Region, r.InstanceID, time.Unix(start, 0), time.Unix(until, 0))
 		if err != nil {
 			return err
 		}
@@ -172,7 +180,7 @@ func (s *Service) collectResource(ctx context.Context, a account, c credentials,
 			return err
 		}
 		for _, p := range points {
-			_, err = tx.ExecContext(ctx, `INSERT INTO cloud_usage_sample(resource_id,interval_end,outbound_bytes) VALUES(?,?,?) ON CONFLICT(resource_id,interval_end) DO UPDATE SET outbound_bytes=excluded.outbound_bytes`, r.ID, p.End, p.Bytes)
+			_, err = tx.ExecContext(ctx, `INSERT INTO cloud_usage_sample(resource_id,interval_end,outbound_bytes,inbound_bytes) VALUES(?,?,?,?) ON CONFLICT(resource_id,interval_end) DO UPDATE SET outbound_bytes=excluded.outbound_bytes,inbound_bytes=excluded.inbound_bytes`, r.ID, p.End, p.Bytes, p.Inbound)
 			if err != nil {
 				break
 			}

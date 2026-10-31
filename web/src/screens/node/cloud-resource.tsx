@@ -36,8 +36,9 @@ function ResourceForm({ nodeId, resource, accounts }: { nodeId: string; resource
   const [amount, setAmount] = useState(resource?.thresholdAmount || "");
   const [currency, setCurrency] = useState(resource?.thresholdCurrency || "CNY");
   const [error, setError] = useState("");
+  const lightsail = accounts.find((a) => a.id === account)?.provider === "aws_lightsail";
   const mutation = useMutation({
-    mutationFn: () => guard(() => cloudUsage.bindCloudResource({ nodeId, resource: account === "none" ? undefined : { accountId: account, region: region.trim(), instanceId: instance.trim(), thresholdBytes: BigInt(Math.round(Number(threshold || 0) * 1e9)), thresholdAmount: amount, thresholdCurrency: currency } })),
+    mutationFn: () => guard(() => cloudUsage.bindCloudResource({ nodeId, resource: account === "none" ? undefined : { accountId: account, region: region.trim(), instanceId: instance.trim(), thresholdBytes: BigInt(Math.round(Number(threshold || 0) * 1e9)), thresholdAmount: lightsail ? "" : amount, thresholdCurrency: lightsail ? "" : currency } })),
     onSuccess: () => { void qc.invalidateQueries({ queryKey: ["cloud-usage", nodeId] }); toast(t("cloud.saved")); },
     onError: (e) => { if (!isStepUpCancelled(e)) setError(cloudError(e, t)); },
   });
@@ -50,16 +51,16 @@ function ResourceForm({ nodeId, resource, accounts }: { nodeId: string; resource
       {account !== "none" && <>
         <div className="grid gap-3 md:grid-cols-2">
           <TextField label={t("cloud.region")} value={region} onChange={(e) => setRegion(e.target.value)} placeholder="ap-southeast-1" required mono />
-          <TextField label={t("cloud.instance")} value={instance} onChange={(e) => setInstance(e.target.value)} placeholder="i-…" required mono />
+          <TextField label={t(lightsail ? "cloud.instanceName" : "cloud.instance")} value={instance} onChange={(e) => setInstance(e.target.value)} placeholder={lightsail ? "my-instance" : "i-…"} required mono />
         </div>
         <details className="border-t border-line pt-3">
           <summary className="cursor-pointer text-xs font-semibold text-muted">{t("cloud.threshold")}</summary>
           <div className="mt-3 flex flex-col gap-3">
-            <TextField label={t("cloud.thresholdTraffic")} type="number" min={0} max={1000000} step="any" value={threshold} onChange={(e) => setThreshold(e.target.value)} placeholder={t("cloud.off")} />
-            <div className="grid grid-cols-[minmax(0,1fr)_100px] items-end gap-3">
+            <TextField label={t(lightsail ? "cloud.thresholdTotal" : "cloud.thresholdTraffic")} type="number" min={0} max={1000000} step="any" value={threshold} onChange={(e) => setThreshold(e.target.value)} placeholder={t("cloud.off")} />
+            {!lightsail && <div className="grid grid-cols-[minmax(0,1fr)_100px] items-end gap-3">
               <TextField label={t("cloud.thresholdCost")} type="number" min={0} step="0.01" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder={t("cloud.off")} />
               <Select aria-label={t("cloud.currency")} value={currency} onValueChange={setCurrency} options={["CNY", "USD", "JPY"].map((v) => ({ value: v, label: v }))} />
-            </div>
+            </div>}
           </div>
         </details>
       </>}

@@ -4,6 +4,7 @@ import { isStepUpCancelled, useStepUp } from "@/components/step-up";
 import { SectionLabel } from "@/components/ui/bits";
 import { Button } from "@/components/ui/button";
 import { Modal } from "@/components/ui/modal";
+import { Select } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { TextField } from "@/components/ui/text-field";
 import { useToast } from "@/components/ui/toast";
@@ -33,7 +34,7 @@ export function CloudAccountsPage() {
           <div key={a.id} className="flex items-center gap-3 px-4 py-3.5">
             <div className="flex min-w-0 flex-1 flex-col gap-1">
               <b className="break-words text-sm">{a.name}</b>
-              <span className="text-xs text-muted">{t("cloud.aliyun")} · <span className="font-mono">{a.accountId}</span></span>
+              <span className="text-xs text-muted">{t(a.provider === "aws_lightsail" ? "cloud.aws" : "cloud.aliyun")} · <span className="font-mono">{a.accountId}</span></span>
               {!a.connected && <span className="text-xs text-muted">{t("cloud.disconnected")}</span>}
             </div>
             <Button size="sm" variant="ghost" onClick={() => setEditing(a)}>{t(a.reconnect || !a.connected ? "cloud.reconnect" : "cloud.edit")}</Button>
@@ -52,6 +53,7 @@ function CloudAccountForm({ account, onClose }: { account?: Plain<CloudAccount>;
   const qc = useQueryClient();
   const toast = useToast();
   const [name, setName] = useState(account?.name ?? "");
+  const [provider, setProvider] = useState(account?.provider ?? "aliyun");
   const [keyId, setKeyId] = useState("");
   const [secret, setSecret] = useState("");
   const [billing, setBilling] = useState(account?.billingEnabled ?? false);
@@ -60,7 +62,7 @@ function CloudAccountForm({ account, onClose }: { account?: Plain<CloudAccount>;
   const saved = () => { void qc.invalidateQueries({ queryKey: ["cloud-accounts"] }); void qc.invalidateQueries({ queryKey: ["cloud-usage"] }); toast(t("cloud.saved")); onClose(); };
   const failed = (e: unknown) => { if (!isStepUpCancelled(e)) setError(cloudError(e, t)); };
   const save = useMutation({
-    mutationFn: () => guard(() => cloudUsage.saveCloudAccount({ id: account?.id ?? "", name: name.trim(), provider: "aliyun", accessKeyId: keyId.trim(), accessKeySecret: secret.trim(), billingEnabled: billing })),
+    mutationFn: () => guard(() => cloudUsage.saveCloudAccount({ id: account?.id ?? "", name: name.trim(), provider, accessKeyId: keyId.trim(), accessKeySecret: secret.trim(), billingEnabled: provider === "aliyun" && billing })),
     onSuccess: saved, onError: failed,
   });
   const disconnect = useMutation({
@@ -74,10 +76,10 @@ function CloudAccountForm({ account, onClose }: { account?: Plain<CloudAccount>;
     <Modal open onOpenChange={(v) => { if (!v && !pending) onClose(); }} title={t(account ? "cloud.edit" : "cloud.add")} closeLabel={t("cloud.cancel")}>
       <form onSubmit={submit} className="flex flex-col gap-4">
         <TextField label={t("cloud.name")} value={name} onChange={(e) => setName(e.target.value)} required maxLength={120} />
-        <div className="flex items-center justify-between text-[13px]"><span className="text-muted">{t("cloud.provider")}</span><span>{t("cloud.aliyun")}</span></div>
+        <div className="flex items-center justify-between gap-3 text-[13px]"><span className="text-muted">{t("cloud.provider")}</span>{account ? <span>{t(provider === "aws_lightsail" ? "cloud.aws" : "cloud.aliyun")}</span> : <Select compact aria-label={t("cloud.provider")} value={provider} onValueChange={setProvider} options={[{ value: "aliyun", label: t("cloud.aliyun") }, { value: "aws_lightsail", label: t("cloud.aws") }]} />}</div>
         <TextField label={t("cloud.keyId")} value={keyId} onChange={(e) => setKeyId(e.target.value)} required={needKey || !!secret} placeholder={account?.connected ? "••••••••" : ""} autoComplete="off" maxLength={256} mono />
         <TextField label={t("cloud.keySecret")} type="password" value={secret} onChange={(e) => setSecret(e.target.value)} required={needKey || !!keyId} placeholder={account?.connected ? "••••••••" : ""} autoComplete="new-password" maxLength={256} />
-        <label className="flex items-center justify-between gap-3 text-[13px]"><span>{t("cloud.billing")}</span><Switch checked={billing} onCheckedChange={setBilling} /></label>
+        {provider === "aliyun" && <label className="flex items-center justify-between gap-3 text-[13px]"><span>{t("cloud.billing")}</span><Switch checked={billing} onCheckedChange={setBilling} /></label>}
         {error && <p role="alert" className="text-xs text-danger-text">{error}</p>}
         <div className="flex flex-wrap items-center gap-2 border-t border-line pt-3">
           {account?.connected && <Button type="button" variant="ghostDanger" size="sm" disabled={pending} onClick={() => setConfirm(true)}>{t("cloud.disconnect")}</Button>}

@@ -4,21 +4,27 @@ import (
 	"context"
 	"errors"
 	"math/big"
+	"regexp"
 	"time"
 )
 
 const samplePeriod = int64(600)
 
 var billingZone = time.FixedZone("UTC+8", 8*3600)
+var lightsailName = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_-]{0,253}[A-Za-z0-9_]$`)
 
 type credentials struct {
 	KeyID  string
 	Secret string
 }
-type instance struct{ CreatedAt time.Time }
+type instance struct {
+	CreatedAt   time.Time
+	AllowanceGB int64
+}
 type sample struct {
-	End   int64
-	Bytes uint64
+	End     int64
+	Bytes   uint64
+	Inbound *uint64
 }
 type billEntry struct {
 	InstanceID string `json:"instance_id"`
@@ -57,12 +63,19 @@ func decimal(s string) (*big.Rat, bool) {
 	return v, ok
 }
 
-func monthBounds(month string, now time.Time) (time.Time, time.Time, error) {
-	if month == "" {
-		month = now.In(billingZone).Format("2006-01")
+func providerZone(name string) *time.Location {
+	if name == "aws_lightsail" {
+		return time.UTC
 	}
-	start, err := time.ParseInLocation("2006-01", month, billingZone)
-	if err != nil || start.After(now) || start.Before(now.In(billingZone).AddDate(-1, -1, 0)) {
+	return billingZone
+}
+
+func monthBounds(month string, now time.Time, zone *time.Location) (time.Time, time.Time, error) {
+	if month == "" {
+		month = now.In(zone).Format("2006-01")
+	}
+	start, err := time.ParseInLocation("2006-01", month, zone)
+	if err != nil || start.After(now) || start.Before(now.In(zone).AddDate(-1, -1, 0)) {
 		return time.Time{}, time.Time{}, errors.New("month")
 	}
 	return start, start.AddDate(0, 1, 0), nil

@@ -16,9 +16,10 @@ export function CloudUsageKit() {
   const [month, setMonth] = useState(cloudMonths()[0]!);
   const [state, setState] = useState("normal");
   const [narrow, setNarrow] = useState(false);
+  const lightsail = state === "lightsail";
   const data: CloudUsage = {
-    accountName: "Personal", month, hasUsage: state !== "empty", outboundBytes: state === "zero" ? 0 : 126.4e9,
-    days: Array.from({ length: 21 }, (_, i) => ({ date: `${month}-${String(i + 1).padStart(2, "0")}`, outboundBytes: state === "zero" ? 0 : 2e9 + ((i * 7) % 11) * 6e8, hasUsage: state !== "empty" && !(state === "partial" && i > 8 && i < 12), partial: false })),
+    provider: lightsail ? "aws_lightsail" : "aliyun", inboundBytes: lightsail ? 93e9 : 0, allowanceGb: lightsail ? 2048 : 0, accountName: "Personal", month, hasUsage: state !== "empty", outboundBytes: state === "zero" ? 0 : 126.4e9,
+    days: Array.from({ length: 21 }, (_, i) => ({ date: `${month}-${String(i + 1).padStart(2, "0")}`, outboundBytes: state === "zero" ? 0 : 2e9 + ((i * 7) % 11) * 6e8, hasUsage: state !== "empty" && !(state === "partial" && i > 8 && i < 12), partial: false, inboundBytes: 0 })),
     observedThroughUnix: state === "empty" ? 0 : Date.parse(`${month}-21T08:00:00+08:00`) / 1000, observedFromUnix: 0,
     partial: state === "partial", hasCost: state !== "empty", billedAmount: "0", currency: "CNY", billedThroughUnix: state === "empty" ? 0 : Date.parse(`${month}-21T00:00:00+08:00`) / 1000,
     thresholdReached: state === "threshold", resource: { accountId: "cld_demo", region: "ap-southeast-1", instanceId: "i-example123", thresholdBytes: 200e9, thresholdAmount: "", thresholdCurrency: "CNY" },
@@ -32,7 +33,7 @@ export function CloudUsageKit() {
   });
   return <QueryClientProvider client={qc}>
     <div className="flex flex-wrap items-center gap-2"><LangToggle /><ThemeToggle /><AccentPicker /><Button onClick={() => setNarrow(!narrow)}>{narrow ? "Desktop" : "390 px"}</Button></div>
-    <div className="flex flex-wrap gap-2">{["normal", "zero", "partial", "threshold", "empty"].map((v) => <Button key={v} onClick={() => setState(v)} variant={state === v ? "primary" : "ghost"}>{v}</Button>)}</div>
+    <div className="flex flex-wrap gap-2">{["normal", "lightsail", "zero", "partial", "threshold", "empty"].map((v) => <Button key={v} onClick={() => setState(v)} variant={state === v ? "primary" : "ghost"}>{v}</Button>)}</div>
     <div className="mx-auto flex w-full flex-col gap-4" style={{ maxWidth: narrow ? 390 : 960 }}>
       <CloudUsageCard data={data} month={month} onMonthChange={setMonth} />
       <CloudAccountsPage />

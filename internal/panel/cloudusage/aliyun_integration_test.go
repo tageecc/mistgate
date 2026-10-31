@@ -23,7 +23,7 @@ func TestAliyunReadOnlyCollectionAndBillingPermissionRecovery(t *testing.T) {
 	const region = "ap-southeast-1"
 	calls := map[string]int{}
 	billingDenied := false
-	e.s.provider = fakeAliyun(t, func(p url.Values) (string, int) {
+	e.s.providers["aliyun"] = fakeAliyun(t, func(p url.Values) (string, int) {
 		action := p.Get("Action")
 		calls[action]++
 		switch action {

@@ -80,12 +80,17 @@ message GetCloudUsageResponse {
   bool threshold_reached = 13;
   // Last successful bill refresh; bills may lag behind monitoring.
   int64 billed_through_unix = 14 [jstype = JS_NUMBER];
+  string provider = 15;
+  uint64 inbound_bytes = 16 [jstype = JS_NUMBER];
+  // Current Lightsail plan allocation, in the vendor's GB unit. Not remaining account allowance.
+  int64 allowance_gb = 17 [jstype = JS_NUMBER];
 }
 message CloudUsageDay {
   string date = 1;
   uint64 outbound_bytes = 2 [jstype = JS_NUMBER];
   bool has_usage = 3;
   bool partial = 4;
+  uint64 inbound_bytes = 5 [jstype = JS_NUMBER];
 }
 
 message BindCloudResourceRequest {

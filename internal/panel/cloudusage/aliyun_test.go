@@ -152,7 +152,7 @@ func TestDecimalAndBillingTimezone(t *testing.T) {
 		}
 	}
 	now := time.Date(2026, 10, 31, 16, 1, 0, 0, time.UTC)
-	start, end, err := monthBounds("", now)
+	start, end, err := monthBounds("", now, billingZone)
 	if err != nil || start.Format("2006-01") != "2026-11" || start.UTC().Hour() != 16 || end.Sub(start) != 30*24*time.Hour {
 		t.Fatal("billing month not UTC+8")
 	}

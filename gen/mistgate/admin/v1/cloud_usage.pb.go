@@ -559,9 +559,13 @@ type GetCloudUsageResponse struct {
 	Currency         string `protobuf:"bytes,12,opt,name=currency,proto3" json:"currency,omitempty"`
 	ThresholdReached bool   `protobuf:"varint,13,opt,name=threshold_reached,json=thresholdReached,proto3" json:"threshold_reached,omitempty"`
 	// Last successful bill refresh; bills may lag behind monitoring.
-	BilledThroughUnix int64 `protobuf:"varint,14,opt,name=billed_through_unix,json=billedThroughUnix,proto3" json:"billed_through_unix,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	BilledThroughUnix int64  `protobuf:"varint,14,opt,name=billed_through_unix,json=billedThroughUnix,proto3" json:"billed_through_unix,omitempty"`
+	Provider          string `protobuf:"bytes,15,opt,name=provider,proto3" json:"provider,omitempty"`
+	InboundBytes      uint64 `protobuf:"varint,16,opt,name=inbound_bytes,json=inboundBytes,proto3" json:"inbound_bytes,omitempty"`
+	// Current Lightsail plan allocation, in the vendor's GB unit. Not remaining account allowance.
+	AllowanceGb   int64 `protobuf:"varint,17,opt,name=allowance_gb,json=allowanceGb,proto3" json:"allowance_gb,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *GetCloudUsageResponse) Reset() {
@@ -692,12 +696,34 @@ func (x *GetCloudUsageResponse) GetBilledThroughUnix() int64 {
 	return 0
 }
 
+func (x *GetCloudUsageResponse) GetProvider() string {
+	if x != nil {
+		return x.Provider
+	}
+	return ""
+}
+
+func (x *GetCloudUsageResponse) GetInboundBytes() uint64 {
+	if x != nil {
+		return x.InboundBytes
+	}
+	return 0
+}
+
+func (x *GetCloudUsageResponse) GetAllowanceGb() int64 {
+	if x != nil {
+		return x.AllowanceGb
+	}
+	return 0
+}
+
 type CloudUsageDay struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Date          string                 `protobuf:"bytes,1,opt,name=date,proto3" json:"date,omitempty"`
 	OutboundBytes uint64                 `protobuf:"varint,2,opt,name=outbound_bytes,json=outboundBytes,proto3" json:"outbound_bytes,omitempty"`
 	HasUsage      bool                   `protobuf:"varint,3,opt,name=has_usage,json=hasUsage,proto3" json:"has_usage,omitempty"`
 	Partial       bool                   `protobuf:"varint,4,opt,name=partial,proto3" json:"partial,omitempty"`
+	InboundBytes  uint64                 `protobuf:"varint,5,opt,name=inbound_bytes,json=inboundBytes,proto3" json:"inbound_bytes,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -758,6 +784,13 @@ func (x *CloudUsageDay) GetPartial() bool {
 		return x.Partial
 	}
 	return false
+}
+
+func (x *CloudUsageDay) GetInboundBytes() uint64 {
+	if x != nil {
+		return x.InboundBytes
+	}
+	return 0
 }
 
 type BindCloudResourceRequest struct {
@@ -889,7 +922,7 @@ const file_mistgate_admin_v1_cloud_usage_proto_rawDesc = "" +
 	"\x12threshold_currency\x18\x06 \x01(\tR\x11thresholdCurrency\"E\n" +
 	"\x14GetCloudUsageRequest\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x14\n" +
-	"\x05month\x18\x02 \x01(\tR\x05month\"\xcd\x04\n" +
+	"\x05month\x18\x02 \x01(\tR\x05month\"\xb9\x05\n" +
 	"\x15GetCloudUsageResponse\x12<\n" +
 	"\bresource\x18\x01 \x01(\v2 .mistgate.admin.v1.CloudResourceR\bresource\x12!\n" +
 	"\faccount_name\x18\x02 \x01(\tR\vaccountName\x12\x14\n" +
@@ -905,12 +938,16 @@ const file_mistgate_admin_v1_cloud_usage_proto_rawDesc = "" +
 	"\rbilled_amount\x18\v \x01(\tR\fbilledAmount\x12\x1a\n" +
 	"\bcurrency\x18\f \x01(\tR\bcurrency\x12+\n" +
 	"\x11threshold_reached\x18\r \x01(\bR\x10thresholdReached\x122\n" +
-	"\x13billed_through_unix\x18\x0e \x01(\x03B\x020\x02R\x11billedThroughUnix\"\x85\x01\n" +
+	"\x13billed_through_unix\x18\x0e \x01(\x03B\x020\x02R\x11billedThroughUnix\x12\x1a\n" +
+	"\bprovider\x18\x0f \x01(\tR\bprovider\x12'\n" +
+	"\rinbound_bytes\x18\x10 \x01(\x04B\x020\x02R\finboundBytes\x12%\n" +
+	"\fallowance_gb\x18\x11 \x01(\x03B\x020\x02R\vallowanceGb\"\xae\x01\n" +
 	"\rCloudUsageDay\x12\x12\n" +
 	"\x04date\x18\x01 \x01(\tR\x04date\x12)\n" +
 	"\x0eoutbound_bytes\x18\x02 \x01(\x04B\x020\x02R\routboundBytes\x12\x1b\n" +
 	"\thas_usage\x18\x03 \x01(\bR\bhasUsage\x12\x18\n" +
-	"\apartial\x18\x04 \x01(\bR\apartial\"q\n" +
+	"\apartial\x18\x04 \x01(\bR\apartial\x12'\n" +
+	"\rinbound_bytes\x18\x05 \x01(\x04B\x020\x02R\finboundBytes\"q\n" +
 	"\x18BindCloudResourceRequest\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12<\n" +
 	"\bresource\x18\x02 \x01(\v2 .mistgate.admin.v1.CloudResourceR\bresource\"\x1b\n" +
