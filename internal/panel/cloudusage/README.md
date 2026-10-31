@@ -9,30 +9,13 @@ Reminder thresholds are local display settings. They do not stop a node or repre
 
 ## Access
 
-Use a dedicated RAM **user**, for example `mistgate-usage`, with programmatic access. An AccessKey inherits its
-user's effective permissions: another key for an existing operations user is not a separate read-only identity.
-
-Attach [the read-only policy](policies/aliyun-readonly.json) to this dedicated user, replacing `ACCOUNT_ID`,
-`REGION_ID` and `INSTANCE_ID`. Add explicit ECS resource ARNs for additional instances. The policy grants
-`ecs:DescribeInstances` and `ecs:DescribeInstanceMonitorData` on those resources, plus
-`bssapi:DescribeInstanceBill` restricted to `bssapi:ProductCode=cdt`. Bill access is account/product-scoped, not an
-instance-only permission. Remove the bill statement and leave **Read bills** off if that scope is not approved.
-STS GetCallerIdentity pins the root account ID when connecting; reconnecting cannot silently switch ownership.
-
-The account administrator can create the key, or attach [the key-creator policy](policies/aliyun-key-creator.json)
-to a human operator's RAM user. Replace `ACCOUNT_ID` and, if different, the dedicated user's name. This delegates
-only key creation and listing for that user, not user creation or permission management. The operator can call
-[CreateAccessKey](https://help.aliyun.com/zh/ram/developer-reference/api-ims-2019-08-15-createaccesskey)
-in OpenAPI Explorer with the dedicated user's full `UserPrincipalName`; broad `ram:ListUsers` access is not required
-by that API. If the operator also maintains rotation, the administrator can add `ram:UpdateAccessKey` and
-`ram:DeleteAccessKey` on the same user. Do not attach these key-management permissions to the collector itself.
-
-The owner enters the resulting key in **Settings → Cloud accounts**, then associates the instance in
+Enter one AccessKey ID and Secret in **Settings → Cloud accounts**, then associate the instance in
 **Node → Server → Cloud resource**. Traffic collection starts after binding; bill collection starts when enabled.
-The panel does not need ECS write permissions, RAM administration or a cloud monitoring agent on the node.
 
-See Alibaba's [AccessKey permission guidance](https://help.aliyun.com/zh/ram/user-guide/create-an-accesskey-pair)
-and [per-user self-management example](https://help.aliyun.com/zh/ram/authorize-a-ram-user-to-manage-accesskey-pairs).
+The key needs `ecs:DescribeInstances` and `ecs:DescribeInstanceMonitorData` on the selected ECS resources.
+Reading bills also needs `bssapi:DescribeInstanceBill` with `bssapi:ProductCode=cdt`; this permission is
+account/product-scoped. STS GetCallerIdentity pins the root account ID when connecting, so reconnecting cannot
+silently switch resource ownership.
 
 Credentials are write-only, sealed by the panel vault with account-specific associated data. All RPCs require an
 owner session, writes require step-up, and API tokens/MCP have no access. Disconnect cancels collection, clears
