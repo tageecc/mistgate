@@ -624,6 +624,7 @@ func (s *Service) subRelays(relays []store.RelayLink, full []store.AccessInbound
 // credential, with the entry node's address and the port it forwards. The forward is one port, so the twin has no hop range.
 func twinInput(in protocols.RenderInput, f store.AccessInboundFull, spec plugin.InboundSpec, l store.RelayLink) protocols.RenderInput {
 	spec.Listen.Port, spec.Listen.HopFrom, spec.Listen.HopTo = l.Port, 0, 0
+	in.ClientPort = l.Port
 	in.Inbound = inboundView(protocols.NodeView{ID: f.Node.ID, Name: f.Node.Name, Address: l.ViaNodeAddress, CountryCode: f.Node.CountryCode}, spec, f.Inbound.CertPinSHA256)
 	return in
 }

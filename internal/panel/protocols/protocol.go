@@ -169,6 +169,7 @@ type RenderInput struct {
 	Format      plugin.ClientFormat
 	Settings    json.RawMessage // merged, secrets in place
 	Inbound     InboundView
+	ClientPort  uint16 // alternate entry's port; takes precedence over a profile's public port
 	UserID      string
 	UserName    string
 	DeviceID    string

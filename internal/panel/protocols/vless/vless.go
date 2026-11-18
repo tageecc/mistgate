@@ -25,16 +25,17 @@ const ID = "vless"
 
 // Settings is the merged profile settings document. Private keys are per inbound and never live here.
 type Settings struct {
-	Port      int             `json:"port"`
-	Transport string          `json:"transport"`
-	Security  string          `json:"security"`
-	TLSMode   string          `json:"tls_mode,omitempty"`
-	SNI       string          `json:"sni,omitempty"`
-	CDN       *CDNSettings    `json:"cdn,omitempty"`
-	Reality   RealitySettings `json:"reality"`
-	XHTTP     XHTTPSettings   `json:"xhttp"`
-	WS        *WSSettings     `json:"ws,omitempty"`
-	Egress    string          `json:"egress"`
+	Port       int             `json:"port"`
+	ClientPort int             `json:"client_port,omitempty"`
+	Transport  string          `json:"transport"`
+	Security   string          `json:"security"`
+	TLSMode    string          `json:"tls_mode,omitempty"`
+	SNI        string          `json:"sni,omitempty"`
+	CDN        *CDNSettings    `json:"cdn,omitempty"`
+	Reality    RealitySettings `json:"reality"`
+	XHTTP      XHTTPSettings   `json:"xhttp"`
+	WS         *WSSettings     `json:"ws,omitempty"`
+	Egress     string          `json:"egress"`
 }
 
 // Target kinds: where REALITY sends everyone who is not a client. self is the node's own site (its name is the profile's
@@ -305,6 +306,14 @@ func validate(s Settings) []protocols.FieldError {
 		add("/port", "out_of_range", "port must be 1-65535")
 	} else if s.Port == 80 {
 		add("/port", "reserved", "port 80 is reserved for the Let's Encrypt HTTP check")
+	}
+	if s.ClientPort < 0 || s.ClientPort > 65535 {
+		add("/client_port", "out_of_range", "client port must be 0-65535")
+	} else if s.ClientPort == 80 {
+		add("/client_port", "reserved", "port 80 is reserved for the Let's Encrypt HTTP check")
+	}
+	if s.ClientPort != 0 && s.CDN != nil {
+		add("/client_port", "unsupported", "use the CDN port when a CDN is configured")
 	}
 	switch s.Transport {
 	case "tcp", "xhttp", "ws":
@@ -797,6 +806,12 @@ func ResolveClientParams(in protocols.RenderInput) (ClientParams, bool) {
 	v := ClientParams{
 		Host: host, Port: in.Inbound.Port, UUID: in.Secret, Security: s.Security, Transport: s.Transport,
 		Fingerprint: defaultString(s.Reality.Fingerprint, "chrome"),
+	}
+	if s.ClientPort != 0 {
+		v.Port = uint16(s.ClientPort)
+	}
+	if in.ClientPort != 0 {
+		v.Port = in.ClientPort
 	}
 	if s.Security == "reality" && s.Transport == "tcp" {
 		v.Flow = "xtls-rprx-vision"

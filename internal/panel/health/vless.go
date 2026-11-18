@@ -39,7 +39,8 @@ const (
 // dialVLESS resolves the same parameters as a subscription and starts an isolated Xray client helper.
 func dialVLESS(ctx context.Context, t Target, o DialOptions) (Tunnel, error) {
 	params, ok := panelvless.ResolveClientParams(protocols.RenderInput{
-		Settings: t.Settings,
+		Settings:   t.Settings,
+		ClientPort: t.ClientPort,
 		Inbound: protocols.InboundView{
 			ID: t.Inbound.ID, Node: protocols.NodeView{ID: t.Node.ID, Name: t.Node.Name, Address: t.Node.Address,
 				CountryCode: t.Node.CountryCode},
