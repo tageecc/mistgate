@@ -41,8 +41,9 @@ const (
 
 // tcpSpec is one enabled inbound of the node as the panel builds it for the agent.
 type tcpSpec struct {
-	Profile string
-	Spec    plugin.InboundSpec
+	Profile  string
+	Spec     plugin.InboundSpec
+	Settings json.RawMessage // profile settings: public ports are deliberately absent from the agent spec
 }
 
 // tcpTarget is one TCP port to probe and what to say about it.
@@ -99,8 +100,14 @@ func tcpTargets(specs []tcpSpec, pins map[string]string) []tcpTarget {
 		case spec.Protocol == "vless" && spec.Listen.Network == "tcp":
 			sni, ownName := vlessProbeName(spec)
 			t := tcpTarget{Port: spec.Listen.Port, Role: tcpRoleVLESS, Profile: s.Profile, Kind: tcpcheck.KindTLS, SNI: sni, Pin: pin}
+			var settings struct {
+				ClientPort uint16 `json:"client_port"`
+			}
+			if json.Unmarshal(s.Settings, &settings) == nil && settings.ClientPort != 0 {
+				t.Port = settings.ClientPort
+			}
 			if ownName {
-				t.ALPN = alpn(t.Port, spec.TLS)
+				t.ALPN = t.Port == 443 && alpn(spec.Listen.Port, spec.TLS)
 			}
 			add(t)
 		case spec.Protocol == "hysteria2":
@@ -202,7 +209,7 @@ func (f *Fleet) runTCPCheck(ctx context.Context, target store.NodeRow, allowPane
 		if err != nil {
 			continue
 		}
-		specs = append(specs, tcpSpec{Profile: inbound.ProfileName, Spec: spec})
+		specs = append(specs, tcpSpec{Profile: inbound.ProfileName, Spec: spec, Settings: json.RawMessage(inbound.Settings)})
 		if pin, ok := protocols.NormalizePin(inbound.CertPin); ok {
 			pins[inbound.ID] = pin
 		}
