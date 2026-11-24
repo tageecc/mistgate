@@ -1,17 +1,18 @@
-import { describe, expect, it } from "vitest";
-import { addModal, defaultWhere, keyView, newAmzState, staleDevices, whereOptions, type AmzState } from "./amnezia";
+import { describe, expect, it, vi } from "vitest";
+import { deviceModal } from "./add";
+import { newAmzState, type AmzState } from "./amnezia";
 import { amzActions, type Api } from "./amz-actions";
 import { ApiError, endpoint } from "./api";
-import { cases } from "./dev-data";
+import { cases, sampleQr } from "./dev-data";
 import { dict } from "./i18n";
-import { awgConfig, awgDevice, canAddDevice, defaultLabel, mainProfile, nodeLabels, normalize, otherDevices, profileChoices, selfServe, versionsFor } from "./logic";
-import { actions, amzNoop, data, plain, state, text } from "./test-kit";
+import { awgConfig, awgDevice, defaultLabel, mainProfile, keyVersions, normalize, otherDevices, selfServe, versionsFor } from "./logic";
+import { actions, amzNoop, data, dialog, plain, state, text } from "./test-kit";
 import type { MgData } from "./types";
 import { view } from "./view";
 
 const t = dict.ru;
 const cfg = (node: string, cc = "DE", label = ({ DE: "Германия · Франкфурт", FI: "Финляндия" } as Record<string, string>)[cc] ?? cc) =>
-  awgConfig({ node_id: node, label, country_code: cc, version: "3.1", conf: "[Interface]\nPrivateKey = x\n", vpn_key: "vpn://k", filename: `mistgate-${cc.toLowerCase()}.conf`, warnings: ["amnezia_desktop_mtu"] });
+  awgConfig({ node_id: node, label, country_code: cc, version: "3.1", conf: "[Interface]\nPrivateKey = x\n", vpn_key: "vpn://k", filename: `mistgate-${cc.toLowerCase()}.conf`, warnings: ["amnezia_desktop_mtu"], qr: sampleQr });
 
 function fakeApi(over: Partial<Api> = {}): Api & { calls: string[] } {
   const calls: string[] = [];
@@ -50,8 +51,6 @@ function setup(name: string, api: Api, f: (d: MgData) => void = () => {}) {
   return { data: d, st, a, log, marked, draws: () => draws };
 }
 const settle = () => new Promise((r) => setTimeout(r, 0));
-/** What the line under a device name says, part by part: "Android · в сети". */
-const meta = (r: HTMLElement) => [...r.querySelector(".dev-m")!.children].map(text).filter((x) => x !== "·").join(" · ");
 const row = (el: HTMLElement, id: string) => el.querySelector<HTMLElement>(`#amz-row-${id}`)!;
 
 describe("page data", () => {
@@ -65,16 +64,6 @@ describe("page data", () => {
   });
   it("lists key devices once: not among the link's", () => {
     expect(otherDevices(normalize(cases.many)).map((x) => x.id)).toEqual(["d1"]);
-  });
-  it("offers adding only with self-service, an address to call, a profile and a free slot", () => {
-    expect(canAddDevice(normalize(cases.many))).toBe(true);
-    expect(canAddDevice(normalize(cases["amnezia-off"]))).toBe(false);
-    expect(canAddDevice(normalize(cases["amnezia-none"]))).toBe(false);
-    expect(canAddDevice(normalize(cases.devices))).toBe(false); // limit reached
-    expect(canAddDevice(normalize(cases.happ))).toBe(false);
-    // the admin's preview: self-service on, no address: nothing to press
-    const preview = normalize({ ...cases.many, amnezia: { ...cases.many!.amnezia, endpoints: "" } });
-    expect([selfServe(preview), canAddDevice(preview)]).toEqual([false, false]);
   });
   it("a subscription that is not active still has its devices (no profiles, nothing to add)", () => {
     const d = normalize(cases.expired);
@@ -102,30 +91,35 @@ describe("names and choices a friend can read", () => {
     expect(defaultLabel("other", [], dict.en)).toBe("Device");
   });
 
-  it("the connection options: the main one first and by its countries, the WARP one as the spare exit, 2.0 for old apps", () => {
-    const d = normalize(cases.many);
-    const choices = profileChoices(d.amnezia!.profiles, t, "ru", "AmneziaVPN");
-    expect(choices.map((c) => [c.id, c.label, c.kind])).toEqual([
-      ["p31", "🇩🇪 Германия, 🇫🇮 Финляндия", "main"],
-      ["pw", "WARP (выход через Cloudflare)", "warp"],
-      ["p20", "Для старых версий AmneziaVPN (до 5.0.1.5)", "old"],
+  it("the key's choices: the new version first, inside it the keys with the servers they hold, as the Servers table names them", () => {
+    const vs = keyVersions(normalize(cases["key-many"]!), "ru");
+    expect(vs.map((v) => [v.kind, v.awg, v.sets.map((x) => [x.id, x.name, x.warp, x.servers.length])])).toEqual([
+      ["new", "3.1", [["p31", "AWG3.1", false, 10], ["p31b", "AWG 3.1 (new)", false, 2]]],
+      ["old", "2.0", [["p20", "AWG2", false, 10], ["p20b", "AWG 2.0 (new)", false, 2], ["p20w", "AWG 2.0 (new) · WARP", true, 1]]],
     ]);
+    // a server is its country, the mark that tells it from its country's others (place, else the number) and the domain it is reached by
+    expect(vs[0]!.sets[0]!.servers.map((x) => [x.cc, x.country, x.mark, x.host])).toEqual([
+      ["BY", "Беларусь", "", "by1.example.com"],
+      ["DE", "Германия", "DE-1", "de1.example.com"],
+      ["DE", "Германия", "DE-2", "de2.example.com"],
+      ["DE", "Германия", "DE-3", "203.0.113.24"],
+      ["EE", "Эстония", "EE-1", "est1.example.com"],
+      ["EE", "Эстония", "EE-2", "est2.example.com"],
+      ["NL", "Нидерланды", "", "nl1.example.com"],
+      ["PL", "Польша", "", "pl1.example.com"],
+      ["RO", "Румыния", "Бухарест", "ro1.example.com"],
+      ["RU", "Россия", "RU-1", "msk1.example.com"],
+    ]);
+    expect(vs[0]!.sets[0]!.countries).toEqual(["BY", "DE", "EE", "NL", "PL", "RO", "RU"]); // once each
+    expect(vs[1]!.sets[2]!.servers.map((x) => x.mark)).toEqual(["EE-2"]);
+    // the other states of the page: the main profile first, the spare exit after it; no server says it carries the profile
+    const d = normalize(cases.many!);
+    expect(keyVersions(d, "ru").map((v) => [v.kind, v.sets.map((x) => [x.id, x.warp])])).toEqual([["new", [["p31", false], ["pw", true]]], ["old", [["p20", false]]]]);
     expect(mainProfile(d.amnezia!.profiles)).toBe("p31");
-    // the same label twice gets a number; without a country the main one is "Main"; without flags (Windows) the names only
-    const two = [
-      { id: "a", name: "x", version: "3.1", egress: "direct" as const, countries: [] },
-      { id: "b", name: "y", version: "3.1", egress: "direct" as const, countries: [] },
-    ];
-    expect(profileChoices(two, t, "ru", "A").map((c) => c.label)).toEqual(["Основной", "Основной (2)"]);
-    expect(profileChoices(d.amnezia!.profiles, t, "ru", "AmneziaVPN", false)[0]!.label).toBe("Германия, Финляндия");
-  });
-
-  it("a key's node choice is the server's public name with the flag, never the panel's node name", () => {
-    expect(nodeLabels([cfg("de1"), cfg("fi1", "FI", "Финляндия")])).toEqual(["🇩🇪 Германия · Франкфурт", "🇫🇮 Финляндия"]);
-    const repeated = [cfg("de1", "DE", "Germany"), cfg("de2", "DE", "Germany 2"), cfg("x", "", "Server")];
-    expect(nodeLabels(repeated, false)).toEqual(["Germany", "Germany 2", "Server"]);
-    expect(nodeLabels(repeated).join(" ")).not.toMatch(/de1|de2/);
-    expect(nodeLabels([awgConfig({ node_name: "de1", country_code: "" })], false)).toEqual(["1"]); // no label: a number, not the node's name
+    expect(keyVersions(d, "ru")[0]!.sets.map((x) => x.servers.map((y) => y.mark))).toEqual([["Франкфурт", ""], []]);
+    const bare = normalize({ ...cases.many!, servers: [] });
+    expect(keyVersions(bare, "ru")[0]!.sets.map((x) => [x.servers.length, x.countries])).toEqual([[0, ["DE", "FI"]], [0, ["DE", "FI"]]]);
+    expect(keyVersions(normalize({ ...cases.many!, amnezia: null }), "ru")).toEqual([]);
   });
 
   it("the app versions a key needs, for the device's platform only", () => {
@@ -137,6 +131,7 @@ describe("names and choices a friend can read", () => {
     expect(versionsFor("ios", all)).toEqual([{ client: "amnezia", app: "AmneziaVPN", min: "5.0.1.5" }]);
     expect(versionsFor("android", all).map((m) => `${m.app} ${m.min}`)).toEqual(["AmneziaVPN 5.0.1.5", "AmneziaWG 3.1.20260814"]);
     expect(plain(t.needApp(versionsFor("android", all)))).toBe("Нужна AmneziaVPN 5.0.1.5 или новее — или AmneziaWG 3.1.20260814 и новее");
+    expect(plain(t.needApp([{ app: "Hiddify", min: "2.0 only" }]))).toBe("Нужна Hiddify (только AWG 2.0)");
   });
 });
 
@@ -251,23 +246,41 @@ describe("actions", () => {
     expect(log).toEqual(["reveal amz-row-d3"]);
   });
 
-  it("'new key needed' that fails says so in its own card and opens nothing", async () => {
+  it("'new key needed' that fails opens nothing and says so under the device's row (and in its own window while that is open)", async () => {
     const { st, a, data: d } = setup("stale", fakeApi({ getConfigs: async () => Promise.reject(new ApiError(409, "no_inbound")) }));
     a.renew("d3");
     await settle();
     expect(st.amz).toMatchObject({ renew: null, error: "no_inbound", errorAt: "renew:d3" });
-    const el = view(d, state("android", { amz: st.amz }), actions());
-    expect(text(el.querySelector(".stale .note.bad"))).toBe("Этот вариант пока нигде не запущен — напишите в поддержку.");
-    expect(row(el, "d3").querySelector(".note.bad")).toBeNull();
+    const el = view(d, state("android", { amz: st.amz, tab: "devices", devicesOpen: true }), actions());
+    expect(text(row(el, "d3").nextElementSibling)).toBe("Этот вариант пока нигде не запущен — напишите в поддержку.");
   });
 
-  it("a question takes the keyboard to its safe answer, and cancelling gives it back to the control that asked", () => {
-    const { a, log } = setup("many", fakeApi());
+  it("a question is its own window (it takes the keyboard to its safe answer itself); cancelling gives the keyboard back to the control that asked; asking closes the menu and the name", () => {
+    const { st, a, log } = setup("many", fakeApi());
+    a.menu("d4");
     a.ask({ id: "d4", kind: "remove" });
+    expect(st.amz).toMatchObject({ menu: null, rename: null, confirm: { id: "d4", kind: "remove" } });
     a.ask(null);
     a.ask({ id: "d4", kind: "rotate" });
     a.ask(null);
-    expect(log).toEqual(["focus amz-no-d4", "focus amz-more-d4", "focus amz-no-d4", "focus amz-more-d4"]);
+    expect(log).toEqual(["focus amz-more-d4", "focus amz-more-d4"]);
+  });
+
+  it("the menu is a window: opening it moves no keyboard (the window does), closing it gives the keyboard back to 'more'", () => {
+    const { st, a, log } = setup("many", fakeApi());
+    a.menu("d4");
+    expect([st.amz.menu, log]).toEqual(["d4", []]);
+    a.menu(null);
+    expect([st.amz.menu, log]).toEqual([null, ["focus amz-more-d4"]]);
+  });
+
+  it("'new key needed' is a question of its own: opened, it takes the device's menu away; closed, it gives the keyboard back", () => {
+    const { st, a, log } = setup("stale", fakeApi());
+    a.menu("d3");
+    a.stale("d3");
+    expect(st.amz).toMatchObject({ stale: "d3", menu: null });
+    a.stale(null);
+    expect(log).toEqual(["focus amz-more-d3"]);
   });
 
   it("rotate replaces the key; remove drops the device and frees the slot", async () => {
@@ -335,307 +348,312 @@ describe("actions", () => {
 });
 
 describe("the list of devices", () => {
-  const rows = (name: string, over: Partial<ReturnType<typeof state>> = {}, a = actions()) => view(data(name), state("android", { returning: true, ...over }), a);
+  const rows = (name: string, over: Partial<ReturnType<typeof state>> = {}, a = actions()) => view(data(name), state("android", { returning: true, tab: "devices", devicesOpen: true, ...over }), a);
+  const listOf = (el: HTMLElement) => [...el.querySelectorAll<HTMLElement>(".u-dvl .u-dv")];
+  const nm = (r: HTMLElement) => text(r.querySelector(".nm"));
+  const sub = (r: HTMLElement) => text(r.querySelector(".mt")).replace(text(r.querySelector(".mt .only-m")), "");
+  const at = (r: HTMLElement) => text(r.querySelector(".when"));
 
-  it("each key with what a friend needs: name, platform, when; no AWG, profile or address", () => {
+  it("each key with what a friend needs: name, what kind of key, when; no AWG list, profile or address", () => {
     const el = rows("many");
-    const names = [...el.querySelectorAll(".dev .dev-n")].map(text);
-    expect(names).toEqual(["Приложения без ID устройства", "Pixel 7", "MacBook", "Windows"]);
-    expect(meta(row(el, "d3"))).toBe("Android · в сети");
-    expect(meta(row(el, "d4"))).toBe("Mac · подключалось 12 дней назад");
-    expect(meta(row(el, "d5"))).toBe("ещё не подключалось");
-    expect(el.textContent).not.toMatch(/AWG|Main|10\.66|fd66/);
+    expect(listOf(el).map(nm)).toEqual(["Приложения без ID устройства", "Pixel 7", "MacBook", "Windows"]);
+    expect(sub(row(el, "d3"))).toBe("Ключ AmneziaVPN · Германия, Финляндия");
+    expect([at(row(el, "d3")), at(row(el, "d4")), at(row(el, "d5"))]).toEqual(["в сети", "подключалось 12 дней назад", "ещё не подключалось"]);
+    expect(el.textContent).not.toMatch(/Main|10\.66|fd66/);
   });
 
-  it("one block of actions on a phone and a computer: the main one and 'more'; the menu has rename, replace and a red remove", () => {
-    const a = actions({ amz: { ...amzNoop, show: (id) => void a.log.push(`show ${id}`), menu: (id) => void a.log.push(`menu ${id}`) } });
+  it("one button on the row, 'more', and it opens the window of the device: the key, rename, replace, remove are there", () => {
+    const a = actions({ amz: { ...amzNoop, menu: (id) => void a.log.push(`menu ${id}`) } });
     const el = rows("many", {}, a);
-    expect(el.querySelectorAll(".dev-acts.only-m, .dev-acts.only-w, .links")).toHaveLength(0); // no second set of buttons for the other size
-    const acts = row(el, "d3").querySelector(".dev-acts")!;
-    expect(text(acts.querySelector(".btn"))).toBe("Показать ключ");
-    expect([...acts.children].filter((x) => x.tagName === "BUTTON")).toHaveLength(2); // the main action and "more": not four words
-    acts.querySelector<HTMLButtonElement>("[data-k=amz-show-d3]")!.click();
-    acts.querySelector<HTMLButtonElement>("[data-k=amz-more-d3]")!.click();
-    expect(a.log).toEqual(["show d3", "menu d3"]);
-    expect(acts.querySelector("[data-k=amz-more-d3]")?.getAttribute("aria-label")).toBe("Ещё: переименовать, заменить ключ, удалить");
-    const open = rows("many", { amz: { ...newAmzState("android", "p31", "android"), menu: "d3" } });
-    const menu = row(open, "d3").querySelector(".menu")!;
-    expect([...menu.querySelectorAll("[role=menuitem]")].map(text)).toEqual(["Переименовать", "Заменить ключ", "Удалить"]);
-    expect(menu.querySelector(".bad")).not.toBeNull();
-    expect(row(open, "d3").querySelector("[data-k=amz-more-d3]")?.getAttribute("aria-expanded")).toBe("true");
-  });
-
-  it("the menu items do what they say", () => {
-    const a = actions({ amz: { ...amzNoop, ask: (c) => void a.log.push(`ask ${c?.kind}`), renameStart: (id) => void a.log.push(`rename ${id}`) } });
-    const open = rows("many", { amz: { ...newAmzState("android", "p31", "android"), menu: "d3" } }, a);
-    open.querySelector<HTMLButtonElement>("[data-k=amz-m-ren-d3]")!.click();
-    open.querySelector<HTMLButtonElement>("[data-k=amz-m-rot-d3]")!.click();
-    open.querySelector<HTMLButtonElement>("[data-k=amz-m-del-d3]")!.click();
-    expect(a.log).toEqual(["rename d3", "ask rotate", "ask remove"]);
-  });
-  it("the questions say what happens, in the row, with a red 'Remove', a plain 'Cancel' and an alertdialog", () => {
-    const remove = row(rows("many", { amz: { ...newAmzState("android", "p31", "android"), confirm: { id: "d3", kind: "remove" } } }), "d3");
-    expect(remove.getAttribute("role")).toBe("alertdialog");
-    expect(text(remove.querySelector(".dev-n"))).toBe("Удалить «Pixel 7»?");
-    expect(text(remove.querySelector(".sm.mut"))).toBe("VPN на нём сразу перестанет работать.");
-    expect([...remove.querySelectorAll(".dev-acts button")].map((b) => [text(b), b.className])).toEqual([["Отмена", "btn sec grow"], ["Удалить", "btn bad grow"]]);
-    const rotate = row(rows("many", { amz: { ...newAmzState("android", "p31", "android"), confirm: { id: "d3", kind: "rotate" } } }), "d3");
-    expect(text(rotate.querySelector(".dev-n"))).toBe("Заменить ключ «Pixel 7»?");
-    expect(text(rotate.querySelector(".sm.mut"))).toBe("Старый перестанет работать сразу — новый нужно будет добавить в AmneziaVPN заново.");
-    expect(text(rotate.querySelector(".btn.pri"))).toBe("Заменить");
-  });
-
-  it("the rename field has the name, the limit and the platform; Save and Cancel", () => {
-    const el = rows("many", { amz: { ...newAmzState("android", "p31", "android"), rename: { id: "d3", value: "Pixel 7" } } });
     const r = row(el, "d3");
-    expect(r.tagName).toBe("FORM");
-    expect(r.querySelector<HTMLInputElement>("input")?.value).toBe("Pixel 7");
-    expect(r.querySelector("input")?.getAttribute("maxlength")).toBe("40");
-    expect(text(r.querySelector(".hint"))).toBe("До 40 символов · Android");
-    expect([...r.querySelectorAll(".dev-acts button")].map(text)).toEqual(["Отмена", "Сохранить"]);
+    expect([...r.querySelectorAll("button")].map((b) => b.getAttribute("data-k"))).toEqual(["amz-more-d3"]);
+    const more = r.querySelector<HTMLButtonElement>("[data-k=amz-more-d3]")!;
+    expect([more.getAttribute("aria-label"), more.getAttribute("aria-haspopup")]).toEqual(["Ещё: Pixel 7", "dialog"]);
+    more.click();
+    expect(a.log).toEqual(["menu d3"]);
   });
 
-  it("a busy row says 'One moment' on the pressed button; an error stays in the row", () => {
+  it("a busy row says so on its button and cannot be pressed twice; an error stays under the row", () => {
     const am = { ...newAmzState("android", "p31", "android"), busy: "d3" };
-    const busy = row(rows("many", { amz: am }), "d3");
-    expect(text(busy.querySelector(".dev-acts .btn"))).toBe("Секунду…");
-    expect(busy.querySelector<HTMLButtonElement>("[data-k=amz-more-d3]")?.disabled).toBe(true);
-    const err = row(rows("many", { amz: { ...newAmzState("android", "p31", "android"), error: "too_many_requests", errorAt: "d4", retryMin: 18 } }), "d4");
-    expect(text(err.querySelector(".note.bad"))).toBe("Слишком много действий подряд. Попробуйте через 18 мин.");
+    const busy = row(rows("many", { amz: am }), "d3").querySelector<HTMLButtonElement>("[data-k=amz-more-d3]")!;
+    expect([busy.disabled, busy.querySelector(".spin") !== null]).toEqual([true, true]);
+    const el = rows("many", { amz: { ...newAmzState("android", "p31", "android"), error: "too_many_requests", errorAt: "d4", retryMin: 18 } });
+    const err = row(el, "d4").nextElementSibling!;
+    expect(text(err)).toBe("Слишком много действий подряд. Попробуйте через 18 мин.");
+    expect(err.getAttribute("role")).toBe("alert");
   });
 
-  it("a stale key is marked, and its main action is the new key", () => {
-    const a = actions({ amz: { ...amzNoop, renew: (id) => void a.log.push(`renew ${id}`) } });
+  it("a stale key is marked on its row and its button asks for the new key", () => {
+    const a = actions({ amz: { ...amzNoop, stale: (id) => void a.log.push(`stale ${id}`) } });
     const r = row(rows("stale", {}, a), "d3");
-    expect(text(r.querySelector(".stag"))).toBe("нужен новый ключ");
-    expect(text(r.querySelector(".dev-acts .btn"))).toBe("Получить новый ключ");
-    expect(r.querySelector(".dev-acts .btn")?.classList.contains("pri")).toBe(true);
-    r.querySelector<HTMLButtonElement>("[data-k=amz-renew-d3]")!.click();
-    expect(a.log).toEqual(["renew d3"]);
+    expect(text(r.querySelector(".u-tag.work"))).toBe("нужен новый ключ");
+    const btn = r.querySelector<HTMLButtonElement>("[data-k=amz-stale-d3]")!;
+    expect([text(btn), btn.classList.contains("pri")]).toEqual(["Получить новый ключ", true]);
+    btn.click();
+    expect(a.log).toEqual(["stale d3"]);
   });
 
-  it("the slot counter: segments and the words", () => {
+  it("the places: the figure, the bar and the words, as the board's card", () => {
     const el = rows("many");
-    expect(el.querySelectorAll(".slots .segs i")).toHaveLength(8);
-    expect(el.querySelectorAll(".slots .segs i.f")).toHaveLength(4);
-    expect(text(el.querySelector(".slots .only-m"))).toBe("4 из 8");
-    expect(text(el.querySelector(".slots .only-w"))).toBe("занято 4 из 8");
-    expect(el.querySelector(".slots")?.getAttribute("aria-label")).toBe("Занято 4 из 8");
-    expect(rows("plain").querySelector(".slots")).toBeNull();
+    expect(text(el.querySelector(".u-dvh .u-fig"))).toBe("4 из 8мест занято, свободно 4 местамест, свободно 4 места");
+    expect(el.querySelector(".u-dvh .u-prog")?.getAttribute("aria-label")).toBe("Занято 4 из 8");
+    expect(el.querySelector(".u-dvh .u-prog i")?.getAttribute("style")).toContain("width: 50%");
+    expect(rows("plain").querySelector(".u-dvh .u-prog")).toBeNull(); // no limit: no bar
+    expect(text(rows("plain").querySelector(".u-dvh .u-fig"))).toContain("устройств, без ограничения");
   });
 
   // a person with keys alone: no link app, so "Add a device" is the key form (the way is not asked)
-  const keysAlone = (name: string, f: (d: MgData) => void = () => {}) => view(data(name, (d) => { d.access.happ = false; d.devices = d.devices.filter((x) => d.amnezia?.devices.some((k) => k.id === x.id)); f(d); }), state("android", { returning: true }), actions());
+  const keysAlone = (name: string, f: (d: MgData) => void = () => {}) => view(data(name, (d) => { d.access.happ = false; d.devices = d.devices.filter((x) => d.amnezia?.devices.some((k) => k.id === x.id)); f(d); }), state("android", { returning: true, tab: "devices", devicesOpen: true }), actions());
 
-  it("add a device: one button for both ways that opens the dialog; the free slots under it", () => {
+  it("add a device: one button for both ways that opens the window; the free places are in the figure", () => {
     const a = actions();
     const el = rows("many", {}, a);
-    const btns = [...el.querySelectorAll("button")].filter((b) => text(b) === "Добавить устройство");
+    const btns = [...el.querySelectorAll<HTMLButtonElement>(".u-dvh button")].filter((b) => text(b) === "Добавить устройство");
     expect(btns).toHaveLength(1);
     expect(btns[0]!.getAttribute("data-k")).toBe("dev-add");
     btns[0]!.click();
     expect(a.log).toEqual(["add true"]);
-    expect(text(el.querySelector(".dev-hint"))).toBe("Свободно ещё 4 места");
-    // no second block "connect one more device" under the card
+    expect(text(el.querySelector(".u-dvh .u-fig .only-w"))).toBe("мест занято, свободно 4 места");
     expect(el.querySelector("[data-k=more]")).toBeNull();
   });
 
-  it("with no keys yet the list is the link's row; keys alone get the row that explains", () => {
-    expect([...rows("amnezia-empty").querySelectorAll(".dev-n")].map(text)).toEqual(["Приложения по ссылке"]);
+  it("with no keys yet the list is the link's row; keys alone get no row and the empty line", () => {
+    expect(listOf(rows("amnezia-empty")).map(nm)).toEqual(["Приложения по ссылке"]);
     const empty = keysAlone("amnezia-empty");
-    expect([...empty.querySelectorAll(".dev-n")].map(text)).toEqual(["Ключи AmneziaVPN"]);
-    expect(text(empty.querySelector(".dev-b .sm.mut"))).toBe("Пока ни одного. Ключ выдаётся на каждое устройство отдельно");
+    expect(listOf(empty)).toHaveLength(0);
+    expect(text(empty.querySelector(".u-dvl .u-empty"))).toBe("Устройств пока нет. Добавьте первое, и оно появится здесь");
+    expect(empty.querySelector("[data-k=dev-add]")).not.toBeNull();
   });
 
-  it("every slot taken: the link still connects, so 'Add' stays; only the words change", () => {
+  it("every slot taken: the link still connects, and 'Add' stays; the words say the places are gone", () => {
     const el = rows("limit");
-    const btn = el.querySelector<HTMLButtonElement>("[data-k=dev-add]")!;
-    expect(btn.disabled).toBe(false);
-    expect(text(btn.closest(".dev")!.querySelector(".dev-hint"))).toBe("Все места заняты");
-    expect(text(el.querySelector(".slots .only-m"))).toBe("3 из 3");
+    expect(el.querySelector<HTMLButtonElement>("[data-k=dev-add]")!.disabled).toBe(false);
+    expect(text(el.querySelector(".u-dvh .u-fig .only-w"))).toBe("мест занято, свободных мест нет");
+    expect(el.querySelector(".u-dvh .u-prog i")?.classList.contains("full")).toBe(true);
+    expect(text(el.querySelector(".u-dvh .u-fig"))).toContain("3 из 3");
+    // keys the only way: 'Add' still opens the window, which says there is no place and how to write
+    expect(keysAlone("limit").querySelector<HTMLButtonElement>("[data-k=dev-add]")!.disabled).toBe(false);
   });
 
-  it("every slot taken and keys the only way: the words, 'Add' waits, and the way to write", () => {
-    const el = keysAlone("limit");
-    const slotRow = el.querySelector(".dev-x")!.closest(".dev")!;
-    expect(text(slotRow.querySelector(".note.warn"))).toBe("Занято 3 из 3. Удалите устройство, которым больше не пользуетесь, или напишите — добавим место.");
-    expect(slotRow.querySelector<HTMLButtonElement>("[data-k=dev-add]")?.disabled).toBe(true);
-    expect(text(slotRow.querySelector("a.btn"))).toBe("Написать");
-  });
-
-  it("the owner issues the keys: rows without buttons; keys alone get 'ask for a key' and Write, with the link 'Add' still opens the sheet", () => {
+  it("the owner issues the keys: rows without buttons; 'Add' still opens the window, which says to ask", () => {
     const both = rows("amnezia-off");
-    expect(both.querySelectorAll(".dev-acts [data-k^=amz-]")).toHaveLength(0); // no key actions (the link row has its own: copy)
+    expect(both.querySelector("[data-k^=amz-more-d]")).toBeNull();
     expect(both.querySelector("[data-k=dev-add]")).not.toBeNull();
     const el = keysAlone("amnezia-off");
-    expect(el.querySelectorAll(".dev-acts")).toHaveLength(0);
-    expect(el.querySelector("[data-k=dev-add]")).toBeNull();
-    const ask = [...el.querySelectorAll(".dev")].at(-1)!;
-    expect(text(ask.querySelector(".dev-n"))).toBe("Попросите ключ");
-    expect(text(ask.querySelector(".sm.mut"))).toBe("Ключи AmneziaVPN выдаёт владелец — напишите, для какого устройства нужен.");
-    expect(text(ask.querySelector("a.btn"))).toBe("Написать");
+    expect(el.querySelector("[data-k^=amz-more-]")).toBeNull();
+    expect(listOf(el).map(nm)).toEqual(["Pixel 7", "MacBook", "Windows"]);
+    expect(el.querySelector("[data-k=dev-add]")).not.toBeNull();
   });
 
-  it("no profile: keys are not available yet", () => {
+  it("no profile: no row, the empty line; 'Add' opens the window, which says the keys are not ready", () => {
     const el = keysAlone("amnezia-none");
-    const last = [...el.querySelectorAll(".dev")].at(-1)!;
-    expect(text(last.querySelector(".dev-n"))).toBe("Ключи пока недоступны");
-    expect(text(last.querySelector(".sm.mut"))).toBe("Сервер ещё настраивается — напишите администратору.");
-    expect(text(view(data("amnezia-none", (d) => (d.access.happ = false)), state("android", { returning: true }, "en"), actions()))).toContain("The server is still being set up — message the admin.");
+    expect(listOf(el)).toHaveLength(0);
+    expect(el.querySelector("[data-k=dev-add]")).not.toBeNull();
   });
 
-  it("the admin's preview (no address) shows the rows without buttons and does not say 'ask the owner'; the link branch still opens", () => {
-    const d = data("many", (x) => (x.amnezia!.endpoints = ""));
-    const p = view(d, state("android", { returning: true }), actions());
-    expect(p.querySelectorAll(".dev-acts [data-k^=amz-]")).toHaveLength(0);
+  it("the admin's preview (no address) shows the rows without buttons; the link branch still opens", () => {
+    const p = view(data("many", (x) => (x.amnezia!.endpoints = "")), state("android", { returning: true, tab: "devices" }), actions());
+    expect(p.querySelector("[data-k^=amz-more-d]")).toBeNull();
     expect(p.querySelector("[data-k=dev-add]")).not.toBeNull(); // the link needs no address
-    expect(p.textContent).not.toContain("Попросите ключ");
-    expect(rows("many").querySelectorAll(".dev-acts").length).toBeGreaterThan(0);
-    // keys alone: nothing to press
-    const keys = view(data("many", (x) => ((x.amnezia!.endpoints = ""), (x.access.happ = false))), state("android", { returning: true }), actions());
-    expect(keys.querySelector("[data-k=dev-add]")).toBeNull();
+    expect(rows("many").querySelector("[data-k^=amz-more-d]")).not.toBeNull();
+    // keys alone, in the preview: nothing to press in the rows
+    const keys = view(data("many", (x) => ((x.amnezia!.endpoints = ""), (x.access.happ = false))), state("android", { returning: true, tab: "devices" }), actions());
+    expect(keys.querySelector("[data-k^=amz-more-d]")).toBeNull();
   });
 
-  it("only the shared place: one row of one line, and 'Add a device' is there for the next app", () => {
+  it("only the shared place: one row, and 'Add a device' is there for the next app", () => {
     const a = actions();
     const el = rows("happ", {}, a);
-    expect([...el.querySelectorAll(".dev-n")].map(text)).toEqual(["Приложения без ID устройства"]);
-    expect(text(el.querySelector(".dev .dev-m"))).toBe("одно место на всех·в сети"); // online: the state, else the time alone
-    expect(el.querySelector(".dev .hint")).toBeNull();
+    expect(listOf(el).map(nm)).toEqual(["Приложения без ID устройства"]);
+    expect(sub(listOf(el)[0]!)).toBe("одно место на всех");
+    expect(at(listOf(el)[0]!)).toBe("в сети"); // online: the state, else the time
     el.querySelector<HTMLButtonElement>("[data-k=dev-add]")!.click();
     expect(a.log).toEqual(["add true"]);
   });
 
-  it("no hint under the title: a device is a place, whatever the way (the shared place says its own exception)", () => {
-    const hint = (el: HTMLElement) => [...el.querySelectorAll(".shead")].find((x) => text(x.querySelector(".h2")) === "Мои устройства")?.querySelector(".sec-sub");
-    expect(hint(rows("many"))).toBeNull();
-  });
-  it("when the subscription is not active the devices stay: rename and remove, but no key is shown or issued", () => {
+  it("when the subscription is not active the devices stay: the keys can be changed, nothing is issued", () => {
     for (const name of ["expired", "quota", "disabled"]) {
       const el = view(data(name), state("android"), actions());
-      const r = row(el, "d3");
-      const show = r.querySelector<HTMLButtonElement>("[data-k=amz-show-d3]")!;
-      expect(show.disabled).toBe(true);
-      expect(show.getAttribute("aria-describedby")).toBe("why-off");
-      expect(el.querySelector("#why-off")?.textContent).toBe("Подписка сейчас не активна");
-      expect(el.querySelector<HTMLButtonElement>(".dev .btn.out")?.disabled).toBe(true);
-      expect(r.querySelector("[data-k=amz-more-d3]")?.getAttribute("aria-label")).toBe("Ещё: переименовать, удалить");
-      expect(text(el.querySelector(".dev .note"))).toBe(name === "disabled" ? "Подписка отключена, ключи не выдаются. Удалить или переименовать устройство можно." : "Подписка сейчас не активна — ключи не выдаются. Удалить или переименовать устройство можно.");
-      expect(el.querySelector(".srv")).toBeNull();
+      expect(el.querySelector(".u-tabs")).toBeNull();
+      const add = el.querySelector<HTMLButtonElement>("[data-k=dev-add]")!;
+      expect(add.disabled).toBe(true);
+      expect(add.getAttribute("aria-describedby")).toBe("why-off");
+      expect(text(el.querySelector("#why-off"))).toBe(name === "disabled" ? "Подписка отключена, ключи не выдаются. Удалить или переименовать устройство можно." : "Подписка сейчас не активна — ключи не выдаются. Удалить или переименовать устройство можно.");
+      expect(el.querySelector("[data-k=amz-more-d3]")?.getAttribute("aria-label")).toBe("Ещё: Pixel 7");
+      expect(el.querySelector(".u-tbl, [data-k^=amz-stale-]")).toBeNull();
     }
   });
 });
 
 describe("the key dialog", () => {
-  const modal = (here: string, id: string, mode: "open" | "renew" | "created" = "open", over: (s: AmzState) => void = () => {}, name = "return") => {
-    const d = data(name);
-    const s = { lang: "ru" as const, amz: newAmzState("android", "p31", here) };
-    s.amz[mode] = id;
-    s.amz.configs[id] = [cfg("de1"), cfg("fi1", "FI")];
-    over(s.amz);
+  /** The window on the key of `id` for a person whose page is open on `here`; `over` may change the state of the keys first. */
+  const modal = (here: "android" | "windows", id: string, mode: "open" | "renew" | "created" = "open", over: (s: AmzState) => void = () => {}, name = "return") => {
+    const amz = { [mode]: id, configs: { [id]: [cfg("de1"), cfg("fi1", "FI")] }, here } as Partial<AmzState>;
+    const r = dialog(data(name), { platform: here, amz });
+    over(r.c.s.amz);
     const box = document.createElement("div");
-    box.append(...(addModal({ d, s, a: actions(), t, support: "https://t.me/example_support" }) as Node[]));
+    box.append(...(deviceModal(r.c) as Node[]));
     return box;
   };
+  const withKey = (extra: Partial<Parameters<typeof dialog>[1] & object> = {}, list = [cfg("de1")]) => dialog(data("return"), { platform: "windows", amz: { open: "d3", configs: { d3: list } }, ...extra });
 
-  it("where to add it: a phone offers itself or another device, a computer itself, a phone or another computer", () => {
-    expect(whereOptions("android", t).map((o) => o.id)).toEqual(["this", "other"]);
-    expect(whereOptions("windows", t).map((o) => o.label)).toEqual(["Этот компьютер", "Телефон", "Другой компьютер"]);
-    expect(whereOptions("", t).map((o) => o.id)).toEqual(["phone", "other"]);
-    expect([defaultWhere("android", "android"), defaultWhere("ios", "android"), defaultWhere("windows", "windows"), defaultWhere("android", "windows"), defaultWhere("macos", "windows"), defaultWhere("ios", "")]).toEqual(["this", "other", "this", "phone", "other", "phone"]);
-    expect([keyView("android", "android", "this"), keyView("macos", "windows", "this"), keyView("ios", "windows", "phone"), keyView("macos", "windows", "other"), keyView("windows", "android", "other"), keyView("android", "ios", "other")]).toEqual([
-      "this-phone",
-      "this-desktop",
-      "phone-qr",
-      "other-desktop",
-      "other-desktop",
-      "phone-qr",
-    ]);
-  });
-
-  it("on this very phone the key is copied: the copy button leads, then the steps; the title says whose key it is", () => {
+  it("the frame of a key: its title says whose key it is, there is no count, the foot says it is in the list", () => {
     const b = modal("android", "d3");
-    expect(text(b.querySelector("h3"))).toBe("Ключ для «Pixel 7»");
-    expect(text(b.querySelector(".sh-head .sub"))).toBe("Устройство уже в списке — ключ можно показать снова");
-    expect([...b.querySelectorAll(".seg:not(.pills) [role=radio]")].map((x) => [text(x), x.getAttribute("aria-checked")])).toEqual([["Этот телефон", "true"], ["Другое устройство", "false"]]);
-    expect(text(b.querySelector(".cfg > .btn.pri, .cfg .btn.pri"))).toBe("Скопировать ключ");
-    expect([...b.querySelectorAll(".steps-box li")].map(text)).toEqual(["1Откройте AmneziaVPN", "2Нажмите «+» и вставьте ключ", "3Нажмите «Продолжить»"]);
-    expect(b.querySelector(".qr")).toBeNull();
-    expect(plain(text(b.querySelector(".hint.row")))).toBe("Нужна AmneziaVPN 5.0.1.5 или новее — или AmneziaWG 3.1.20260814 и новее");
-    expect(text(b.querySelector(".priv"))).toBe("В ключе личные данные устройства — не пересылайте его.");
-    expect(b.textContent).not.toContain("vpn://"); // the key is copied, never written out
+    expect(text(b.querySelector(".a-h .t"))).toBe("Ключ для Pixel 7");
+    expect(text(b.querySelector(".a-h .n"))).toBe("");
+    expect(text(b.querySelector(".a-f .u-hint"))).toBe("Устройство уже в списке — ключ можно показать снова");
+    expect(text(b.querySelector(".a-f .u-btn"))).toBe("Готово");
   });
 
-  it("on this very computer the file is downloaded, and the page says why not the key", () => {
-    const b = modal("windows", "d5", "open", () => {}, "many");
-    expect(text(b.querySelector(".btn.pri"))).toBe("Скачать файл");
-    expect(text(b.querySelector(".keyfile"))).toBe("mistgate-de.conf");
-    expect(text(b.querySelector("p.sm:not(.mut)"))).toBe("Затем: AmneziaVPN → «+» → «Файл с настройками подключения»");
-    expect(text(b.querySelector(".note.warn"))).toBe("На компьютере добавляйте файл, а не ключ — иначе соединение может не заработать.");
+  it("the key is the same wherever it is added: the three ways beside the code, and what the person must know", () => {
+    for (const [b, id] of [[modal("android", "d3"), "d3"], [modal("windows", "d3"), "d3"], [modal("windows", "d4"), "d4"]] as const) {
+      expect([...b.querySelectorAll(".a-b > .a-fld")].map((x) => text(x.querySelector(".a-lbl")))).toEqual(["Серверв ключе 2 сервера"]);
+      const two = b.querySelector(".a-b > .a-two.a-got")!;
+      expect([...two.querySelectorAll(".a-acts3 > .a-act")].map((x) => text(x.querySelector(".t")) + text(x.querySelector(".d:not(.dd)")))).toEqual(["Скачать конфигmistgate-de.conf", "Скопировать конфигТекст того же файла", "Скопировать ключСтрока vpn:// для AmneziaVPN"]);
+      expect([...two.querySelectorAll(".a-act")].map((x) => x.getAttribute("data-k"))).toEqual([`amz-dl-${id}`, `amz-conf-${id}`, `amz-key-${id}`]);
+      // the file name and the scheme of the key stand in the file's own face
+      expect([...two.querySelectorAll(".a-act .m")].map(text)).toEqual(["mistgate-de.conf", "vpn://"]);
+      expect(two.querySelector(".a-side .u-qr svg")).not.toBeNull();
+      expect(two.querySelector(".a-side .u-qr .u-qt img")).not.toBeNull();
+      expect(two.querySelector(".a-side svg")?.getAttribute("aria-label")).toBe("QR-код ключа для AmneziaVPN");
+      expect(text(two.querySelector(".a-side .u-hint"))).toBe("Или отсканируйте код в AmneziaVPN на телефоне");
+      // what the old window had: the choice of the place, the numbered steps, the file-not-key warning
+      expect(b.querySelector(".a-steps, .a-st, .a-n, .a-fname, .u-acts, [data-k^=amz-where]")).toBeNull();
+      expect(b.textContent).not.toContain("Куда добавить");
+      expect(b.textContent).not.toContain("добавляйте файл, а не ключ");
+      expect(b.textContent).not.toContain("vpn://k"); // the key is copied, never written out
+      expect([...b.querySelectorAll(".a-meta p")].map(text)[0]).toBe("Ключ личный, не пересылайте его");
+    }
+    expect([...modal("android", "d3").querySelectorAll(".a-meta p")].map(text)).toEqual(["Ключ личный, не пересылайте его", "Нужна AmneziaVPN 5.0.1.5 или новее — или AmneziaWG 3.1.20260814 и новее"]);
+    // a key of a device that is open from the list says the same (the warning about the file is no more, whatever the config says)
+    expect([...modal("windows", "d5", "open", () => {}, "many").querySelectorAll(".a-meta p")].map(text)).toHaveLength(2);
   });
 
-  it("for a phone the QR code comes first, dark on white, with what to press in the app; the file and the key are still at hand", () => {
-    const b = modal("windows", "d3");
-    expect([...b.querySelectorAll(".seg:not(.pills) [role=radio]")].map((x) => x.getAttribute("aria-checked"))).toEqual(["false", "true", "false"]);
-    expect(b.querySelector(".keyq .qr svg")).not.toBeNull();
-    expect(text(b.querySelector(".keyq-t .b"))).toBe("Отсканируйте в AmneziaVPN");
-    expect(text(b.querySelector(".keyq-t .sm.mut"))).toBe("«+» → «QR-код» и наведите камеру телефона на код");
-    expect([...b.querySelectorAll(".keyq-t .btn")].map(text)).toEqual(["Скачать файл", "Скопировать ключ"]);
+  it("a key for the old versions of the app says so", () => {
+    const old = awgConfig({ node_id: "x", label: "X", country_code: "DE", version: "2.0", conf: "[Interface]\n", vpn_key: "vpn://k", filename: "x.conf", qr: sampleQr });
+    const b = modal("windows", "d3", "open", (s) => (s.configs.d3 = [old]));
+    expect([...b.querySelectorAll(".a-meta p")].map(text)).toEqual(["Ключ личный, не пересылайте его", "Для AmneziaVPN до 5.0.1.5"]);
+    expect(b.querySelector(".a-fld")).toBeNull(); // one server: no choice
   });
 
-  it("for another computer: open this page there; the file can be moved by hand", () => {
-    const b = modal("windows", "d4");
-    expect(text(b.querySelector(".h3"))).toBe("Откройте эту страницу на том компьютере");
-    expect(text(b.querySelector(".stack .sm.mut"))).toMatch(/^Проще всего так: на нужном компьютере/);
-    expect([...b.querySelectorAll(".cfg .btn")].map(text)).toEqual(["Скачать файл", "Готово"]);
+  it("a key too long for a QR code says so, and the three ways stay", () => {
+    const long = awgConfig({ node_id: "x", label: "X", country_code: "DE", conf: "x".repeat(4000), vpn_key: "vpn://k", filename: "x.conf" });
+    const b = modal("windows", "d3", "open", (s) => (s.configs.d3 = [long]));
+    expect(b.querySelector(".u-qr, .a-two, .a-side")).toBeNull();
+    expect([...b.querySelectorAll(".a-meta p")].map(text).some((x) => x.includes("слишком длинный для QR-кода"))).toBe(true);
+    expect(b.querySelectorAll(".a-b > .a-acts3 > .a-act")).toHaveLength(3);
   });
 
-  it("the choice of where to add comes from the page's state", () => {
-    const b = modal("android", "d3", "open", (s) => (s.where.d3 = "other"));
-    expect(b.querySelector(".keyq .qr")).not.toBeNull();
+  it("the server choice: one chip each, the flag and the name the page gives it; it counts them and explains itself", () => {
+    const fld = modal("android", "d3").querySelector(".a-b > .a-fld")!;
+    expect(text(fld.querySelector(".a-lbl"))).toBe("Серверв ключе 2 сервера");
+    // these configs name no server of the page (another node id): the name the panel gave them, with the flag
+    expect([...fld.querySelectorAll(".a-chip")].map((x) => [text(x), x.getAttribute("aria-checked")])).toEqual([["Германия · Франкфурт", "true"], ["FIФинляндия", "false"]]);
+    expect([...fld.querySelectorAll(".a-chip .fl2")].map((x) => x.className)).toEqual(["fl2 de", "fl2 cc"]);
+    expect(fld.querySelector(".u-hint")).toBeNull();
+    const log: number[] = [];
+    const r = withKey({ a: actions({ amz: { ...amzNoop, node: (_id, i) => log.push(i) } }) }, [cfg("de1"), cfg("fi1", "FI")]);
+    r.box.querySelector<HTMLButtonElement>("[data-k=amz-node-d3-1]")!.click();
+    expect(log).toEqual([1]);
+    expect(modal("android", "d3", "open", (s) => (s.configs.d3 = [cfg("de1")])).querySelector("[id^=k-c-]")).toBeNull(); // one server: no choice
   });
 
-  it("the country choice: names with the flag (none on Windows), and it explains itself", () => {
-    const b = modal("android", "d3");
-    expect([...b.querySelectorAll(".pick select option")].map(text)).toEqual(["🇩🇪 Германия · Франкфурт", "🇫🇮 Финляндия"]);
-    expect(text(b.querySelector(".pick .hint"))).toBe("ещё 1");
-    const w = modal("windows", "d3");
-    expect([...w.querySelectorAll(".pick select option")].map(text)).toEqual(["Германия · Франкфурт", "Финляндия"]);
-    expect([...w.querySelectorAll(".seg.pills button")].map(text)).toEqual(["Германия · Франкфурт", "Финляндия"]);
-    expect(text(w.querySelector(".fld > .hint.only-w"))).toBe("Каждая страна — отдельное подключение. Добавьте одну; перестанет работать — добавьте другую.");
+  it("the server chips are told apart as the Servers table tells the servers apart: the number among twins, the place", () => {
+    const d = data("key-many", (x) => x.amnezia!.devices.push(awgDevice({ id: "d3", platform: "windows", label: "PC", profile_id: "p31", version: "3.1" })));
+    const node = (slug: string, cc: string) => awgConfig({ node_id: `nod_${slug}`, label: `${cc} ${slug}`, country_code: cc, version: "3.1", conf: "[Interface]\nPrivateKey = x\n", vpn_key: "vpn://k", filename: `${slug}.conf`, qr: sampleQr });
+    const configs = [node("by1", "BY"), node("de1", "DE"), node("de2", "DE"), node("est1", "EE"), node("ro1", "RO"), node("rus1", "RU")];
+    const { box } = dialog(d, { platform: "windows", amz: { open: "d3", configs: { d3: configs }, here: "windows" } });
+    const fld = box.querySelector(".a-b > .a-fld")!;
+    expect(text(fld.querySelector(".a-lbl"))).toBe("Серверв ключе 6 серверов");
+    expect([...fld.querySelectorAll(".a-chip")].map(text)).toEqual(["Беларусь", "ГерманияDE-1", "ГерманияDE-2", "ЭстонияEE-1", "РумынияБухарест", "РоссияRU-1"]);
   });
 
-  it("the new key of a stale device: what to add, and which old connection goes (by country, never by the panel's node)", () => {
+  it("a key through an entry shares the node of the direct one: it is named as the app names it, and says once that it is a new server", () => {
+    const via = awgConfig({ node_id: "de1", via_node_id: "nod_msk1", via_country: "ru", label: "Германия · Франкфурт · via RU", country_code: "DE", version: "3.1", conf: "[Interface]\nPrivateKey = y\n", vpn_key: "vpn://via", filename: "mistgate-de-via.conf", warnings: ["amnezia_desktop_mtu"] });
+    expect([via.via_node_id, via.via_country]).toEqual(["nod_msk1", "RU"]);
+    expect([cfg("de1").via_node_id, cfg("de1").via_country]).toEqual(["", ""]);
+    expect(awgConfig({ node_id: "de1", via_country: "RU" }).via_country).toBe(""); // a country with no entry means nothing
+    const open = (mode: "open" | "renew", pick: number) =>
+      modal("android", "d3", mode, (s) => {
+        s.configs.d3 = [cfg("de1"), via];
+        s.node.d3 = pick;
+      });
+    const notes = (b: HTMLElement) => [...b.querySelectorAll(".a-meta p")].map(text);
+    expect(notes(open("open", 0)).some((x) => x.startsWith("Это отдельный ключ"))).toBe(false);
+    expect(notes(open("open", 1))).toContain("Это отдельный ключ для пути через RU: импортируйте его в AmneziaVPN как новый сервер.");
+    expect([...open("open", 1).querySelectorAll(".a-b > .a-fld .a-chip.on")].map(text)).toEqual(["Германия · Франкфурт · via RU"]);
+  });
+
+  it("a key to the IPv6 entry is told like a key through an entry: its own chip and one note", () => {
+    const v6 = awgConfig({ node_id: "de1", ipv6: true, label: "Германия · Франкфурт · IPv6", country_code: "DE", version: "3.1", conf: "[Interface]\nPrivateKey = z\n", vpn_key: "vpn://v6", filename: "mistgate-de-ipv6.conf" });
+    expect([v6.ipv6, v6.via_node_id, cfg("de1").ipv6]).toEqual([true, "", false]);
+    const open = (mode: "open" | "renew", pick: number) =>
+      modal("android", "d3", mode, (s) => {
+        s.configs.d3 = [cfg("de1"), v6];
+        s.node.d3 = pick;
+      });
+    const notes = (b: HTMLElement) => [...b.querySelectorAll(".a-meta p")].map(text);
+    expect(notes(open("open", 0)).some((x) => x.startsWith("Это отдельный ключ"))).toBe(false);
+    expect(notes(open("open", 1))).toContain("Это отдельный ключ для пути IPv6: импортируйте его в AmneziaVPN как новый сервер.");
+    expect([...open("open", 1).querySelectorAll(".a-b > .a-fld .a-chip.on")].map(text)).toEqual(["Германия · Франкфурт · IPv6"]);
+  });
+
+  it("the new key of a stale device is the same key under its own title; no steps, no connection to delete is named", () => {
     const b = modal("android", "d3", "renew", () => {}, "stale");
-    expect(text(b.querySelector("h3"))).toBe("Новый ключ для «Pixel 7»");
-    expect(text(b.querySelector(".sh-head .sub"))).toBe("Старый ключ больше не работает");
-    expect([...b.querySelectorAll(".steps-box li")].map((x) => text(x.lastElementChild))).toEqual(["В AmneziaVPN нажмите «+», вставьте ключ и «Продолжить»", "Удалите старое подключение «Германия» — оно больше не подключается"]);
+    expect(text(b.querySelector(".a-h .t"))).toBe("Новый ключ для Pixel 7");
+    expect(text(b.querySelector(".a-f .u-hint"))).toBe("Старый ключ больше не работает");
+    expect([...b.querySelectorAll(".a-two .a-act")]).toHaveLength(3);
+    expect(b.querySelector("ol, .a-st")).toBeNull();
+    expect(b.textContent).not.toContain("Удалите старое подключение");
     expect(b.textContent).not.toMatch(/de1|fi1/);
-    expect(b.querySelector("[data-autofocus]")).toBe(b.querySelector(".btn.pri"));
-    const pc = modal("windows", "d3", "renew", () => {}, "stale");
-    expect(text(pc.querySelector(".note:not(.warn)"))).toBe("Удалите старое подключение «Германия» — оно больше не подключается");
+    expect([...modal("windows", "d3", "renew", () => {}, "stale").querySelectorAll(".a-meta p")].map(text)).toHaveLength(2);
   });
 
-  it("after Create the dialog shows the new device's key with its own words", () => {
-    const b = modal("android", "d3", "created");
-    expect(text(b.querySelector(".sh-head .sub"))).toBe("Настройте устройство сейчас. Закроете окно — устройство останется в списке, ключ можно будет показать снова.");
+  it("after Create the window shows the new device's key as the last step of the branch, with Back to the form", () => {
+    const b = modal("android", "d3", "created", () => {}, "many");
+    expect(text(b.querySelector(".a-h .n"))).toBe("3 из 3");
     expect(b.querySelector("form")).toBeNull();
+    expect(b.querySelector("[data-k=add-back]")).not.toBeNull();
   });
 
-  it("buttons copy and download what the key is", () => {
-    const a = actions();
-    const d = data("return");
-    const s = { lang: "ru" as const, amz: newAmzState("android", "p31", "windows") };
-    s.amz.open = "d3";
-    s.amz.configs.d3 = [cfg("de1")];
-    const box = document.createElement("div");
-    box.append(...(addModal({ d, s, a, t }) as Node[]));
-    const [dl, cp] = [...box.querySelectorAll<HTMLButtonElement>(".keyq-t .btn")];
-    dl!.click();
-    cp!.click();
-    expect(a.log).toEqual(["download mistgate-de.conf", "copy vpn://k"]);
+  it("buttons copy and download what the key is: the file, the text of the file, the key line", () => {
+    const { box, a } = withKey();
+    box.querySelector<HTMLButtonElement>("[data-k=amz-dl-d3]")!.click();
+    box.querySelector<HTMLButtonElement>("[data-k=amz-conf-d3]")!.click();
+    box.querySelector<HTMLButtonElement>("[data-k=amz-key-d3]")!.click();
+    expect(a.log).toEqual(["download mistgate-de.conf", "copy [Interface]\nPrivateKey = x\n", "copy vpn://k"]);
     box.querySelector<HTMLButtonElement>("[data-k=modal-done]")!.click();
     expect(a.log.at(-1)).toBe("add false");
+  });
+
+  it("a tile that did its work says so in place for two seconds: a tick and the done word under the same name, no toast", () => {
+    vi.useFakeTimers();
+    try {
+      const { box, a } = withKey();
+      const done = (k: string) => box.querySelector<HTMLButtonElement>(`[data-k=${k}]`)!.classList.contains("done");
+      const tile = box.querySelector<HTMLButtonElement>("[data-k=amz-key-d3]")!;
+      expect([text(tile.querySelector(".t")), text(tile.querySelector(".dd")), tile.querySelector(".dd")!.getAttribute("aria-live"), done("amz-key-d3")]).toEqual(["Скопировать ключ", "Ключ скопирован", "polite", false]);
+      tile.click();
+      expect(a.log.at(-1)).toBe("copy vpn://k");
+      expect([text(tile.querySelector(".t")), done("amz-key-d3"), done("amz-conf-d3")]).toEqual(["Скопировать ключ", true, false]);
+      box.querySelector<HTMLButtonElement>("[data-k=amz-dl-d3]")!.click();
+      expect([text(box.querySelector("[data-k=amz-dl-d3] .dd")), done("amz-dl-d3")]).toEqual(["Файл скачан", true]);
+      vi.advanceTimersByTime(2001);
+      expect([done("amz-key-d3"), done("amz-dl-d3")]).toEqual([false, false]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("five languages: the key reads the same way, none of the words missing", () => {
+    for (const lang of ["ru", "en", "zh", "fa", "tr"] as const) {
+      const { box } = withKey({ lang }, [cfg("de1"), cfg("fi1", "FI")]);
+      expect(box.textContent, lang).not.toMatch(/undefined|\[object|NaN/);
+      expect(box.querySelectorAll(".a-two .a-act"), lang).toHaveLength(3);
+      expect(text(box.querySelector(".a-side .u-hint")), lang).not.toBe("");
+      expect(box.querySelectorAll(".a-meta p"), lang).toHaveLength(2);
+    }
+    expect(text(withKey({ lang: "fa" }).box.querySelector(".a-meta"))).toContain("کلید شخصی است");
   });
 
   it("a label is text, never markup", () => {
@@ -643,84 +661,92 @@ describe("the key dialog", () => {
     evil.amnezia!.devices[0]!.label = "<img src=x onerror=alert(1)>";
     const el = view(normalize(evil), state("android", { returning: true }, "en"), actions());
     expect(el.querySelector("img[onerror]")).toBeNull();
-    expect(text(row(el, "d3").querySelector(".dev-n"))).toBe("<img src=x onerror=alert(1)>");
+    const { box } = dialog(normalize(evil), { amz: { open: "d3", configs: { d3: [cfg("de1")] } } });
+    expect(box.querySelector("img[onerror]")).toBeNull();
+    expect(text(box.querySelector(".a-h .t"))).toBe("Ключ для <img src=x onerror=alert(1)>");
   });
 });
 
 describe("the add-a-device dialog", () => {
-  const form = (name = "many", over: (s: AmzState) => void = () => {}, here = "ios") => {
-    const d = data(name);
-    const s = { lang: "ru" as const, amz: newAmzState(here, "p31", here) };
-    s.amz.adding = true;
-    over(s.amz);
-    const box = document.createElement("div");
-    box.append(...(addModal({ d, s, a: actions(), t, support: "https://t.me/example_support" }) as Node[]));
-    return box;
-  };
+  const form = (name = "many", amz: Partial<AmzState> = {}) => dialog(data(name), { amz: { pane: "key", ...amz } });
 
-  it("the device (six choices), its name, and the connection option only when there is a choice, named by countries", () => {
-    const b = form();
-    expect(text(b.querySelector("h3"))).toBe("Ключом AmneziaVPN"); // named as the card it came from
-    expect(text(b.querySelector(".sh-head .sub"))).toBe("Для него появится свой ключ AmneziaVPN");
-    expect([...b.querySelectorAll(".plats .plat")].map(text)).toEqual(["iPhone", "Android", "Windows", "Mac", "Linux", "Другое"]);
-    expect(b.querySelector<HTMLElement>(".plat.on")?.textContent).toBe("iPhone");
+  it("the device (six choices), its name, and the version of the app: a choice when there are two, a line when there is one", () => {
+    const { box: b } = form();
+    expect(text(b.querySelector(".a-h .t"))).toBe("Ключ AmneziaVPN");
+    expect([...b.querySelectorAll(".a-chip")].map(text)).toEqual(["iPhone", "Android", "Windows", "Mac", "Linux", "Другое"]);
+    expect(b.querySelector<HTMLElement>(".a-chip.on")?.textContent).toBe("iPhone");
     expect(b.querySelector<HTMLInputElement>("[data-k=amz-label]")?.placeholder).toBe("Например, телефон мамы");
-    expect(text(b.querySelector(".pick .t"))).toBe("🇩🇪 Германия, 🇫🇮 Финляндия");
-    expect(text(b.querySelector(".pick .s"))).toBe("Обычное — подходит почти всегда");
-    expect([...b.querySelectorAll(".pick select option")].map(text)).toHaveLength(3);
+    expect([...b.querySelectorAll(".a-ver .d")].map(text)).toEqual(["Подходит почти всегда", "Для старых версий приложения"]);
+    expect([...b.querySelectorAll(".a-set .t")].map(text)).toEqual(["Main", "Main · WARPЗапасной выход"]);
     expect(b.querySelector("[data-k=modal-create]")?.textContent).toBe("Создать ключ");
-    expect(form("both").querySelector(".pick")).toBeNull();
+    expect(form("both").box.querySelector(".a-vers")).toBeNull();
+    expect(form("both").box.querySelector(".a-vone")).not.toBeNull();
+  });
+
+  it("two profiles of one version are told apart by their name, and by the servers they hold", () => {
+    const d = data("many", (x) => x.amnezia!.profiles.push({ id: "p31b", name: "Second", version: "3.1", egress: "direct", countries: ["NL"] }));
+    const { box } = dialog(d, { amz: { pane: "key" } });
+    expect([...box.querySelectorAll(".a-set")].map((x) => [text(x.querySelector(".t")), text(x.querySelector(".d"))])).toEqual([
+      ["Main", "2 сервера в 2 странах"],
+      ["Second", "В ключе 1 страна"],
+      ["Main · WARPЗапасной выход", "В ключе 2 страны"],
+    ]);
   });
 
   it("busy: 'One moment', and the button waits", () => {
-    const b = form("many", (s) => (s.busy = "add"));
-    const go = b.querySelector<HTMLButtonElement>("[data-k=modal-create]")!;
-    expect([go.textContent, go.disabled]).toEqual(["Секунду…", true]);
+    const btn = form("many", { busy: "add" }).box.querySelector<HTMLButtonElement>("[data-k=modal-create]")!;
+    expect([text(btn), btn.disabled]).toEqual(["Секунду…", true]);
   });
 
-  it("'all slots are used' is an error in the form with the way to write", () => {
-    const b = form("many", (s) => ((s.error = "device_limit"), (s.errorAt = "add")));
-    const note = b.querySelector(".note.bad")!;
-    expect(note.getAttribute("role")).toBe("alert");
-    expect(text(note.querySelector("b"))).toBe("Все места заняты.");
-    expect(text(note.querySelector("a.tlink"))).toBe("Написать в Telegram");
-    const other = form("many", (s) => ((s.error = "network"), (s.errorAt = "add")));
-    expect(text(other.querySelector(".note.bad"))).toBe("Нет связи. Проверьте интернет и повторите.");
-  });
-
-  it("the stale devices of a page", () => {
-    expect(staleDevices(data("stale")).map((x) => x.id)).toEqual(["d3"]);
-    expect(staleDevices(data("first"))).toEqual([]);
+  it("'all slots are used' is a step of its own with the way to write; any other error stays in the form", () => {
+    const full = form("many", { error: "device_limit", errorAt: "add" });
+    expect(full.stage).toBe("full");
+    expect(text(full.box.querySelector(".a-f a"))).toBe("Написать в поддержку");
+    const other = form("many", { error: "network", errorAt: "add" }).box;
+    expect(other.querySelector(".a-err")?.getAttribute("role")).toBe("alert");
+    expect(text(other.querySelector(".a-err"))).toBe("Нет связи. Проверьте интернет и повторите.");
   });
 });
 
 describe("the 'new key needed' card", () => {
-  it("names the device, says why, has a button per stale device and steps in a safe order", () => {
-    const one = view(data("stale"), state("android", { returning: true }), actions());
-    expect(text(one.querySelector(".stale .h3"))).toBe("Нужен новый ключ для «Pixel 7»");
-    expect(text(one.querySelector(".stale .sm.mut"))).toBe("Серверы обновились — старый ключ этого устройства больше не работает.");
-    expect([...one.querySelectorAll(".stale ol li")].map((li) => text(li.lastElementChild))).toEqual(["Нажмите «Получить новый ключ»", "Добавьте его в AmneziaVPN, как в первый раз", "Удалите старое подключение этого устройства — оно больше не работает"]);
-    expect(one.querySelector(".stale")?.textContent).not.toContain("ниже");
+  const page = (d: MgData) => view(d, state("android", { returning: true, tab: "devices", devicesOpen: true }), actions());
+
+  it("the mark and the button are on the row of each stale device, which the question names", () => {
+    const one = page(data("stale"));
+    const r = row(one, "d3");
+    expect(r.classList.contains("stale")).toBe(true);
+    expect(text(r.querySelector(".nm"))).toBe("Pixel 7");
+    expect(text(r.querySelector(".u-tag.work"))).toBe("нужен новый ключ");
+    expect(text(r.querySelector("[data-k=amz-stale-d3]"))).toBe("Получить новый ключ");
     const two = data("many");
     two.amnezia!.devices.forEach((x) => (x.stale = true));
-    const el = view(two, state("android", { returning: true }), actions());
-    expect(text(el.querySelector(".stale .h3"))).toBe("Нужны новые ключи");
-    expect([...el.querySelectorAll(".stale button")].map(text)).toEqual(["Новый ключ для «Pixel 7»", "Новый ключ для «MacBook»", "Новый ключ для «Windows»"]);
+    const el = page(two);
+    expect([...el.querySelectorAll(".u-dv.stale")].map((x) => text(x.querySelector(".nm")))).toEqual(["Pixel 7", "MacBook", "Windows"]);
+    expect([...el.querySelectorAll("[data-k^=amz-stale-]")].map(text)).toEqual(["Получить новый ключ", "Получить новый ключ", "Получить новый ключ"]);
   });
 
   it("a key stale only because of a DNS says the key itself stays", () => {
-    const el = view(data("stale-dns"), state("android", { returning: true }), actions());
-    expect(text(el.querySelector(".stale .sm.mut"))).toBe("DNS сервера изменился — получите ключ заново. Сам ключ останется прежним.");
+    const el = page(data("stale-dns"));
+    expect(plain(row(el, "d3").querySelector(".u-tag.work")?.getAttribute("title"))).toBe("DNS сервера изменился — получите ключ заново. Сам ключ останется прежним.");
+    expect(plain(row(page(data("stale")), "d3").querySelector(".u-tag.work")?.getAttribute("title"))).toBe("Серверы обновились — старый ключ этого устройства больше не работает.");
   });
 
   it("without self-service it says to ask, and has no buttons", () => {
-    const el = view(data("stale", (d) => (d.amnezia!.self_service = false)), state("android"), actions());
-    expect(text(el.querySelector(".stale .sm.mut"))).toBe("Ключи выдаёт администратор — напишите, если нужен новый.");
-    expect(el.querySelector(".stale button")).toBeNull();
+    const el = page(data("stale", (d) => (d.amnezia!.self_service = false)));
+    expect(plain(el.querySelector(".u-tag.work")?.getAttribute("title"))).toBe("Ключи выдаёт администратор — напишите, если нужен новый.");
+    expect(el.querySelector("[data-k^=amz-stale-]")).toBeNull();
   });
 
   it("is not shown for a subscription that is not active", () => {
     const d = data("stale", (x) => (x.user.status = "expired"));
-    expect(view(d, state("android"), actions()).querySelector(".stale")).toBeNull();
+    expect(view(d, state("android"), actions()).querySelector(".u-tag.work, .u-dv.stale")).toBeNull();
+  });
+
+  it("the failed 'new key' says so where it was asked: the row shows the error under it", async () => {
+    const { st, a, data: d } = setup("stale", fakeApi({ getConfigs: async () => Promise.reject(new ApiError(409, "no_inbound")) }));
+    a.renew("d3");
+    await settle();
+    const el = view(d, state("android", { amz: st.amz, tab: "devices", devicesOpen: true }), actions());
+    expect(text(row(el, "d3").nextElementSibling)).toBe("Этот вариант пока нигде не запущен — напишите в поддержку.");
   });
 });

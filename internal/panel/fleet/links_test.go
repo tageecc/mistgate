@@ -11,7 +11,9 @@ import (
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
 	agentv1 "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/internal/agentcap"
 	"github.com/mistgate/mistgate/internal/panel/connectiondiag"
+	"github.com/mistgate/mistgate/internal/panel/store"
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
@@ -25,7 +27,7 @@ func linksBatch(links ...*agentv1.LinkCounters) *agentv1.ConnectRequest {
 
 // connectLinks connects an agent that lists links/1 and confirms the full state.
 func connectLinks(a *agent, instance string) *conn {
-	return connectLinksWithCaps(a, instance, capLinks)
+	return connectLinksWithCaps(a, instance, agentcap.Links)
 }
 
 func connectLinksWithCaps(a *agent, instance string, capabilities ...string) *conn {
@@ -96,7 +98,7 @@ func TestStatsLinksAreStoredAndRead(t *testing.T) {
 		hy.KeysStalled != 1 || hy.KeysTried != 2 {
 		t.Errorf("hysteria inbound = %+v", hy)
 	}
-	if !equalStrings(hy.Unsupported, connectiondiag.UnsupportedCountersForNode("hysteria2", []string{capLinks})) ||
+	if !equalStrings(hy.Unsupported, connectiondiag.UnsupportedCountersForNode("hysteria2", []string{agentcap.Links})) ||
 		len(hy.Clients) != 1 || hy.Clients[0].Client != "Happ/3.4.2" || hy.Clients[0].Platform != "android" ||
 		hy.Clients[0].Devices != 2 || hy.Clients[0].Connects != 4 {
 		t.Errorf("Hysteria2 clients/unsupported = %+v / %v", hy.Clients, hy.Unsupported)
@@ -155,7 +157,7 @@ func TestStatsLinks2QualityIsStoredAndRead(t *testing.T) {
 	e.exec(`UPDATE profile SET protocol = 'hysteria2' WHERE id = 'prf_1'`)
 	e.exec(`UPDATE device_credential SET protocol = 'hysteria2' WHERE id = 'crd_alice_hy'`)
 	e.exec(`UPDATE device SET platform = 'android', client = 'Happ/3.4.2' WHERE id = 'dev_alice'`)
-	c := connectLinksWithCaps(a, "inst2", capLinks, connectiondiag.Links2Capability)
+	c := connectLinksWithCaps(a, "inst2", agentcap.Links, agentcap.Links2)
 	c.send(1, linksBatch(
 		&agentv1.LinkCounters{CredId: "crd_alice_hy", InboundId: ids.i1, Connects: 3, ClientCloses: 1, Freezes: 2, Quiet: 3,
 			RttMsSum: 1500, RttSamples: 3, PktsSent: 1000, PktsLost: 10},
@@ -169,7 +171,7 @@ func TestStatsLinks2QualityIsStoredAndRead(t *testing.T) {
 		t.Fatalf("GetNodeConnections with links/2 = %+v, %v", resp, err)
 	}
 	hy := resp.Msg.Inbounds[0]
-	if len(hy.Unsupported) != 0 || hy.ClientCloses != 1 || hy.Freezes != 2 || hy.Quiet != 3 || hy.Accepted != 9 || hy.HellosForeign != 4 ||
+	if !equalStrings(hy.Unsupported, connectiondiag.Link3Fields) || hy.ClientCloses != 1 || hy.Freezes != 2 || hy.Quiet != 3 || hy.Accepted != 9 || hy.HellosForeign != 4 ||
 		hy.RttMs != 500 || hy.LossPermille != 10 || hy.RttSamples != 3 || hy.PktsSent != 1000 || len(hy.Hours) != 1 ||
 		hy.Hours[0].ClientCloses != 1 || hy.Hours[0].Freezes != 2 || hy.Hours[0].Accepted != 9 || hy.Hours[0].HellosForeign != 4 ||
 		hy.Hours[0].RttMs != 500 || hy.Hours[0].LossPermille != 10 || hy.Hours[0].RttSamples != 3 || hy.Hours[0].PktsSent != 1000 ||
@@ -179,8 +181,211 @@ func TestStatsLinks2QualityIsStoredAndRead(t *testing.T) {
 
 	fleet, err := node.GetFleetConnections(e.ctx, connect.NewRequest(&adminv1.GetFleetConnectionsRequest{}))
 	if err != nil || len(fleet.Msg.Nodes) == 0 || fleet.Msg.Nodes[0].Inbounds[0].Accepted != 9 || fleet.Msg.Nodes[0].Inbounds[0].RttMs != 500 ||
-		fleet.Msg.Nodes[0].Inbounds[0].LossPermille != 10 || len(fleet.Msg.Nodes[0].Inbounds[0].Unsupported) != 0 {
+		fleet.Msg.Nodes[0].Inbounds[0].LossPermille != 10 || !equalStrings(fleet.Msg.Nodes[0].Inbounds[0].Unsupported, connectiondiag.Link3Fields) {
 		t.Errorf("GetFleetConnections links/2 = %+v, %v", fleet, err)
+	}
+}
+
+// links/3: the handshake-failure reasons of a batch are stored and read back per inbound and hour, and unsupported names what the
+// protocol, the VLESS transport or the AWG backend cannot see (an old agent: all of them).
+func TestStatsLinks3ReasonsAreStoredAndRead(t *testing.T) {
+	e := newEnv(t)
+	a := e.enroll("nodea")
+	ids := e.fixture(a.nodeID)
+	e.exec(`UPDATE profile SET protocol = CASE id WHEN 'prf_1' THEN 'hysteria2' WHEN 'prf_2' THEN 'awg' END WHERE id IN ('prf_1', 'prf_2')`)
+	e.exec(`UPDATE device_credential SET protocol = CASE protocol WHEN 'fakehy' THEN 'hysteria2' WHEN 'fakewg' THEN 'awg' END WHERE protocol IN ('fakehy', 'fakewg')`)
+	e.exec(`INSERT INTO profile (id, protocol, name, settings_json, version, created_at, updated_at) VALUES ('prf_vless', 'vless', 'VLESS',
+		'{"security":"reality","transport":"tcp","reality":{"target":"www.example.com:443"}}', 1, unixepoch(), unixepoch())`)
+	e.exec(`INSERT INTO inbound (id, profile_id, node_id, spec_version, created_at, updated_at) VALUES ('inb_vless', 'prf_vless', ?, 1, unixepoch(), unixepoch())`, a.nodeID)
+	health, err := protojson.Marshal(&agentv1.AwgHealth{Backend: "userspace"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.st.SetInboundAwgHealth(e.ctx, a.nodeID, ids.i2, string(health), e.f.now()); err != nil {
+		t.Fatal(err)
+	}
+	c := connectLinksWithCaps(a, "inst3", agentcap.Links, agentcap.Links2, agentcap.Links3)
+	c.send(1, linksBatch(
+		&agentv1.LinkCounters{InboundId: ids.i1, Hellos: 40, Accepted: 20, HsUnfinished: 12, TlsAlertsSent: 2, TlsAlertsRecv: 5, TlsCertRefused: 4},
+		&agentv1.LinkCounters{CredId: "crd_alice_wg", InboundId: ids.i2, Connects: 1, Initiations: 9, Responses: 8, ResponsesUnmatched: 7},
+		&agentv1.LinkCounters{InboundId: "inb_vless", Hellos: 30, HellosForeign: 6, RealityFallback: 11, AuthFailed: 4, HsUnfinished: 3},
+	))
+	c.wait(func(m *agentv1.ConnectResponse) bool { return m.GetAck() != nil && m.GetAck().UpToSeq >= 1 })
+
+	node := nodeService{e.f}
+	resp, err := node.GetNodeConnections(e.ctx, connect.NewRequest(&adminv1.GetNodeConnectionsRequest{NodeId: a.nodeID, ByHour: true}))
+	if err != nil || len(resp.Msg.Inbounds) != 3 {
+		t.Fatalf("GetNodeConnections = %+v, %v", resp, err)
+	}
+	by := map[string]*adminv1.InboundConnections{}
+	for _, in := range resp.Msg.Inbounds {
+		by[in.InboundId] = in
+	}
+	hy, wg, vl := by[ids.i1], by[ids.i2], by["inb_vless"]
+	if hy.HsUnfinished != 12 || hy.TlsAlertsSent != 2 || hy.TlsAlertsRecv != 5 || hy.TlsCertRefused != 4 || len(hy.Hours) != 1 || hy.Hours[0].HsUnfinished != 12 ||
+		hy.Hours[0].TlsCertRefused != 4 || contains(hy.Unsupported, "hs_unfinished") || !contains(hy.Unsupported, "reality_fallback") {
+		t.Errorf("Hysteria2 links/3 = %+v", hy)
+	}
+	if wg.Initiations != 9 || wg.Responses != 8 || wg.ResponsesUnmatched != 7 || contains(wg.Unsupported, "responses_unmatched") ||
+		!contains(wg.Unsupported, "hs_unfinished") || wg.Hours[0].ResponsesUnmatched != 7 {
+		t.Errorf("AWG links/3 = %+v", wg)
+	}
+	if vl.Hellos != 30 || vl.HellosForeign != 6 || vl.RealityFallback != 11 || vl.AuthFailed != 4 || vl.HsUnfinished != 3 ||
+		contains(vl.Unsupported, "hellos") || contains(vl.Unsupported, "connects") || contains(vl.Unsupported, "tcp_stalls") ||
+		!contains(vl.Unsupported, "tls_alerts_sent") || !contains(vl.Unsupported, "initiations") {
+		t.Errorf("VLESS links/3 = %+v", vl)
+	}
+	fleet, err := node.GetFleetConnections(e.ctx, connect.NewRequest(&adminv1.GetFleetConnectionsRequest{}))
+	if err != nil || len(fleet.Msg.Nodes) == 0 {
+		t.Fatalf("GetFleetConnections = %+v, %v", fleet, err)
+	}
+	for _, in := range fleet.Msg.Nodes[0].Inbounds {
+		want := by[in.InboundId]
+		if in.HsUnfinished != want.HsUnfinished || in.RealityFallback != want.RealityFallback || in.ResponsesUnmatched != want.ResponsesUnmatched ||
+			!equalStrings(in.Unsupported, want.Unsupported) {
+			t.Errorf("fleet %s = %+v, node read %+v", in.InboundId, in, want)
+		}
+	}
+
+	// the kernel backend cannot tell initiations from responses: not known
+	health, _ = protojson.Marshal(&agentv1.AwgHealth{Backend: "kernel"})
+	if err := e.st.SetInboundAwgHealth(e.ctx, a.nodeID, ids.i2, string(health), e.f.now()); err != nil {
+		t.Fatal(err)
+	}
+	resp, _ = node.GetNodeConnections(e.ctx, connect.NewRequest(&adminv1.GetNodeConnectionsRequest{NodeId: a.nodeID}))
+	for _, in := range resp.Msg.Inbounds {
+		if in.InboundId == ids.i2 && !contains(in.Unsupported, "initiations") {
+			t.Errorf("AWG kernel backend unsupported = %v, want initiations", in.Unsupported)
+		}
+	}
+}
+
+// trusttunnel-refusals/1: the refusals of a TrustTunnel inbound are stored by the hour on the inbound's own row and read back in every
+// field; a credential's row that carries them is dropped (a refusal is never attributed); an agent without the capability has them
+// listed as unsupported, and another protocol never lists them.
+func TestStatsTunnelRefusalsAreStoredAndRead(t *testing.T) {
+	e := newEnv(t)
+	a := e.enroll("nodea")
+	ids := e.fixture(a.nodeID)
+	e.exec(`UPDATE profile SET protocol = CASE id WHEN 'prf_1' THEN 'trusttunnel' WHEN 'prf_2' THEN 'awg' END WHERE id IN ('prf_1', 'prf_2')`)
+	e.exec(`UPDATE device_credential SET protocol = CASE protocol WHEN 'fakehy' THEN 'trusttunnel' WHEN 'fakewg' THEN 'awg' END WHERE protocol IN ('fakehy', 'fakewg')`)
+	c := connectLinksWithCaps(a, "insttt", agentcap.Links, agentcap.TrustTunnel, agentcap.TrustTunnelRefusals)
+	row := &agentv1.LinkCounters{InboundId: ids.i1, TunnelBlocked: 1, TunnelNoIpv4: 2, TunnelConnRefused: 3, TunnelConnUnreachable: 4, TunnelConnDns: 5,
+		TunnelConnOther: 6, TunnelTimeout: 7, TunnelOtherDeadlines: 8, TunnelOtherAuthority: 9, TunnelOtherIcmp: 10, TunnelOtherDial: 11,
+		TunnelStreamClosed: 12, TunnelStreamCredGone: 13, TunnelStreamConnLimit: 14}
+	c.send(1, linksBatch(row, &agentv1.LinkCounters{CredId: "crd_alice_hy", InboundId: ids.i1, Connects: 2, TunnelBlocked: 99}))
+	c.wait(func(m *agentv1.ConnectResponse) bool { return m.GetAck() != nil && m.GetAck().UpToSeq >= 1 })
+	c.send(2, linksBatch(&agentv1.LinkCounters{InboundId: ids.i1, TunnelNoIpv4: 40, TunnelStreamConnLimit: 1}))
+	c.wait(func(m *agentv1.ConnectResponse) bool { return m.GetAck() != nil && m.GetAck().UpToSeq >= 2 })
+
+	node := nodeService{e.f}
+	resp, err := node.GetNodeConnections(e.ctx, connect.NewRequest(&adminv1.GetNodeConnectionsRequest{NodeId: a.nodeID, ByHour: true}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	by := map[string]*adminv1.InboundConnections{}
+	for _, in := range resp.Msg.Inbounds {
+		by[in.InboundId] = in
+	}
+	tt, wg := by[ids.i1], by[ids.i2]
+	got := []uint32{tt.TunnelBlocked, tt.TunnelNoIpv4, tt.TunnelConnRefused, tt.TunnelConnUnreachable, tt.TunnelConnDns, tt.TunnelConnOther, tt.TunnelTimeout,
+		tt.TunnelOtherDeadlines, tt.TunnelOtherAuthority, tt.TunnelOtherIcmp, tt.TunnelOtherDial, tt.TunnelStreamClosed, tt.TunnelStreamCredGone, tt.TunnelStreamConnLimit}
+	want := []uint32{1, 42, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15}
+	if !equalUint32s(got, want) {
+		t.Errorf("TrustTunnel refusals = %v, want %v (the credential row's 99 must not count)", got, want)
+	}
+	if len(tt.Hours) != 1 || tt.Hours[0].TunnelNoIpv4 != 42 || tt.Hours[0].TunnelStreamConnLimit != 15 || tt.Hours[0].TunnelBlocked != 1 {
+		t.Errorf("TrustTunnel hours = %+v", tt.Hours)
+	}
+	if tt.Connects != 2 || contains(tt.Unsupported, "tunnel_blocked") || contains(tt.Unsupported, "auth_failed") || !contains(tt.Unsupported, "hs_unfinished") {
+		t.Errorf("TrustTunnel counters = %+v", tt)
+	}
+	if contains(wg.Unsupported, "tunnel_blocked") || wg.TunnelBlocked != 0 {
+		t.Errorf("AWG lists or counts refusals: %+v", wg)
+	}
+	fleet, err := node.GetFleetConnections(e.ctx, connect.NewRequest(&adminv1.GetFleetConnectionsRequest{}))
+	if err != nil || len(fleet.Msg.Nodes) == 0 {
+		t.Fatalf("GetFleetConnections = %+v, %v", fleet, err)
+	}
+	for _, in := range fleet.Msg.Nodes[0].Inbounds {
+		if in.InboundId == ids.i1 && (in.TunnelNoIpv4 != 42 || in.TunnelStreamConnLimit != 15 || in.TunnelConnDns != 5) {
+			t.Errorf("fleet TrustTunnel inbound = %+v", in)
+		}
+	}
+
+	// An agent that does not list the capability: the fields are unsupported, whatever the batch carried.
+	b := e.enroll("nodec")
+	e.exec(`INSERT INTO inbound (id, profile_id, node_id, spec_version, created_at, updated_at) VALUES ('inb_old', 'prf_1', ?, 1, unixepoch(), unixepoch())`, b.nodeID)
+	idsB := fixtureIDs{i1: "inb_old"}
+	old := connectLinksWithCaps(b, "instold", agentcap.Links, agentcap.TrustTunnel)
+	old.send(1, linksBatch(&agentv1.LinkCounters{InboundId: idsB.i1, Connects: 1}))
+	old.wait(func(m *agentv1.ConnectResponse) bool { return m.GetAck() != nil && m.GetAck().UpToSeq >= 1 })
+	oldResp, err := node.GetNodeConnections(e.ctx, connect.NewRequest(&adminv1.GetNodeConnectionsRequest{NodeId: b.nodeID}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, in := range oldResp.Msg.Inbounds {
+		if in.InboundId == idsB.i1 && (!contains(in.Unsupported, "tunnel_blocked") || !contains(in.Unsupported, "tunnel_stream_conn_limit") || contains(in.Unsupported, "auth_failed")) {
+			t.Errorf("an agent without trusttunnel-refusals/1 lists %v", in.Unsupported)
+		}
+	}
+}
+
+func equalUint32s(a, b []uint32) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// vless-hello-kex/1: the hello counts of a REALITY key are stored by the hour, summed per device and read back for the fleet, with
+// the nodes that do not count yet; an agent without the capability sends none and the panel reads none; an absurd number is clamped.
+func TestStatsHelloKexIsStoredAndRead(t *testing.T) {
+	e := newEnv(t)
+	a := e.enroll("nodea")
+	ids := e.fixture(a.nodeID)
+	e.exec(`UPDATE profile SET protocol = 'vless', settings_json = '{"security":"reality","transport":"xhttp","reality":{"target":"www.example.com:443"}}' WHERE id = 'prf_1'`)
+	e.exec(`UPDATE device_credential SET protocol = 'vless', profile_id = 'prf_1' WHERE id IN ('crd_alice_hy', 'crd_bob_hy')`)
+	e.exec(`UPDATE device SET platform = 'ios', client = 'Streisand/1.7' WHERE id = 'dev_bob'`)
+	c := connectLinksWithCaps(a, "inst-kex", agentcap.Links, agentcap.Links3, agentcap.VLESSHelloKex)
+	c.send(1, linksBatch(
+		&agentv1.LinkCounters{CredId: "crd_alice_hy", InboundId: ids.i1, HelloPq: 3, HelloClassic: 1},
+		&agentv1.LinkCounters{CredId: "crd_bob_hy", InboundId: ids.i1, HelloClassic: 2, HelloUnknown: 1},
+		&agentv1.LinkCounters{CredId: "crd_alice_hy", InboundId: ids.i1, HelloPq: 4294967295}, // clamped, not believed
+	))
+	c.wait(func(m *agentv1.ConnectResponse) bool { return m.GetAck() != nil && m.GetAck().UpToSeq >= 1 })
+
+	node := nodeService{e.f}
+	fleet, err := node.GetFleetConnections(e.ctx, connect.NewRequest(&adminv1.GetFleetConnectionsRequest{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := fleet.Msg
+	if m.HelloKexMixed != 1 || m.HelloKexClassicOnly != 1 || m.HelloKexPqOnly != 0 || m.HelloKexUnknownOnly != 0 || len(m.HelloKexClassic) != 2 {
+		t.Fatalf("fleet hello key exchange = %+v", m)
+	}
+	if d := m.HelloKexClassic[0]; d.DeviceId != "dev_bob" || d.UserName != "bob" || d.Client != "Streisand/1.7" || d.Platform != "ios" ||
+		d.HelloClassic != 2 || d.HelloUnknown != 1 || d.HelloPq != 0 {
+		t.Errorf("most classic device = %+v", d)
+	}
+	if d := m.HelloKexClassic[1]; d.DeviceId != "dev_alice" || d.HelloPq != uint32(store.MaxLinkCount)+3 || d.HelloClassic != 1 {
+		t.Errorf("alice's device = %+v; want the clamped sum", d)
+	}
+	// nodeb serves the same profile and has no agent that lists the capability; nodea lists it
+	if !equalStrings(m.HelloKexNodesWithout, []string{ids.nodeB}) {
+		t.Errorf("nodes without the capability = %v, want only %s", m.HelloKexNodesWithout, ids.nodeB)
+	}
+
+	// an agent that does not list the capability: the node is named too
+	e.exec(`UPDATE node SET agent_caps = 'links/1 links/3' WHERE id = ?`, a.nodeID)
+	fleet, err = node.GetFleetConnections(e.ctx, connect.NewRequest(&adminv1.GetFleetConnectionsRequest{}))
+	if err != nil || len(fleet.Msg.HelloKexNodesWithout) != 2 || !contains(fleet.Msg.HelloKexNodesWithout, a.nodeID) {
+		t.Errorf("nodes without the capability = %+v, %v; want %s and %s", fleet.Msg.GetHelloKexNodesWithout(), err, a.nodeID, ids.nodeB)
 	}
 }
 
@@ -204,7 +409,7 @@ func TestGuardStatsLimitsLinkRows(t *testing.T) {
 		links[i] = &agentv1.LinkCounters{CredId: fmt.Sprintf("crd_%d", i), InboundId: "inb_cap", Connects: 1,
 			ClientCloses: 2, Freezes: 3, Quiet: 4, Accepted: 5, HellosForeign: 6, RttMsSum: 7, RttSamples: 8, PktsSent: 9, PktsLost: 10}
 	}
-	g := f.guardStats(&agentv1.StatsBatch{IntervalStartUnix: 1_000, IntervalEndUnix: 1_010, Links: links})
+	g := guardStatsForTest(f, &agentv1.StatsBatch{IntervalStartUnix: 1_000, IntervalEndUnix: 1_010, Links: links})
 	if len(g.links) != maxStatsDeltas || g.rejected != 0 || g.links[maxStatsDeltas-1].CredID != fmt.Sprintf("crd_%d", maxStatsDeltas-1) ||
 		g.links[0].ClientCloses != 2 || g.links[0].Freezes != 3 || g.links[0].Quiet != 4 || g.links[0].Accepted != 5 ||
 		g.links[0].HellosForeign != 6 || g.links[0].RttMSSum != 7 || g.links[0].RttSamples != 8 || g.links[0].PktsSent != 9 || g.links[0].PktsLost != 10 {
@@ -212,7 +417,7 @@ func TestGuardStatsLimitsLinkRows(t *testing.T) {
 	}
 	// a batch whose traffic is refused still gets its counters in
 	deltas := []*agentv1.TrafficDelta{{CredId: "crd_a", InboundId: "inb_cap", BytesUp: 1 << 60}}
-	g = f.guardStats(&agentv1.StatsBatch{IntervalStartUnix: 1_000, IntervalEndUnix: 1_010, Traffic: deltas, Links: links[:2]})
+	g = guardStatsForTest(f, &agentv1.StatsBatch{IntervalStartUnix: 1_000, IntervalEndUnix: 1_010, Traffic: deltas, Links: links[:2]})
 	if g.rejected != 1 || len(g.links) != 2 {
 		t.Fatalf("a refused delta: rejected %d, links %d, want 1 and 2", g.rejected, len(g.links))
 	}

@@ -110,13 +110,33 @@ func (s *Store) AlertHistory(ctx context.Context, since time.Time, nodeID string
 // reopenWithin ago is re-opened (id and first_seen stay, so flapping does not fill the history; opened_at moves to
 // now, the start of the new episode); otherwise a row is inserted. The active-alert unique index makes concurrent
 // opens update the same row instead of duplicating it.
+//
+// An alert an admin closed (resolution "dismissed") stays closed while its condition continues: when the latest
+// dismissed row of the key was last seen within reopenWithin, at the same or a higher severity than a, and no alert
+// of the key is active, only that row's last_seen moves and it is returned still resolved (the caller must not notify).
+// A gap longer than reopenWithin, or a higher severity, opens a new alert; a dismissed row is never re-opened in place.
 func (s *Store) OpenAlert(ctx context.Context, a HealthAlert, reopenWithin time.Duration, now time.Time) (out HealthAlert, reopened bool, err error) {
 	a.ID, a.FirstSeen, a.CreatedAt = NewID("alt_"), now, now
+	held, err := s.batch(ctx, Stmt{Query: `UPDATE health_alert SET last_seen = ?
+		WHERE id = (SELECT id FROM health_alert WHERE kind = ? AND node_id = ? AND subject = ?
+			AND resolved_at > 0 AND resolution = 'dismissed' AND last_seen >= ? AND severity >= ?
+			ORDER BY last_seen DESC, resolved_at DESC LIMIT 1)
+		AND NOT EXISTS (SELECT 1 FROM health_alert WHERE kind = ? AND node_id = ? AND subject = ? AND resolved_at = 0)
+		RETURNING ` + alertCols,
+		Args: []any{unix(now), a.Kind, a.NodeID, a.Subject, unix(now.Add(-reopenWithin)), int64(a.Severity),
+			a.Kind, a.NodeID, a.Subject}, Returning: true})
+	if err != nil {
+		return HealthAlert{}, false, err
+	}
+	if len(held) == 1 && len(held[0].Rows) == 1 {
+		out, err = scanAlert(batchRow(held[0].Rows[0]))
+		return out, false, err
+	}
 	results, err := s.batch(ctx,
 		Stmt{Query: `UPDATE health_alert SET resolved_at = 0, resolution = '', severity = ?, params_json = ?,
 			title_key = ?, why_key = ?, last_seen = ?, opened_at = ?
 			WHERE id = (SELECT id FROM health_alert WHERE kind = ? AND node_id = ? AND subject = ?
-				AND resolved_at >= ? AND resolved_at > 0 ORDER BY resolved_at DESC LIMIT 1)
+				AND resolved_at >= ? AND resolved_at > 0 AND resolution != 'dismissed' ORDER BY resolved_at DESC LIMIT 1)
 			AND NOT EXISTS (SELECT 1 FROM health_alert WHERE kind = ? AND node_id = ? AND subject = ? AND resolved_at = 0)
 			RETURNING ` + alertCols,
 			Args: []any{int64(a.Severity), jsonMap(a.Params), a.TitleKey, a.WhyKey, unix(now), unix(now),
@@ -175,6 +195,43 @@ func (s *Store) InsertResolvedAlert(ctx context.Context, a HealthAlert) error {
 // the alert does not exist, ErrConflict when it is already resolved.
 func (s *Store) MuteAlert(ctx context.Context, id string, until time.Time) (HealthAlert, error) {
 	res, err := s.W.ExecContext(ctx, `UPDATE health_alert SET muted_until = ? WHERE id = ? AND resolved_at = 0`, fleetUnix(until), id)
+	if err != nil {
+		return HealthAlert{}, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		if _, err := s.HealthAlert(ctx, id); err != nil {
+			return HealthAlert{}, err
+		}
+		return HealthAlert{}, ErrConflict
+	}
+	return s.HealthAlert(ctx, id)
+}
+
+// DismissAlert closes an active alert as resolved with resolution "dismissed" (an admin's Close) and clears its mute.
+// OpenAlert keeps it closed while the condition continues. ErrNotFound when the alert does not exist, ErrConflict
+// when it is already resolved.
+func (s *Store) DismissAlert(ctx context.Context, id string, now time.Time) (HealthAlert, error) {
+	res, err := s.W.ExecContext(ctx, `UPDATE health_alert SET resolved_at = ?, resolution = 'dismissed', muted_until = 0
+		WHERE id = ? AND resolved_at = 0`, max(unix(now), 1), id)
+	if err != nil {
+		return HealthAlert{}, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		if _, err := s.HealthAlert(ctx, id); err != nil {
+			return HealthAlert{}, err
+		}
+		return HealthAlert{}, ErrConflict
+	}
+	return s.HealthAlert(ctx, id)
+}
+
+// ReopenDismissedAlert undoes DismissAlert: the alert becomes active again. ErrNotFound when it does not exist,
+// ErrConflict when it was not closed by an admin or another alert of the same key is active by now.
+func (s *Store) ReopenDismissedAlert(ctx context.Context, id string, now time.Time) (HealthAlert, error) {
+	res, err := s.W.ExecContext(ctx, `UPDATE health_alert SET resolved_at = 0, resolution = '', last_seen = ?
+		WHERE id = ? AND resolved_at > 0 AND resolution = 'dismissed'
+		AND NOT EXISTS (SELECT 1 FROM health_alert o WHERE o.kind = health_alert.kind AND o.node_id = health_alert.node_id
+			AND o.subject = health_alert.subject AND o.resolved_at = 0)`, unix(now), id)
 	if err != nil {
 		return HealthAlert{}, err
 	}
@@ -385,6 +442,36 @@ func (s *Store) RecentSamples(ctx context.Context, inboundID string, n int) ([]C
 		FROM health_check_sample WHERE inbound_id = ? ORDER BY at DESC LIMIT ?`, inboundID, n)
 }
 
+// LatestProbeSamples returns the newest stored health-check result for each current inbound. An empty nodeID means all
+// inbounds; callers use it to compare the panel's protocol probe with the latest UDP port check without running probes.
+func (s *Store) LatestProbeSamples(ctx context.Context, nodeID string) ([]CheckSample, error) {
+	q := `SELECT c.inbound_id, c.at, c.status FROM health_check_sample c
+		JOIN inbound i ON i.id = c.inbound_id
+		WHERE c.at = (SELECT MAX(latest.at) FROM health_check_sample latest WHERE latest.inbound_id = c.inbound_id)`
+	args := []any{}
+	if nodeID != "" {
+		q += ` AND i.node_id = ?`
+		args = append(args, nodeID)
+	}
+	q += ` ORDER BY c.inbound_id`
+	rows, err := s.R.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CheckSample
+	for rows.Next() {
+		var sample CheckSample
+		var at int64
+		if err := rows.Scan(&sample.InboundID, &at, &sample.Status); err != nil {
+			return nil, err
+		}
+		sample.At = fromUnix(at)
+		out = append(out, sample)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) samples(ctx context.Context, q string, args ...any) ([]CheckSample, error) {
 	rows, err := s.R.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -405,44 +492,69 @@ func (s *Store) samples(ctx context.Context, q string, args ...any) ([]CheckSamp
 	return out, rows.Err()
 }
 
-// DailyRow is one health_check_daily row.
+// DailyRow is one health_check_daily row. The connect and response percentiles and the jitter are 0 for a day rolled up
+// before migration 00105.
 type DailyRow struct {
-	InboundID            string
-	Day                  time.Time // 00:00 UTC
-	OK, Failed, Degraded int
-	P50MS, P95MS         uint32
+	InboundID                    string
+	Day                          time.Time // 00:00 UTC
+	OK, Failed, Degraded         int
+	P50MS, P95MS                 uint32 // latency_ms: the cold time of the whole round
+	ConnectP50MS, ConnectP95MS   uint32
+	ResponseP50MS, ResponseP95MS uint32
+	JitterMS                     uint32 // standard deviation of response_ms
+}
+
+const dailyColumns = `inbound_id, day, ok, failed, degraded, p50_ms, p95_ms, connect_p50_ms, connect_p95_ms, response_p50_ms, response_p95_ms, jitter_ms`
+
+func scanDaily(rows *sql.Rows) ([]DailyRow, error) {
+	var out []DailyRow
+	for rows.Next() {
+		var r DailyRow
+		var day, p50, p95, c50, c95, r50, r95, jit int64
+		if err := rows.Scan(&r.InboundID, &day, &r.OK, &r.Failed, &r.Degraded, &p50, &p95, &c50, &c95, &r50, &r95, &jit); err != nil {
+			return nil, err
+		}
+		r.Day, r.P50MS, r.P95MS = fromUnix(day), uint32(max(p50, 0)), uint32(max(p95, 0))
+		r.ConnectP50MS, r.ConnectP95MS = uint32(max(c50, 0)), uint32(max(c95, 0))
+		r.ResponseP50MS, r.ResponseP95MS, r.JitterMS = uint32(max(r50, 0)), uint32(max(r95, 0)), uint32(max(jit, 0))
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 // DailyRows returns the aggregates of an inbound (all when inboundID is empty), oldest day first.
 func (s *Store) DailyRows(ctx context.Context, inboundID string) ([]DailyRow, error) {
-	rows, err := s.R.QueryContext(ctx, `SELECT inbound_id, day, ok, failed, degraded, p50_ms, p95_ms FROM health_check_daily
+	rows, err := s.R.QueryContext(ctx, `SELECT `+dailyColumns+` FROM health_check_daily
 		WHERE (? = '' OR inbound_id = ?) ORDER BY day, inbound_id`, inboundID, inboundID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []DailyRow
-	for rows.Next() {
-		var r DailyRow
-		var day, p50, p95 int64
-		if err := rows.Scan(&r.InboundID, &day, &r.OK, &r.Failed, &r.Degraded, &p50, &p95); err != nil {
-			return nil, err
-		}
-		r.Day, r.P50MS, r.P95MS = fromUnix(day), uint32(p50), uint32(p95)
-		out = append(out, r)
+	return scanDaily(rows)
+}
+
+// DailyRowsSince returns the aggregates of every inbound for the days at or after since, oldest day first.
+func (s *Store) DailyRowsSince(ctx context.Context, since time.Time) ([]DailyRow, error) {
+	rows, err := s.R.QueryContext(ctx, `SELECT `+dailyColumns+` FROM health_check_daily
+		WHERE day >= ? ORDER BY day, inbound_id`, unix(since))
+	if err != nil {
+		return nil, err
 	}
-	return out, rows.Err()
+	defer rows.Close()
+	return scanDaily(rows)
 }
 
 // RollupDaily aggregates the stored rounds of every UTC day that has ended before now into health_check_daily.
 // A day that already has a row is left alone, so it runs safely every hour. The raw rounds live 25 h, which
 // covers a whole finished day for an hour after midnight.
 // A panel that was down for more than an hour after midnight loses that day's aggregate for the
-// hours already pruned (it is computed from what is left); nothing reads the aggregates yet.
+// hours already pruned (it is computed from what is left).
+// Percentiles are nearest-rank over the rounds that measured the value (status != failed and the value > 0); jitter is the
+// population standard deviation of response_ms over the same kind of rounds.
 func (s *Store) RollupDaily(ctx context.Context, now time.Time) error {
 	today := unix(now) - unix(now)%86400
 	_, err := s.batch(ctx, Stmt{Query: `WITH daily_sample AS (
-			SELECT inbound_id, at - (at % 86400) AS day, status, latency_ms
+			SELECT inbound_id, at - (at % 86400) AS day, status, latency_ms, connect_ms, response_ms
 			FROM health_check_sample WHERE at < ?
 		), counts AS (
 			SELECT inbound_id, day,
@@ -460,10 +572,40 @@ func (s *Store) RollupDaily(ctx context.Context, now time.Time) error {
 				MAX(CASE WHEN rank = (total * 50 + 99) / 100 THEN latency_ms ELSE 0 END) AS p50_ms,
 				MAX(CASE WHEN rank = (total * 95 + 99) / 100 THEN latency_ms ELSE 0 END) AS p95_ms
 			FROM ranked_latency GROUP BY inbound_id, day
+		), ranked_connect AS (
+			SELECT inbound_id, day, connect_ms,
+				ROW_NUMBER() OVER (PARTITION BY inbound_id, day ORDER BY connect_ms) AS rank,
+				COUNT(*) OVER (PARTITION BY inbound_id, day) AS total
+			FROM daily_sample WHERE status != 3 AND connect_ms > 0
+		), connect_pct AS (
+			SELECT inbound_id, day,
+				MAX(CASE WHEN rank = (total * 50 + 99) / 100 THEN connect_ms ELSE 0 END) AS p50_ms,
+				MAX(CASE WHEN rank = (total * 95 + 99) / 100 THEN connect_ms ELSE 0 END) AS p95_ms
+			FROM ranked_connect GROUP BY inbound_id, day
+		), ranked_response AS (
+			SELECT inbound_id, day, response_ms,
+				ROW_NUMBER() OVER (PARTITION BY inbound_id, day ORDER BY response_ms) AS rank,
+				COUNT(*) OVER (PARTITION BY inbound_id, day) AS total
+			FROM daily_sample WHERE status != 3 AND response_ms > 0
+		), response_pct AS (
+			SELECT inbound_id, day,
+				MAX(CASE WHEN rank = (total * 50 + 99) / 100 THEN response_ms ELSE 0 END) AS p50_ms,
+				MAX(CASE WHEN rank = (total * 95 + 99) / 100 THEN response_ms ELSE 0 END) AS p95_ms
+			FROM ranked_response GROUP BY inbound_id, day
+		), jitter AS (
+			SELECT inbound_id, day,
+				AVG(CAST(response_ms AS REAL) * response_ms) AS mean_sq, AVG(CAST(response_ms AS REAL)) AS mean
+			FROM daily_sample WHERE status != 3 AND response_ms > 0 GROUP BY inbound_id, day
 		)
-		INSERT OR IGNORE INTO health_check_daily (inbound_id, day, ok, failed, degraded, p50_ms, p95_ms)
-		SELECT c.inbound_id, c.day, c.ok, c.failed, c.degraded, COALESCE(p.p50_ms, 0), COALESCE(p.p95_ms, 0)
-		FROM counts c LEFT JOIN percentiles p ON p.inbound_id = c.inbound_id AND p.day = c.day`, Args: []any{today}})
+		INSERT OR IGNORE INTO health_check_daily (inbound_id, day, ok, failed, degraded, p50_ms, p95_ms,
+			connect_p50_ms, connect_p95_ms, response_p50_ms, response_p95_ms, jitter_ms)
+		SELECT c.inbound_id, c.day, c.ok, c.failed, c.degraded, COALESCE(p.p50_ms, 0), COALESCE(p.p95_ms, 0),
+			COALESCE(cp.p50_ms, 0), COALESCE(cp.p95_ms, 0), COALESCE(rp.p50_ms, 0), COALESCE(rp.p95_ms, 0),
+			COALESCE(CAST(ROUND(SQRT(MAX(j.mean_sq - j.mean * j.mean, 0.0))) AS INTEGER), 0)
+		FROM counts c LEFT JOIN percentiles p ON p.inbound_id = c.inbound_id AND p.day = c.day
+		LEFT JOIN connect_pct cp ON cp.inbound_id = c.inbound_id AND cp.day = c.day
+		LEFT JOIN response_pct rp ON rp.inbound_id = c.inbound_id AND rp.day = c.day
+		LEFT JOIN jitter j ON j.inbound_id = c.inbound_id AND j.day = c.day`, Args: []any{today}})
 	return err
 }
 

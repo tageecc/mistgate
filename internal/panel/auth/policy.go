@@ -5,6 +5,29 @@ import (
 	"github.com/mistgate/mistgate/internal/panel/store"
 )
 
+// BackupDownloadProcedure is the plain HTTP archive route mounted beside Connect services.
+const BackupDownloadProcedure = "/backup/download"
+const BackupUploadProcedure = "/backup/upload"
+
+// The ProbeService procedures (proto/mistgate/probe/v1) as strings: importing probev1connect here would put the generated
+// messages into the Cloudflare Workers, which have no room for them and never serve the service. A test compares them with the
+// generated names.
+const (
+	PathProbeProcedure    = "/mistgate.probe.v1.ProbeService/PathProbe"
+	NodeTraceProcedure    = "/mistgate.probe.v1.ProbeService/NodeTrace"
+	NodeDnsCheckProcedure = "/mistgate.probe.v1.ProbeService/NodeDnsCheck"
+	PathSpeedProcedure    = "/mistgate.probe.v1.ProbeService/PathSpeed"
+
+	PathSpeedResultsProcedure = "/mistgate.probe.v1.ProbeService/PathSpeedResults"
+
+	ChannelMeasurePlanProcedure   = "/mistgate.probe.v1.ProbeService/ChannelMeasurePlan"
+	ChannelMeasureStartProcedure  = "/mistgate.probe.v1.ProbeService/ChannelMeasureStart"
+	ChannelMeasureStatusProcedure = "/mistgate.probe.v1.ProbeService/ChannelMeasureStatus"
+	ChannelMeasureCancelProcedure = "/mistgate.probe.v1.ProbeService/ChannelMeasureCancel"
+
+	NodeSniScanProcedure = "/mistgate.probe.v1.ProbeService/NodeSniScan"
+)
+
 // level is how much of the admin API a procedure needs.
 type level int
 
@@ -53,29 +76,54 @@ var procedureLevels = map[string]level{
 
 	adminv1connect.InstanceServiceGetInstanceProcedure:    levelRead,
 	adminv1connect.InstanceServiceUpdateInstanceProcedure: levelOwner,
+	adminv1connect.InstanceServiceEncodeQrProcedure:       levelRead, // draws a text the caller sends; keeps nothing
 
 	adminv1connect.FleetServiceOverviewProcedure:   levelRead,
 	adminv1connect.FleetServiceListEventsProcedure: levelRead,
 
-	adminv1connect.NodeServiceListNodesProcedure:           levelRead,
-	adminv1connect.NodeServiceGetNodeProcedure:             levelRead,
-	adminv1connect.NodeServiceGetNodeConnectionsProcedure:  levelRead,  // counts only, no address
-	adminv1connect.NodeServiceGetNodeJournalProcedure:      levelRead,  // addresses cut on the node and in the panel
+	adminv1connect.NodeServiceListNodesProcedure:          levelRead,
+	adminv1connect.NodeServiceGetNodeProcedure:            levelRead,
+	adminv1connect.NodeServiceGetNodeConnectionsProcedure: levelRead, // counts only, no address
+	adminv1connect.NodeServiceGetNodeJournalProcedure:     levelRead, // addresses cut on the node and in the panel
+	adminv1connect.NodeServiceGetNodeRuntimeProcedure:     levelRead, // desired vs applied: hashes, states, no address or pin
+	adminv1connect.NodeServiceGetNodeHostHistoryProcedure: levelRead, // hourly host load
+	adminv1connect.NodeServiceGetPathLossProcedure:        levelRead, // node names, never addresses
+	// On-demand probes between nodes send test traffic (rate-limited, one per pair): day-to-day work like "check now".
+	PathProbeProcedure:    levelWrite, // node names only, never addresses
+	NodeTraceProcedure:    levelWrite, // hops with their round trip, no router address
+	NodeDnsCheckProcedure: levelWrite, // resolver timings of the doctor's control domains
+	PathSpeedProcedure:    levelOwner, // moves up to 32 MB between two nodes: owner only, and for tokens only through an approved plan (policy_tokens.go)
+	// The kept figures of those tests: node names and numbers, nothing is sent.
+	PathSpeedResultsProcedure: levelRead,
+	// The channel measure of a node: 8 streams for 10 s each way against up to three nodes (up to 2 GiB a direction). Starting and
+	// stopping it is the owner's; the plan and the status move nothing.
+	ChannelMeasurePlanProcedure:   levelRead,
+	ChannelMeasureStartProcedure:  levelOwner, // fills the links of the node and its partners: owner only, and for tokens only through an approved plan
+	ChannelMeasureStatusProcedure: levelRead,
+	ChannelMeasureCancelProcedure: levelOwner, // closed to tokens: only the owner's screen stops a run
+	// The neighbour scan of a node: the node connects to up to 253 addresses of its /24 that are not the owner's, which a hoster may
+	// read as a port scan. Starting it is the owner's, like the profile it serves; a token of the admin profile reads the last result
+	// and starts a scan directly (the MCP tool node_neighbor_sites says so), the same call.
+	NodeSniScanProcedure: levelOwner,
 	adminv1connect.NodeServiceGetFleetConnectionsProcedure: levelRead,  // counts only, no address
-	adminv1connect.NodeServiceUpdateNodeProcedure:          levelWrite, // the handler refuses a helper that sets client_ipv6 (where people seem to come from): owner only
+	adminv1connect.NodeServiceGetNetworksProcedure:         levelRead,  // ASNs and counts only, no address
+	adminv1connect.NodeServiceUpdateNodeProcedure:          levelWrite, // the handler refuses a helper that sets client_ipv6 (where people seem to come from) or moves the address: owner only
 	adminv1connect.NodeServiceSetNodeDecoyModeProcedure:    levelOwner,
 	adminv1connect.NodeServiceUploadNodeDecoyProcedure:     levelOwner,
 	adminv1connect.NodeServiceSetNodesDecoyModeProcedure:   levelOwner,
 	adminv1connect.NodeServiceRestartInboundsProcedure:     levelWrite,
 	adminv1connect.NodeServiceCheckPortsProcedure:          levelWrite,
+	adminv1connect.NodeServiceCheckIpv6Procedure:           levelOwner, // sends test packets to an address of the node; MCP only for tokens (policy_tokens.go)
+	adminv1connect.NodeServiceUpdateIpv6EntryProcedure:     levelOwner, // changes what every subscription of the node holds; only through the owner's approval for tokens
 	adminv1connect.NodeServicePrepareAwgKernelProcedure:    levelOwner, // installs packages on the node as root, like ApplyFix; closed to tokens (policy_tokens.go)
 	adminv1connect.NodeServiceMeasureBandwidthProcedure:    levelOwner, // makes the node push up to 1 GB through a public server; closed to tokens (policy_tokens.go)
 	adminv1connect.NodeServiceCreateEnrollmentProcedure:    levelOwner, // hands out the means to run an agent as a node
 	adminv1connect.NodeServiceRetireNodeProcedure:          levelOwner,
 	adminv1connect.NodeServiceStreamLogsProcedure:          levelOwner, // node logs carry client addresses
 
-	// ProvisioningService can install a root agent over SSH; every operation is owner-only.
+	// ProvisioningService can install a root agent over SSH or change server SSH keys; every operation is owner-only.
 	adminv1connect.ProvisioningServiceGetSSHFingerprintProcedure:        levelOwner,
+	adminv1connect.ProvisioningServiceGetPanelSSHKeyProcedure:           levelOwner,
 	adminv1connect.ProvisioningServiceCheckSSHProcedure:                 levelOwner, // sends a root password after host-key confirmation; also needs step-up
 	adminv1connect.ProvisioningServiceStartNodeProvisionProcedure:       levelOwner, // installs a root service; also needs step-up
 	adminv1connect.ProvisioningServiceRetryNodeProvisionProcedure:       levelOwner, // resumes a root installation; also needs step-up
@@ -83,26 +131,33 @@ var procedureLevels = map[string]level{
 	adminv1connect.ProvisioningServiceListNodeProvisionsProcedure:       levelOwner,
 	adminv1connect.ProvisioningServiceListNodeProvisionEventsProcedure:  levelOwner,
 	adminv1connect.ProvisioningServiceListNodeServerAccessProcedure:     levelOwner,
+	adminv1connect.ProvisioningServiceListNodeServerKeysProcedure:       levelOwner,
+	adminv1connect.ProvisioningServiceAddNodeServerKeyProcedure:         levelOwner,
+	adminv1connect.ProvisioningServiceRemoveNodeServerKeyProcedure:      levelOwner,
+	adminv1connect.ProvisioningServiceAttachNodeServerAccessProcedure:   levelOwner,
 	adminv1connect.ProvisioningServiceRotateNodeServerPasswordProcedure: levelOwner, // SSH credentials need approval and step-up
 	adminv1connect.ProvisioningServiceRevealNodeServerPasswordProcedure: levelOwner, // credential reveal is owner-only and needs step-up
 	adminv1connect.ProvisioningServiceForgetNodeServerAccessProcedure:   levelOwner, // deletes a saved credential; needs step-up
 
-	adminv1connect.ProfileServiceListProtocolsProcedure:  levelRead,
-	adminv1connect.ProfileServiceListProfilesProcedure:   levelRead,
-	adminv1connect.ProfileServiceGetProfileProcedure:     levelRead, // secrets come back masked
-	adminv1connect.ProfileServicePreviewProfileProcedure: levelRead, // masked too
-	adminv1connect.ProfileServiceCreateProfileProcedure:  levelOwner,
-	adminv1connect.ProfileServiceUpdateProfileProcedure:  levelOwner,
-	adminv1connect.ProfileServiceDeleteProfileProcedure:  levelOwner,
-	adminv1connect.ProfileServiceCreateInboundProcedure:  levelOwner,
-	adminv1connect.ProfileServiceUpdateInboundProcedure:  levelOwner,
-	adminv1connect.ProfileServiceDeleteInboundProcedure:  levelOwner,
-	adminv1connect.ProfileServiceTwinProfileProcedure:    levelOwner, // CreateProfile + CreateInbound + UpdateGroup in one
+	adminv1connect.ProfileServiceListProtocolsProcedure:          levelRead,
+	adminv1connect.ProfileServiceListProfilesProcedure:           levelRead,
+	adminv1connect.ProfileServiceGetProfileProcedure:             levelRead, // secrets come back masked
+	adminv1connect.ProfileServicePreviewProfileProcedure:         levelRead, // masked too
+	adminv1connect.ProfileServiceCreateProfileProcedure:          levelOwner,
+	adminv1connect.ProfileServiceUpdateProfileProcedure:          levelOwner,
+	adminv1connect.ProfileServiceDeleteProfileProcedure:          levelOwner,
+	adminv1connect.ProfileServiceCreateInboundProcedure:          levelOwner,
+	adminv1connect.ProfileServiceUpdateInboundProcedure:          levelOwner,
+	adminv1connect.ProfileServiceDeleteInboundProcedure:          levelOwner,
+	adminv1connect.ProfileServiceRemoveProfileFromNodesProcedure: levelOwner, // DeleteInbound for a list, and DeleteProfile after it
+	adminv1connect.ProfileServiceTwinProfileProcedure:            levelOwner, // CreateProfile + CreateInbound + UpdateGroup in one
 
 	adminv1connect.GroupServiceListGroupsProcedure:  levelRead,
 	adminv1connect.GroupServiceCreateGroupProcedure: levelWrite,
 	adminv1connect.GroupServiceUpdateGroupProcedure: levelWrite,
 	adminv1connect.GroupServiceDeleteGroupProcedure: levelWrite,
+	// Who a node is handed out to is a group edit, with the same rights as UpdateGroup.
+	adminv1connect.GroupServiceSetNodeSharingProcedure: levelWrite,
 
 	// DnsService: presets decide which resolvers a user's traffic trusts, so editing them is owner-only;
 	// choosing one for a user or group is a user/group edit (levelWrite above).
@@ -123,6 +178,9 @@ var procedureLevels = map[string]level{
 	adminv1connect.SubscriptionServiceUpdateSubscriptionSettingsProcedure: levelWrite,
 	adminv1connect.SubscriptionServiceListClientsProcedure:                levelRead,
 	adminv1connect.SubscriptionServiceTestUserAgentProcedure:              levelRead,
+	adminv1connect.SubscriptionServicePreviewResponseHeadersProcedure:     levelRead,
+	adminv1connect.SubscriptionServicePreviewMihomoTemplateProcedure:      levelRead, // builds a profile from a draft and writes nothing
+	adminv1connect.SubscriptionServicePreviewRoutingProfileProcedure:      levelRead, // reads a pasted profile and writes nothing
 
 	// HealthService: reads for every role; mute, "check now" and "run doctor" are day-to-day work; a fix
 	// changes host configuration or drops sessions, so the owner (restart_inbound may later be relaxed
@@ -131,6 +189,7 @@ var procedureLevels = map[string]level{
 	adminv1connect.HealthServiceGetChecksProcedure:    levelRead,
 	adminv1connect.HealthServiceGetDoctorProcedure:    levelRead,
 	adminv1connect.HealthServiceMuteAlertProcedure:    levelWrite,
+	adminv1connect.HealthServiceDismissAlertProcedure: levelWrite, // Close: like a mute, day-to-day work
 	adminv1connect.HealthServiceRunChecksNowProcedure: levelWrite,
 	adminv1connect.HealthServiceRunDoctorProcedure:    levelWrite,
 	adminv1connect.HealthServiceApplyFixProcedure:     levelOwner,
@@ -177,6 +236,14 @@ var procedureLevels = map[string]level{
 	adminv1connect.ClientProbeServiceGetClientProbeProcedure:        levelRead,
 	adminv1connect.ClientProbeServiceUpdateClientProbeProcedure:     levelOwner, // also needs a step-up
 	adminv1connect.ClientProbeServiceDisconnectClientProbeProcedure: levelOwner, // also needs a step-up
+	// ClientApiService: the client API discovery switch is a read for every role and token; changing it belongs to the owner and needs a step-up.
+	adminv1connect.ClientApiServiceGetClientApiProcedure:    levelRead,
+	adminv1connect.ClientApiServiceUpdateClientApiProcedure: levelOwner,
+	// ClientCompatService: the client catalogue and the list of devices below its line are reads for every role; ListOutdatedDevices is
+	// also open to tokens (the MCP tool outdated_devices). Changing the table belongs to the owner and needs a step-up.
+	adminv1connect.ClientCompatServiceGetClientCompatProcedure:     levelRead,
+	adminv1connect.ClientCompatServiceListOutdatedDevicesProcedure: levelRead,
+	adminv1connect.ClientCompatServiceUpdateClientCompatProcedure:  levelOwner,
 	// CountryReachabilityService: the country every source of the country check looks from. Owner's; it sends nothing anywhere,
 	// so no step-up. Not open to tokens. The history of the verdicts is a read like GetChecks: every role, and tokens.
 	adminv1connect.CountryReachabilityServiceGetCountryReachabilityProcedure:    levelOwner,
@@ -197,7 +264,13 @@ var procedureLevels = map[string]level{
 	// nodes (or on the panel itself), so it is owner-only and the handler also requires a fresh step-up
 	// (auth.Service.RequireStepUp, like passkey removal). Not relaxed for helpers.
 	adminv1connect.UpdateServiceGetUpdatesProcedure:               levelRead,
+	adminv1connect.UpdateServiceGetOsUpdatesProcedure:             levelRead,
 	adminv1connect.UpdateServiceCheckPanelUpdateProcedure:         levelRead,
+	adminv1connect.UpdateServiceStartOsRolloutProcedure:           levelOwner, // also needs a step-up
+	adminv1connect.UpdateServicePauseOsRolloutProcedure:           levelOwner, // also needs a step-up
+	adminv1connect.UpdateServiceResumeOsRolloutProcedure:          levelOwner, // also needs a step-up
+	adminv1connect.UpdateServiceCancelOsRolloutProcedure:          levelOwner, // also needs a step-up
+	adminv1connect.UpdateServiceRefreshOsUpdatesProcedure:         levelOwner, // no step-up: it installs nothing, and is rate-limited by the panel
 	adminv1connect.UpdateServiceInstallPanelUpdateProcedure:       levelOwner, // also needs a step-up
 	adminv1connect.UpdateServiceStartRolloutProcedure:             levelOwner, // also needs a step-up
 	adminv1connect.UpdateServicePauseRolloutProcedure:             levelOwner, // also needs a step-up
@@ -208,6 +281,9 @@ var procedureLevels = map[string]level{
 	adminv1connect.UpdateServiceScheduleNodeUpdateProcedure:       levelOwner, // also needs a step-up
 	adminv1connect.UpdateServiceCancelNodeUpdateScheduleProcedure: levelOwner, // also needs a step-up
 	adminv1connect.UpdateServiceSetUpdateTimezoneProcedure:        levelOwner, // also needs a step-up
+	adminv1connect.UpdateServiceSetUpdateChannelProcedure:         levelOwner, // also needs a step-up; never available to tokens
+	adminv1connect.UpdateServiceSetUpdateDownloadTimeoutProcedure: levelOwner, // also needs a step-up
+	adminv1connect.UpdateServiceSetUpdateDownloadSourcesProcedure: levelOwner, // also needs a step-up
 
 	// DeviceService: devices that hold their own keys. All of it is levelWrite, like the subscription link
 	// (it is a user credential), and every call that returns a private key writes an audit row in the handler;
@@ -227,6 +303,7 @@ var procedureLevels = map[string]level{
 	adminv1connect.WarpServiceGetWarpProcedure:                      levelOwner,
 	adminv1connect.WarpServiceRegisterWarpProcedure:                 levelOwner, // also needs a step-up
 	adminv1connect.WarpServiceImportWarpProcedure:                   levelOwner, // also needs a step-up
+	adminv1connect.WarpServiceSetWarpLicenseProcedure:               levelOwner, // also needs a step-up
 	adminv1connect.WarpServiceSetWarpEnabledProcedure:               levelOwner,
 	adminv1connect.WarpServiceRestartWarpProcedure:                  levelOwner,
 	adminv1connect.WarpServiceRefreshWarpProcedure:                  levelOwner,
@@ -235,14 +312,15 @@ var procedureLevels = map[string]level{
 	adminv1connect.WarpServiceUpdateWarpRegistrationParamsProcedure: levelOwner,
 
 	// ApiTokenService and ApprovalService: the owner only, in the signed-in UI, never with a
-	// token. Creating and revoking a token and approving a change decide what an agent may do, so the handlers
+	// token. Creating or changing a token's bulk permission, revoking a token and approving a change decide what an agent may do, so the handlers
 	// also require a fresh step-up (auth.Service.RequireStepUp). Rejecting is safe and needs none.
-	adminv1connect.ApiTokenServiceCreateApiTokenProcedure: levelOwner, // also needs a step-up
-	adminv1connect.ApiTokenServiceListApiTokensProcedure:  levelOwner,
-	adminv1connect.ApiTokenServiceRevokeApiTokenProcedure: levelOwner, // also needs a step-up
-	adminv1connect.ApprovalServiceListApprovalsProcedure:  levelOwner,
-	adminv1connect.ApprovalServiceApproveProcedure:        levelOwner, // also needs a step-up
-	adminv1connect.ApprovalServiceRejectProcedure:         levelOwner,
+	adminv1connect.ApiTokenServiceCreateApiTokenProcedure:  levelOwner, // also needs a step-up
+	adminv1connect.ApiTokenServiceSetApiTokenBulkProcedure: levelOwner, // also needs a step-up
+	adminv1connect.ApiTokenServiceListApiTokensProcedure:   levelOwner,
+	adminv1connect.ApiTokenServiceRevokeApiTokenProcedure:  levelOwner, // also needs a step-up
+	adminv1connect.ApprovalServiceListApprovalsProcedure:   levelOwner,
+	adminv1connect.ApprovalServiceApproveProcedure:         levelOwner, // also needs a step-up
+	adminv1connect.ApprovalServiceRejectProcedure:          levelOwner,
 
 	// Backups hold the panel database and encrypted server credentials. Only the owner can manage them.
 	adminv1connect.BackupServiceGetBackupSettingsProcedure:    levelOwner,
@@ -250,6 +328,11 @@ var procedureLevels = map[string]level{
 	adminv1connect.BackupServiceTestBackupStorageProcedure:    levelOwner, // writes and deletes a probe object; also needs a step-up
 	adminv1connect.BackupServiceCreateBackupProcedure:         levelOwner, // exports sensitive installation state; also needs a step-up
 	adminv1connect.BackupServiceListBackupsProcedure:          levelOwner,
+	adminv1connect.BackupServicePrepareRestoreProcedure:       levelOwner,
+	adminv1connect.BackupServiceConfirmRestoreProcedure:       levelOwner, // also needs a step-up
+	adminv1connect.BackupServiceListKeptDataProcedure:         levelOwner,
+	adminv1connect.BackupServiceDeleteKeptDataProcedure:       levelOwner, // also needs a step-up
+	adminv1connect.BackupServiceGetRestoreResultProcedure:     levelOwner,
 
 	// TelegramService: setting the bot is the owner's (it decides where alerts go; also needs a step-up); linking, unlinking and
 	// switching alerts is each admin's own account, any role, like passkeys (linking also needs a step-up). Not open to tokens.
@@ -272,6 +355,32 @@ var procedureLevels = map[string]level{
 	adminv1connect.UserServiceUnblockDeviceProcedure:       levelWrite,
 	adminv1connect.UserServiceDeleteUsersProcedure:         levelWrite,
 	adminv1connect.UserServiceGetSubscriptionLinkProcedure: levelWrite, // the link is the user's credential
+	adminv1connect.UserServiceGetTelegramLinksProcedure:    levelWrite, // a tg:// link carries the proxy secret
+	adminv1connect.UserServiceIssueTelegramKeyProcedure:    levelWrite, // like the AmneziaVPN key calls: the key is a user credential
+	adminv1connect.UserServiceRotateTelegramKeyProcedure:   levelWrite,
+	adminv1connect.UserServiceRevokeTelegramKeyProcedure:   levelWrite,
+
+	// AssistantService is a signed-in UI surface only; token access is deliberately absent from policy_tokens.go.
+	adminv1connect.AssistantServiceGetAssistantAccessProcedure:      levelRead,
+	adminv1connect.AssistantServiceGetAssistantSettingsProcedure:    levelOwner,
+	adminv1connect.AssistantServiceUpdateAssistantSettingsProcedure: levelOwner,
+	adminv1connect.AssistantServiceSetProviderKeyProcedure:          levelOwner,
+	adminv1connect.AssistantServiceRemoveProviderKeyProcedure:       levelOwner,
+	adminv1connect.AssistantServiceListProviderModelsProcedure:      levelOwner,
+	adminv1connect.AssistantServiceListConversationsProcedure:       levelRead,
+	adminv1connect.AssistantServiceRecentQuestionsProcedure:         levelRead,
+	adminv1connect.AssistantServiceGetConversationProcedure:         levelRead,
+	adminv1connect.AssistantServiceDeleteConversationProcedure:      levelRead,
+	adminv1connect.AssistantServiceDeleteAllConversationsProcedure:  levelRead,
+	adminv1connect.AssistantServiceChatProcedure:                    levelRead,
+	adminv1connect.AssistantServiceStopTurnProcedure:                levelRead,
+	adminv1connect.AssistantServiceApplyPlanProcedure:               levelRead,
+	adminv1connect.AssistantServiceDismissPlanProcedure:             levelRead,
+	adminv1connect.AssistantServiceCancelFollowUpProcedure:          levelRead,
+	adminv1connect.AssistantServiceListMemoryProcedure:              levelRead,
+	adminv1connect.AssistantServiceSaveMemoryProcedure:              levelRead,
+	adminv1connect.AssistantServiceDeleteMemoryProcedure:            levelRead,
+	adminv1connect.AssistantServiceForgetAllProcedure:               levelRead,
 }
 
 // levelOf is the level a procedure path needs; unknown paths need the owner.

@@ -95,6 +95,109 @@ func TestAlertLifecycleInStore(t *testing.T) {
 	}
 }
 
+func TestDismissedAlertStaysClosed(t *testing.T) {
+	ctx := context.Background()
+	s := openTemp(t)
+	t0 := time.Unix(10_000, 0)
+	a := HealthAlert{Kind: "check_failed", Severity: 2, NodeID: "nod_a", Subject: "inb_1", TitleKey: "t", WhyKey: "w"}
+	open, _, err := s.OpenAlert(ctx, a, time.Hour, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MuteAlert(ctx, open.ID, t0.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	// dismiss
+	d, err := s.DismissAlert(ctx, open.ID, t0.Add(time.Minute))
+	if err != nil || d.Resolution != "dismissed" || !d.ResolvedAt.Equal(t0.Add(time.Minute)) || !d.MutedUntil.IsZero() {
+		t.Fatalf("dismiss: %+v %v", d, err)
+	}
+	if _, err := s.DismissAlert(ctx, open.ID, t0.Add(2*time.Minute)); !errors.Is(err, ErrConflict) {
+		t.Fatalf("dismiss twice: %v", err)
+	}
+	if _, err := s.DismissAlert(ctx, "alt_none", t0); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("dismiss unknown: %v", err)
+	}
+	// the condition continues: no new row, last_seen moves, still resolved
+	for i := 2; i <= 4; i++ {
+		now := t0.Add(time.Duration(i*20) * time.Minute) // each round within an hour of the last
+		got, reopened, err := s.OpenAlert(ctx, a, time.Hour, now)
+		if err != nil || reopened || got.ID != open.ID || got.ResolvedAt.IsZero() || got.Resolution != "dismissed" || !got.LastSeen.Equal(now) {
+			t.Fatalf("suppressed round %d: %+v reopened=%v err=%v", i, got, reopened, err)
+		}
+	}
+	if act, _ := s.ActiveAlerts(ctx); len(act) != 0 {
+		t.Fatalf("active while closed: %+v", act)
+	}
+	// a lower severity of the same condition stays closed too
+	low := a
+	low.Severity = 1
+	if got, _, err := s.OpenAlert(ctx, low, time.Hour, t0.Add(90*time.Minute)); err != nil || got.ResolvedAt.IsZero() {
+		t.Fatalf("lower severity: %+v %v", got, err)
+	}
+	// a higher severity opens a new alert
+	high := a
+	high.Severity = 3
+	hi, reopened, err := s.OpenAlert(ctx, high, time.Hour, t0.Add(95*time.Minute))
+	if err != nil || reopened || hi.ID == open.ID || !hi.ResolvedAt.IsZero() || hi.Severity != 3 {
+		t.Fatalf("higher severity: %+v reopened=%v err=%v", hi, reopened, err)
+	}
+	if st, _ := s.HealthAlert(ctx, open.ID); st.Resolution != "dismissed" {
+		t.Fatalf("dismissed row re-opened in place: %+v", st)
+	}
+	// Undo cannot clash with the newer active alert of the key
+	if _, err := s.ReopenDismissedAlert(ctx, open.ID, t0.Add(96*time.Minute)); !errors.Is(err, ErrConflict) {
+		t.Fatalf("reopen beside an active one: %v", err)
+	}
+	hist, err := s.AlertHistory(ctx, t0, "", 10)
+	if err != nil || len(hist) != 1 || hist[0].Resolution != "dismissed" {
+		t.Fatalf("history: %+v %v", hist, err)
+	}
+}
+
+func TestDismissedAlertAfterGap(t *testing.T) {
+	ctx := context.Background()
+	s := openTemp(t)
+	t0 := time.Unix(10_000, 0)
+	a := HealthAlert{Kind: "no_traffic", Severity: 3, NodeID: "nod_a", TitleKey: "t", WhyKey: "w"}
+	open, _, _ := s.OpenAlert(ctx, a, time.Hour, t0)
+	if _, err := s.DismissAlert(ctx, open.ID, t0.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	// the problem stopped for longer than reopenWithin and came back: a new alert, not the closed row
+	got, reopened, err := s.OpenAlert(ctx, a, time.Hour, t0.Add(62*time.Minute))
+	if err != nil || reopened || got.ID == open.ID || !got.ResolvedAt.IsZero() || !got.FirstSeen.Equal(t0.Add(62*time.Minute)) {
+		t.Fatalf("after the gap: %+v reopened=%v err=%v", got, reopened, err)
+	}
+}
+
+func TestReopenDismissedAlert(t *testing.T) {
+	ctx := context.Background()
+	s := openTemp(t)
+	t0 := time.Unix(10_000, 0)
+	a := HealthAlert{Kind: "no_traffic", Severity: 3, NodeID: "nod_a", TitleKey: "t", WhyKey: "w"}
+	open, _, _ := s.OpenAlert(ctx, a, time.Hour, t0)
+	if _, err := s.ReopenDismissedAlert(ctx, open.ID, t0); !errors.Is(err, ErrConflict) {
+		t.Fatalf("reopen of an active alert: %v", err)
+	}
+	if _, err := s.ReopenDismissedAlert(ctx, "alt_none", t0); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("reopen unknown: %v", err)
+	}
+	s.DismissAlert(ctx, open.ID, t0.Add(time.Minute))
+	got, err := s.ReopenDismissedAlert(ctx, open.ID, t0.Add(2*time.Minute))
+	if err != nil || !got.ResolvedAt.IsZero() || got.Resolution != "" || got.ID != open.ID {
+		t.Fatalf("reopen: %+v %v", got, err)
+	}
+	if n, _, _ := s.AlertCounts(ctx, t0.Add(3*time.Minute)); n != 1 {
+		t.Fatalf("badge after undo: %d", n)
+	}
+	// a cleared alert is not Undo-able
+	s.ResolveAlert(ctx, open.ID, "cleared", t0.Add(5*time.Minute))
+	if _, err := s.ReopenDismissedAlert(ctx, open.ID, t0.Add(6*time.Minute)); !errors.Is(err, ErrConflict) {
+		t.Fatalf("reopen of a cleared alert: %v", err)
+	}
+}
+
 func TestProbeCredFollowsItsInbound(t *testing.T) {
 	ctx := context.Background()
 	s := openTemp(t)
@@ -263,5 +366,42 @@ func TestPruneEventsKeepsWarningsLonger(t *testing.T) {
 	var left int
 	if err := s.R.QueryRowContext(ctx, `SELECT count(*) FROM event`).Scan(&left); err != nil || left != 3 {
 		t.Fatalf("left %d: %v", left, err)
+	}
+}
+
+func TestRollupDailyConnectResponseJitter(t *testing.T) {
+	ctx := context.Background()
+	s := openTemp(t)
+	_, in := fixtureInbound(t, s, "split")
+	day := int64(20_000) * 86400
+	put := func(at int64, st int, lat, conn, resp uint32) {
+		t.Helper()
+		if err := s.InsertSample(ctx, CheckSample{InboundID: in, At: time.Unix(at, 0), Status: st, LatencyMS: lat, ConnectMS: conn, ResponseMS: resp}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put(day+10, 1, 300, 200, 100)
+	put(day+20, 1, 500, 300, 200)
+	put(day+30, 2, 700, 500, 0)     // no response measured: left out of the response stats
+	put(day+40, 3, 0, 900, 999)     // failed rounds never count
+	put(day+86400+5, 1, 50, 40, 10) // the running day
+	if err := s.RollupDaily(ctx, time.Unix(day+86400+3600, 0)); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s.DailyRows(ctx, in)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("rows: %+v %v", rows, err)
+	}
+	r := rows[0]
+	// connect 200,300,500: p50 is the 2nd, p95 the 3rd. response 100,200: p50 the 1st, p95 the 2nd; stddev of {100,200} = 50.
+	if r.ConnectP50MS != 300 || r.ConnectP95MS != 500 || r.ResponseP50MS != 100 || r.ResponseP95MS != 200 || r.JitterMS != 50 {
+		t.Fatalf("split stats: %+v", r)
+	}
+	since, err := s.DailyRowsSince(ctx, time.Unix(day, 0))
+	if err != nil || len(since) != 1 {
+		t.Fatalf("since: %+v %v", since, err)
+	}
+	if none, _ := s.DailyRowsSince(ctx, time.Unix(day+86400, 0)); len(none) != 0 {
+		t.Fatalf("since is a lower bound: %+v", none)
 	}
 }

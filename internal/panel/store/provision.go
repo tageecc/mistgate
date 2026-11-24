@@ -7,6 +7,15 @@ import (
 	"time"
 )
 
+// NodeProvisionCredentialsAAD binds a temporary install credential to its durable provisioning job.
+func NodeProvisionCredentialsAAD(jobID string) string { return "node-provision:" + jobID }
+
+// NodeServerAccessPasswordAAD binds a saved SSH password to its node.
+func NodeServerAccessPasswordAAD(nodeID string) string { return "node-access:" + nodeID }
+
+// PendingNodeServerPasswordAAD binds an unverified replacement SSH password to its node.
+func PendingNodeServerPasswordAAD(nodeID string) string { return "node-access-pending:" + nodeID }
+
 // NodeProvisionJob is durable metadata for one owner-requested SSH installation.
 // Secret is ciphertext produced by vault.Vault and is never returned by RPC methods.
 type NodeProvisionJob struct {
@@ -16,6 +25,8 @@ type NodeProvisionJob struct {
 	Secret                                                     []byte
 	State, Phase, ErrorCode, CreatedBy                         string
 	CreatedAt, UpdatedAt                                       time.Time
+	// Sharing is who the node is handed out to once installed; the zero value lets the panel decide (migration 00146).
+	Sharing NodeShareChoice
 }
 
 // NodeProvisionEvent is a redacted, stable-code progress event.
@@ -30,22 +41,58 @@ type NodeProvisionEvent struct {
 // (both read from node); PasswordGenerated says the panel generated the saved password.
 type NodeServerAccess struct {
 	NodeID, NodeName, SSHHost, SSHUser, HostFingerprint string
+	PanelKeyFingerprint                                 string
 	SSHPort                                             uint16
 	Password, PendingPassword                           []byte
 	ConfiguredAt                                        time.Time
-	PasswordGenerated, NodeRetired                      bool
+	PasswordGenerated, PasswordLogin, NodeRetired       bool
+}
+
+// PanelSSHKey is the panel-wide SSH identity. PrivateKey is vault ciphertext and is never returned by RPC methods.
+type PanelSSHKey struct {
+	PrivateKey             []byte
+	PublicKey, Fingerprint string
+	CreatedAt              time.Time
+}
+
+// PanelSSHKey returns the panel's SSH key record, or ErrNotFound before its first use.
+func (s *Store) PanelSSHKey(ctx context.Context) (PanelSSHKey, error) {
+	var out PanelSSHKey
+	var created int64
+	err := s.R.QueryRowContext(ctx, `SELECT private_key, public_key, fingerprint, created_at FROM panel_ssh_key WHERE id = 1`).Scan(
+		&out.PrivateKey, &out.PublicKey, &out.Fingerprint, &created)
+	if errors.Is(err, sql.ErrNoRows) {
+		return PanelSSHKey{}, ErrNotFound
+	}
+	if err != nil {
+		return PanelSSHKey{}, err
+	}
+	out.CreatedAt = fromUnix(created)
+	return out, nil
+}
+
+// CreatePanelSSHKeyIfAbsent stores the first panel key. Concurrent callers read the row that won the insert.
+func (s *Store) CreatePanelSSHKeyIfAbsent(ctx context.Context, key PanelSSHKey) (bool, error) {
+	result, err := s.W.ExecContext(ctx, `INSERT INTO panel_ssh_key (id, private_key, public_key, fingerprint, created_at)
+		VALUES (1, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`, key.PrivateKey, key.PublicKey, key.Fingerprint, unix(key.CreatedAt))
+	if err != nil {
+		return false, err
+	}
+	n, err := result.RowsAffected()
+	return n == 1, err
 }
 
 const nodeProvisionJobCols = `id, node_id, name, address, country_code, location, provider,
-	ssh_host, ssh_port, host_fingerprint, secret, state, phase, error_code, created_by, created_at, updated_at`
+	ssh_host, ssh_port, host_fingerprint, secret, state, phase, error_code, created_by, created_at, updated_at, sharing`
 
 func scanNodeProvisionJob(row rowScanner) (NodeProvisionJob, error) {
 	var job NodeProvisionJob
 	var port int
 	var created, updated int64
+	var sharing string
 	err := row.Scan(&job.ID, &job.NodeID, &job.Name, &job.Address, &job.CountryCode, &job.Location, &job.Provider,
 		&job.SSHHost, &port, &job.HostFingerprint, &job.Secret, &job.State, &job.Phase, &job.ErrorCode,
-		&job.CreatedBy, &created, &updated)
+		&job.CreatedBy, &created, &updated, &sharing)
 	if errors.Is(err, sql.ErrNoRows) {
 		return NodeProvisionJob{}, ErrNotFound
 	}
@@ -53,6 +100,7 @@ func scanNodeProvisionJob(row rowScanner) (NodeProvisionJob, error) {
 		return NodeProvisionJob{}, err
 	}
 	job.SSHPort = uint16(port)
+	job.Sharing = ParseNodeShareChoice(sharing)
 	job.CreatedAt, job.UpdatedAt = fromUnix(created), fromUnix(updated)
 	return job, nil
 }
@@ -65,11 +113,11 @@ func (s *Store) CreateNodeProvisionJob(ctx context.Context, job NodeProvisionJob
 func (s *Store) createNodeProvisionJob(ctx context.Context, job NodeProvisionJob, eventCode string) error {
 	stmts := []Stmt{{Query: `INSERT INTO node_provision_job (
 		id, node_id, name, address, country_code, location, provider, ssh_host, ssh_port,
-		host_fingerprint, secret, state, phase, error_code, created_by, created_at, updated_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)`,
+		host_fingerprint, secret, state, phase, error_code, created_by, created_at, updated_at, sharing
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?)`,
 		Args: []any{job.ID, job.NodeID, job.Name, job.Address, job.CountryCode, job.Location, job.Provider,
 			job.SSHHost, int64(job.SSHPort), job.HostFingerprint, job.Secret, "queued", "queued", job.CreatedBy,
-			unix(job.CreatedAt), unix(job.UpdatedAt)}}}
+			unix(job.CreatedAt), unix(job.UpdatedAt), job.Sharing.JSON()}}}
 	if eventCode != "" {
 		stmts = append(stmts, Stmt{Query: `INSERT INTO node_provision_event (job_id, phase, code, created_at) VALUES (?, 'queued', ?, ?)`,
 			Args: []any{job.ID, eventCode, unix(job.CreatedAt)}})
@@ -304,14 +352,16 @@ func (s *Store) CompleteNodeProvisionJob(ctx context.Context, id string, access 
 			Args: []any{unix(now), id}},
 		// node_name is kept only because the column is NOT NULL: readers take the node's current name from node.
 		Stmt{Query: `INSERT INTO node_server_access (
-		node_id, node_name, ssh_host, ssh_port, ssh_username, host_fingerprint, password, pending_password, configured_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)
+		node_id, node_name, ssh_host, ssh_port, ssh_username, host_fingerprint, password, pending_password, configured_at,
+		panel_key_fp, password_login
+	) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
 	ON CONFLICT(node_id) DO UPDATE SET node_name=excluded.node_name, ssh_host=excluded.ssh_host,
 		ssh_port=excluded.ssh_port, ssh_username=excluded.ssh_username,
 		host_fingerprint=excluded.host_fingerprint, password=excluded.password,
-		pending_password=NULL, configured_at=excluded.configured_at, password_generated=0`,
+		pending_password=NULL, configured_at=excluded.configured_at, password_generated=0,
+		panel_key_fp=excluded.panel_key_fp, password_login=excluded.password_login`,
 			Args: []any{access.NodeID, access.NodeName, access.SSHHost, int64(access.SSHPort), access.SSHUser,
-				access.HostFingerprint, access.Password, unix(now)}},
+				access.HostFingerprint, access.Password, unix(now), access.PanelKeyFingerprint, access.PasswordLogin}},
 		Stmt{Query: `INSERT INTO node_provision_event (job_id, phase, code, created_at)
 			VALUES (?, 'completed', 'agent_connected', ?)`, Args: []any{id, unix(now)}},
 	)
@@ -326,7 +376,7 @@ func (s *Store) CompleteNodeProvisionJob(ctx context.Context, id string, access 
 
 // nodeServerAccessFrom joins the node: its name changes with a rename, and a retired node's access is marked.
 const nodeServerAccessFrom = `SELECT a.node_id, n.name, a.ssh_host, a.ssh_port, a.ssh_username, a.host_fingerprint,
-	a.password, a.pending_password, a.configured_at, a.password_generated, n.state = 'retired'
+	a.password, a.pending_password, a.configured_at, a.password_generated, n.state = 'retired', a.panel_key_fp, a.password_login
 	FROM node_server_access a JOIN node n ON n.id = a.node_id `
 
 func scanNodeServerAccess(row rowScanner) (NodeServerAccess, error) {
@@ -334,7 +384,8 @@ func scanNodeServerAccess(row rowScanner) (NodeServerAccess, error) {
 	var port int
 	var configured int64
 	err := row.Scan(&out.NodeID, &out.NodeName, &out.SSHHost, &port, &out.SSHUser, &out.HostFingerprint,
-		&out.Password, &out.PendingPassword, &configured, &out.PasswordGenerated, &out.NodeRetired)
+		&out.Password, &out.PendingPassword, &configured, &out.PasswordGenerated, &out.NodeRetired,
+		&out.PanelKeyFingerprint, &out.PasswordLogin)
 	if errors.Is(err, sql.ErrNoRows) {
 		return NodeServerAccess{}, ErrNotFound
 	}
@@ -369,6 +420,66 @@ func (s *Store) NodeServerAccesses(ctx context.Context) ([]NodeServerAccess, err
 	return out, rows.Err()
 }
 
+// InsertNodeServerAccess attaches credentials to a live enrolled node only when no access row exists yet.
+func (s *Store) InsertNodeServerAccess(ctx context.Context, access NodeServerAccess) error {
+	result, err := s.W.ExecContext(ctx, `INSERT INTO node_server_access (
+		node_id, node_name, ssh_host, ssh_port, ssh_username, host_fingerprint, password, pending_password, configured_at,
+		panel_key_fp, password_login
+	) SELECT n.id, n.name, ?, ?, ?, ?, ?, NULL, ?, ?, ? FROM node n
+		WHERE n.id = ? AND n.state != 'retired'
+		AND NOT EXISTS (SELECT 1 FROM node_server_access a WHERE a.node_id = n.id)`,
+		access.SSHHost, int64(access.SSHPort), access.SSHUser, access.HostFingerprint,
+		access.Password, unix(access.ConfiguredAt), access.PanelKeyFingerprint, access.PasswordLogin, access.NodeID)
+	if err != nil {
+		if fleetIsUnique(err) {
+			return ErrConflict
+		}
+		return err
+	}
+	if n, err := result.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return ErrConflict
+	}
+	return nil
+}
+
+// SetNodeServerPanelKey records a panel key only for a non-retired node with saved SSH access.
+func (s *Store) SetNodeServerPanelKey(ctx context.Context, nodeID, fingerprint string) error {
+	result, err := s.W.ExecContext(ctx, `UPDATE node_server_access SET panel_key_fp = ? WHERE node_id = ?
+		AND EXISTS (SELECT 1 FROM node WHERE id = node_server_access.node_id AND state != 'retired')`, fingerprint, nodeID)
+	if err != nil {
+		return err
+	}
+	if n, err := result.RowsAffected(); err != nil {
+		return err
+	} else if n == 1 {
+		return nil
+	}
+	if _, err := s.NodeServerAccess(ctx, nodeID); err != nil {
+		return err
+	}
+	return ErrConflict
+}
+
+// SetNodeServerPasswordLogin records whether the last explicit password proof succeeded for a live node.
+func (s *Store) SetNodeServerPasswordLogin(ctx context.Context, nodeID string, succeeded bool) error {
+	result, err := s.W.ExecContext(ctx, `UPDATE node_server_access SET password_login = ? WHERE node_id = ?
+		AND EXISTS (SELECT 1 FROM node WHERE id = node_server_access.node_id AND state != 'retired')`, succeeded, nodeID)
+	if err != nil {
+		return err
+	}
+	if n, err := result.RowsAffected(); err != nil {
+		return err
+	} else if n == 1 {
+		return nil
+	}
+	if _, err := s.NodeServerAccess(ctx, nodeID); err != nil {
+		return err
+	}
+	return ErrConflict
+}
+
 // SetPendingNodeServerPassword journals an encrypted replacement before it is sent to the server. A generated one marks
 // the access as holding a panel-generated password at once: from here on the server may already use it.
 func (s *Store) SetPendingNodeServerPassword(ctx context.Context, nodeID string, encrypted []byte, generated bool, now time.Time) error {
@@ -387,10 +498,10 @@ func (s *Store) SetPendingNodeServerPassword(ctx context.Context, nodeID string,
 
 // CommitPendingNodeServerPassword promotes the verified node-bound ciphertext and removes its recovery copy. ownerChosen
 // says the owner typed the promoted password (it clears the generated mark); a recovered pending value leaves it.
-func (s *Store) CommitPendingNodeServerPassword(ctx context.Context, nodeID string, encryptedCurrent []byte, ownerChosen bool, now time.Time) error {
+func (s *Store) CommitPendingNodeServerPassword(ctx context.Context, nodeID string, encryptedCurrent []byte, ownerChosen, passwordLogin bool, now time.Time) error {
 	result, err := s.W.ExecContext(ctx, `UPDATE node_server_access SET password = ?, pending_password = NULL, configured_at = ?,
-		password_generated = CASE WHEN ? THEN 0 ELSE password_generated END
-		WHERE node_id = ? AND pending_password IS NOT NULL`, encryptedCurrent, unix(now), ownerChosen, nodeID)
+		password_generated = CASE WHEN ? THEN 0 ELSE password_generated END, password_login = ?
+		WHERE node_id = ? AND pending_password IS NOT NULL`, encryptedCurrent, unix(now), ownerChosen, passwordLogin, nodeID)
 	if err != nil {
 		return err
 	}
@@ -404,7 +515,7 @@ func (s *Store) CommitPendingNodeServerPassword(ctx context.Context, nodeID stri
 
 // ClearPendingNodeServerPassword discards a replacement that could not be applied while the old login still works.
 func (s *Store) ClearPendingNodeServerPassword(ctx context.Context, nodeID string) error {
-	result, err := s.W.ExecContext(ctx, `UPDATE node_server_access SET pending_password = NULL WHERE node_id = ?`, nodeID)
+	result, err := s.W.ExecContext(ctx, `UPDATE node_server_access SET pending_password = NULL, password_login = 1 WHERE node_id = ?`, nodeID)
 	if err != nil {
 		return err
 	}

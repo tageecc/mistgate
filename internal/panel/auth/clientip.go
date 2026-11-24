@@ -6,12 +6,18 @@ import (
 	"net/http"
 	"net/netip"
 	"strings"
+	"sync/atomic"
 )
 
-// ProxyTrust says which peers are reverse proxies whose X-Forwarded-For / Forwarded
-// headers may be believed. The zero value trusts nobody: the client address is the TCP
-// peer, whatever the headers say.
-type ProxyTrust struct{ prefixes []netip.Prefix }
+// ProxyTrust says which peers are reverse proxies. A configured proxy must set or overwrite
+// X-Forwarded-For; a proxy that only writes Forwarded is not supported. The zero value trusts
+// nobody: the client address is the TCP peer, whatever the headers say.
+// Overwriting that chain prevents a client-supplied address from changing per-client limits.
+type ProxyTrust struct {
+	prefixes []netip.Prefix
+}
+
+var untrustedForwardedWarning atomic.Bool
 
 // NewProxyTrust trusts the given networks.
 func NewProxyTrust(p []netip.Prefix) ProxyTrust { return ProxyTrust{prefixes: p} }
@@ -51,39 +57,20 @@ func (t ProxyTrust) trusts(a netip.Addr) bool {
 // proxy. Then the chain is walked from the right (the proxy nearest to us appended
 // last) and the first address that is not itself a trusted proxy is the client, so
 // values the client put at the left of the header are never believed.
-// X-Forwarded-For and Forwarded are both understood; if a request carries both and they
-// name different clients, neither is believed and the proxy's own address is returned
-// (one shared bucket for that request, instead of letting a spoofed header pick one).
-// An unparseable chain falls back to the peer as well.
+// The configured proxy must set or overwrite X-Forwarded-For. Other forwarding headers are ignored.
+// An unparseable X-Forwarded-For chain falls back to the peer.
 func (t ProxyTrust) ClientIP(remoteAddr string, h http.Header) netip.Addr {
 	peer := parseNode(remoteAddr)
 	if !peer.IsValid() || !t.trusts(peer) {
 		return peer
 	}
-	var fromXFF, fromFwd netip.Addr
-	xff, fwd := h.Values("X-Forwarded-For"), h.Values("Forwarded")
+	xff := h.Values("X-Forwarded-For")
 	if len(xff) > 0 {
-		fromXFF = t.rightmostUntrusted(splitList(xff))
+		fromXFF := t.rightmostUntrusted(splitList(xff))
 		if !fromXFF.IsValid() {
 			return peer
 		}
-	}
-	if len(fwd) > 0 {
-		fromFwd = t.rightmostUntrusted(forwardedFor(fwd))
-		if !fromFwd.IsValid() {
-			return peer
-		}
-	}
-	switch {
-	case fromXFF.IsValid() && fromFwd.IsValid():
-		if fromXFF != fromFwd {
-			return peer
-		}
 		return fromXFF
-	case fromXFF.IsValid():
-		return fromXFF
-	case fromFwd.IsValid():
-		return fromFwd
 	}
 	return peer
 }
@@ -112,23 +99,6 @@ func splitList(values []string) []string {
 		for _, p := range strings.Split(v, ",") {
 			out = append(out, strings.TrimSpace(p))
 		}
-	}
-	return out
-}
-
-// forwardedFor extracts the for= node of every element of Forwarded headers (RFC 7239).
-// An element without for=, or with an obfuscated or unknown node, yields "" (invalid).
-func forwardedFor(values []string) []string {
-	var out []string
-	for _, el := range splitList(values) {
-		node := ""
-		for _, pair := range strings.Split(el, ";") {
-			k, v, ok := strings.Cut(strings.TrimSpace(pair), "=")
-			if ok && strings.EqualFold(k, "for") {
-				node = strings.Trim(v, `"`)
-			}
-		}
-		out = append(out, node)
 	}
 	return out
 }

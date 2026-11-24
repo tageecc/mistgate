@@ -11,45 +11,59 @@ import (
 
 // AccessUser is a user row with its group name and explicit node list.
 type AccessUser struct {
-	ID, Name, SubscriptionName, GroupID, GroupName string
-	Disabled                                       bool
-	Status                                         string // active | disabled | expired | limited (derived, see access.ComputeStatus)
-	AppHapp, AppAmnezia                            bool
-	AllNodes                                       bool
-	QuotaBytes                                     uint64 // 0 = unlimited
-	QuotaReset                                     string // none | day | week | month | rolling_month
-	PeriodStart                                    time.Time
-	UsedBytes                                      uint64
-	ExpiresAt                                      time.Time // zero = never
-	DeviceLimit                                    int
-	SpeedLimitBps                                  uint64 // the person's limit: all their devices on one node together (0 = none)
-	DeviceSpeedLimitBps                            uint64 // one device's limit (0 = none)
-	SubTokenHash, SubTokenEnc                      []byte
-	LastSeenAt                                     time.Time
-	LastNodeID                                     string
-	CreatedAt                                      time.Time
-	NodeIDs                                        []string // rows of user_node; meaningful while AllNodes is false
-	DNSPresetID                                    string   // "" = inherit (group, then the instance default)
-	GroupDNSPresetID                               string   // the user's group's preset, read-only here ("" = none)
+	ID, Name, SubscriptionName, GroupID, GroupName   string
+	Disabled                                         bool
+	Status                                           string // active | disabled | expired | limited (derived, see access.ComputeStatus)
+	AppHapp, AppAmnezia, AppTelegram, AppTrustTunnel bool
+	AllNodes                                         bool
+	QuotaBytes                                       uint64 // 0 = unlimited
+	QuotaReset                                       string // none | day | week | month | rolling_month
+	PeriodStart                                      time.Time
+	UsedBytes                                        uint64
+	ExpiresAt                                        time.Time // zero = never
+	DeviceLimit                                      int
+	SpeedLimitBps                                    uint64 // the person's limit: all their devices on one node together (0 = none)
+	DeviceSpeedLimitBps                              uint64 // one device's limit (0 = none)
+	SubTokenHash, SubTokenEnc                        []byte
+	LastSeenAt                                       time.Time
+	LastNodeID                                       string
+	CreatedAt                                        time.Time
+	NodeIDs                                          []string // rows of user_node; meaningful while AllNodes is false
+	// ExtraGroupIDs are the person's extra groups (user_extra_group), ordered by id; GroupID is the main one and never among them.
+	// They only add access (see AccessGroups). Every reader of a whole person fills them: User, UsersByIDs, ListUsers,
+	// UserByTokenHash, AWGDeviceScope and RelayAudienceUsers.
+	ExtraGroupIDs    []string
+	DNSPresetID      string // "" = inherit (group, then the instance default)
+	GroupDNSPresetID string // the user's group's preset, read-only here ("" = none)
+
+	// AppMistgateOff is the Mistgate app switch of the person, stored as "off" so that the zero value (a row nobody touched) keeps
+	// what the person had before the switch existed: the app works while the subscription link (AppHapp) is on.
+	AppMistgateOff bool
+
+	// PagePassGen is the generation of the person's page password and PageOpen is "the password was removed" (package pagepass): the
+	// password is computed from the subscription token and the generation, so these two are all the database holds of it.
+	PagePassGen int
+	PageOpen    bool
 }
 
-const accUserCols = `u.id, u.name, u.subscription_name, u.group_id, g.name AS group_name, u.disabled, u.status, u.app_happ, u.app_amnezia, u.all_nodes,
+const accUserCols = `u.id, u.name, u.subscription_name, u.group_id, g.name AS group_name, u.disabled, u.status, u.app_happ, u.app_amnezia, u.app_telegram, u.app_trusttunnel, u.app_mistgate_off, u.all_nodes,
 	u.quota_bytes, u.quota_reset, u.period_start, u.used_bytes, u.expires_at, u.device_limit, u.speed_limit_bps, u.device_speed_limit_bps,
-	u.sub_token_hash, u.sub_token_enc, u.last_seen_at, u.last_node_id, u.created_at, u.dns_preset_id, g.dns_preset_id AS group_dns_preset_id`
+	u.sub_token_hash, u.sub_token_enc, u.last_seen_at, u.last_node_id, u.created_at, u.dns_preset_id, g.dns_preset_id AS group_dns_preset_id, u.page_pass_gen, u.page_open`
 
 const accUserFrom = ` FROM user u JOIN user_group g ON g.id = u.group_id `
 
 func scanAccessUser(r rowScanner) (AccessUser, error) {
 	var u AccessUser
-	var dis, happ, amn, all int
+	var dis, happ, amn, tgl, trustTunnel, mgOff, all, pageOpen int
 	var quota, used, speed, deviceSpeed, period, seen, created int64
 	var expires sql.NullInt64
 	var lastNode, dns, gdns sql.NullString
-	err := r.Scan(&u.ID, &u.Name, &u.SubscriptionName, &u.GroupID, &u.GroupName, &dis, &u.Status, &happ, &amn, &all,
+	err := r.Scan(&u.ID, &u.Name, &u.SubscriptionName, &u.GroupID, &u.GroupName, &dis, &u.Status, &happ, &amn, &tgl, &trustTunnel, &mgOff, &all,
 		&quota, &u.QuotaReset, &period, &used, &expires, &u.DeviceLimit, &speed, &deviceSpeed,
-		&u.SubTokenHash, &u.SubTokenEnc, &seen, &lastNode, &created, &dns, &gdns)
+		&u.SubTokenHash, &u.SubTokenEnc, &seen, &lastNode, &created, &dns, &gdns, &u.PagePassGen, &pageOpen)
+	u.PageOpen = pageOpen == 1
 	u.DNSPresetID, u.GroupDNSPresetID = dns.String, gdns.String
-	u.Disabled, u.AppHapp, u.AppAmnezia, u.AllNodes = dis == 1, happ == 1, amn == 1, all == 1
+	u.Disabled, u.AppHapp, u.AppAmnezia, u.AppTelegram, u.AppTrustTunnel, u.AppMistgateOff, u.AllNodes = dis == 1, happ == 1, amn == 1, tgl == 1, trustTunnel == 1, mgOff == 1, all == 1
 	u.QuotaBytes, u.UsedBytes, u.SpeedLimitBps, u.DeviceSpeedLimitBps = uint64(quota), uint64(used), uint64(speed), uint64(deviceSpeed)
 	u.PeriodStart = fromUnix(period)
 	u.ExpiresAt = accTimeIfNonzero(expires)
@@ -82,8 +96,13 @@ type AccessDevice struct {
 	HWIDHash []byte
 	// AWG marks a device created by AddAWGDevice: a synthetic hwid_hash (AWGHwidHash) and first/last seen 0 =
 	// "never connected" until the fleet records a handshake.
-	AWG                                bool
+	AWG bool
+	// Key marks an app key (Telegram, TrustTunnel or AmneziaVPN): kind key with a synthetic hwid_hash and no seen times.
+	Key                                bool
+	KeyHash, EnrolTokenHash            []byte // client API hashes; nil until the device enrols
 	FirstSeenAt, LastSeenAt, CreatedAt time.Time
+	Idle                               bool
+	IdleSinceAt                        time.Time
 	Protocols                          []string // protocols with a live credential
 }
 
@@ -92,6 +111,7 @@ type AccessDevice struct {
 type AccessCred struct {
 	ID, DeviceID, UserID, Protocol string
 	ProfileID                      string
+	Path                           string // "" is the direct key; "relay:<node id>" is a relay key
 	SecretEnc                      []byte // vault, AAD = ID
 	DataJSON                       string
 	ConfigEpoch                    int64
@@ -99,10 +119,10 @@ type AccessCred struct {
 }
 
 func accInsertUserStmt(u AccessUser) Stmt {
-	return Stmt{Query: `INSERT INTO user (id, name, subscription_name, group_id, disabled, status, app_happ, app_amnezia, all_nodes, quota_bytes, quota_reset,
+	return Stmt{Query: `INSERT INTO user (id, name, subscription_name, group_id, disabled, status, app_happ, app_amnezia, app_telegram, app_trusttunnel, app_mistgate_off, all_nodes, quota_bytes, quota_reset,
 		   period_start, used_bytes, expires_at, device_limit, speed_limit_bps, device_speed_limit_bps, sub_token_hash, sub_token_enc, created_at, dns_preset_id)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		Args: []any{u.ID, u.Name, u.SubscriptionName, u.GroupID, int64(accBool(u.Disabled)), u.Status, int64(accBool(u.AppHapp)), int64(accBool(u.AppAmnezia)), int64(accBool(u.AllNodes)),
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		Args: []any{u.ID, u.Name, u.SubscriptionName, u.GroupID, int64(accBool(u.Disabled)), u.Status, int64(accBool(u.AppHapp)), int64(accBool(u.AppAmnezia)), int64(accBool(u.AppTelegram)), int64(accBool(u.AppTrustTunnel)), int64(accBool(u.AppMistgateOff)), int64(accBool(u.AllNodes)),
 			int64(u.QuotaBytes), u.QuotaReset, unix(u.PeriodStart), accNullUnix(u.ExpiresAt), int64(u.DeviceLimit), int64(u.SpeedLimitBps), int64(u.DeviceSpeedLimitBps),
 			u.SubTokenHash, u.SubTokenEnc, unix(u.CreatedAt), accNullStr(u.DNSPresetID)}}
 }
@@ -120,7 +140,7 @@ func accInsertDeviceStmt(d AccessDevice) Stmt {
 	kind := DeviceKindLink
 	seen := unix(d.CreatedAt)
 	switch {
-	case d.AWG:
+	case d.AWG || d.Key:
 		hwid, seen, kind = AWGHwidHash(d.ID), 0, DeviceKindKey
 	case len(d.HWIDHash) > 0:
 		hwid = d.HWIDHash
@@ -128,17 +148,27 @@ func accInsertDeviceStmt(d AccessDevice) Stmt {
 		// Only tests take this branch: a link device with a HWID of its own.
 		hwid = []byte(d.ID)
 	}
-	return Stmt{Query: `INSERT INTO device (id, user_id, hwid_hash, kind, platform, model, os_version, client, first_seen_at, last_seen_at, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		Args: []any{d.ID, d.UserID, hwid, kind, d.Platform, d.Model, d.OSVersion, d.Client, seen, seen, unix(d.CreatedAt)}}
+	keyHash, enrolHash := nullableClientDeviceHash(d.KeyHash), nullableClientDeviceHash(d.EnrolTokenHash)
+	return Stmt{Query: `INSERT INTO device (id, user_id, hwid_hash, kind, platform, model, os_version, client, first_seen_at, last_seen_at, created_at, key_hash, enrol_token_hash)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		Args: []any{d.ID, d.UserID, hwid, kind, d.Platform, d.Model, d.OSVersion, d.Client, seen, seen, unix(d.CreatedAt), keyHash, enrolHash}}
+}
+
+// nullableClientDeviceHash returns untyped nil for an absent hash so both SQL drivers bind NULL. D1's JS adapter otherwise
+// sees a nil []byte as a zero-length Uint8Array, which fails the 32-byte column check.
+func nullableClientDeviceHash(hash []byte) any {
+	if len(hash) == 0 {
+		return nil
+	}
+	return hash
 }
 
 func accInsertCredStmts(creds []AccessCred) []Stmt {
 	stmts := make([]Stmt, 0, len(creds))
 	for _, c := range creds {
-		stmts = append(stmts, Stmt{Query: `INSERT INTO device_credential (id, device_id, user_id, protocol, profile_id, secret_enc, data_json, config_epoch, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			Args: []any{c.ID, c.DeviceID, c.UserID, c.Protocol, accNullStr(c.ProfileID), c.SecretEnc, c.DataJSON, c.ConfigEpoch, unix(c.CreatedAt)}})
+		stmts = append(stmts, Stmt{Query: `INSERT INTO device_credential (id, device_id, user_id, protocol, profile_id, path, secret_enc, data_json, config_epoch, created_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			Args: []any{c.ID, c.DeviceID, c.UserID, c.Protocol, accNullStr(c.ProfileID), c.Path, c.SecretEnc, c.DataJSON, c.ConfigEpoch, unix(c.CreatedAt)}})
 	}
 	return stmts
 }
@@ -170,10 +200,28 @@ func accInsertCreds(ctx context.Context, tx *sql.Tx, creds []AccessCred) error {
 // credentials no device is made, so it is not counted against the device limit.
 // ErrAccessExists on a name (or token) clash, ErrNotFound when the group or a node does not exist.
 func (a Access) CreateUser(ctx context.Context, u AccessUser, dev AccessDevice, creds []AccessCred) error {
+	var keys []AccessKeyDevice
+	if len(creds) != 0 {
+		keys = append(keys, AccessKeyDevice{Device: dev, Creds: creds})
+	}
+	return a.CreateUserWithKeys(ctx, u, keys...)
+}
+
+// AccessKeyDevice is one key device and its initial credentials, inserted with its new user.
+type AccessKeyDevice struct {
+	Device AccessDevice
+	Creds  []AccessCred
+}
+
+// CreateUserWithKeys inserts a user, its node selection, and zero or more devices with their credentials in one transaction.
+// The devices go in as given (a key device carries Key and CreatedAt itself, like the implicit device of CreateUser).
+func (a Access) CreateUserWithKeys(ctx context.Context, u AccessUser, keys ...AccessKeyDevice) error {
 	stmts := []Stmt{accInsertUserStmt(u)}
 	stmts = append(stmts, accSetUserNodeStmts(u.ID, u.NodeIDs)...)
-	if len(creds) != 0 {
-		stmts = append(stmts, accInsertDeviceStmts(dev, creds)...)
+	for _, key := range keys {
+		if len(key.Creds) != 0 {
+			stmts = append(stmts, accInsertDeviceStmts(key.Device, key.Creds)...)
+		}
 	}
 	_, err := a.s.batch(ctx, stmts...)
 	switch {
@@ -207,31 +255,196 @@ func (a Access) UsersByIDs(ctx context.Context, ids []string) ([]AccessUser, err
 	return a.collectUsers(ctx, rows)
 }
 
+// RelayAudienceUsers reads the subscription access fields for every person once. NodeIDs is limited to the candidate exits and
+// entry, so callers can apply the same node-selection rule as subscriptions without a query per candidate.
+func (a Access) RelayAudienceUsers(ctx context.Context, nodeIDs []string) ([]AccessUser, error) {
+	rows, err := a.s.R.QueryContext(ctx, `SELECT u.id, u.group_id, u.disabled, u.status, u.app_happ, u.app_amnezia, u.app_telegram, u.app_trusttunnel,
+		u.all_nodes, u.quota_bytes, u.quota_reset, u.period_start, u.used_bytes, u.expires_at
+		FROM user u`)
+	if err != nil {
+		return nil, err
+	}
+	var out []AccessUser
+	idx := map[string]int{}
+	for rows.Next() {
+		var u AccessUser
+		var disabled, happ, amnezia, telegram, trustTunnel, all int
+		var quota, period, used int64
+		var expires sql.NullInt64
+		if err := rows.Scan(&u.ID, &u.GroupID, &disabled, &u.Status, &happ, &amnezia, &telegram, &trustTunnel, &all,
+			&quota, &u.QuotaReset, &period, &used, &expires); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		u.Disabled, u.AppHapp, u.AppAmnezia, u.AppTelegram, u.AppTrustTunnel, u.AllNodes = disabled != 0, happ != 0, amnezia != 0, telegram != 0, trustTunnel != 0, all != 0
+		u.QuotaBytes, u.UsedBytes, u.PeriodStart, u.ExpiresAt = uint64(quota), uint64(used), fromUnix(period), accTimeIfNonzero(expires)
+		idx[u.ID] = len(out)
+		out = append(out, u)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil || len(out) == 0 {
+		return out, err
+	}
+	xrows, err := a.s.R.QueryContext(ctx, `SELECT user_id, group_id FROM user_extra_group ORDER BY group_id`)
+	if err != nil {
+		return nil, err
+	}
+	for xrows.Next() {
+		var userID, groupID string
+		if err := xrows.Scan(&userID, &groupID); err != nil {
+			xrows.Close()
+			return nil, err
+		}
+		if i, ok := idx[userID]; ok {
+			out[i].ExtraGroupIDs = append(out[i].ExtraGroupIDs, groupID)
+		}
+	}
+	xrows.Close()
+	if err := xrows.Err(); err != nil || len(nodeIDs) == 0 {
+		return out, err
+	}
+	nrows, err := a.s.R.QueryContext(ctx, `SELECT user_id, node_id FROM user_node
+		WHERE node_id IN (SELECT value FROM json_each(?)) ORDER BY node_id`, accJSON(nodeIDs))
+	if err != nil {
+		return nil, err
+	}
+	defer nrows.Close()
+	for nrows.Next() {
+		var userID, nodeID string
+		if err := nrows.Scan(&userID, &nodeID); err != nil {
+			return nil, err
+		}
+		if i, ok := idx[userID]; ok {
+			out[i].NodeIDs = append(out[i].NodeIDs, nodeID)
+		}
+	}
+	return out, nrows.Err()
+}
+
+// RelayStaticAWGDeviceCounts counts live static AmneziaVPN keys by person and profile for the candidate AWG profiles.
+func (a Access) RelayStaticAWGDeviceCounts(ctx context.Context, profileIDs []string) (map[string]map[string]uint64, error) {
+	out := map[string]map[string]uint64{}
+	if len(profileIDs) == 0 {
+		return out, nil
+	}
+	rows, err := a.s.R.QueryContext(ctx, `SELECT c.user_id, c.profile_id, count(*) FROM device_credential c
+		JOIN device d ON d.id = c.device_id AND d.user_id = c.user_id AND d.kind = 'key' AND d.revoked_at IS NULL
+		WHERE c.protocol = 'awg' AND c.path = '' AND c.revoked_at IS NULL AND c.profile_id IN (SELECT value FROM json_each(?))
+		GROUP BY c.user_id, c.profile_id`, accJSON(profileIDs))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var userID, profileID string
+		var count uint64
+		if err := rows.Scan(&userID, &profileID, &count); err != nil {
+			return nil, err
+		}
+		if out[userID] == nil {
+			out[userID] = map[string]uint64{}
+		}
+		out[userID][profileID] = count
+	}
+	return out, rows.Err()
+}
+
 // UserByTokenHash finds the user of a subscription token hash (sha256), or ErrNotFound.
 func (a Access) UserByTokenHash(ctx context.Context, hash []byte) (AccessUser, error) {
 	var user AccessUser
-	var nodeIDs []string
+	var nodeIDs, extraGroupIDs []string
 	r := reads{}
 	r.add(maybeOneRow(&user, scanAccessUser), `SELECT `+accUserCols+accUserFrom+`WHERE u.sub_token_hash = ?`, hash)
 	r.add(appendRows(&nodeIDs, scanString), `SELECT node_id FROM user_node WHERE user_id = (SELECT id FROM user WHERE sub_token_hash = ?) ORDER BY node_id`, hash)
+	r.add(appendRows(&extraGroupIDs, scanString), `SELECT group_id FROM user_extra_group WHERE user_id = (SELECT id FROM user WHERE sub_token_hash = ?) ORDER BY group_id`, hash)
 	if err := r.run(ctx, a.s); err != nil {
 		return AccessUser{}, err
 	}
 	if user.ID == "" {
 		return AccessUser{}, ErrNotFound
 	}
-	user.NodeIDs = nodeIDs
+	user.NodeIDs, user.ExtraGroupIDs = nodeIDs, extraGroupIDs
 	return user, nil
 }
 
-// HasUserWithTokenHash checks a subscription token without loading the user's view.
-func (a Access) HasUserWithTokenHash(ctx context.Context, hash []byte) (bool, error) {
-	var found int
-	err := a.s.R.QueryRowContext(ctx, `SELECT 1 FROM user WHERE sub_token_hash = ?`, hash).Scan(&found)
+// PageState is what the public handler needs of a person's page password: the generation it is computed with and whether it was
+// removed (see AccessUser.PagePassGen).
+type PageState struct {
+	Gen  int
+	Open bool
+}
+
+// PageStateByTokenHash looks a subscription token up without loading the user's view and returns the state of the person's page
+// password. It is the one-row read that confirms a link (it replaced HasUserWithTokenHash), so asking for the state costs nothing more.
+// found is false for a token that belongs to nobody.
+func (a Access) PageStateByTokenHash(ctx context.Context, hash []byte) (st PageState, found bool, err error) {
+	var open int
+	err = a.s.R.QueryRowContext(ctx, `SELECT page_pass_gen, page_open FROM user WHERE sub_token_hash = ?`, hash).Scan(&st.Gen, &open)
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+		return PageState{}, false, nil
 	}
-	return err == nil, err
+	if err != nil {
+		return PageState{}, false, err
+	}
+	st.Open = open == 1
+	return st, true, nil
+}
+
+// The changes of a person's page password (SetPagePassword).
+const (
+	PagePassChange  = "change"  // generation + 1: a new password, the link stays
+	PagePassRemove  = "remove"  // the page opens on the link alone
+	PagePassRestore = "restore" // the password is asked again, a new one (generation + 1: the old one does not come back)
+)
+
+// SetPagePassword changes the person's page password state in one statement, so two changes at once cannot lose one. It reports
+// whether the row changed: removing a password that is already removed, restoring one that is not, and changing one that was
+// removed do nothing (changed false, a nil error); ErrNotFound for a person that does not exist.
+func (a Access) SetPagePassword(ctx context.Context, id, action string) (changed bool, err error) {
+	var q string
+	switch action {
+	case PagePassChange:
+		q = `UPDATE user SET page_pass_gen = page_pass_gen + 1 WHERE id = ? AND page_open = 0`
+	case PagePassRemove:
+		q = `UPDATE user SET page_open = 1 WHERE id = ? AND page_open = 0`
+	case PagePassRestore:
+		q = `UPDATE user SET page_open = 0, page_pass_gen = page_pass_gen + 1 WHERE id = ? AND page_open = 1`
+	default:
+		return false, errors.New("store: unknown page password action")
+	}
+	res, err := a.s.W.ExecContext(ctx, q, id)
+	if err != nil {
+		return false, err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		return true, nil
+	}
+	if _, err := a.User(ctx, id); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+// SubTokenHashes returns the subscription token hashes (sha256) of every user.
+func (a Access) SubTokenHashes(ctx context.Context) ([][32]byte, error) {
+	rows, err := a.s.R.QueryContext(ctx, `SELECT sub_token_hash FROM user`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out [][32]byte
+	for rows.Next() {
+		var b []byte
+		if err := rows.Scan(&b); err != nil {
+			return nil, err
+		}
+		var h [32]byte
+		if len(b) == len(h) {
+			copy(h[:], b)
+			out = append(out, h)
+		}
+	}
+	return out, rows.Err()
 }
 
 // collectUsers drains rows and attaches the explicit node lists.
@@ -266,10 +479,26 @@ func (a Access) collectUsers(ctx context.Context, rows *sql.Rows) ([]AccessUser,
 		}
 		out[idx[uid]].NodeIDs = append(out[idx[uid]].NodeIDs, nid)
 	}
-	return out, nrows.Err()
+	if err := nrows.Err(); err != nil {
+		return nil, err
+	}
+	xrows, err := a.s.R.QueryContext(ctx,
+		`SELECT user_id, group_id FROM user_extra_group WHERE user_id IN (SELECT value FROM json_each(?)) ORDER BY group_id`, accJSON(ids))
+	if err != nil {
+		return nil, err
+	}
+	defer xrows.Close()
+	for xrows.Next() {
+		var uid, gid string
+		if err := xrows.Scan(&uid, &gid); err != nil {
+			return nil, err
+		}
+		out[idx[uid]].ExtraGroupIDs = append(out[idx[uid]].ExtraGroupIDs, gid)
+	}
+	return out, xrows.Err()
 }
 
-// AccessUserQuery is a list request. Filter is "", "online", "expiring", "over_quota" or "over_device_limit".
+// AccessUserQuery is a list request. Filter is "", "online", "expiring", "over_quota", "over_device_limit" or "telegram".
 type AccessUserQuery struct {
 	Filter            string
 	Query             string
@@ -300,7 +529,9 @@ const (
 )
 
 // AccessUserCounts are the filter chip badges for one query, ignoring the filter itself.
-type AccessUserCounts struct{ All, Online, Expiring, OverQuota, DevicesUsed, DevicesOnline, OverDeviceLimit int }
+type AccessUserCounts struct{ All, Online, Expiring, OverQuota, DevicesUsed, DevicesOnline, OverDeviceLimit, Telegram int }
+
+type AccessDeviceCounts struct{ Used, Idle int }
 
 // accOverDeviceLimit is the condition "the user has more live devices than the limit" over the device_counts join (dc): the
 // same count as devices_used. A limit of 0 is no limit, never over.
@@ -317,21 +548,24 @@ func accLike(s string) string {
 // key devices follow their latest handshake; subscription devices follow their sessions (the nodes say which credential a
 // session uses, so a person with four HWID apps and one in use has one device online). The user scope keeps the aggregate
 // bounded by the same query and group_id as the people counts.
-func accUserDeviceCountsCTE(base string) string {
+func accUserDeviceCountsCTE(base string, now time.Time) string {
+	idle, _ := deviceIdleSQL("d", now)
 	return `live_devices AS (
 		SELECT d.id, d.user_id, d.last_seen_at,
+		   ` + idle + ` AS is_idle,
 		   max(CASE WHEN d.kind = 'key' AND c.profile_id IS NOT NULL AND ap.credential_id IS NOT NULL THEN 1 ELSE 0 END) AS is_awg
 		 FROM device d
 		 JOIN device_credential c ON c.device_id = d.id AND c.revoked_at IS NULL
 		 LEFT JOIN awg_peer ap ON ap.credential_id = c.id AND ap.released_at = 0
 		 JOIN user u ON u.id = d.user_id
 		 JOIN user_group g ON g.id = u.group_id
-		 WHERE ` + base + ` AND d.revoked_at IS NULL
+		 WHERE ` + base + ` AND d.revoked_at IS NULL AND ` + accNotTelegramKey + `
 		 GROUP BY d.id
 	), device_counts AS (
-		SELECT user_id, count(*) AS devices_used,
-		   sum(CASE WHEN is_awg = 1 AND last_seen_at > ? THEN 1
-		            WHEN is_awg = 0 AND id IN (SELECT value FROM json_each(?)) THEN 1 ELSE 0 END) AS devices_online
+		SELECT user_id, sum(CASE WHEN is_idle = 0 THEN 1 ELSE 0 END) AS devices_used,
+		   sum(CASE WHEN is_idle = 1 THEN 1 ELSE 0 END) AS devices_idle,
+		   sum(CASE WHEN is_idle = 0 AND is_awg = 1 AND last_seen_at > ? THEN 1
+		            WHEN is_idle = 0 AND is_awg = 0 AND id IN (SELECT value FROM json_each(?)) THEN 1 ELSE 0 END) AS devices_online
 		 FROM live_devices GROUP BY user_id
 	)`
 }
@@ -383,7 +617,7 @@ func accUserListQuery(q AccessUserQuery, base string, baseArgs []any, lconds str
 		queryArgs = append(queryArgs, online)
 	}
 	if needsDeviceCounts {
-		query = `WITH ` + accUserDeviceCountsCTE(base) + ` ` + query
+		query = `WITH ` + accUserDeviceCountsCTE(base, q.Now) + ` ` + query
 		cteArgs := append([]any{}, baseArgs...)
 		cteArgs = append(cteArgs, unix(q.DeviceOnlineAfter), accJSON(q.OnlineDeviceIDs))
 		queryArgs = append(cteArgs, queryArgs...)
@@ -396,13 +630,17 @@ func accUserListQuery(q AccessUserQuery, base string, baseArgs []any, lconds str
 	return query, queryArgs
 }
 
+// accGroupMemberCond is the list filter "a member of the group" (two placeholders, both the group id): the main group or an extra
+// one, each person once.
+const accGroupMemberCond = `u.id IN (SELECT id FROM user WHERE group_id = ? UNION SELECT user_id FROM user_extra_group WHERE group_id = ?)`
+
 // ListUsers returns one page in the requested total order (up to Limit users plus a flag telling whether more
 // follow) and the chip counts. LIKE is case-insensitive for ASCII only.
 func (a Access) ListUsers(ctx context.Context, q AccessUserQuery) ([]AccessUser, bool, AccessUserCounts, error) {
 	conds, args := []string{"1 = 1"}, []any{}
 	if q.GroupID != "" {
-		conds = append(conds, "u.group_id = ?")
-		args = append(args, q.GroupID)
+		conds = append(conds, accGroupMemberCond)
+		args = append(args, q.GroupID, q.GroupID)
 	}
 	if q.Query != "" {
 		conds = append(conds, `(u.name LIKE ? ESCAPE '\' OR g.name LIKE ? ESCAPE '\')`)
@@ -413,7 +651,7 @@ func (a Access) ListUsers(ctx context.Context, q AccessUserQuery) ([]AccessUser,
 	now, soon := unix(q.Now), unix(q.Now.Add(accExpiringWindow))
 	online := accJSON(q.OnlineIDs)
 
-	deviceCTE := accUserDeviceCountsCTE(base)
+	deviceCTE := accUserDeviceCountsCTE(base, q.Now)
 	var counts AccessUserCounts
 	countArgs := append([]any{}, args...)
 	countArgs = append(countArgs, unix(q.DeviceOnlineAfter), accJSON(q.OnlineDeviceIDs), online, now, soon)
@@ -426,10 +664,11 @@ func (a Access) ListUsers(ctx context.Context, q AccessUserQuery) ([]AccessUser,
 		   coalesce(sum(u.quota_bytes > 0 AND u.used_bytes >= u.quota_bytes), 0),
 		   coalesce(sum(coalesce(dc.devices_used, 0)), 0),
 		   coalesce(sum(coalesce(dc.devices_online, 0)), 0),
-		   coalesce(sum(`+accOverDeviceLimit+`), 0)`+accUserFrom+
+		   coalesce(sum(`+accOverDeviceLimit+`), 0),
+		   coalesce(sum(u.app_telegram = 1), 0)`+accUserFrom+
 			`LEFT JOIN device_counts dc ON dc.user_id = u.id WHERE `+base,
 		countArgs...).
-		Scan(&counts.All, &counts.Online, &counts.Expiring, &counts.OverQuota, &counts.DevicesUsed, &counts.DevicesOnline, &counts.OverDeviceLimit)
+		Scan(&counts.All, &counts.Online, &counts.Expiring, &counts.OverQuota, &counts.DevicesUsed, &counts.DevicesOnline, &counts.OverDeviceLimit, &counts.Telegram)
 	if err != nil {
 		return nil, false, counts, err
 	}
@@ -446,6 +685,8 @@ func (a Access) ListUsers(ctx context.Context, q AccessUserQuery) ([]AccessUser,
 		lconds += ` AND u.quota_bytes > 0 AND u.used_bytes >= u.quota_bytes`
 	case "over_device_limit":
 		lconds += ` AND ` + accOverDeviceLimit
+	case "telegram":
+		lconds += ` AND u.app_telegram = 1`
 	}
 	sort := q.Sort
 	if sort == AccessUserSortUnspecified {
@@ -479,25 +720,92 @@ func (a Access) ListUsers(ctx context.Context, q AccessUserQuery) ([]AccessUser,
 	return users, more, counts, nil
 }
 
-// UpdateUser writes every admin-editable column of u (matched by ID) and its status. setNodes also
-// replaces the explicit node list with u.NodeIDs. Usage counters are left alone (the fleet increments them).
-// ErrAccessExists on a name clash, ErrNotFound when the user, group or a node does not exist.
-func (a Access) UpdateUser(ctx context.Context, u AccessUser, setNodes bool) error {
-	stmts := []Stmt{
-		guard(`EXISTS (SELECT 1 FROM user WHERE id = ?)`, u.ID),
-		{Query: `UPDATE user SET name = ?, subscription_name = ?, group_id = ?, disabled = ?, status = ?, app_happ = ?, app_amnezia = ?, all_nodes = ?,
-			   quota_bytes = ?, quota_reset = ?, period_start = ?, expires_at = ?, device_limit = ?, speed_limit_bps = ?, device_speed_limit_bps = ?,
-			   dns_preset_id = ?
-			 WHERE id = ?`,
-			Args: []any{u.Name, u.SubscriptionName, u.GroupID, int64(accBool(u.Disabled)), u.Status, int64(accBool(u.AppHapp)), int64(accBool(u.AppAmnezia)), int64(accBool(u.AllNodes)),
-				int64(u.QuotaBytes), u.QuotaReset, unix(u.PeriodStart), accNullUnix(u.ExpiresAt), int64(u.DeviceLimit), int64(u.SpeedLimitBps), int64(u.DeviceSpeedLimitBps), accNullStr(u.DNSPresetID), u.ID}},
+// AccessGroupChange is what UpdateUser does to a person's extra groups: it adds the groups of Add and removes the groups of
+// Remove (ids), as deltas on the rows that are stored when the batch runs, so two changes made at once do not lose each other
+// and a repeat does nothing. An id of Add that is the person's main group (as stored when the batch runs) is not added.
+type AccessGroupChange struct{ Add, Remove []string }
+
+// accExtraGroupStmts are the statements that keep user_extra_group right after user.group_id was written for userID: the
+// person's main group is never among their extra groups, then the change. The one place that holds that invariant for
+// UpdateUser; DeleteGroup holds it for the people it moves.
+func accExtraGroupStmts(userID string, change AccessGroupChange) []Stmt {
+	stmts := []Stmt{{Query: `DELETE FROM user_extra_group WHERE user_id = ?1 AND group_id = (SELECT group_id FROM user WHERE id = ?1)`, Args: []any{userID}}}
+	for _, id := range change.Remove {
+		stmts = append(stmts, Stmt{Query: `DELETE FROM user_extra_group WHERE user_id = ? AND group_id = ?`, Args: []any{userID, id}})
 	}
+	for _, id := range change.Add {
+		stmts = append(stmts, Stmt{Query: `INSERT OR IGNORE INTO user_extra_group (user_id, group_id)
+			SELECT ?1, ?2 WHERE NOT EXISTS (SELECT 1 FROM user WHERE id = ?1 AND group_id = ?2)`, Args: []any{userID, id}})
+	}
+	return stmts
+}
+
+// UpdateUser writes every admin-editable column of u (matched by ID) and its status, provided the row still holds the
+// columns of was, the row u was made from: another admin's switch-off, extension or new period between the read and the write
+// must not be written back with the old value. The usage counters, the last-seen fields, the subscription token and the
+// page password are not written here (the fleet and the page-password calls own them), and status is written but not
+// compared: the minute sweep recomputes it all the time. setNodes also replaces the explicit node list with u.NodeIDs, and
+// then the stored list must be the one of was too. The main group is u.GroupID; the extra groups change by change only
+// (u.ExtraGroupIDs is not written; they are deltas on the stored rows), and the group that becomes the main one leaves them
+// in the same batch.
+// ErrAccessVersion when the row changed since it was read, ErrAccessExists on a name clash, ErrNotFound when the user, group
+// or a node does not exist.
+func (a Access) UpdateUser(ctx context.Context, u, was AccessUser, setNodes bool, change AccessGroupChange) error {
+	flag := func(v bool) any { return int64(accBool(v)) }
+	// Per column: the value to write, the stored column as the row was read (a NULL as the zero value, a name as typed: the
+	// column itself folds case) and the value that read gave.
+	edits := []struct {
+		col, stored string
+		now, was    any
+	}{
+		{"name", "name COLLATE BINARY", u.Name, was.Name},
+		{"subscription_name", "subscription_name", u.SubscriptionName, was.SubscriptionName},
+		{"group_id", "group_id", u.GroupID, was.GroupID},
+		{"disabled", "disabled", flag(u.Disabled), flag(was.Disabled)},
+		{"app_happ", "app_happ", flag(u.AppHapp), flag(was.AppHapp)},
+		{"app_amnezia", "app_amnezia", flag(u.AppAmnezia), flag(was.AppAmnezia)},
+		{"app_telegram", "app_telegram", flag(u.AppTelegram), flag(was.AppTelegram)},
+		{"app_trusttunnel", "app_trusttunnel", flag(u.AppTrustTunnel), flag(was.AppTrustTunnel)},
+		{"app_mistgate_off", "app_mistgate_off", flag(u.AppMistgateOff), flag(was.AppMistgateOff)},
+		{"all_nodes", "all_nodes", flag(u.AllNodes), flag(was.AllNodes)},
+		{"quota_bytes", "quota_bytes", int64(u.QuotaBytes), int64(was.QuotaBytes)},
+		{"quota_reset", "quota_reset", u.QuotaReset, was.QuotaReset},
+		{"period_start", "period_start", unix(u.PeriodStart), unix(was.PeriodStart)},
+		{"expires_at", "coalesce(expires_at, 0)", accNullUnix(u.ExpiresAt), unixOrZero(was.ExpiresAt)},
+		{"device_limit", "device_limit", int64(u.DeviceLimit), int64(was.DeviceLimit)},
+		{"speed_limit_bps", "speed_limit_bps", int64(u.SpeedLimitBps), int64(was.SpeedLimitBps)},
+		{"device_speed_limit_bps", "device_speed_limit_bps", int64(u.DeviceSpeedLimitBps), int64(was.DeviceSpeedLimitBps)},
+		{"dns_preset_id", "coalesce(dns_preset_id, '')", accNullStr(u.DNSPresetID), was.DNSPresetID},
+	}
+	set, same := []string{"status = ?"}, []string{"id = ?"}
+	setArgs, sameArgs := []any{u.Status}, []any{u.ID}
+	for _, e := range edits {
+		set, setArgs = append(set, e.col+" = ?"), append(setArgs, e.now)
+		same, sameArgs = append(same, e.stored+" = ?"), append(sameArgs, e.was)
+	}
+	var stmts []Stmt
+	if setNodes {
+		// as many rows as were read, none of them a node that was not (the pair is the key, so no node twice)
+		stmts = append(stmts, guard(`(SELECT count(*) FROM user_node WHERE user_id = ?1) = json_array_length(?2)
+			AND NOT EXISTS (SELECT 1 FROM user_node WHERE user_id = ?1 AND node_id NOT IN (SELECT value FROM json_each(?2)))`, u.ID, accJSON(was.NodeIDs)))
+	}
+	stmts = append(stmts,
+		guard(`EXISTS (SELECT 1 FROM user WHERE `+strings.Join(same, " AND ")+`)`, sameArgs...),
+		Stmt{Query: `UPDATE user SET ` + strings.Join(set, ", ") + ` WHERE id = ?`, Args: append(setArgs, u.ID)})
+	stmts = append(stmts, accExtraGroupStmts(u.ID, change)...)
 	if setNodes {
 		stmts = append(stmts, accSetUserNodeStmts(u.ID, u.NodeIDs)...)
 	}
 	_, err := a.s.batch(ctx, stmts...)
 	if errors.Is(err, errGuard) {
-		return ErrNotFound
+		var one int
+		switch readErr := a.s.R.QueryRowContext(ctx, `SELECT 1 FROM user WHERE id = ?`, u.ID).Scan(&one); {
+		case errors.Is(readErr, sql.ErrNoRows):
+			return ErrNotFound
+		case readErr != nil:
+			return readErr
+		}
+		return ErrAccessVersion
 	}
 	switch {
 	case accIsUnique(err):
@@ -516,7 +824,7 @@ func (a Access) SetUsersDisabled(ctx context.Context, ids []string, disabled boo
 
 // SetUserStatus stores a recomputed status.
 func (a Access) SetUserStatus(ctx context.Context, id, status string) error {
-	_, err := a.s.W.ExecContext(ctx, `UPDATE user SET status = ? WHERE id = ?`, status, id)
+	_, err := a.s.W.ExecContext(ctx, `UPDATE user SET status = CASE WHEN disabled = 1 THEN 'disabled' ELSE ? END WHERE id = ?`, status, id)
 	return err
 }
 
@@ -530,13 +838,15 @@ func (a Access) ResetUserPeriod(ctx context.Context, id string, oldPeriodStart, 
 
 // ResetUserTraffic clears current usage and stores a recomputed status without changing period_start.
 func (a Access) ResetUserTraffic(ctx context.Context, id, status string) error {
-	_, err := a.s.W.ExecContext(ctx, `UPDATE user SET used_bytes = 0, status = ? WHERE id = ?`, status, id)
+	_, err := a.s.W.ExecContext(ctx, `UPDATE user SET used_bytes = 0, status = CASE WHEN disabled = 1 THEN 'disabled' ELSE ? END WHERE id = ?`, status, id)
 	return err
 }
 
-// SetSubToken replaces the subscription token of a user.
+// SetSubToken replaces the subscription token of a user. The page password is computed from the token and the generation, so the
+// new token is already a new password; the generation starts again at 0 (it counts changes of one link), and page_open stays as the
+// owner left it: it is his decision about this person's page, not about this link.
 func (a Access) SetSubToken(ctx context.Context, id string, hash, enc []byte) error {
-	res, err := a.s.W.ExecContext(ctx, `UPDATE user SET sub_token_hash = ?, sub_token_enc = ? WHERE id = ?`, hash, enc, id)
+	res, err := a.s.W.ExecContext(ctx, `UPDATE user SET sub_token_hash = ?, sub_token_enc = ?, page_pass_gen = 0 WHERE id = ?`, hash, enc, id)
 	if err != nil {
 		return err
 	}
@@ -546,8 +856,8 @@ func (a Access) SetSubToken(ctx context.Context, id string, hash, enc []byte) er
 	return nil
 }
 
-// AddUsage adds bytes to a user's usage in the current period. The fleet module does the same inside its
-// stats transaction; this exists for callers that have no transaction of their own.
+// AddUsage adds bytes to a user's usage in the current period. Only tests call it: the fleet adds usage inside its stats
+// transaction (IngestStats).
 func (a Access) AddUsage(ctx context.Context, id string, bytes uint64) error {
 	_, err := a.s.W.ExecContext(ctx, `UPDATE user SET used_bytes = used_bytes + ? WHERE id = ?`, int64(bytes), id)
 	return err
@@ -556,12 +866,15 @@ func (a Access) AddUsage(ctx context.Context, id string, bytes uint64) error {
 // DeleteUsers deletes users (devices, credentials, node list and traffic rows cascade) and returns the
 // number deleted.
 func (a Access) DeleteUsers(ctx context.Context, ids []string) (int, error) {
-	res, err := a.s.W.ExecContext(ctx, `DELETE FROM user WHERE id IN (SELECT value FROM json_each(?))`, accJSON(ids))
+	args := []any{accJSON(ids)}
+	results, err := a.s.batch(ctx,
+		Stmt{Query: `DELETE FROM user_network WHERE user_id IN (SELECT value FROM json_each(?))`, Args: args},
+		Stmt{Query: `DELETE FROM user WHERE id IN (SELECT value FROM json_each(?))`, Args: args},
+	)
 	if err != nil {
 		return 0, err
 	}
-	n, _ := res.RowsAffected()
-	return int(n), nil
+	return int(results[1].RowsAffected), nil
 }
 
 // AccessUserState is what the status sweep needs about a user.
@@ -613,11 +926,17 @@ type SubscriptionData struct {
 	// none) and its live credentials. The zero value: there is none (yet).
 	Device      AccessDevice
 	DeviceCreds []AccessCred
+	// TelegramCred is the credential of the person's Telegram key (zero ID: they hold none). It is read for the links of the
+	// person's page, never for a request's device.
+	TelegramCred AccessCred
+	// TrustTunnelCred is the credential of the person's tt:// key, never of a link device.
+	TrustTunnelCred AccessCred
 	// LinkMode is the stored mode of the device limit (LinkModeTrack, LinkModeEnforce or LinkModeStrict), read in the same batch.
 	// Blocked: the owner blocked the HWID this request reports (always false for a request without one).
-	LinkMode  string
-	Blocked   bool
-	Group     AccessGroup
+	LinkMode string
+	Blocked  bool
+	// Groups are the person's groups, the main one first; read for an active user only.
+	Groups    AccessGroups
 	Inbounds  []AccessInboundFull
 	LiveNodes []NodeLiveRow
 	// Relays are the relays that are switched on, with both ends (a person's twin servers follow them, access.relayUsable); read
@@ -657,16 +976,34 @@ func scanSubscriptionTraffic(r rowScanner) (subscriptionTraffic, error) {
 	return subscriptionTraffic{Up: uint64(up), Down: uint64(down)}, nil
 }
 
+func scanSpecialKeyCred(r rowScanner) (AccessCred, error) {
+	var protocol string
+	c := AccessCred{}
+	var created int64
+	if err := r.Scan(&protocol, &c.ID, &c.DeviceID, &c.UserID, &c.SecretEnc, &c.DataJSON, &created); err != nil {
+		return AccessCred{}, err
+	}
+	c.Protocol = protocol
+	c.CreatedAt = fromUnix(created)
+	return c, nil
+}
+
 func scanAccessDevice(r rowScanner) (AccessDevice, error) {
 	var d AccessDevice
 	var id, userID, kind, platform, model, osVersion, client, protocols, fingerprint sql.NullString
-	var implicit, first, last, created, used sql.NullInt64
-	if err := r.Scan(&id, &userID, &implicit, &kind, &platform, &model, &osVersion, &client, &first, &last, &created, &protocols, &used, &fingerprint); err != nil {
+	var implicit, first, last, created, used, idle, idleSince sql.NullInt64
+	var keyHash, enrolTokenHash []byte
+	if err := r.Scan(&id, &userID, &implicit, &kind, &platform, &model, &osVersion, &client, &first, &last, &created, &protocols, &used, &fingerprint, &keyHash, &enrolTokenHash, &idle, &idleSince); err != nil {
 		return AccessDevice{}, err
 	}
 	d.ID, d.UserID, d.Platform, d.Model, d.OSVersion = id.String, userID.String, platform.String, model.String, osVersion.String
 	d.Kind, d.Client = kind.String, client.String
 	d.UsedBytes, d.Fingerprint = uint64(max(used.Int64, 0)), fingerprint.String
+	d.KeyHash, d.EnrolTokenHash = keyHash, enrolTokenHash
+	d.Idle = idle.Int64 == 1
+	if idleSince.Valid && idleSince.Int64 != 0 {
+		d.IdleSinceAt = fromUnix(idleSince.Int64)
+	}
 	d.Implicit = implicit.Int64 == 1
 	if first.Valid && first.Int64 != 0 {
 		d.FirstSeenAt = fromUnix(first.Int64)
@@ -681,19 +1018,25 @@ func scanAccessDevice(r rowScanner) (AccessDevice, error) {
 	return d, nil
 }
 
-// linkDeviceCredsSQL reads one live link device of a user and all its live credentials: ?1 is the user, ?2 the device's
+// linkDeviceCredsSQLAt reads one live link device of a user and all its live credentials: ?1 is the user, ?2 the device's
 // hwid_hash, NULL for the shared device (IS compares NULL too, so one statement serves both). Its aliases are unique so
-// the query can also be the trailing SELECT of a Returning batch.
-const linkDeviceCredsSQL = `
+// the query can also be the trailing SELECT of a Returning batch. Callers distinguish keys by their path.
+func linkDeviceCredsSQLAt(now time.Time) string {
+	idle, since := deviceIdleSQL("d", now)
+	return `
 	SELECT d.id AS device_id, d.user_id AS user_id, coalesce(d.platform, '') AS platform, coalesce(d.model, '') AS model,
 		coalesce(d.os_version, '') AS os_version, coalesce(d.client, '') AS client, d.hwid_hash IS NULL AS shared,
+		d.key_hash, d.enrol_token_hash,
 		coalesce(d.first_seen_at, 0) AS first_seen_at, coalesce(d.last_seen_at, 0) AS last_seen_at,
-		d.created_at AS device_created_at, coalesce(c.id, '') AS credential_id, coalesce(c.protocol, '') AS protocol,
-		coalesce(c.profile_id, '') AS profile_id, coalesce(c.secret_enc, X'') AS secret_enc, coalesce(c.data_json, '') AS data_json,
+		d.created_at AS device_created_at, ` + idle + ` AS idle, ` + since + ` AS idle_since_unix,
+		coalesce(c.id, '') AS credential_id, coalesce(c.protocol, '') AS protocol,
+		coalesce(c.profile_id, '') AS profile_id, coalesce(c.path, '') AS credential_path,
+		coalesce(c.secret_enc, X'') AS secret_enc, coalesce(c.data_json, '') AS data_json,
 		coalesce(c.config_epoch, 0) AS config_epoch, coalesce(c.created_at, 0) AS credential_created_at
 	FROM device d LEFT JOIN device_credential c ON c.device_id = d.id AND c.revoked_at IS NULL
 	WHERE d.user_id = ?1 AND d.revoked_at IS NULL AND d.hwid_hash IS ?2 AND d.kind = 'link'
-	ORDER BY c.protocol, c.profile_id, c.id`
+	ORDER BY c.protocol, c.profile_id, c.path, c.id`
+}
 
 // hwidArg is the ?2 of linkDeviceCredsSQL: NULL, not an empty blob, for the shared device.
 func hwidArg(hash []byte) any {
@@ -751,34 +1094,40 @@ func (s *linkDeviceSnapshot) scan(row rowScanner) error {
 func scanLinkDeviceCred(row rowScanner) (AccessDevice, AccessCred, bool, error) {
 	var device AccessDevice
 	var shared bool
-	var first, last, deviceCreated, configEpoch, credCreated int64
-	var id, protocol, profile, data string
+	var first, last, deviceCreated, idle, idleSince, configEpoch, credCreated int64
+	var id, protocol, profile, path, data string
 	var secret []byte
 	if err := row.Scan(&device.ID, &device.UserID, &device.Platform, &device.Model, &device.OSVersion, &device.Client, &shared,
-		&first, &last, &deviceCreated, &id, &protocol, &profile, &secret, &data, &configEpoch, &credCreated); err != nil {
+		&device.KeyHash, &device.EnrolTokenHash,
+		&first, &last, &deviceCreated, &idle, &idleSince, &id, &protocol, &profile, &path, &secret, &data, &configEpoch, &credCreated); err != nil {
 		return AccessDevice{}, AccessCred{}, false, err
 	}
 	device.Kind, device.Implicit = DeviceKindLink, shared
 	device.FirstSeenAt, device.LastSeenAt, device.CreatedAt = fromUnix(first), fromUnix(last), fromUnix(deviceCreated)
+	device.Idle = idle == 1
+	if idleSince != 0 {
+		device.IdleSinceAt = fromUnix(idleSince)
+	}
 	if id == "" {
 		return device, AccessCred{}, false, nil
 	}
-	cred := AccessCred{ID: id, DeviceID: device.ID, UserID: device.UserID, Protocol: protocol, ProfileID: profile,
+	cred := AccessCred{ID: id, DeviceID: device.ID, UserID: device.UserID, Protocol: protocol, ProfileID: profile, Path: path,
 		SecretEnc: secret, DataJSON: data, ConfigEpoch: configEpoch, CreatedAt: fromUnix(credCreated)}
 	return device, cred, true, nil
 }
 
 // SubscriptionData reads everything a subscription view needs in one read batch. hwidHash selects the request's own device
 // (SubscriptionData.Device): nil for an app that sends no HWID.
-func (a Access) SubscriptionData(ctx context.Context, userID, groupID string, since time.Time, active bool, now time.Time, hwidHash []byte) (SubscriptionData, error) {
+func (a Access) SubscriptionData(ctx context.Context, userID string, since time.Time, active bool, now time.Time, hwidHash []byte) (SubscriptionData, error) {
 	var traffic subscriptionTraffic
 	var devices []AccessDevice
 	var awgDevices []AccessAWGDevice
 	var deviceRows []linkDeviceCredRow
+	var specialKeys []AccessCred
 	var mode string
 	var blocked int
-	var group AccessGroup
-	var groupProfileIDs []string
+	var groups []AccessGroup
+	var groupProfileIDs, groupDisabledNodeIDs []groupItem
 	var inbounds []AccessInboundFull
 	var liveNodes []NodeLiveRow
 	var relays []RelayLink
@@ -787,25 +1136,30 @@ func (a Access) SubscriptionData(ctx context.Context, userID, groupID string, si
 	r.add(oneRow(&traffic, scanSubscriptionTraffic), `SELECT coalesce(sum(bytes_up), 0) AS bytes_up, coalesce(sum(bytes_down), 0) AS bytes_down FROM traffic_bucket WHERE user_id = ? AND hour_start >= ?`, userID, unix(since))
 	r.add(appendRows(&devices, scanAccessDevice), `SELECT d.id, d.user_id, CASE WHEN d.hwid_hash IS NULL THEN 1 ELSE 0 END AS implicit, d.kind, d.platform, d.model, d.os_version, d.client,
 			coalesce(d.first_seen_at, 0) AS first_seen_at, coalesce(d.last_seen_at, 0) AS last_seen_at, d.created_at,
-			coalesce((SELECT group_concat(DISTINCT c.protocol) FROM device_credential c WHERE c.device_id = d.id AND c.revoked_at IS NULL), '') AS protocols`+accDeviceTail+`
+			coalesce((SELECT group_concat(DISTINCT c.protocol) FROM device_credential c WHERE c.device_id = d.id AND c.revoked_at IS NULL), '') AS protocols`+accDeviceTail(now)+`
 			FROM device d WHERE d.user_id = ? AND d.revoked_at IS NULL AND `+accDeviceLive+` ORDER BY d.created_at, d.id`, userID)
 	r.add(appendRows(&awgDevices, scanAWGDevice), `SELECT d.id, d.user_id, d.platform, d.model, d.os_version, coalesce(d.first_seen_at, 0) AS first_seen_at, coalesce(d.last_seen_at, 0) AS last_seen_at, d.created_at,
 			p.id AS profile_id, p.name AS profile_name, p.settings_json AS profile_settings_json, c.id AS credential_id, c.data_json, c.secret_enc, ap.public_key, ap.idx, c.config_epoch, p.critical_epoch, coalesce(c.dns_sig, '') AS dns_sig
 			FROM device d
-			JOIN device_credential c ON c.device_id = d.id AND c.revoked_at IS NULL AND c.profile_id IS NOT NULL
+			JOIN device_credential c ON c.device_id = d.id AND c.revoked_at IS NULL AND c.profile_id IS NOT NULL AND c.path = ''
 			JOIN awg_peer ap ON ap.credential_id = c.id AND ap.released_at = 0
 			JOIN profile p ON p.id = c.profile_id
 			WHERE d.revoked_at IS NULL AND d.kind = 'key' AND d.user_id = ? ORDER BY d.created_at, d.id`, userID)
 	// Read without access too: a denied fetch still touches the device (access.subView).
-	r.add(appendRows(&deviceRows, scanLinkDeviceCredRow), linkDeviceCredsSQL, userID, hwidArg(hwidHash))
+	r.add(appendRows(&deviceRows, scanLinkDeviceCredRow), linkDeviceCredsSQLAt(now), userID, hwidArg(hwidHash))
+	r.add(appendRows(&specialKeys, scanSpecialKeyCred), `SELECT c.protocol, c.id AS credential_id, c.device_id AS device_id, c.user_id AS user_id, c.secret_enc AS secret_enc, c.data_json AS data_json, c.created_at AS credential_created_at
+			FROM device_credential c JOIN device d ON d.id = c.device_id AND d.revoked_at IS NULL AND d.kind = 'key'
+			WHERE c.user_id = ? AND c.protocol IN ('mtproto', 'trusttunnel') AND c.revoked_at IS NULL`, userID)
 	r.add(oneRow(&mode, scanString), `SELECT coalesce((SELECT v FROM setting WHERE k = ?), '') AS mode`, SettingLinkDeviceLimit)
 	if len(hwidHash) > 0 {
 		r.add(oneRow(&blocked, scanCount), `SELECT count(*) AS n FROM device WHERE user_id = ? AND hwid_hash = ? AND blocked_at IS NOT NULL`, userID, hwidHash)
 	}
 	if active {
-		r.add(oneRow(&group, scanAccessGroup), `SELECT g.id, g.name, g.created_at, (SELECT count(*) FROM user u WHERE u.group_id = g.id) AS user_count,
-			coalesce(g.dns_preset_id, '') AS dns_preset_id, g.color FROM user_group g WHERE g.id = ?`, groupID)
-		r.add(appendRows(&groupProfileIDs, scanString), `SELECT profile_id FROM user_group_profile WHERE group_id = ? ORDER BY profile_id`, groupID)
+		r.add(appendRows(&groups, scanAccessGroup), `SELECT g.id, g.name, g.created_at, 0 AS user_count,
+			coalesce(g.dns_preset_id, '') AS dns_preset_id, g.color FROM user_group g WHERE g.id IN (`+accUserGroupIDs("?1")+`)
+			ORDER BY g.id = (SELECT group_id FROM user WHERE id = ?1) DESC, g.name, g.id`, userID)
+		r.add(appendRows(&groupProfileIDs, scanGroupItem), `SELECT group_id, profile_id FROM user_group_profile WHERE group_id IN (`+accUserGroupIDs("?1")+`) ORDER BY profile_id`, userID)
+		r.add(appendRows(&groupDisabledNodeIDs, scanGroupItem), `SELECT group_id, node_id FROM user_group_disabled_node WHERE group_id IN (`+accUserGroupIDs("?1")+`) ORDER BY node_id`, userID)
 		r.add(appendRows(&inbounds, scanAccessInboundFull), `SELECT `+accInboundCols+`, `+accProfileCols+`, `+accNodeCols+`
 			FROM inbound i JOIN profile p ON p.id = i.profile_id JOIN node n ON n.id = i.node_id
 			WHERE n.state <> 'retired' ORDER BY i.created_at, i.rowid`)
@@ -826,8 +1180,18 @@ func (a Access) SubscriptionData(ctx context.Context, userID, groupID string, si
 		return SubscriptionData{}, err
 	}
 	snapshot := linkDeviceSnapshotOf(deviceRows)
+	var telegram, trustTunnel AccessCred
+	for _, key := range specialKeys {
+		switch key.Protocol {
+		case TelegramProtocol:
+			telegram = key
+		case TrustTunnelProtocol:
+			trustTunnel = key
+		}
+	}
 	out := SubscriptionData{Up: traffic.Up, Down: traffic.Down, Devices: devices, AWG: awgDevices,
-		Group: group, Inbounds: inbounds, LiveNodes: liveNodes, Relays: relays, Device: snapshot.Device, DeviceCreds: snapshot.Creds,
+		Inbounds: inbounds, LiveNodes: liveNodes, Relays: relays, Device: snapshot.Device, DeviceCreds: snapshot.Creds,
+		TelegramCred: telegram, TrustTunnelCred: trustTunnel,
 		LinkMode: LinkModeOf(mode), Blocked: blocked > 0}
 	if len(online) > 0 {
 		out.OnlineDevices = make(map[string][]string, len(online))
@@ -836,7 +1200,7 @@ func (a Access) SubscriptionData(ctx context.Context, userID, groupID string, si
 		}
 	}
 	if active {
-		out.Group.ProfileIDs = groupProfileIDs
+		out.Groups = groupsWithLists(groups, groupProfileIDs, groupDisabledNodeIDs)
 	}
 	return out, nil
 }
@@ -864,22 +1228,24 @@ func (a Access) UsersProtocolsSince(ctx context.Context, ids []string, since tim
 // DeviceCounts returns the number of devices per user that count against the device limit: not revoked and
 // holding at least one live credential (a device without any is an empty shell, e.g. the implicit device of a
 // user of the Amnezia app only, created by an older version).
-func (a Access) DeviceCounts(ctx context.Context, ids []string) (map[string]int, error) {
+
+func (a Access) DeviceCounts(ctx context.Context, ids []string, now time.Time) (map[string]AccessDeviceCounts, error) {
+	idle, _ := deviceIdleSQL("d", now)
 	rows, err := a.s.R.QueryContext(ctx,
-		`SELECT d.user_id, count(*) FROM device d
-		 WHERE d.revoked_at IS NULL AND `+accDeviceLive+` AND d.user_id IN (SELECT value FROM json_each(?)) GROUP BY d.user_id`, accJSON(ids))
+		`SELECT d.user_id, sum(CASE WHEN `+idle+` THEN 0 ELSE 1 END), sum(CASE WHEN `+idle+` THEN 1 ELSE 0 END) FROM device d
+		 WHERE d.revoked_at IS NULL AND `+accLimitDevice+` AND d.user_id IN (SELECT value FROM json_each(?)) GROUP BY d.user_id`, accJSON(ids))
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := map[string]int{}
+	out := map[string]AccessDeviceCounts{}
 	for rows.Next() {
 		var uid string
-		var n int
-		if err := rows.Scan(&uid, &n); err != nil {
+		var counts AccessDeviceCounts
+		if err := rows.Scan(&uid, &counts.Used, &counts.Idle); err != nil {
 			return nil, err
 		}
-		out[uid] = n
+		out[uid] = counts
 	}
 	return out, rows.Err()
 }
@@ -936,21 +1302,25 @@ func (a Access) NodeTraffic(ctx context.Context, userID string, since time.Time)
 // ---- devices and credentials ----
 
 // accDeviceTail is what scanAccessDevice reads after the protocols: the device's traffic and its fingerprint.
-const accDeviceTail = `, d.used_bytes, CASE WHEN d.kind = 'link' THEN lower(hex(substr(d.hwid_hash, 1, 3))) ELSE '' END`
+func accDeviceTail(now time.Time) string {
+	idle, since := deviceIdleSQL("d", now)
+	return `, d.used_bytes, CASE WHEN d.kind = 'link' THEN lower(hex(substr(d.hwid_hash, 1, 3))) ELSE '' END,
+		d.key_hash, d.enrol_token_hash, ` + idle + `, ` + since
+}
 
 // accDeviceLive is the SQL condition "device d holds a live credential".
 const accDeviceLive = `EXISTS (SELECT 1 FROM device_credential c WHERE c.device_id = d.id AND c.revoked_at IS NULL)`
 
 // Devices returns the non-revoked devices of a user that hold a live credential, with their credential
 // protocols.
-func (a Access) Devices(ctx context.Context, userID string) ([]AccessDevice, error) {
-	return a.devices(ctx, userID, true)
+func (a Access) Devices(ctx context.Context, userID string, now time.Time) ([]AccessDevice, error) {
+	return a.devices(ctx, userID, true, now)
 }
 
-func (a Access) devices(ctx context.Context, userID string, withCredsOnly bool) ([]AccessDevice, error) {
+func (a Access) devices(ctx context.Context, userID string, withCredsOnly bool, now time.Time) ([]AccessDevice, error) {
 	rows, err := a.s.R.QueryContext(ctx,
 		`SELECT d.id, d.user_id, CASE WHEN d.hwid_hash IS NULL THEN 1 ELSE 0 END AS implicit, d.kind, d.platform, d.model, d.os_version, d.client, d.first_seen_at, d.last_seen_at, d.created_at,
-		   coalesce((SELECT group_concat(DISTINCT c.protocol) FROM device_credential c WHERE c.device_id = d.id AND c.revoked_at IS NULL), '')`+accDeviceTail+`
+		   coalesce((SELECT group_concat(DISTINCT c.protocol) FROM device_credential c WHERE c.device_id = d.id AND c.revoked_at IS NULL), '')`+accDeviceTail(now)+`
 		 FROM device d WHERE d.user_id = ? AND d.revoked_at IS NULL AND (? = 0 OR `+accDeviceLive+`) ORDER BY d.created_at, d.id`,
 		userID, accBool(withCredsOnly))
 	if err != nil {
@@ -964,6 +1334,34 @@ func (a Access) devices(ctx context.Context, userID string, withCredsOnly bool) 
 			return nil, err
 		}
 		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// DeviceLastOnline is, per device of a user, when the nodes last counted a connection of it: the newer of the last session a
+// node saw (device.last_connected_at) and the newest hour of the connection counters with connects or online time (the hour's
+// start, so at most an hour older than the truth). A device with neither is not in the map. last_seen_at is not this: for a link
+// device it is the last subscription fetch.
+func (a Access) DeviceLastOnline(ctx context.Context, userID string) (map[string]time.Time, error) {
+	rows, err := a.s.R.QueryContext(ctx,
+		`SELECT d.id, max(d.last_connected_at, coalesce((SELECT max(l.hour_start) FROM link_hour l
+			JOIN device_credential c ON c.id = l.cred_id
+			WHERE l.user_id = ? AND c.device_id = d.id AND (l.connects > 0 OR l.online_s > 0)), 0)) AS last_online
+		 FROM device d WHERE d.user_id = ? AND d.revoked_at IS NULL`, userID, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]time.Time{}
+	for rows.Next() {
+		var id string
+		var at int64
+		if err := rows.Scan(&id, &at); err != nil {
+			return nil, err
+		}
+		if at > 0 {
+			out[id] = fromUnix(at)
+		}
 	}
 	return out, rows.Err()
 }
@@ -1009,30 +1407,57 @@ func (a Access) revokeDevice(ctx context.Context, id string, now time.Time, cond
 }
 
 // AccessDesiredCred is a live credential that may go to a node: its user is active, belongs to a group
-// with the inbound's profile and has the node selected. The caller still checks the app toggles against
-// the protocol's Clients().
+// with the inbound's profile, the node is enabled for the group, and the user selected the node or chose all nodes. The caller
+// still checks the app toggles against the protocol's Clients().
 type AccessDesiredCred struct {
 	InboundID, CredID, UserID, DeviceID, Protocol, DataJSON string
 	SpeedLimitBps                                           uint64 // the person's limit (user.speed_limit_bps)
 	DeviceSpeedLimitBps                                     uint64 // one device's limit (user.device_speed_limit_bps)
 	ExpiresAt                                               time.Time
-	AppHapp, AppAmnezia                                     bool
+	AppHapp, AppAmnezia, AppTelegram, AppTrustTunnel        bool
+	MistgateDevice                                          bool // the credential belongs to a client-API-enrolled Mistgate device
 }
 
-// DesiredCreds returns the candidate credentials of every enabled inbound of a node.
-func (a Access) DesiredCreds(ctx context.Context, nodeID string) ([]AccessDesiredCred, error) {
-	rows, err := a.s.R.QueryContext(ctx,
-		`SELECT i.id, c.id, c.user_id, c.device_id, c.protocol, c.data_json, u.speed_limit_bps, u.device_speed_limit_bps, u.expires_at, u.app_happ, u.app_amnezia
-		 FROM inbound i
+// accMistgateAppOn leaves out the credentials of the devices of the Mistgate app (the ones that hold a key of their own) of a
+// person who switched the app off: the nodes stop accepting them, as they stop accepting the credentials of any app that is off,
+// and take them again when it is switched on. The credentials themselves are kept. Needs u (user) and d (device) in scope.
+const accMistgateAppOn = `(d.key_hash IS NULL OR u.app_mistgate_off = 0)`
+
+// accUserInGroup says that the person u is a member of the group of gp (a user_group_profile row): the main group or an extra one.
+const accUserInGroup = `(u.group_id = gp.group_id OR EXISTS (SELECT 1 FROM user_extra_group x WHERE x.user_id = u.id AND x.group_id = gp.group_id))`
+
+// accGroupGetsNode is GroupGetsNode in SQL, for the group of gp (a user_group_profile row): needs gp and i (inbound) in scope.
+const accGroupGetsNode = `NOT EXISTS (SELECT 1 FROM user_group_disabled_node gd WHERE gd.group_id = gp.group_id AND gd.node_id = i.node_id)`
+
+// accDesiredCredsSQL lists the candidate credentials of every enabled inbound of the node (?1). granted holds the pairs (inbound,
+// person) that a group of the person gives, each pair once whatever the number of groups that give it, so that a credential
+// is never listed twice for one inbound.
+const accDesiredCredsSQL = `WITH granted(inbound_id, user_id) AS MATERIALIZED (
+			SELECT i.id, u.id FROM inbound i
+			JOIN user_group_profile gp ON gp.profile_id = i.profile_id
+			JOIN user u ON u.group_id = gp.group_id
+			WHERE i.node_id = ?1 AND i.enabled = 1 AND ` + accGroupGetsNode + `
+			UNION
+			SELECT i.id, x.user_id FROM inbound i
+			JOIN user_group_profile gp ON gp.profile_id = i.profile_id
+			JOIN user_extra_group x ON x.group_id = gp.group_id
+			WHERE i.node_id = ?1 AND i.enabled = 1 AND ` + accGroupGetsNode + `
+		 )
+		 SELECT i.id, c.id, c.user_id, c.device_id, c.protocol, c.data_json, u.speed_limit_bps, u.device_speed_limit_bps, u.expires_at, u.app_happ, u.app_amnezia, u.app_telegram, u.app_trusttunnel, CAST(d.key_hash IS NOT NULL AS INTEGER)
+		 FROM granted g
+		 JOIN inbound i ON i.id = g.inbound_id
 		 JOIN profile p ON p.id = i.profile_id
-		 JOIN user_group_profile gp ON gp.profile_id = p.id
-		 JOIN user u ON u.group_id = gp.group_id AND u.status = 'active'
+		 CROSS JOIN user u ON u.id = g.user_id AND u.status = 'active'
 		      AND (u.all_nodes = 1 OR EXISTS (SELECT 1 FROM user_node un WHERE un.user_id = u.id AND un.node_id = i.node_id))
 		 JOIN device_credential c ON c.user_id = u.id AND c.protocol = p.protocol AND c.revoked_at IS NULL
 		      AND (c.profile_id IS NULL OR c.profile_id = i.profile_id)
 		 JOIN device d ON d.id = c.device_id AND d.revoked_at IS NULL
-		 WHERE i.node_id = ? AND i.enabled = 1
-		 ORDER BY i.id, c.id`, nodeID)
+		 WHERE ` + accMistgateAppOn + `
+		 ORDER BY i.id, c.id`
+
+// DesiredCreds returns the candidate credentials of every enabled inbound of a node.
+func (a Access) DesiredCreds(ctx context.Context, nodeID string) ([]AccessDesiredCred, error) {
+	rows, err := a.s.R.QueryContext(ctx, accDesiredCredsSQL, nodeID)
 	if err != nil {
 		return nil, err
 	}
@@ -1042,19 +1467,49 @@ func (a Access) DesiredCreds(ctx context.Context, nodeID string) ([]AccessDesire
 		var c AccessDesiredCred
 		var speed, deviceSpeed int64
 		var exp sql.NullInt64
-		var happ, amn int
-		if err := rows.Scan(&c.InboundID, &c.CredID, &c.UserID, &c.DeviceID, &c.Protocol, &c.DataJSON, &speed, &deviceSpeed, &exp, &happ, &amn); err != nil {
+		var happ, amn, tgl, trustTunnel, mistgateDevice int
+		if err := rows.Scan(&c.InboundID, &c.CredID, &c.UserID, &c.DeviceID, &c.Protocol, &c.DataJSON, &speed, &deviceSpeed, &exp, &happ, &amn, &tgl, &trustTunnel, &mistgateDevice); err != nil {
 			return nil, err
 		}
 		c.SpeedLimitBps, c.DeviceSpeedLimitBps = uint64(speed), uint64(deviceSpeed)
-		c.ExpiresAt, c.AppHapp, c.AppAmnezia = accTimeIfNonzero(exp), happ == 1, amn == 1
+		c.ExpiresAt, c.AppHapp, c.AppAmnezia, c.AppTelegram, c.AppTrustTunnel, c.MistgateDevice = accTimeIfNonzero(exp), happ == 1, amn == 1, tgl == 1, trustTunnel == 1, mistgateDevice == 1
 		out = append(out, c)
 	}
 	return out, rows.Err()
 }
 
-// SetUserExpiry sets a user's term end (zero = never).
-func (a Access) SetUserExpiry(ctx context.Context, id string, t time.Time) error {
-	_, err := a.s.W.ExecContext(ctx, `UPDATE user SET expires_at = ? WHERE id = ?`, accNullUnix(t), id)
-	return err
+// accHasCredentialSQL is the desired-access joins for one user (?2) on one node (?1).
+const accHasCredentialSQL = `SELECT EXISTS (
+			SELECT 1
+			FROM inbound i
+			JOIN profile p ON p.id = i.profile_id
+			JOIN user_group_profile gp ON gp.profile_id = p.id
+			JOIN user u ON u.id = ?2 AND ` + accUserInGroup + ` AND u.status = 'active'
+			     AND (u.all_nodes = 1 OR EXISTS (SELECT 1 FROM user_node un WHERE un.user_id = u.id AND un.node_id = i.node_id))
+			JOIN device_credential c ON c.user_id = u.id AND c.protocol = p.protocol AND c.revoked_at IS NULL
+			     AND (c.profile_id IS NULL OR c.profile_id = i.profile_id)
+			JOIN device d ON d.id = c.device_id AND d.revoked_at IS NULL
+			WHERE i.node_id = ?1 AND i.enabled = 1
+			  AND ` + accGroupGetsNode + `
+			  AND ` + accMistgateAppOn + `
+		)`
+
+// HasUserCredentialOnNode checks the desired-access joins for one user without building the node's full credential list.
+func (a Access) HasUserCredentialOnNode(ctx context.Context, nodeID, userID string) (bool, error) {
+	var found bool
+	err := a.s.R.QueryRowContext(ctx, accHasCredentialSQL, nodeID, userID).Scan(&found)
+	return found, err
+}
+
+// SetUserExpiry moves a user's term end (zero = never) from was to t. ErrAccessVersion when the term end is no longer was
+// (an edit or another extension got there first) or the person is gone: the caller reads again and works t out anew.
+func (a Access) SetUserExpiry(ctx context.Context, id string, was, t time.Time) error {
+	res, err := a.s.W.ExecContext(ctx, `UPDATE user SET expires_at = ? WHERE id = ? AND coalesce(expires_at, 0) = ?`, accNullUnix(t), id, unixOrZero(was))
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrAccessVersion
+	}
+	return nil
 }

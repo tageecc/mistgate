@@ -12,16 +12,37 @@ export const minClients: Record<AwgVersion, { app: string; min: string }[]> = {
     { app: "AmneziaWG Android", min: "v3.1.20260814" },
     { app: "AmneziaWG Windows", min: "3.1.0" },
     { app: "AmneziaWG Apple", min: "v3.1.3" },
+    { app: "WG Tunnel", min: "5.6.0" },
+    { app: "FlClash", min: "0.8.97" },
+    { app: "Throne", min: "1.4.0" },
+    { app: "ZedSecure", min: "3.1.8" },
+    { app: "Keenetic", min: "5.2 alpha 11" },
+    { app: "GL.iNet", min: "2.0 only" },
+    { app: "Hiddify", min: "2.0 only" },
     { app: "Mihomo", min: "v1.19.30" },
   ],
   "2.0": [
     { app: "AmneziaVPN", min: "4.8.12.9" },
     { app: "AmneziaWG", min: "2.0.0" },
+    { app: "Keenetic stable", min: "5.1" },
+    { app: "GL.iNet firmware", min: "4.9" },
+    { app: "Hiddify", min: "2.0 only" },
     { app: "Mihomo", min: "v1.19.14" },
   ],
 };
 
-export const asVersion = (v: unknown): AwgVersion => (v === "2.0" ? "2.0" : "3.1");
+/** A protocol limitation, not a client-version threshold. */
+export function minClientLabel(app: string, min: string, only20 = "2.0 only"): string {
+  return min === "2.0 only" ? `${app} · ${only20}` : `${app} ${min}+`;
+}
+
+/**
+ * What picks one config of a device: the node and the entry it goes through (or its IPv6 entry). A config through an entry or to
+ * the IPv6 entry has the SAME node id as the direct one, so the node alone does not tell them apart.
+ */
+export const configKey = (c: { nodeId: string; viaNodeId: string; ipv6?: boolean }) => (c.viaNodeId ? `${c.nodeId}|${c.viaNodeId}` : c.ipv6 ? `${c.nodeId}|ipv6` : c.nodeId);
+
+export const asVersion =(v: unknown): AwgVersion => (v === "2.0" ? "2.0" : "3.1");
 
 /** Platforms the "add a device" dialogs offer (device.proto: CreateAwgDeviceRequest.platform). */
 export const platforms = ["ios", "android", "windows", "macos", "linux", "other"] as const;
@@ -63,12 +84,6 @@ export function changedCount(before: unknown, after: unknown): number {
 }
 
 // ---- import of a client .conf ----
-
-/** The 3.x-only keys of the obfuscation block: a 2.0 profile refuses them. */
-export const v31Only = [
-  "header_protection_key", "random_trailers", "disable_cookies", "content_padding_addition",
-  "rekey_after_time", "rekey_timeout", "reject_after_time", "keepalive_timeout", "max_handshake_attempts",
-] as const;
 
 export type ConfKind = "3.1" | "2.0" | "1.5" | "1.0" | "wg" | "none";
 
@@ -209,9 +224,9 @@ export const key32Fields = new Set(["obfuscation.header_protection_key"]);
 
 // ---- devices ----
 
-/** Saves text as a file in the browser (no server round trip: the config is already here). */
+/** Saves text as a file in the browser (no server round trip: the config is already here). Not text/plain: Firefox on Android adds ".txt" to a text download. */
 export function downloadText(filename: string, text: string) {
-  const url = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
+  const url = URL.createObjectURL(new Blob([text], { type: "application/octet-stream" }));
   const a = document.createElement("a");
   a.href = url;
   a.download = filename;

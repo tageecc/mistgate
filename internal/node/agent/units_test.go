@@ -3,6 +3,7 @@ package agent
 import (
 	"errors"
 	"log/slog"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -146,7 +147,7 @@ func TestMergeRules(t *testing.T) {
 		t.Fatal("full state not merged")
 	}
 
-	// A delta never mutates the model it is applied on, so a failure later cannot leave half a state.
+	// A delta never mutates the model it is applied on.
 	delta := &pb.DesiredState{Revision: 6, BaseRevision: 5, RemovedInboundIds: []string{"inb_2"}, Inbounds: []*pb.InboundState{
 		{InboundId: "inb_1", Creds: []*pb.Credential{cred("crd_c")}},
 	}}
@@ -180,8 +181,14 @@ func TestMergeRules(t *testing.T) {
 		"credential without id":    {Revision: 6, BaseRevision: 5, Inbounds: []*pb.InboundState{{InboundId: "inb_1", Creds: []*pb.Credential{{}}}}},
 		"unknown protocol":         {Revision: 6, BaseRevision: 5, Inbounds: []*pb.InboundState{func() *pb.InboundState { i := inb("inb_7", 0, 0); i.Spec.Protocol = "x"; return i }()}},
 	} {
-		if _, err := merge(base, ds, known); !errors.Is(err, errRejected) {
-			t.Errorf("%s: err = %v", name, err)
+		next, err := merge(base, ds, known)
+		var partial *partialStateError
+		if !errors.As(err, &partial) || next == nil {
+			t.Errorf("%s: merge = %v, %v; want a partial result", name, next, err)
+			continue
+		}
+		if name == "credential without id" && (next.inbounds["inb_1"].parseErr != "" || len(next.inbounds["inb_1"].credWarn) != 1) {
+			t.Errorf("%s: want the inbound kept with one skipped credential, got %+v", name, next.inbounds["inb_1"])
 		}
 	}
 }
@@ -241,6 +248,30 @@ func TestStateSurvivesRoundTripThroughDisk(t *testing.T) {
 	corrupt(t, dir)
 	if g, err := loadState(dir, known); err == nil || g.revision != 0 {
 		t.Fatalf("corrupt state: %v %v", g, err)
+	}
+}
+
+func TestStateIgnoresFieldsFromNewerBuild(t *testing.T) {
+	m, err := merge(newModel(), fullState(4, inb("inb_de1", 20000, 30000, cred("crd_de1"))), known)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := saveState(dir, m); err != nil {
+		t.Fatal(err)
+	}
+	path := dir + "/" + fileState
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b = append(b[:len(b)-1], []byte(`,"futureField":true}`)...)
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := loadState(dir, known)
+	if err != nil || got.revision != 4 || len(got.inbounds) != 1 {
+		t.Fatalf("newer state did not survive rollback: model=%+v err=%v", got, err)
 	}
 }
 

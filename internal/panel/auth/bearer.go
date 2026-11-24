@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"io"
+	"maps"
 	"mime"
 	"net/http"
 	"net/netip"
@@ -22,6 +23,7 @@ import (
 	"github.com/mistgate/mistgate/gen/mistgate/admin/v1/adminv1connect"
 	"github.com/mistgate/mistgate/internal/panel/securitylimit"
 	"github.com/mistgate/mistgate/internal/panel/store"
+	"github.com/mistgate/mistgate/internal/reqid"
 )
 
 // Bearer authentication with API tokens. It is a second way into
@@ -160,7 +162,10 @@ func (s *Service) touchToken(ctx context.Context, tok store.APIToken, ip netip.A
 }
 
 func principalOf(tok store.APIToken, ch Channel) Principal {
-	return Principal{Token: true, TokenID: tok.ID, Profile: tok.Profile, Channel: ch, Name: tok.Name, ExpiresAt: tok.ExpiresAt}
+	return Principal{
+		Token: true, TokenID: tok.ID, Profile: tok.Profile, Channel: ch, Name: tok.Name, ExpiresAt: tok.ExpiresAt,
+		AllowBulkUserChanges: tok.AllowBulkUserChanges,
+	}
 }
 
 // auditCall writes the "call" row of a token request (section 8): who, over which channel, which procedure,
@@ -183,6 +188,9 @@ func (s *Service) auditCall(ctx context.Context, p Principal, path string, statu
 	e := store.AuditEntry{Actor: p.ActorID(), Action: "call", Params: string(params), Result: result, Source: store.AuditAPI}
 	if p.Channel == ChannelMCP {
 		e.Source = store.AuditMCP
+	}
+	if p.Assistant {
+		e.Source = store.AuditAssistant
 	}
 	if ip.IsValid() {
 		e.IP = ip.String()
@@ -237,6 +245,12 @@ func (s *Service) tokenDenied(r *http.Request, tok store.APIToken, path string) 
 		return ""
 	}
 	ctx := context.WithValue(r.Context(), procedureKey{}, path)
+	if access == TokenAccessDraft {
+		if planningAllows(ctx) || s.grantAllows(ctx, tok.ID, path) {
+			return ""
+		}
+		return msgPlanning
+	}
 	if access == TokenAccessPlanning {
 		if planningAllows(ctx) {
 			return ""
@@ -247,17 +261,18 @@ func (s *Service) tokenDenied(r *http.Request, tok store.APIToken, path string) 
 		return ""
 	}
 	// Planning opens only requests whose procedure-specific flag guarantees no change.
-	if planningAllows(ctx) && planningDryRun(r) {
+	if planningAllows(ctx) && PlanningDryRun(r) {
 		return ""
 	}
 	return msgApproval
 }
 
-// planningDryRun reports whether r is a request whose procedure-specific flag guarantees no change, and puts the body
+// PlanningDryRun reports whether r is a request whose procedure-specific flag guarantees no change, and puts the body
 // back for the handler. Anything it cannot read as such (compressed, another content type, too large) is not a dry run.
-func planningDryRun(r *http.Request) bool {
-	m := planningRequest(r.URL.Path)
-	if m == nil {
+// It is the one test of a plan's check call: the middleware applies it, and the MCP tests' stand-in for the middleware too.
+func PlanningDryRun(r *http.Request) bool {
+	x, ok := planningRequests()[r.URL.Path]
+	if !ok {
 		return false
 	}
 	if enc := r.Header.Get("Content-Encoding"); enc != "" && enc != "identity" {
@@ -268,6 +283,7 @@ func planningDryRun(r *http.Request) bool {
 	if err != nil || len(body) > maxPlanningBody {
 		return false
 	}
+	m := x.message()
 	mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	switch mt {
 	case "application/proto":
@@ -277,35 +293,41 @@ func planningDryRun(r *http.Request) bool {
 	default:
 		return false
 	}
-	if err != nil {
-		return false
-	}
-	switch m := m.(type) {
-	case *adminv1.ApplyFixRequest:
-		return m.GetDryRun()
-	case *adminv1.UpdateProfileRequest:
-		return m.GetDryRun()
-	case *adminv1.CreateInboundRequest:
-		return m.GetValidateOnly()
-	case *adminv1.UpdateGroupRequest:
-		return m.GetDryRun()
-	}
-	return false
+	return err == nil && x.dry(m)
 }
 
-func planningRequest(path string) proto.Message {
-	switch path {
-	case adminv1connect.HealthServiceApplyFixProcedure:
-		return &adminv1.ApplyFixRequest{}
-	case adminv1connect.ProfileServiceUpdateProfileProcedure:
-		return &adminv1.UpdateProfileRequest{}
-	case adminv1connect.ProfileServiceCreateInboundProcedure:
-		return &adminv1.CreateInboundRequest{}
-	case adminv1connect.GroupServiceUpdateGroupProcedure:
-		return &adminv1.UpdateGroupRequest{}
-	default:
-		return nil
+// planningRequest is the request message of a procedure a plan may call with its check flag set, and the flag that says the
+// call changes nothing.
+type planningRequest struct {
+	message func() proto.Message
+	dry     func(proto.Message) bool
+}
+
+// planningCheck is the planningRequest of a request type whose flag is flag (a getter such as (*X).GetDryRun).
+func planningCheck[M proto.Message](flag func(M) bool) planningRequest {
+	return planningRequest{
+		message: func() proto.Message { var zero M; return zero.ProtoReflect().Type().New().Interface() },
+		dry:     func(m proto.Message) bool { x, ok := m.(M); return ok && flag(x) },
 	}
+}
+
+// planningExtra is the dry-run requests of the services the Cloudflare edition does not link, added by their policy files.
+var planningExtra = map[string]planningRequest{}
+
+// planningRequests is the one table of the dry-run procedures: the procedures a plan may call under planning, and the flag
+// of the request that makes the call a check. It is built where it is read, not at start-up: the edge Workers that never see a
+// token's plan would otherwise carry the request types of every row.
+func planningRequests() map[string]planningRequest {
+	m := map[string]planningRequest{
+		adminv1connect.HealthServiceApplyFixProcedure:       planningCheck((*adminv1.ApplyFixRequest).GetDryRun),
+		adminv1connect.ProfileServiceUpdateProfileProcedure: planningCheck((*adminv1.UpdateProfileRequest).GetDryRun),
+		adminv1connect.ProfileServiceCreateInboundProcedure: planningCheck((*adminv1.CreateInboundRequest).GetValidateOnly),
+		adminv1connect.GroupServiceUpdateGroupProcedure:     planningCheck((*adminv1.UpdateGroupRequest).GetDryRun),
+		adminv1connect.GroupServiceSetNodeSharingProcedure:  planningCheck((*adminv1.SetNodeSharingRequest).GetDryRun),
+		adminv1connect.ProfileServiceUpdateInboundProcedure: planningCheck((*adminv1.UpdateInboundRequest).GetValidateOnly),
+	}
+	maps.Copy(m, planningExtra)
+	return m
 }
 
 // serveToken is RequireSession for a request with a Bearer header.
@@ -335,6 +357,7 @@ func (s *Service) serveToken(w http.ResponseWriter, r *http.Request, next http.H
 		return
 	}
 	admin := store.Admin{ID: p.ActorID(), DisplayName: tok.Name, Role: profileRole(tok.Profile)}
+	reqid.MarkAuthed(r.Context())
 	ctx := context.WithValue(r.Context(), adminKey{}, admin)
 	ctx = context.WithValue(ctx, principalKey{}, p)
 	ctx = context.WithValue(ctx, procedureKey{}, path)

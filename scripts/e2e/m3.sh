@@ -89,6 +89,9 @@ class H(http.server.BaseHTTPRequestHandler):
 class S(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    # socketserver's default backlog is 5: with dozens of parallel requests through a tunnel the rest wait for a SYN retry
+    # (1, 3, 7, 15 s), which looks like a hang after a successful CONNECT
+    request_queue_size = 512
 
 S((host, port), H).serve_forever()
 PY
@@ -112,6 +115,8 @@ m3_lab() {
 
 # who_from <ns pid> <tag>: the address whoami saw for a request made from a namespace ("" = no answer)
 who_from() { cns "$1" curl -s -m 10 "http://$WHOAMI/$2" 2>/dev/null | tr -d '\n' || true; }
+# who_from_retry: the same, asked again for a few seconds while there is no answer (the first request through a fresh tunnel can be lost)
+who_from_retry() { local i out=; for i in 1 2 3 4 5; do out=$(who_from "$1" "$2"); [ -n "$out" ] && break; sleep 1; done; printf '%s' "$out"; }
 who_socks() { curl -s -m 15 --socks5-hostname "127.0.0.1:$1" "http://$WHOAMI/$2" 2>/dev/null | tr -d '\n' || true; }
 # log_srcs <path prefix>: the distinct sources whoami logged for paths that start with it
 log_srcs() { awk -v p="/$1" 'index($3, p) == 1 {print $2}' "$WORK/whoami.log" | sort -u | tr '\n' ' '; }
@@ -150,9 +155,9 @@ m3_build() {
   fi
   if [ -n "$M3_JSON" ]; then
     singbox_bin 1.12.25 >/dev/null || { tail -n 5 "$WORK/build-singbox-1.12.25.log" 2>/dev/null; die "building sing-box 1.12.25 failed"; }
-    if singbox_bin 1.14.3 >/dev/null; then SB_VERSIONS="1.12.25 1.14.3"; else
-      tail -n 3 "$WORK/build-singbox-1.14.3.log" 2>/dev/null
-      note "sing-box 1.14.3 could not be built: the profiles are run with 1.12.25 only"
+    if singbox_bin 1.14.4 >/dev/null; then SB_VERSIONS="1.12.25 1.14.4"; else
+      tail -n 3 "$WORK/build-singbox-1.14.4.log" 2>/dev/null
+      note "sing-box 1.14.4 could not be built: the profiles are run with 1.12.25 only"
       SB_VERSIONS="1.12.25"
     fi
     say "sing-box clients: $SB_VERSIONS ($M3_CACHE)"
@@ -328,13 +333,13 @@ m3_awg() {
   C31=$LAST_PID C31_SOCK=$AWG_SOCK
   wait_for 40 "a ping to the node through the 3.1 tunnel" ping_ok "$cli1_PID" "$GW31" || { tail -n 8 "$WORK/client-awg-c31.log" | redact; die "no handshake: the 3.1 client cannot ping $GW31"; }
   [ "$(hs_of "$C31_SOCK")" -ge "$T_HS" ] || die "the client counts no fresh handshake"
-  SRC=$(who_from "$cli1_PID" awg31)
+  SRC=$(who_from_retry "$cli1_PID" awg31)
   [ "$SRC" = "$DIRECT_SRC" ] || die "3.1: the fake internet saw '$SRC', expected the node's $DIRECT_SRC (masquerade)"
   pass "3.1 client: handshake in $(($(date +%s) - T_HS)) s, ping to $GW31 through the tunnel, the fake internet sees the node ($SRC)"
   start_awg_client c20 cli2 "$WORK/dev-dev20.conf" 2.0 "$cli2_GW:$AWG20_PORT" || { tail -n 8 "$WORK/client-awg-c20.log" | redact; die "the 2.0 client did not start"; }
   C20=$LAST_PID
   wait_for 40 "a ping through the 2.0 tunnel" ping_ok "$cli2_PID" "$GW20" || { tail -n 8 "$WORK/client-awg-c20.log" | redact; die "no handshake: the 2.0 client (v0.2.17) cannot ping $GW20"; }
-  SRC=$(who_from "$cli2_PID" awg20)
+  SRC=$(who_from_retry "$cli2_PID" awg20)
   [ "$SRC" = "$DIRECT_SRC" ] || die "2.0: the fake internet saw '$SRC'"
   pass "2.0 client (v0.2.17) on the other profile of the same node: handshake, ping, the fake internet sees the node"
   # the internet itself, as the owner's users would use it: the address a public service sees is the node's
@@ -658,12 +663,22 @@ m3_awg_signatures() {
 }
 
 # ================================================================ Mihomo
-mihomo_bin() {
-  local p=$M3_CACHE/mihomo-v1.19.32
+# mihomo_bin: the Mihomo core, built from the module source (never downloaded) and cached. `go install ...@version` is refused
+# because the go.mod of mihomo has a replace directive, so the module is fetched into the module cache and built from a copy.
+mihomo_bin() { # [version, default 1.19.33]
+  local v=${1:-1.19.33} p src
+  p=$M3_CACHE/mihomo-v$v
   if [ ! -x "$p" ]; then
-    mkdir -p "$M3_CACHE/mihomo-build"
-    (cd "$WORK" && GOBIN=$M3_CACHE/mihomo-build GOFLAGS=-mod=mod GOTOOLCHAIN=auto go install github.com/metacubex/mihomo@v1.19.32) >"$WORK/build-mihomo.log" 2>&1 \
-      && mv "$M3_CACHE/mihomo-build/mihomo" "$p" || return 1
+    mkdir -p "$M3_CACHE"
+    src=$(mktemp -d "$M3_CACHE/mihomo-build.XXXXXX")
+    (
+      cd "$WORK" && export GOFLAGS=-mod=mod GOTOOLCHAIN=auto
+      go mod download "github.com/metacubex/mihomo@v$v" || exit 1
+      cp -r "$(go list -m -f '{{.Dir}}' "github.com/metacubex/mihomo@v$v")/." "$src/" || exit 1
+      chmod -R u+w "$src" && cd "$src" || exit 1
+      go build -trimpath -ldflags "-X github.com/metacubex/mihomo/constant.Version=$v" -o "$src/mihomo" .
+    ) >"$WORK/build-mihomo.log" 2>&1 && mv "$src/mihomo" "$p" || { rm -rf "$src"; return 1; }
+    rm -rf "$src"
   fi
   echo "$p"
 }
@@ -672,13 +687,13 @@ m3_mihomo() {
   local mh code
   if ! mh=$(mihomo_bin); then
     tail -n 3 "$WORK/build-mihomo.log" 2>/dev/null
-    note "mihomo v1.19.32 is not in $M3_CACHE and could not be built: the Mihomo steps are skipped"
+    note "mihomo v1.19.33 is not in $M3_CACHE and could not be built: the Mihomo steps are skipped"
     return 0
   fi
   # the user gets the hysteria2 profile as well, so the profile has all three kinds of proxy
   mutate GroupService/UpdateGroup "$(jq -nc --arg g "$AWG_GROUP" --arg a "$AWG31" --arg b "$AWG20" --arg c "$PROFILE_ID" '{groupId:$g, profileIds:{values:[$a,$b,$c]}}')" >/dev/null \
     || die "could not add the hysteria2 profile to carol's group"
-  have_yaml() { curl -sk -m 15 -A 'mihomo/1.19.32' -D "$WORK/mh.hdr" "$CAROL_URL" -o "$WORK/mihomo.yaml" && grep -q '^proxies:' "$WORK/mihomo.yaml" && python3 -c "
+  have_yaml() { curl -sk -m 15 -A 'mihomo/1.19.33' -D "$WORK/mh.hdr" "$CAROL_URL" -o "$WORK/mihomo.yaml" && grep -q '^proxies:' "$WORK/mihomo.yaml" && python3 -c "
 import sys, yaml
 d = yaml.safe_load(open('$WORK/mihomo.yaml'))
 sys.exit(0 if len(d.get('proxies') or []) >= 3 else 1)"; }
@@ -925,10 +940,10 @@ m3_compat() {
 
 # ================================================================ VLESS
 # xray_bin: the xray client, built from the module the node embeds (github.com/xtls/xray-core/main at the version in
-# go.mod, through the Go proxy) and cached
+# go.mod, through the Go proxy) and cached. With an argument: that module version or commit (the old clients of m3_vless_oldclients)
 xray_bin() {
-  local ver p tmp
-  ver=$(sed -n 's|^[[:space:]]*github.com/xtls/xray-core \(v[^ ]*\).*|\1|p' "$REPO/go.mod" | head -1)
+  local ver=${1:-} p tmp
+  [ -n "$ver" ] || ver=$(sed -n 's|^[[:space:]]*github.com/xtls/xray-core \(v[^ ]*\).*|\1|p' "$REPO/go.mod" | head -1)
   [ -n "$ver" ] || die "no xray-core version in go.mod"
   p=$M3_CACHE/xray-$ver
   if [ ! -x "$p" ]; then
@@ -939,6 +954,14 @@ xray_bin() {
     rm -rf "$tmp"
   fi
   echo "$p"
+}
+
+# hello_kex <user id>: "<pq> <classic> <unknown>", the sums over the user's devices of the ClientHello counts the nodes keep per
+# key (vless-hello-kex/1, UserService/GetUserConnection helloKex): an X25519MLKEM768 share before any X25519 share, a hello
+# without it, a hello that could not be read. The counts leave the node with the next stats batch (10 s).
+hello_kex() {
+  api UserService/GetUserConnection "{\"userId\":\"$1\",\"hours\":1}" \
+    | jq -r '[.helloKex[]?] | "\(map(.helloPq // 0) | add // 0) \(map(.helloClassic // 0) | add // 0) \(map(.helloUnknown // 0) | add // 0)"'
 }
 
 # write_vless2xray: $WORK/vless2xray.py <vless:// uri> <socks port> <out file> makes an xray client config (a socks inbound and
@@ -1177,6 +1200,16 @@ m3_vless() {
     pass "$l: 20 MB through the node in ${out#* } s, the panel counted $delta bytes (ratio $ratio)"
   done
 
+  # ---- the node counted the key exchange of the ClientHellos of the three REALITY xray clients (vless-hello-kex/1): this xray
+  # (chrome and firefox fingerprints of its uTLS) offers an X25519MLKEM768 share before X25519, so every hello is pq; the TLS
+  # profiles end in the node's own TLS front and count nothing
+  local hk_pq hk_classic hk_unknown
+  hk_pq_seen() { read -r hk_pq hk_classic hk_unknown < <(hello_kex "$vera"); [ "$hk_pq" -ge 3 ]; }
+  wait_for 40 "the node's hello counters for the xray clients (pq >= 3)" hk_pq_seen \
+    || die "the panel counted pq $hk_pq, classic $hk_classic, unknown $hk_unknown ClientHellos of the REALITY xray clients (want pq >= 3): $(api UserService/GetUserConnection "{\"userId\":\"$vera\",\"hours\":1}" | jq -c '[.helloKex[]? | {deviceId, helloPq, helloClassic, helloUnknown}]')"
+  [ "$hk_classic" = 0 ] || die "the panel counted $hk_classic classic ClientHellos for xray clients with the chrome and firefox fingerprints (pq $hk_pq)"
+  pass "hello key exchange (vless-hello-kex/1): after the xray clients' traffic over REALITY XHTTP, RAW+Vision and packet-up the panel has pq=$hk_pq classic=$hk_classic unknown=$hk_unknown for the user"
+
   # ---- disable: the running downloads die and new connections are refused; enable restores
   local -A dl dead
   local t_off t_gone kicks="" ndead=0 egress_open
@@ -1231,7 +1264,13 @@ m3_vless() {
   pass "re-enabled user: requests work again through all six clients after$back"
 
   # ---- the Mihomo profile of the same user: mihomo -t, then traffic through each proxy
+  local hk_p0=$hk_pq hk_c0=$hk_classic
   m3_vless_mihomo "$vera_url"
+  if [ -s "$WORK/mihomo-vless.yaml" ]; then # mihomo ran: what its REALITY hellos looked like (no support-x25519mlkem768 in the profile; informational)
+    sleep 12 # one more stats batch
+    read -r hk_pq hk_classic hk_unknown < <(hello_kex "$vera")
+    say "hello key exchange of the mihomo clients (profile without support-x25519mlkem768): pq +$((hk_pq - hk_p0)), classic +$((hk_classic - hk_c0)) (informational)"
+  fi
 
   # ---- the memory of the node with every inbound this run has made
   for l in "${labels[@]}"; do stop_pid "${pid[$l]}"; done
@@ -1275,6 +1314,467 @@ m3_vless() {
   pass "first REALITY handshake after an agent start (client-visible, requests sent when the listeners came up):$first_s the second request:$second_s"
   for l in "${rlabels[@]}"; do stop_pid "${pid[$l]}"; done
   wait_for 90 "the node ONLINE and its inbounds ACTIVE again" inbounds_active "$want" || die "the inbounds are not ACTIVE after the agent restart"
+
+  # ---- the old clients: apps that cannot send a post-quantum share keep working against this node. Last, because it adds ~90 users
+  # (the memory budget above is the node's with the users of the steps before)
+  m3_vless_oldclients "$px" "$pt"
+}
+
+# ================================================================ old clients against the upgraded node
+
+# oc_expect <kind> <version> <fingerprint> <flag>: the key exchange the ClientHello of an old client offers (pq, classic or any), as
+# measured by this step: Xray's chrome sends X25519MLKEM768 from 25.5.16 (25.4.30 and older build HelloChrome_120, a classical
+# hello), firefox and safari from 26.3.23, ios and edge never; sing-box strips the share in every version; Mihomo sends it only for
+# chrome and only with support-x25519mlkem768 (1.19.9 and later, 1.19.8 ignores the key); random is any
+oc_expect() {
+  case $1 in
+    xray)
+      case $3 in
+        random) echo any ;;
+        ios | edge) echo classic ;;
+        chrome) case $2 in 25.3.6 | 25.4.30) echo classic ;; *) echo pq ;; esac ;;
+        *) case $2 in 25.3.6 | 25.4.30 | 25.5.16 | 26.2.6) echo classic ;; *) echo pq ;; esac ;;
+      esac ;;
+    singbox) echo classic ;;
+    mihomo)
+      if [ "$3" = random ]; then echo any
+      elif [ "$4" = 1 ] && [ "$2" != 1.19.8 ] && [ "$3" = chrome ]; then echo pq
+      else echo classic; fi ;;
+  esac
+}
+
+# The servers of the fake internet the extra checks need, one process in its namespace: HTTPS on :8443 (TLS 1.3 only, a self-signed
+# certificate) with /pattern/N, N bytes of a fixed pseudo-random stream; a UDP echo on :4433; a DNS server on :5353 that answers
+# every A query with 198.51.100.7. `inetextras.py sha N` prints the sha256 of /pattern/N.
+write_inet_extras() {
+  cat >"$WORK/inetextras.py" <<'PY'
+import hashlib, http.server, socket, socketserver, ssl, sys, threading
+
+def chunk(k):
+    return hashlib.shake_256(b"mistgate-pattern-%d" % k).digest(65536)
+
+def pattern(n):
+    k = 0
+    while n > 0:
+        c = chunk(k)[:min(n, 65536)]
+        yield c
+        n -= len(c)
+        k += 1
+
+if sys.argv[1] == "sha":
+    h = hashlib.sha256()
+    for c in pattern(int(sys.argv[2])):
+        h.update(c)
+    print(h.hexdigest())
+    sys.exit(0)
+
+host, cert, key = sys.argv[1:4]
+
+class H(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def log_message(self, *a): pass
+    def do_GET(self):
+        n = int(self.path.split("?")[0].split("/")[2])
+        self.send_response(200)
+        self.send_header("Content-Length", str(n))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            for c in pattern(n):
+                self.wfile.write(c)
+            self.wfile.flush()
+            self.connection.unwrap()  # close_notify: a clean TLS close
+        except (OSError, ssl.SSLError):
+            pass
+        self.close_connection = True
+
+class S(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+def udp(port, answer):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind((host, port))
+    while True:
+        d, a = s.recvfrom(65535)
+        r = answer(d)
+        if r is not None:
+            s.sendto(r, a)
+
+def dns(q):
+    if len(q) < 17:
+        return None
+    i = 12
+    while i < len(q) and q[i] != 0:
+        i += q[i] + 1
+    qend = i + 5
+    return q[:2] + b"\x81\x80" + q[4:6] + b"\x00\x01\x00\x00\x00\x00" + q[12:qend] + b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04" + bytes([198, 51, 100, 7])
+
+threading.Thread(target=udp, args=(4433, lambda d: d), daemon=True).start()
+threading.Thread(target=udp, args=(5353, dns), daemon=True).start()
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+ctx.load_cert_chain(cert, key)
+srv = S((host, 8443), H)
+srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+srv.serve_forever()
+PY
+  cat >"$WORK/udpprobe.py" <<'PY'
+# A SOCKS5 UDP client: udpprobe.py <socks port> dns|echo <dest ip> <dest port>. dns: an A query, the answer must hold 198.51.100.7.
+# echo: a short datagram, one that looks like a QUIC Initial (long header, version 1, 1200 bytes) and a random one; all must come back
+# unchanged, and the first must not be slower than the rest by 150 ms.
+import os, socket, struct, sys, time
+
+port, mode, dst, dport = int(sys.argv[1]), sys.argv[2], sys.argv[3], int(sys.argv[4])
+tcp = socket.create_connection(("127.0.0.1", port), timeout=10)
+tcp.sendall(b"\x05\x01\x00")
+assert tcp.recv(2) == b"\x05\x00", "no SOCKS5 greeting"
+tcp.sendall(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00")
+
+def need(sock, n):
+    b = b""
+    while len(b) < n:
+        c = sock.recv(n - len(b))
+        assert c, "the SOCKS5 server closed the connection"
+        b += c
+    return b
+
+head = need(tcp, 4)
+assert head[1] == 0, "UDP ASSOCIATE refused: %r" % head
+atyp = head[3]
+if atyp == 1:
+    addr = need(tcp, 4)
+elif atyp == 4:
+    addr = need(tcp, 16)
+else:
+    addr = need(tcp, need(tcp, 1)[0])
+relay_port = struct.unpack(">H", need(tcp, 2))[0]
+relay_ip = "127.0.0.1"  # the relay is the inbound's own address, whatever it reports (0.0.0.0, ::, 127.0.0.1)
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+u.settimeout(10)
+
+def exchange(payload, tries=3):
+    hdr = b"\x00\x00\x00\x01" + socket.inet_aton(dst) + struct.pack(">H", dport)
+    for _ in range(tries):
+        u.sendto(hdr + payload, (relay_ip, relay_port))
+        try:
+            d, _ = u.recvfrom(65535)
+            at = d[3]
+            return d[10:] if at == 1 else d[22:] if at == 4 else d[7 + d[4]:]
+        except socket.timeout:
+            continue
+    raise SystemExit("no UDP answer through the tunnel")
+
+if mode == "dns":
+    q = os.urandom(2) + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + b"\x07example\x04test\x00\x00\x01\x00\x01"
+    a = exchange(q)
+    assert a[:2] == q[:2] and bytes([198, 51, 100, 7]) in a, "wrong DNS answer %r" % a
+else:
+    quic = bytes([0xc3, 0, 0, 0, 1, 8]) + os.urandom(8) + bytes([8]) + os.urandom(8) + os.urandom(1200 - 24)
+    # The first datagram is short (under 20 bytes): the node must not hold it back to sniff it (xray-core waits 200 ms for a longer one).
+    seq = (b"first-datagram-1", quic, os.urandom(40), quic)
+    times = []
+    for p in seq:
+        t0 = time.monotonic()
+        assert exchange(p) == p, "the echo differs"
+        times.append(time.monotonic() - t0)
+    assert times[0] - min(times[1:]) < 0.15, "the first datagram of the flow took %.0f ms, the next %.0f ms" % (times[0] * 1000, min(times[1:]) * 1000)
+print("ok")
+PY
+}
+
+# oc_label_of <vless:// line>: the label vless2xray.py gives the line (tcp, xhttp-auto, xhttp-packet-up, tls-ws ...)
+oc_label_of() { python3 "$WORK/vless2xray.py" "$1" 0 "$WORK/oc-label.json" 2>/dev/null | cut -d' ' -f1; }
+
+# oc_launch <n> <kind> <version> <fingerprint> <flag> <label> <subscription url> <udp 0|1>: write the client's config for the line
+# or proxy named by <label> from the subscription the panel serves to this user, start the client, wait until it listens. Sets OC_SP
+# (socks/mixed port) and OC_PID; OC_NOTE is "client cannot ..." when the client does not support the transport, and then nothing runs.
+oc_launch() {
+  local n=$1 kind=$2 ver=$3 fp=$4 flag=$5 label=$6 url=$7 udp=$8
+  local conf=$WORK/old-$n.json log=$WORK/client-old-$n.log ua line l i tag uuid
+  OC_SP=$(free_port tcp) OC_PID="" OC_NOTE=""
+  case $kind in xray) ua="Happ/3.0" ;; singbox) ua="sing-box/$ver" ;; *) ua="mihomo/$ver" ;; esac
+  if [ "$kind" = xray ]; then
+    line="" i=0
+    while [ -z "$line" ] && [ $i -lt 20 ]; do
+      i=$((i + 1))
+      while IFS= read -r l; do
+        if [ "$(oc_label_of "$l")" = "$label" ]; then line=$l; break; fi
+      done < <(curl -sk -m 15 -A "$ua" "$url" | base64 -d 2>/dev/null | grep '^vless://' || true)
+      [ -n "$line" ] || sleep 1
+    done
+    [ -n "$line" ] || die "no $label line in the subscription of user $n"
+    SECRETS+=("$(sed 's|^vless://\([^@]*\)@.*|\1|' <<<"$line")")
+    python3 "$WORK/vless2xray.py" "$line" "$OC_SP" "$conf.0" >/dev/null || die "cannot convert the $label line of client $n to an xray config"
+    # Xray 25 has no pinnedPeerCertSha256 on TLS (it is allowInsecure there); the lab certificate is the node's own
+    jq --arg fp "$fp" --argjson udp "$udp" --arg ver "$ver" '
+      (if .outbounds[0].streamSettings.security == "reality" then .outbounds[0].streamSettings.realitySettings.fingerprint = $fp
+       else .outbounds[0].streamSettings.tlsSettings.fingerprint = $fp end)
+      | .inbounds[0].settings.udp = ($udp == 1) | .inbounds[0].settings.ip = "127.0.0.1"
+      | if .outbounds[0].streamSettings.security == "tls" and ($ver | startswith("25.")) then
+          .outbounds[0].streamSettings.tlsSettings |= (del(.pinnedPeerCertSha256) | .allowInsecure = true) else . end' "$conf.0" >"$conf"
+    spawn "${OC_BIN[xray-$ver]}" run -c "$conf" >"$log" 2>&1
+  elif [ "$kind" = singbox ]; then
+    [ "$label" = tcp ] || { OC_NOTE="client cannot: sing-box carries REALITY over RAW only here"; return 0; }
+    curl -sk -m 15 -A "$ua" "$url" -o "$conf.0"
+    jq -e '.outbounds' "$conf.0" >/dev/null 2>&1 || die "no sing-box document for user $n: $(head -c 200 "$conf.0" | redact)"
+    tag=$(jq -r '[.outbounds[] | select(.type == "vless" and .tls.reality.enabled == true)][0].tag' "$conf.0")
+    [ -n "$tag" ] && [ "$tag" != null ] || die "the sing-box document of user $n has no REALITY outbound"
+    SECRETS+=("$(jq -r --arg t "$tag" '.outbounds[] | select(.tag == $t) | .uuid' "$conf.0")")
+    jq --argjson lp "$OC_SP" --arg tag "$tag" --arg fp "$fp" '
+      .inbounds = [{type: "mixed", tag: "mixed-in", listen: "127.0.0.1", listen_port: $lp}]
+      | (.outbounds[] | select(.type == "selector")).default = $tag
+      | (.outbounds[] | select(.tag == $tag)).tls.utls.fingerprint = $fp' "$conf.0" >"$conf"
+    mkdir -p "$WORK/old-sb-$n"
+    spawn "${OC_BIN[singbox-$ver]}" run -D "$WORK/old-sb-$n" -c "$conf" >"$log" 2>&1
+  else
+    curl -sk -m 15 -A "$ua" "$url" -o "$conf.0"
+    grep -q '^proxies:' "$conf.0" || die "no Mihomo profile for user $n: $(head -c 200 "$conf.0" | redact)"
+    uuid=$(python3 - "$conf.0" "$conf" "$OC_SP" "$fp" "$flag" "$label" <<'PY' || die "cannot build the Mihomo config of client $n ($label)"
+import hashlib, socket, ssl, sys, yaml
+src, out, port, fp, flag, label = sys.argv[1:7]
+d = yaml.safe_load(open(src))
+want = {  # label -> (network, reality, mode)
+    "tcp": ("tcp", True, None), "xhttp-auto": ("xhttp", True, "auto"), "xhttp-packet-up": ("xhttp", True, "packet-up"),
+    "xhttp-stream-up": ("xhttp", True, "stream-up"), "tls-xhttp-packet-up": ("xhttp", False, "packet-up"),
+    "tls-xhttp-stream-up": ("xhttp", False, "stream-up"), "tls-ws": ("ws", False, None)}[label]
+def mode(x):
+    return (x.get("xhttp-opts") or {}).get("mode")
+cand = [x for x in d["proxies"] if x.get("network") == want[0] and ("reality-opts" in x) == want[1] and (want[2] is None or mode(x) == want[2])]
+p = cand[0]
+p["client-fingerprint"] = fp
+if "reality-opts" in p:
+    if flag == "1":
+        p["reality-opts"]["support-x25519mlkem768"] = True
+else:
+    # the "CDN" is the node itself: dial it and trust its self-signed certificate by its pin
+    ctx = ssl.create_default_context()
+    ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+    with socket.create_connection(("127.0.0.1", p["port"]), timeout=10) as raw, ctx.wrap_socket(raw, server_hostname=p["servername"]) as t:
+        p["fingerprint"] = hashlib.sha256(t.getpeercert(binary_form=True)).hexdigest()
+    p["server"] = "127.0.0.1"
+d = {"mixed-port": int(port), "allow-lan": False, "mode": "rule", "log-level": "info", "proxies": [p], "rules": ["MATCH," + p["name"]]}
+yaml.safe_dump(d, open(out, "w"), allow_unicode=True)
+print(p["uuid"])
+PY
+)
+    SECRETS+=("$uuid")
+    mkdir -p "$WORK/old-mh-$n"
+    case $label in *xhttp*) # the YAML parses, but a Mihomo without the transport carries the traffic nowhere
+      if ! grep -aq xhttp-opts "${OC_BIN[mihomo-$ver]}"; then OC_NOTE="client cannot: Mihomo $ver has no XHTTP transport (no xhttp-opts in the binary)"; return 0; fi ;;
+    esac
+    if ! "${OC_BIN[mihomo-$ver]}" -t -d "$WORK/old-mh-$n" -f "$conf" >"$log" 2>&1; then
+      if grep -qiE 'xhttp|unsupport|unknown|not support' "$log"; then OC_NOTE="client cannot: $(grep -iE 'xhttp|unsupport|unknown|not support' "$log" | head -1 | cut -c1-120)"; return 0; fi
+      redact <"$log" | tail -n 5
+      die "mihomo $ver rejects the $label config of client $n"
+    fi
+    spawn "${OC_BIN[mihomo-$ver]}" -d "$WORK/old-mh-$n" -f "$conf" >"$log" 2>&1
+  fi
+  OC_PID=$LAST_PID
+  if ! { wait_for 20 "old client $n ($kind $ver $fp $label) to listen" listening "$OC_SP" && alive "$OC_PID"; }; then
+    if [ "$kind" = xray ] && grep -qiE 'mode|unsupported|unknown' "$log"; then # the old core does not know the transport setting
+      OC_NOTE="client cannot: $(grep -iE 'mode|unsupported|unknown' "$log" | head -1 | cut -c1-120)"
+      stop_pid "$OC_PID"
+      OC_PID=""
+    fi
+  fi
+}
+
+# oc_https <socks port>: 20 MB over HTTPS (TLS 1.3 inside the tunnel, so Vision leaves the copy loop for the raw socket) from the
+# fake internet, the sha256 checked, curl exit 0 (a close that is not clean, or short, fails it)
+oc_https() {
+  local out rc=0
+  out=$(curl -s -k --tlsv1.3 -m 120 -o "$WORK/oc-https.bin" -w '%{size_download}' --socks5-hostname "127.0.0.1:$1" "https://$WHOAMI:8443/pattern/20000000") || rc=$?
+  [ "$rc" = 0 ] && [ "$out" = 20000000 ] && [ "$(sha256sum <"$WORK/oc-https.bin" | cut -d' ' -f1)" = "$OC_HTTPS_SHA" ]
+}
+
+# oc_udp <socks port> <kind>: a DNS query and a QUIC-looking datagram (echoed) through the tunnel's UDP
+oc_udp() {
+  # sing-box's served document hijacks DNS (a query is answered by the client itself, never tunnelled): only the echo goes through it
+  if [ "$2" != singbox ]; then python3 "$WORK/udpprobe.py" "$1" dns "$WHOAMI" 5353 >"$WORK/oc-udp.err" 2>&1 || return 1; fi
+  python3 "$WORK/udpprobe.py" "$1" echo "$WHOAMI" 4433 >"$WORK/oc-udp.err" 2>&1
+}
+
+# oc_run <rows file> <n> <url> <spec>: one client of the matrix. spec = kind|version|fingerprint|label|flag|extras (extras: s = HTTPS
+# 20 MB, u = UDP). Appends "n<TAB>client<TAB>fp<TAB>label<TAB>http<TAB>https<TAB>udp<TAB>expected" to the rows file.
+oc_run() {
+  local rows=$1 n=$2 url=$3 kind ver ufp label flag extras out http=no https=- udp=- udpflag=0 exp
+  IFS='|' read -r kind ver ufp label flag extras <<<"$4"
+  case $extras in *u*) udpflag=1 ;; esac
+  oc_launch "$n" "$kind" "$ver" "$ufp" "$flag" "$label" "$url" "$udpflag" || true
+  if [ -n "$OC_NOTE" ]; then
+    http="$OC_NOTE"
+  else
+    local i
+    for ((i = 0; i < 4; i++)); do
+      out=$(VL_T=30 vl_get "$OC_SP" "oldclient-$n")
+      if [ "${out%% *}" = 200 ]; then http=ok; break; fi
+      sleep 2
+    done
+    if [ "$http" != ok ]; then http=no; echo "--- $kind $ver $ufp $label did not connect:" >&2; tail -n 6 "$WORK/client-old-$n.log" | redact >&2; fi
+    case $extras in *s*) if [ "$http" = ok ]; then if oc_https "$OC_SP"; then https=ok; else https=FAIL; fi; fi ;; esac
+    case $extras in *u*) if [ "$http" = ok ]; then if oc_udp "$OC_SP" "$kind"; then udp=ok; else udp=FAIL; echo "--- $kind $ver UDP: $(tail -n 2 "$WORK/oc-udp.err" | tr '\n' ' ')" >&2; tail -n 4 "$WORK/client-old-$n.log" | redact >&2; fi; fi ;; esac
+    stop_pid "$OC_PID"
+  fi
+  exp=$(oc_expect "$kind" "$ver" "$ufp" "$flag")
+  case $label in tls-*) exp=none ;; esac # the TLS profiles end in the node's own TLS front: no hello is counted
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$n" "$kind $ver" "$ufp" "$label$([ "$flag" = 1 ] && echo '+flag')" "$http" "$https" "$udp" "$exp" >>"$rows"
+}
+
+# oc_report <rows file> <uid array name>: counters of every user, the table, and the verdicts; prints the table, returns the
+# failures as a text in OC_BAD
+oc_report() {
+  local rows=$1 n who ufp lab http https udp exp pq cl un class res table="" nrows
+  local -n uids=$2
+  OC_BAD="" nrows=$(wc -l <"$rows")
+  for ((n = 1; n <= nrows; n++)); do
+    IFS=$'\t' read -r _ who ufp lab http https udp exp < <(sed -n "${n}p" "$rows")
+    read -r pq cl un < <(hello_kex "${uids[$n]}")
+    class=none
+    if [ "$pq" -gt 0 ] && [ "$cl" = 0 ]; then class=pq
+    elif [ "$cl" -gt 0 ] && [ "$pq" = 0 ]; then class=classic
+    elif [ "$pq" -gt 0 ] && [ "$cl" -gt 0 ]; then class=mixed; fi
+    res=ok
+    if [ "$http" != ok ]; then
+      case $http in "client cannot"*) res="$http" ;; *) res=NOT-CONNECTED ;; esac
+    elif [ "$exp" = none ]; then :
+    elif [ "$exp" = any ]; then [ "$class" = pq ] || [ "$class" = classic ] || res="CLASS(want pq or classic)"
+    elif [ "$class" != "$exp" ]; then res="CLASS(want $exp)"; fi
+    [ "$https" != FAIL ] || res="$res HTTPS-FAIL"
+    [ "$udp" != FAIL ] || res="$res UDP-FAIL"
+    table="$table
+  $(printf '%-16s %-9s %-22s http=%-3s https20MB=%-4s udp=%-4s hello pq=%s classic=%s unknown=%s -> %-7s %s' "$who" "$ufp" "$lab" "${http:0:3}" "$https" "$udp" "$pq" "$cl" "$un" "$class" "$res")"
+    case $res in ok | "client cannot"*) ;; *) OC_BAD="$OC_BAD
+  $who $ufp $lab: $res (pq=$pq classic=$cl unknown=$un)" ;; esac
+  done
+  say "old clients against the upgraded node (compatibility on):$table"
+}
+
+# m3_vless_oldclients <REALITY XHTTP profile id> <REALITY RAW+Vision profile id>: clients of older releases against this (the
+# upgraded) node, each as a user of its own. Xray 25.3.6 25.4.30 25.5.16 26.2.6 26.3.27, sing-box 1.12.25 and 1.14.4, Mihomo 1.19.8
+# and 1.19.33, built from source into $M3_CACHE (a client that cannot be built fails the step), with the fingerprints chrome,
+# firefox, safari, ios, edge and random over REALITY; chrome over both transports for every Xray. The node accepts classical hellos
+# (third_party/reality/MISTGATE.md), so every one must pass traffic, and the panel's hello counters of its user must show the class
+# its hello has (oc_expect). The chrome RAW+Vision clients of the main releases also pull 20 MB over HTTPS (Vision's direct copy)
+# and send UDP (xudp: DNS and a QUIC-looking echo). Then Xray 25.3.6 and Mihomo 1.19.8 over REALITY packet-up and stream-up and
+# over the TLS profiles of the Go front (XHTTP packet-up, stream-up, WebSocket); where the client cannot do a transport, the row says
+# "client cannot".
+m3_vless_oldclients() {
+  local px=$1 pt=$2 fps="chrome firefox safari ios edge random" v fp n=0 i t0=$SECONDS
+  local -A xref=([25.3.6]=v1.250306.0 [25.4.30]=87ab8e512882 [25.5.16]=v1.250516.0 [26.2.6]=v1.260206.0 [26.3.27]=v1.260327.0)
+  local xv="25.3.6 25.4.30 25.5.16 26.2.6 26.3.27"
+  declare -gA OC_BIN=()
+  local specs=() # kind|version|fingerprint|label|flag|extras
+
+  say "old clients: building Xray $xv, sing-box 1.12.25 1.14.4, Mihomo 1.19.8 1.19.33 ($M3_CACHE); the node's own Xray 26.11.9 is built already"
+  for v in $xv; do
+    OC_BIN[xray-$v]=$(xray_bin "${xref[$v]}") || die "NOT BUILT: xray-core $v (${xref[$v]})"
+  done
+  OC_BIN[xray-26.11.9]=$XRAY
+  for v in 1.12.25 1.14.4; do
+    OC_BIN[singbox-$v]=$(singbox_bin "$v") || { tail -n 5 "$WORK/build-singbox-$v.log" 2>/dev/null; die "NOT BUILT: sing-box $v"; }
+  done
+  for v in 1.19.8 1.19.33; do
+    OC_BIN[mihomo-$v]=$(mihomo_bin "$v") || { tail -n 5 "$WORK/build-mihomo.log" 2>/dev/null; die "NOT BUILT: mihomo $v"; }
+  done
+
+  # the fake internet's extra servers: HTTPS (TLS 1.3), a UDP echo, a DNS answerer
+  write_inet_extras
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -subj /CN=big.example.test -days 2 \
+    -keyout "$WORK/inet-key.pem" -out "$WORK/inet-cert.pem" >/dev/null 2>&1 || die "openssl cannot make the certificate of the HTTPS server of the lab"
+  spawn nsenter -t "$inet_PID" -n -- python3 "$WORK/inetextras.py" "$WHOAMI" "$WORK/inet-cert.pem" "$WORK/inet-key.pem" >"$WORK/inetextras.log" 2>&1
+  local extras_pid=$LAST_PID
+  inet_https_up() { curl -sk --tlsv1.3 -m 3 -o /dev/null "https://$WHOAMI:8443/pattern/1"; }
+  wait_for 15 "the lab's HTTPS server" inet_https_up || die "the lab's HTTPS server does not answer: $(cat "$WORK/inetextras.log")"
+  OC_HTTPS_SHA=$(python3 "$WORK/inetextras.py" sha 20000000)
+
+  # the matrix. Xray: the REALITY transport alternates with the version for the six fingerprints, and chrome runs over the other
+  # one too, so every release is met by both RAW+Vision and XHTTP with the default fingerprint; the node's own version runs
+  # everything on both. sing-box and Mihomo speak RAW+Vision (no XHTTP in sing-box, none in Mihomo 1.19.8).
+  i=0
+  for v in $xv; do
+    for fp in $fps; do
+      specs+=("xray|$v|$fp|$([ $((i % 2)) = 0 ] && echo tcp || echo xhttp-auto)|0|")
+    done
+    specs+=("xray|$v|chrome|$([ $((i % 2)) = 0 ] && echo xhttp-auto || echo tcp)|0|")
+    i=$((i + 1))
+  done
+  for fp in $fps; do specs+=("xray|26.11.9|$fp|tcp|0|" "xray|26.11.9|$fp|xhttp-auto|0|"); done
+  for v in 1.12.25 1.14.4; do for fp in $fps; do specs+=("singbox|$v|$fp|tcp|0|"); done; done
+  for v in 1.19.8 1.19.33; do for fp in $fps; do specs+=("mihomo|$v|$fp|tcp|0|"); done; done
+  specs+=("mihomo|1.19.8|chrome|tcp|1|" "mihomo|1.19.33|chrome|tcp|1|" "mihomo|1.19.33|firefox|tcp|1|" "mihomo|1.19.33|safari|tcp|1|")
+  # HTTPS 20 MB and UDP ride on the chrome RAW+Vision client of the main releases
+  local k
+  for k in "${!specs[@]}"; do
+    case ${specs[$k]} in
+      "xray|25.3.6|chrome|tcp|0|" | "xray|26.3.27|chrome|tcp|0|" | "xray|26.11.9|chrome|tcp|0|" | "singbox|1.12.25|chrome|tcp|0|" | "singbox|1.14.4|chrome|tcp|0|" | "mihomo|1.19.8|chrome|tcp|0|" | "mihomo|1.19.33|chrome|tcp|0|")
+        specs[$k]="${specs[$k]}su" ;;
+    esac
+  done
+
+  local grp
+  grp=$(make_group e2e-oldclients "[\"$px\",\"$pt\"]")
+  local -a uid url
+  local spec rows="$WORK/oldclients.tsv"
+  for spec in "${specs[@]}"; do
+    n=$((n + 1))
+    new_user "oc$n" "$grp"
+    uid[$n]=$U_ID url[$n]=$U_URL
+  done
+  : >"$rows"
+  sleep 8 # the keys of the new users reach the node
+  n=0
+  for spec in "${specs[@]}"; do
+    n=$((n + 1))
+    oc_run "$rows" "$n" "${url[$n]}" "$spec"
+  done
+  local nmain=$n
+
+  # ---- more REALITY transports and the TLS profiles of the Go front, with the oldest Xray and Mihomo 1.19.8
+  # (pp, tp, ts, tw: the profiles of tunnels.6, m3_vless's variables)
+  local pps g2
+  pps=$(make_profile vless e2e-vless-streamup "$(vless_settings "$(free_port tcp)" xhttp www.example.com '.xhttp.mode = "stream-up"')")
+  [ -n "$pps" ] && [ "$pps" != null ] || die "CreateProfile(vless stream-up) returned no id"
+  make_inbound "$pps"
+  wait_for 90 "the stream-up inbound ACTIVE" inbounds_active_all || die "the REALITY stream-up inbound did not become ACTIVE"
+  g2=$(make_group e2e-oldclients2 "[\"$pp\",\"$pps\",\"$tp\",\"$ts\",\"$tw\"]")
+  specs=()
+  for fp in chrome; do
+    specs+=("xray|25.3.6|$fp|xhttp-packet-up|0|" "xray|25.3.6|$fp|xhttp-stream-up|0|" "xray|25.3.6|$fp|tls-xhttp-packet-up|0|" "xray|25.3.6|$fp|tls-xhttp-stream-up|0|" "xray|25.3.6|$fp|tls-ws|0|")
+    specs+=("mihomo|1.19.8|$fp|xhttp-packet-up|0|" "mihomo|1.19.8|$fp|xhttp-stream-up|0|" "mihomo|1.19.8|$fp|tls-xhttp-packet-up|0|" "mihomo|1.19.8|$fp|tls-xhttp-stream-up|0|" "mihomo|1.19.8|$fp|tls-ws|0|")
+  done
+  local -a uid2 url2
+  local m=0
+  for spec in "${specs[@]}"; do
+    m=$((m + 1))
+    new_user "oe$m" "$g2"
+    uid2[$m]=$U_ID url2[$m]=$U_URL
+  done
+  local rows2="$WORK/oldclients2.tsv"
+  : >"$rows2"
+  sleep 8
+  m=0
+  for spec in "${specs[@]}"; do
+    m=$((m + 1))
+    oc_run "$rows2" "$((nmain + m))" "${url2[$m]}" "$spec"
+  done
+
+  # ---- the counters, after the stats batch that carries the last hellos
+  sleep 12
+  local bad=""
+  oc_report "$rows" uid
+  bad="$OC_BAD"
+  oc_report "$rows2" uid2
+  bad="$bad$OC_BAD"
+  say "node RSS after the old clients: $(vmrss_mb "$NODE_PID") MB ($((nmain + m)) users, as many more REALITY connections and the TLS ones)"
+  stop_pid "$extras_pid"
+  if grep -nE 'panic|fatal error|runtime error|checkptr' "$WORK/node.log" >"$WORK/oc-panics.log"; then
+    head -n 3 "$WORK/oc-panics.log" >&2
+    bad="$bad
+  the node log holds a panic or runtime error"
+  fi
+  [ -z "$bad" ] || die "old clients: these differ from what was expected:$bad"
+  pass "old clients ($((nmain + m)) runs in $((SECONDS - t0)) s: Xray $xv 26.11.9, sing-box 1.12.25 1.14.4, Mihomo 1.19.8 1.19.33; REALITY over RAW+Vision and XHTTP, packet-up and stream-up, the TLS profiles; HTTPS 20 MB with sha256 and UDP on the chrome RAW+Vision clients): every one that can do the transport connected, and every hello was counted in the class its core sends"
 }
 
 # m3_vless_mihomo <subscription url>: mihomo -t on the profile the user gets, then a real mihomo per proxy
@@ -1282,10 +1782,10 @@ m3_vless_mihomo() {
   local url=$1 mh n i name code port
   if ! mh=$(mihomo_bin); then
     tail -n 3 "$WORK/build-mihomo.log" 2>/dev/null
-    note "mihomo v1.19.32 is not in $M3_CACHE and could not be built: the VLESS Mihomo steps are skipped"
+    note "mihomo v1.19.33 is not in $M3_CACHE and could not be built: the VLESS Mihomo steps are skipped"
     return 0
   fi
-  have_vyaml() { curl -sk -m 15 -A 'mihomo/1.19.31' -D "$WORK/mhv.hdr" "$url" -o "$WORK/mihomo-vless.yaml" && grep -q '^proxies:' "$WORK/mihomo-vless.yaml"; }
+  have_vyaml() { curl -sk -m 15 -A 'mihomo/1.19.33' -D "$WORK/mhv.hdr" "$url" -o "$WORK/mihomo-vless.yaml" && grep -q '^proxies:' "$WORK/mihomo-vless.yaml"; }
   wait_for 40 "a Mihomo profile for the VLESS user" have_vyaml || die "no Mihomo profile for the VLESS user: $(head -c 300 "$WORK/mihomo-vless.yaml" | redact)"
   grep -qi '^content-type: text/yaml' "$WORK/mhv.hdr" || die "the Mihomo profile is not served as text/yaml"
   python3 - "$WORK/mihomo-vless.yaml" <<'PY' || die "the VLESS Mihomo profile is not what the clients expect"
@@ -1471,7 +1971,7 @@ json_secrets() {
 }
 
 # m3_json: the Xray JSON and sing-box documents of a fixture user, run by the real clients (Xray from go.mod, sing-box 1.12.25 and
-# 1.14.3 built from source) one server at a time, each in the namespace cli7, which has nothing but the veth to this namespace. The
+# 1.14.4 built from source) one server at a time, each in the namespace cli7, which has nothing but the veth to this namespace. The
 # user's group holds the profiles that are already on the node (the Hysteria2 inbound of step 2, the VLESS inbounds of --vless and the
 # WARP twin of --warp), so the coverage is the matrix of the plan:
 #
@@ -1486,7 +1986,7 @@ json_secrets() {
 # self-signed) is covered by a probe: a hand-made hy2 outbound with the credentials of the Xray document.
 m3_json() {
   step "tunnels.7 Xray JSON and sing-box: the documents of the subscription run in real clients (Xray, sing-box ${SB_VERSIONS:-1.12.25}), placeholders, DNS"
-  local t0 ver sb i k port label tag src
+  local t0 ver sb i k port label tag src auto_i auto_name want_x_docs
   t0=$(date +%s)
   write_json_helpers
   mk_ns cli7 198.18.57
@@ -1512,6 +2012,8 @@ m3_json() {
   new_user gina "$grp"
   local gina=$U_ID j_url=$U_URL
   want_x=${#profiles[@]} want_s=2
+  want_x_docs=$want_x
+  [ "$want_x" -lt 2 ] || want_x_docs=$((want_x + 1))
   [ -z "$twin" ] || want_s=3 # (REALITY TCP, WS, and the WARP twin)
 
   local -A lab lport
@@ -1531,13 +2033,13 @@ m3_json() {
   }
   docs_ready() {
     jget xray-json 'v2rayNG/1.10.20' "$XF" "$WORK/json-xray.hdr" && jget sing-box 'v2rayNG/1.10.20' "$SF" "$WORK/json-singbox.hdr" \
-      && jq -e --argjson n "$want_x" 'type == "array" and length == $n' "$XF" >/dev/null \
+      && jq -e --argjson n "$want_x_docs" 'type == "array" and length == $n' "$XF" >/dev/null \
       && jq -e --argjson n "$want_s" '[.outbounds[] | select(.type == "hysteria2" or .type == "vless")] | length == $n' "$SF" >/dev/null
   }
-  wait_for 60 "the Xray JSON ($want_x servers) and the sing-box profile ($want_s servers)" docs_ready \
+  wait_for 60 "the Xray JSON ($want_x servers plus Auto when eligible) and the sing-box profile ($want_s servers)" docs_ready \
     || die "the documents are not what the group holds: xray $(jq -c 'if type == "array" then length else "not an array" end' "$XF" 2>&1 | head -c 80), sing-box $(jq -c '[.outbounds[] | .type]' "$SF" 2>&1 | head -c 200)"
   json_secrets "$XF" "$SF"
-  jget '' 'SFA (sing-box 1.14.3; language en_US)' "$UF" "$WORK/json-singbox-ua.hdr" || die "the fetch by the sing-box UA failed"
+  jget '' 'SFA (sing-box 1.14.4; language en_US)' "$UF" "$WORK/json-singbox-ua.hdr" || die "the fetch by the sing-box UA failed"
   jget sing-box 'v2rayNG/1.10.20' "$GF.gz" "$WORK/json-singbox-gz.hdr" gzip || die "the gzip fetch failed"
   local h
   for h in json-xray json-singbox json-singbox-ua json-singbox-gz; do
@@ -1552,11 +2054,30 @@ m3_json() {
   json_secrets "$UF"
   [ "$(jq -S . "$SF")" = "$(jq -S . "$UF")" ] || die "the sing-box default rule (UA SFA) did not hand out the same profile as ?format=sing-box"
   [ "$(jq -S . "$SF")" = "$(jq -S . "$GF.json")" ] || die "the gzip body differs from the plain one"
-  pass "fetch: ?format=xray-json (a JSON array of $want_x) and ?format=sing-box, and sing-box by the UA 'SFA (sing-box ...)' without the parameter (the same profile): 200, application/json, no Routing, Subscription-Userinfo present, gzip when accepted and identical once decompressed"
+  pass "fetch: ?format=xray-json (a JSON array of $want_x_docs) and ?format=sing-box, and sing-box by the UA 'SFA (sing-box ...)' without the parameter (the same profile): 200, application/json, no Routing, Subscription-Userinfo present, gzip when accepted and identical once decompressed"
 
   # ---- which server is in which document: the present cells and the absent ones
   local -A in_x in_s
-  for ((i = 0; i < want_x; i++)); do
+  auto_i="" auto_name=""
+  if [ "$want_x" -gt 1 ]; then
+    auto_i=$(jq -r '[to_entries[] | select(any(.value.routing.balancers[]?; .tag == "auto")) | (.key | tonumber)] | if length == 1 then .[0] else empty end' "$XF")
+    [ -n "$auto_i" ] || die "the Xray array does not contain exactly one Auto balancer config"
+    auto_name=$(jq -r --argjson i "$auto_i" '.[$i].remarks' "$XF")
+    [ "$(jq -r '.[0].remarks' "$XF")" = "$auto_name" ] || die "the Xray Auto config is not the first array element"
+    jq -e --argjson i "$auto_i" --argjson n "$want_x" --arg prefix "proxy-" --arg probe "https://www.gstatic.com/generate_204" '
+      .[$i] as $c |
+      [$c.outbounds[] | select(.tag | startswith($prefix)) | .tag] as $proxyTags |
+      [$c.inbounds[].tag, $c.outbounds[].tag, $c.routing.balancers[].tag] as $allTags |
+      ($proxyTags == [range(1; $n + 1) | $prefix + tostring]) and
+      ([$allTags[] | select(startswith($prefix))] == $proxyTags) and
+      ($c.routing.balancers == [{tag:"auto", selector:[$prefix], strategy:{type:"leastPing"}, fallbackTag:"proxy-1"}]) and
+      ($c.observatory.subjectSelector == [$prefix] and $c.observatory.probeURL == $probe and $c.observatory.probeInterval == "5m" and $c.observatory.enableConcurrency == true) and
+      ([ $c.routing.rules[] | select(.balancerTag == "auto") ] | length > 0) and
+      (all($c.routing.rules[]; .outboundTag != "proxy"))' "$XF" >/dev/null \
+      || die "the Xray Auto config has the wrong proxy selector, leastPing balancer, fallback, observatory or routing rules"
+  fi
+  for ((i = 0; i < want_x_docs; i++)); do
+    if [ -n "$auto_name" ] && [ "$(jq -r --argjson i "$i" '.[$i].remarks' "$XF")" = "$auto_name" ]; then continue; fi
     port=$(jq -r --argjson i "$i" '.[$i].outbounds[] | select(.tag == "proxy") | (.settings.port // .settings.vnext[0].port)' "$XF")
     label=${lab[$port]:-}
     [ -n "$label" ] || die "the Xray document has an element on port $port that no profile of the group owns"
@@ -1564,7 +2085,7 @@ m3_json() {
     in_x[$label]=$i
   done
   jq -e 'all(.[]; (.remarks | type == "string" and length > 0))' "$XF" >/dev/null || die "an Xray element has no remarks"
-  [ "$(jq '[.[].remarks] | unique | length' "$XF")" = "$want_x" ] || die "the remarks of the Xray elements are not unique"
+  [ "$(jq '[.[].remarks] | unique | length' "$XF")" = "$want_x_docs" ] || die "the remarks of the Xray elements are not unique"
   for k in "${lab[@]}"; do [ -n "${in_x[$k]:-}" ] || die "Xray JSON: the server $k is missing"; done
   while read -r port; do
     label=${lab[$port]:-}
@@ -1579,8 +2100,10 @@ m3_json() {
     [ -z "${in_s[$k]:-}" ] || die "sing-box: the server $k must be absent (self-signed Hysteria2 and XHTTP are not expressible) but is in the profile"
   done
   jq -e '[.outbounds[] | select(.type == "hysteria2" or .transport.type == "xhttp")] | length == 0' "$SF" >/dev/null || die "the sing-box profile has a hysteria2 or xhttp outbound"
-  jq -e '.outbounds[] | select(.type == "selector") | (.outbounds - ["direct"] | length) == '"$want_s" "$SF" >/dev/null || die "the sing-box selector does not list exactly the $want_s servers"
-  pass "coverage: Xray JSON has all $want_x servers (${!in_x[*]}); sing-box has ${!in_s[*]} and neither the self-signed hysteria2 inbounds nor XHTTP"
+  # automatic server choice is on by default: with more than one server the selector starts on an urltest "Auto" over them
+  jq -e '.outbounds[] | select(.type == "urltest") | select(.tag == "Auto") | (.outbounds | length) == '"$want_s" "$SF" >/dev/null || die "the sing-box profile has no Auto urltest over the $want_s servers"
+  jq -e '.outbounds[] | select(.type == "selector") | (.outbounds[0] == "Auto" and .default == "Auto" and (.outbounds - ["direct", "Auto"] | length) == '"$want_s"')' "$SF" >/dev/null || die "the sing-box selector does not start on Auto and list exactly the $want_s servers"
+  pass "coverage: Xray JSON has Auto first plus all $want_x servers (${!in_x[*]}); sing-box has ${!in_s[*]}, an Auto urltest over them as the selector's default, and neither the self-signed hysteria2 inbounds nor XHTTP"
 
   # ---- the sing-box documents are valid for the cores as served
   for ver in $SB_VERSIONS; do
@@ -1591,8 +2114,40 @@ m3_json() {
   done
   pass "sing-box check accepts the profile as served with every version under test ($SB_VERSIONS)"
 
+  # ---- block_ads on the preset: the block is the first rule, and the cores still take the documents (the Xray run below
+  # keeps the documents fetched above: a real xray without geosite.dat would not start one with geosite:category-ads-all)
+  ads_preset() { # <true|false>
+    mutate DnsService/UpdateDnsPreset "$(jq -nc --arg id "$pre" --arg a "$WHOAMI" --argjson on "$1" '{id:$id, name:"e2e-fake-dns", description:"the resolver of the fake internet", servers:[{kind:"DNS_SERVER_KIND_PLAIN", address:$a}], ipv4Only:true, blockAds:$on}')" >/dev/null
+  }
+  ads_preset true || die "UpdateDnsPreset (blockAds on) failed"
+  local AF=$WORK/json-singbox-ads.json MF=$WORK/mihomo-ads.yaml mh ads_mh="mihomo not available"
+  ads_ready() {
+    jget sing-box 'v2rayNG/1.10.20' "$AF" "$WORK/json-singbox-ads.hdr" \
+      && jq -e '[.route.rules[] | select(.action == "reject" and ((.rule_set // []) | index("geosite-category-ads-all")) != null)] | length == 1' "$AF" >/dev/null
+  }
+  wait_for 60 "the sing-box profile with the ads block" ads_ready || die "sing-box: no reject rule for geosite-category-ads-all after blockAds: $(jq -c '.route.rules' "$AF" 2>&1 | head -c 300)"
+  jq -e '.dns.rules[0].action == "predefined" and (.dns.rules[0].rule_set | index("geosite-category-ads-all")) != null' "$AF" >/dev/null \
+    || die "sing-box: the ads block is not the first DNS rule: $(jq -c '.dns.rules[0]' "$AF" 2>&1 | head -c 200)"
+  for ver in $SB_VERSIONS; do
+    "$M3_CACHE/sing-box-$ver" check -c "$AF" >"$WORK/client-singbox-check.log" 2>&1 || { redact <"$WORK/client-singbox-check.log" | tail -n 5; die "sing-box $ver rejects the profile with the ads block"; }
+  done
+  if mh=$(mihomo_bin); then
+    curl -sk -m 15 -A 'mihomo/1.19.33' -o "$MF" "$j_url" || die "the Mihomo profile with the ads block did not download"
+    python3 - "$MF" <<'PY' || die "the Mihomo profile does not start with the ads block"
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1]))
+assert d["rules"][0] == "RULE-SET,geosite-category-ads-all,REJECT", d["rules"][:3]
+assert "geosite-category-ads-all" in (d.get("rule-providers") or {}), list(d.get("rule-providers") or {})
+PY
+    mkdir -p "$WORK/mha-test"
+    "$mh" -t -d "$WORK/mha-test" -f "$MF" >"$WORK/mihomo-ads-t.log" 2>&1 || { redact <"$WORK/mihomo-ads-t.log" | tail -n 5; die "mihomo -t rejects the profile with the ads block"; }
+    ads_mh="mihomo -t accepts the Mihomo profile, whose first rule rejects the list"
+  fi
+  ads_preset false || die "UpdateDnsPreset (blockAds off) failed"
+  pass "block_ads: sing-box gets the list as the first DNS rule (NXDOMAIN) and a reject route, and sing-box check accepts it ($SB_VERSIONS); $ads_mh"
+
   # ---- Xray: every element in a client of its own; the node (or the WARP address) is what the fake internet sees; DNS is intercepted
-  local pin conf cp dns_ok dns_bad
+  local pin conf cp dns_ok dns_bad auto_conf auto_log auto_pid auto_dead auto_ws_tag auto_ws_sni auto_pin auto_src
   cns_listening() { [ -n "$(cns "$cli7_PID" ss -Hltn "sport = :$1")" ]; } # <port>
   j_who() { # <socks port> <path>: the address whoami saw through a client ("" = none); retries, the first REALITY handshake can take seconds
     local r out=""
@@ -1628,10 +2183,57 @@ m3_json() {
     say "xray $label: the fake internet sees $src; DNS to a dead address: blocked name -> $dns_bad, other -> $dns_ok (via the preset's resolver)"
     stop_pid "$cp"
   done
-  pass "real xray ($(basename "$XRAY")): all $want_x elements run (hy2 with its pin, REALITY XHTTP and TCP Vision, TLS WebSocket${twin:+, both WARP twins}), the fake internet sees the node (the WARP address for the twins), and DNS to an unreachable resolver is intercepted and answered from the preset (blocked name -> 0.0.0.0)"
+  local hk7_pq hk7_classic hk7_unknown
+  hk7_seen() { read -r hk7_pq hk7_classic hk7_unknown < <(hello_kex "$gina"); [ "$hk7_pq" -ge 2 ]; }
+  wait_for 40 "the node's hello counters for the xray clients of the JSON document (pq >= 2)" hk7_seen \
+    || die "the panel counted pq $hk7_pq, classic $hk7_classic, unknown $hk7_unknown ClientHellos for the REALITY xray clients of the JSON document (want pq >= 2)"
+  pass "hello key exchange: the real xray clients of the Xray JSON document (REALITY XHTTP and TCP Vision, fingerprint chrome) sent post-quantum hellos: pq=$hk7_pq classic=$hk7_classic unknown=$hk7_unknown"
+  if [ "$want_x" -gt 1 ]; then
+    # Pin the WebSocket certificate just as the individual-server check does, then kill proxy-1, the configured fallback. Auto can
+    # reach whoami only after its first observatory results exclude that dead outbound.
+    auto_ws_tag=$(jq -r --argjson i "$auto_i" --argjson p "${lport[ws]}" '.[$i].outbounds[] | select((.settings.vnext[0].port // .settings.port) == $p) | .tag' "$XF")
+    [ -n "$auto_ws_tag" ] || die "the Xray Auto config has no WebSocket outbound for the TLS pin check"
+    auto_ws_sni=$(jq -r --argjson i "$auto_i" --arg tag "$auto_ws_tag" '.[$i].outbounds[] | select(.tag == $tag) | .streamSettings.tlsSettings.serverName // empty' "$XF")
+    [ -n "$auto_ws_sni" ] || die "the Xray Auto WebSocket outbound has no TLS server name"
+    auto_pin=$(tls_pin "${lport[ws]}" "$auto_ws_sni") || die "could not read the Xray Auto WebSocket certificate pin"
+    auto_dead=$(free_port udp)
+    auto_conf=$WORK/json-xray-auto.json auto_log=$WORK/client-xray-json-auto.log
+    jq --argjson i "$auto_i" --arg gw "$cli7_GW" --arg who "$WHOAMI" --arg tag "$auto_ws_tag" --arg pin "$auto_pin" --argjson dead "$auto_dead" '
+      .[$i]
+      | .observatory.probeURL = ("http://" + $who + "/xray-auto-probe")
+      | .observatory.probeInterval = "2s"
+      | (.outbounds[] | select(.tag | startswith("proxy-")) | .settings) |=
+          (if has("address") then .address = $gw else . end | if has("vnext") then .vnext[].address = $gw else . end)
+      | (.outbounds[] | select(.tag == "proxy-1") | .settings.port) = $dead
+      | (.outbounds[] | select(.tag == $tag) | .streamSettings.tlsSettings).pinnedPeerCertSha256 = $pin' "$XF" >"$auto_conf" \
+      || die "could not prepare the Xray Auto config with the fake probe URL and one dead outbound"
+    spawn nsenter -t "$cli7_PID" -n -- "$XRAY" run -c "$auto_conf" >"$auto_log" 2>&1
+    auto_pid=$LAST_PID
+    wait_for 15 "Xray Auto to listen" cns_listening 10808 && alive "$auto_pid" \
+      || { redact <"$auto_log" | tail -n 8; die "Xray Auto did not start with its balancer and observatory"; }
+    auto_probe_seen() { grep -q ' /xray-auto-probe' "$WORK/whoami.log"; }
+    wait_for 20 "the Xray Auto observatory to probe the fake internet" auto_probe_seen && alive "$auto_pid" \
+      || { redact <"$auto_log" | tail -n 8; die "Xray Auto did not send a probe to the fake HTTP endpoint"; }
+    auto_src=$(j_who 10808 "json-xray-auto-after-probe")
+    if [ "$auto_src" != "$DIRECT_SRC" ] && { [ -z "$twin" ] || [ "$auto_src" != "$WARP_SRC" ]; }; then
+      redact <"$auto_log" | tail -n 8
+      die "Xray Auto did not route around dead proxy-1 after probing: the fake internet saw '$auto_src', expected the node or its WARP egress"
+    fi
+    sleep 3
+    auto_src=$(j_who 10808 "json-xray-auto-stays-live")
+    if [ "$auto_src" != "$DIRECT_SRC" ] && { [ -z "$twin" ] || [ "$auto_src" != "$WARP_SRC" ]; }; then
+      redact <"$auto_log" | tail -n 8
+      die "Xray Auto stopped passing after observatory probes: the fake internet saw '$auto_src', expected the node or its WARP egress"
+    fi
+    say "xray Auto: observatory reached the fake HTTP endpoint; with fallback proxy-1 dead, requests kept reaching the fake internet from $auto_src"
+    stop_pid "$auto_pid"
+  fi
+  pass "real xray ($(basename "$XRAY")): all $want_x server elements run (hy2 with its pin, REALITY XHTTP and TCP Vision, TLS WebSocket${twin:+, both WARP twins}), and the Auto element switches away from dead proxy-1 after probing; the fake internet sees the node (the WARP address for the twins), and DNS to an unreachable resolver is intercepted and answered from the preset (blocked name -> 0.0.0.0)"
 
   # ---- sing-box: the TUN inbound is replaced by a mixed one, the selector is pointed at one server at a time
-  local mport sconf sdir sp sbl
+  local mport sconf sdir sp sbl hk7_p0 hk7_c0
+  sleep 12 # the hellos of the xray clients above (the Auto one included) are all in the panel; sing-box adds to this
+  read -r hk7_p0 hk7_c0 _ < <(hello_kex "$gina")
   for ver in $SB_VERSIONS; do
     sb=$M3_CACHE/sing-box-$ver
     for label in "${!in_s[@]}"; do
@@ -1671,6 +2273,12 @@ m3_json() {
     [ "$src" = "$DIRECT_SRC" ] || { redact <"$sbl" | tail -n 8; die "sing-box $ver hy2 probe: the fake internet saw '$src', expected $DIRECT_SRC"; }
     stop_pid "$sp"
   done
+  # sing-box strips the X25519MLKEM768 share from the REALITY hello whatever its version: every hello it sent is classic
+  sleep 12 # one more stats batch
+  read -r hk7_pq hk7_classic hk7_unknown < <(hello_kex "$gina")
+  [ "$hk7_classic" -gt "$hk7_c0" ] || die "the panel counted no classic ClientHello for the sing-box REALITY clients (pq $hk7_pq, classic $hk7_classic, unknown $hk7_unknown)"
+  [ "$hk7_pq" = "$hk7_p0" ] || die "sing-box ($SB_VERSIONS) sent post-quantum ClientHellos: pq $hk7_p0 -> $hk7_pq (it strips X25519MLKEM768 from the REALITY hello)"
+  pass "hello key exchange: real sing-box ($SB_VERSIONS) over REALITY RAW sent classic hellos only: classic +$((hk7_classic - hk7_c0)), pq +$((hk7_pq - hk7_p0)); the user's totals are pq=$hk7_pq classic=$hk7_classic unknown=$hk7_unknown"
   pass "real sing-box ($SB_VERSIONS): the served profile runs server by server (${!in_s[*]}), the fake internet sees the node (the WARP address for the twin); a hand-made hysteria2 + Salamander outbound with the credentials of the Xray document also reaches it"
 
   # ---- placeholders: a disabled person gets one entry that connects nowhere

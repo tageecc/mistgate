@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { en } from "./en";
 import { ru } from "./ru";
-import { dictionaries, isLang, langs, localeOf, pickForm } from "./index";
+import { dictionaries, dirOf, fill, intlLocaleOf, isLang, langs, localeOf, pickForm, plainText } from "./index";
 
 describe("pickForm", () => {
   const ruForms = ru["auth.attemptsLeft"];
@@ -15,17 +15,6 @@ describe("pickForm", () => {
   it("picks English one / other", () => {
     expect(pickForm(en["auth.attemptsLeft"], 1, "en")).toBe("{n} attempt left");
     expect(pickForm(en["auth.attemptsLeft"], 2, "en")).toBe("{n} attempts left");
-  });
-  it("Overview health strip: Russian plurals, one node, nobody online", () => {
-    const pick = (k: "ov.allOk" | "ov.onlineNow", n: number) => pickForm(ru[k], n, "ru").replace("{n}", String(n));
-    expect(pick("ov.allOk", 2)).toBe("Все 2 ноды работают");
-    expect(pick("ov.allOk", 5)).toBe("Все 5 нод работают");
-    expect(pick("ov.onlineNow", 1)).toBe("1 человек онлайн");
-    expect(pick("ov.onlineNow", 3)).toBe("3 человека онлайн");
-    expect(pick("ov.onlineNow", 12)).toBe("12 человек онлайн");
-    expect(pickForm(en["ov.allOk"], 4, "en")).toBe("All {n} nodes are up");
-    expect(ru["ov.oneUp"]).toBe("Нода {name} работает");
-    expect(ru["ov.onlineNone"]).toBe("Сейчас никого онлайн");
   });
   it("returns a single form as it is", () => {
     expect(pickForm("Hello", 3, "en")).toBe("Hello");
@@ -42,15 +31,54 @@ describe("pickForm", () => {
 });
 
 describe("languages", () => {
-  it("are the three of the panel, each with its dictionary and an Intl locale", () => {
-    expect([...langs].sort()).toEqual(["en", "ru", "zh"]);
+  it("are the five of the panel, each with its dictionary and an Intl locale", () => {
+    expect([...langs].sort()).toEqual(["en", "fa", "ru", "tr", "zh"]);
     for (const lang of langs) {
       expect(isLang(lang)).toBe(true);
       expect(Object.keys(dictionaries[lang]).sort(), lang).toEqual(Object.keys(en).sort());
-      expect(Intl.DateTimeFormat.supportedLocalesOf(localeOf(lang))).toHaveLength(1);
+      expect(Intl.DateTimeFormat.supportedLocalesOf(intlLocaleOf(lang))).toHaveLength(1);
     }
     expect(localeOf("zh")).toBe("zh-CN");
+    expect(localeOf("fa")).toBe("fa");
     expect(isLang("fr")).toBe(false);
+    expect(langs.map(dirOf)).toEqual(["ltr", "ltr", "ltr", "rtl", "ltr"]);
+  });
+
+  it("format Persian with Latin digits, like the IPs and counts around them, and the Persian calendar, like the person's page", () => {
+    const fa = intlLocaleOf("fa");
+    expect(new Intl.NumberFormat(fa).format(1234.5)).toBe("1,234.5");
+    const date = new Date(Date.UTC(2026, 10, 2, 12));
+    expect(date.toLocaleDateString(fa, { day: "numeric", month: "long", year: "numeric", timeZone: "UTC" })).toBe("11 آبان 1405");
+    expect(new Intl.NumberFormat(intlLocaleOf("tr")).format(1234.5)).toBe("1.234,5");
+  });
+});
+
+describe("Persian and Turkish plurals", () => {
+  it("Persian has one form everywhere: a noun stays singular after a number, and Intl counts 0 as \"one\"", () => {
+    for (const [key, text] of Object.entries(dictionaries.fa)) expect(text.includes("|"), key).toBe(false);
+    expect(pickForm(dictionaries.fa["pager.count"], 0, "fa")).toBe(dictionaries.fa["pager.count"]);
+  });
+  it("Turkish picks one|other by Intl, and a single form for every count", () => {
+    expect(pickForm("{n} portu|{n} portları", 1, "tr")).toBe("{n} portu");
+    expect(pickForm("{n} portu|{n} portları", 0, "tr")).toBe("{n} portları");
+    expect(pickForm("{n} portu|{n} portları", 5, "tr")).toBe("{n} portları");
+    for (const n of [0, 1, 2, 21]) expect(fill(pickForm(dictionaries.tr["pager.count"], n, "tr"), { n })).toBe(`${n} kayıt`);
+    for (const [key, text] of Object.entries(dictionaries.tr)) expect(text.split("|").length, key).toBeLessThanOrEqual(2);
+  });
+});
+
+describe("right to left", () => {
+  it("isolates every value filled into a Persian sentence, and leaves Latin templates and copied text bare", () => {
+    const sentence = fill("{ip} از {country} در دسترس نیست", { ip: "203.0.113.7", country: "Iran" }, true);
+    expect(sentence).toBe("\u2068203.0.113.7\u2069 از \u2068Iran\u2069 در دسترس نیست");
+    expect(plainText(sentence)).toBe("203.0.113.7 از Iran در دسترس نیست");
+    expect(fill("mistgate backup keygen --identity-file {path}", { path: "/root/key.txt" }, true)).toBe("mistgate backup keygen --identity-file /root/key.txt");
+    expect(fill("{ip} از", { ip: "203.0.113.7" })).toBe("203.0.113.7 از");
+  });
+  it("points the change arrow the way the language reads", () => {
+    expect(dictionaries.fa["common.fromTo"]).toBe("{from} ← {to}");
+    expect(dictionaries.tr["common.fromTo"]).toBe("{from} → {to}");
+    expect(dictionaries.fa["common.quoted"]).toBe("«{name}»");
   });
 });
 
@@ -79,6 +107,5 @@ describe("dictionaries", () => {
     expect(dictionaries.zh["common.quoted"]).toBe("「{name}」");
     expect(en["common.labeled"]).toBe("{label}: {value}");
     expect(dictionaries.zh["common.labeled"]).toBe("{label}：{value}");
-    expect(dictionaries.zh["hl.strip.headline"]).toBe("{count}：{names}{more}");
   });
 });

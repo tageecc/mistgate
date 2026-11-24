@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -18,7 +17,6 @@ import (
 	"connectrpc.com/connect"
 	"filippo.io/age"
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
-	"github.com/mistgate/mistgate/gen/mistgate/admin/v1/adminv1connect"
 	"github.com/mistgate/mistgate/internal/buildinfo"
 	"github.com/mistgate/mistgate/internal/panel/auth"
 	"github.com/mistgate/mistgate/internal/panel/edition"
@@ -31,7 +29,7 @@ const (
 	secretRecordID      = "panel_backup_settings.secret_access_key"
 	defaultIntervalHour = 24
 	listResponseLimit   = 100
-	// backupTimeout bounds one backup, scheduled or started by hand: a snapshot and an upload of up to the 50 GiB the
+	// backupTimeout bounds one backup, scheduled or started by hand: a snapshot and an upload of up to the 2 GiB the
 	// archive may hold, to a slow bucket.
 	backupTimeout = 4 * time.Hour
 )
@@ -55,10 +53,25 @@ type Config struct {
 	StepUp    func(context.Context) error
 	// Edge is the edge edition: no scheduled or manual backup runs there yet (R2), so those RPCs refuse.
 	Edge bool
+	// RestorePanelData hands a prepared stage to the update service's privileged helper.
+	RestorePanelData func(context.Context, RestoreRequest, func() error) error
+	// DeleteKeptData delegates deletion beside the data directory to the privileged panel-update helper.
+	DeleteKeptData func(context.Context, string) error
+	// RestoreHelperRunning reports the shared panel-update helper's in-progress state.
+	RestoreHelperRunning func() bool
 	// OnResult is told how every backup ended: "" when it worked, else the error code (backup_storage_failed, ...). The
 	// Telegram alerts hang on it. It must not block.
 	OnResult func(code string)
 	Log      *slog.Logger
+}
+
+// RestoreRequest is the public metadata passed to the VPS restore helper. It contains no recovery key.
+type RestoreRequest struct {
+	StageDir      string
+	Source        string
+	FileName      string
+	MadeByVersion string
+	RequestedUnix int64
 }
 
 type Service struct {
@@ -67,6 +80,7 @@ type Service struct {
 	dataDir   string
 	masterKey []byte
 	stepUp    func(context.Context) error
+	restore   restoreState
 	onResult  func(code string)
 	edge      bool
 	log       *slog.Logger
@@ -87,16 +101,16 @@ func New(cfg Config) (*Service, error) {
 	if cfg.Log == nil {
 		cfg.Log = slog.Default()
 	}
-	s := &Service{st: cfg.Store, vault: cfg.Vault, dataDir: cfg.DataDir, masterKey: append([]byte(nil), cfg.MasterKey...), stepUp: cfg.StepUp, onResult: cfg.OnResult, edge: cfg.Edge, log: cfg.Log, now: time.Now}
+	s := &Service{st: cfg.Store, vault: cfg.Vault, dataDir: cfg.DataDir, masterKey: append([]byte(nil), cfg.MasterKey...),
+		stepUp: cfg.StepUp, onResult: cfg.OnResult, edge: cfg.Edge, log: cfg.Log, now: time.Now}
+	s.restore = newRestoreState(cfg)
 	s.r2Factory = s.newR2Client
+	s.initializeRestore()
 	return s, nil
 }
 
-func (s *Service) Handler(opts ...connect.HandlerOption) (string, http.Handler) {
-	return adminv1connect.NewBackupServiceHandler(rpc{s}, append([]connect.HandlerOption{connect.WithReadMaxBytes(64 << 10)}, opts...)...)
-}
-
 func (s *Service) Run(ctx context.Context) {
+	s.reconcileRestore(ctx)
 	s.runDue(ctx)
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
@@ -105,6 +119,7 @@ func (s *Service) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			s.maintainRestore(ctx)
 			s.runDue(ctx)
 		}
 	}
@@ -113,6 +128,9 @@ func (s *Service) Run(ctx context.Context) {
 // runDue starts a scheduled backup once the interval has passed since the last success. After a failure it waits out
 // the backoff first (retryDelay): every attempt snapshots the database and reads the whole data directory.
 func (s *Service) runDue(ctx context.Context) {
+	if s.panelOperationRunning() {
+		return
+	}
 	settings, err := s.st.PanelBackupSettings(ctx)
 	if err != nil {
 		s.log.Error("read panel backup schedule", "code", "backup_settings_unavailable")
@@ -163,15 +181,25 @@ func (s *Service) backoff(failed bool, interval time.Duration) {
 
 type rpc struct{ s *Service }
 
+// GetBackupSettings answers the signed-in owner with the settings and a token of the admin profile (the MCP's backup_status, the
+// assistant) with the status only: no account, bucket, key id, age recipient or whether a secret is set. Every other backup call
+// stays closed to tokens.
 func (r rpc) GetBackupSettings(ctx context.Context, _ *connect.Request[adminv1.GetBackupSettingsRequest]) (*connect.Response[adminv1.GetBackupSettingsResponse], error) {
-	if err := requireOwner(ctx); err != nil {
-		return nil, err
+	if a, ok := auth.AdminFrom(ctx); !ok || a.Role != store.RoleOwner {
+		return nil, connect.NewError(connect.CodePermissionDenied, errors.New("owner access required"))
 	}
 	settings, err := r.s.st.PanelBackupSettings(ctx)
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, errBackupInvalidSettings)
 	}
-	return connect.NewResponse(&adminv1.GetBackupSettingsResponse{Settings: r.s.settingsProto(settings)}), nil
+	out := r.s.settingsProto(settings)
+	if auth.PrincipalFrom(ctx).Token {
+		out = &adminv1.BackupSettings{
+			Enabled: out.Enabled, IntervalHours: out.IntervalHours, RetentionDays: out.RetentionDays,
+			LastSuccessUnix: out.LastSuccessUnix, LastErrorCode: out.LastErrorCode, Running: out.Running,
+		}
+	}
+	return connect.NewResponse(&adminv1.GetBackupSettingsResponse{Settings: out}), nil
 }
 
 func (r rpc) UpdateBackupSettings(ctx context.Context, req *connect.Request[adminv1.UpdateBackupSettingsRequest]) (*connect.Response[adminv1.UpdateBackupSettingsResponse], error) {
@@ -225,7 +253,7 @@ func (r rpc) UpdateBackupSettings(ctx context.Context, req *connect.Request[admi
 }
 
 func (r rpc) TestBackupStorage(ctx context.Context, _ *connect.Request[adminv1.TestBackupStorageRequest]) (*connect.Response[adminv1.TestBackupStorageResponse], error) {
-	if err := requireOwner(ctx); err != nil {
+	if _, err := auth.OwnerSession(ctx); err != nil {
 		return nil, err
 	}
 	if err := edition.Check(r.s.edge, edition.Backups); err != nil {
@@ -251,7 +279,7 @@ func (r rpc) TestBackupStorage(ctx context.Context, _ *connect.Request[adminv1.T
 }
 
 func (r rpc) CreateBackup(ctx context.Context, _ *connect.Request[adminv1.CreateBackupRequest]) (*connect.Response[adminv1.CreateBackupResponse], error) {
-	if err := requireOwner(ctx); err != nil {
+	if _, err := auth.OwnerSession(ctx); err != nil {
 		return nil, err
 	}
 	if err := edition.Check(r.s.edge, edition.Backups); err != nil {
@@ -270,7 +298,14 @@ func (r rpc) CreateBackup(ctx context.Context, _ *connect.Request[adminv1.Create
 // a slow bucket takes longer. A busy or unconfigured service is refused at once; the outcome lands in the settings (last
 // success, last error) and the audit log. ctx carries the owner for the audit and must not end with the request.
 func (s *Service) startBackup(ctx context.Context) error {
+	if s.panelOperationRunning() {
+		return errBackupBusy
+	}
 	if !s.mu.TryLock() {
+		return errBackupBusy
+	}
+	if s.panelOperationRunning() {
+		s.mu.Unlock()
 		return errBackupBusy
 	}
 	settings, err := s.st.PanelBackupSettings(ctx)
@@ -293,7 +328,7 @@ func (s *Service) startBackup(ctx context.Context) error {
 }
 
 func (r rpc) ListBackups(ctx context.Context, _ *connect.Request[adminv1.ListBackupsRequest]) (*connect.Response[adminv1.ListBackupsResponse], error) {
-	if err := requireOwner(ctx); err != nil {
+	if _, err := auth.OwnerSession(ctx); err != nil {
 		return nil, err
 	}
 	if err := edition.Check(r.s.edge, edition.Backups); err != nil {
@@ -319,21 +354,13 @@ func (r rpc) ListBackups(ctx context.Context, _ *connect.Request[adminv1.ListBac
 }
 
 func (s *Service) requireOwnerStepUp(ctx context.Context) error {
-	if err := requireOwner(ctx); err != nil {
+	if _, err := auth.OwnerSession(ctx); err != nil {
 		return err
 	}
 	if s.stepUp == nil {
 		return connect.NewError(connect.CodeFailedPrecondition, errors.New("backup step-up is unavailable"))
 	}
 	return s.stepUp(ctx)
-}
-
-func requireOwner(ctx context.Context) error {
-	admin, ok := auth.AdminFrom(ctx)
-	if !ok || admin.Role != store.RoleOwner || strings.HasPrefix(admin.ID, "token:") {
-		return connect.NewError(connect.CodePermissionDenied, errors.New("owner access required"))
-	}
-	return nil
 }
 
 func (s *Service) newR2Client(ctx context.Context, settings store.PanelBackupSettings) (s3API, error) {
@@ -380,7 +407,14 @@ func validateSettings(settings store.PanelBackupSettings, enabled bool) error {
 
 // createBackup makes one backup unless one is already running (the scheduler's way).
 func (s *Service) createBackup(ctx context.Context) (backupObject, string, error) {
+	if s.panelOperationRunning() {
+		return backupObject{}, "", errBackupBusy
+	}
 	if !s.mu.TryLock() {
+		return backupObject{}, "", errBackupBusy
+	}
+	if s.panelOperationRunning() {
+		s.mu.Unlock()
 		return backupObject{}, "", errBackupBusy
 	}
 	defer s.mu.Unlock()
@@ -421,30 +455,12 @@ func (s *Service) run(ctx context.Context) (_ backupObject, _ string, err error)
 		s.recordRun(ctx, false, errorCode(errBackupStorageFailed))
 		return backupObject{}, "", errBackupStorageFailed
 	}
-	// The work directory (the snapshot, the encrypted archive) lives in the data directory, on its disk: the only place
-	// the service may write, and not a tmpfs that counts against its memory. One a crash left behind goes first.
-	if entries, err := os.ReadDir(s.dataDir); err == nil {
-		for _, e := range entries {
-			if e.IsDir() && strings.HasPrefix(e.Name(), stagePrefix) {
-				os.RemoveAll(filepath.Join(s.dataDir, e.Name()))
-			}
-		}
-	}
-	workDir, err := os.MkdirTemp(s.dataDir, stagePrefix)
+	workDir, snapshot, err := s.stageSnapshot(ctx)
 	if err != nil {
 		s.recordRun(ctx, false, errorCode(errBackupArchiveFailed))
 		return backupObject{}, "", errBackupArchiveFailed
 	}
 	defer os.RemoveAll(workDir)
-	if err := os.Chmod(workDir, 0o700); err != nil {
-		s.recordRun(ctx, false, errorCode(errBackupArchiveFailed))
-		return backupObject{}, "", errBackupArchiveFailed
-	}
-	snapshot := filepath.Join(workDir, "snapshot.db")
-	if err := s.st.SnapshotDatabase(ctx, snapshot); err != nil {
-		s.recordRun(ctx, false, errorCode(errBackupArchiveFailed))
-		return backupObject{}, "", errBackupArchiveFailed
-	}
 	archivePath := filepath.Join(workDir, "mistgate-backup.tar.gz.age")
 	archive, err := os.OpenFile(archivePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
@@ -483,6 +499,38 @@ func (s *Service) run(ctx context.Context) (_ backupObject, _ string, err error)
 	return object, warning, nil
 }
 
+// stageSnapshot makes the consistent SQLite snapshot in a private directory under the panel data directory. A crashed
+// prior backup's stage is removed first; callers hold s.mu and remove the returned directory on every exit path.
+func (s *Service) stageSnapshot(ctx context.Context) (workDir, snapshot string, err error) {
+	if entries, readErr := os.ReadDir(s.dataDir); readErr == nil {
+		for _, entry := range entries {
+			name := entry.Name()
+			if entry.IsDir() && strings.HasPrefix(name, stagePrefix) &&
+				!s.protectRestoreStage(name) {
+				_ = os.RemoveAll(filepath.Join(s.dataDir, entry.Name()))
+			}
+		}
+	}
+	workDir, err = os.MkdirTemp(s.dataDir, snapshotStagePrefix)
+	if err != nil {
+		return "", "", err
+	}
+	stageDir := workDir
+	defer func() {
+		if err != nil {
+			_ = os.RemoveAll(stageDir)
+		}
+	}()
+	if err = os.Chmod(workDir, 0o700); err != nil {
+		return "", "", err
+	}
+	snapshot = filepath.Join(workDir, "snapshot.db")
+	if err = s.st.SnapshotDatabase(ctx, snapshot); err != nil {
+		return "", "", err
+	}
+	return workDir, snapshot, nil
+}
+
 func (s *Service) recordRun(ctx context.Context, success bool, code string) error {
 	statusCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -500,7 +548,7 @@ func (s *Service) audit(ctx context.Context, action string, params any) {
 		ipText = ip.String()
 	}
 	if err := s.st.Audit(ctx, time.Now(), store.AuditEntry{
-		Actor: auth.ActorLabel(ctx), Action: action, Params: string(encoded),
+		Actor: auth.ActorID(ctx), Action: action, Params: string(encoded),
 		Result: "ok", IP: ipText,
 	}); err != nil {
 		s.log.Warn("write backup audit event failed", "code", "audit_unavailable")

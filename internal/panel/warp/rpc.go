@@ -13,7 +13,7 @@ import (
 )
 
 // rpc is the admin WarpService (warp.proto). Roles are decided by auth/policy.go before a call gets here (all
-// owner-only); register, import and delete also need a fresh step-up, checked first, before anything is read.
+// owner-only); register, import, set license and delete also need a fresh step-up, checked first, before anything is read.
 type rpc struct{ s *Service }
 
 func (r rpc) GetWarp(ctx context.Context, req *connect.Request[adminv1.GetWarpRequest]) (*connect.Response[adminv1.GetWarpResponse], error) {
@@ -37,6 +37,8 @@ func (r rpc) GetWarp(ctx context.Context, req *connect.Request[adminv1.GetWarpRe
 	resp.Account = s.accountMsg(a)
 	resp.Health = healthMsg(a)
 	resp.NeedsAttention, resp.AttentionReason = a.Attention != "", a.Attention
+	resp.Reach, resp.ReachState = s.reachView(ctx, n, a)
+	resp.ReachCheck = s.reachCheck(ctx, n, a, req.Msg.CheckReachNow)
 	if resp.Inbounds, err = s.warpInbounds(ctx, n.ID); err != nil {
 		return nil, s.internal("warp inbounds", err)
 	}
@@ -66,6 +68,17 @@ func (r rpc) ImportWarp(ctx context.Context, req *connect.Request[adminv1.Import
 		return nil, err
 	}
 	return connect.NewResponse(&adminv1.ImportWarpResponse{Account: r.s.accountMsg(a)}), nil
+}
+
+func (r rpc) SetWarpLicense(ctx context.Context, req *connect.Request[adminv1.SetWarpLicenseRequest]) (*connect.Response[adminv1.SetWarpLicenseResponse], error) {
+	if err := r.s.cfg.StepUp(ctx); err != nil {
+		return nil, err
+	}
+	a, err := r.s.setLicense(ctx, req.Msg.NodeId, req.Msg.LicenseKey)
+	if err != nil {
+		return nil, err
+	}
+	return connect.NewResponse(&adminv1.SetWarpLicenseResponse{Account: r.s.accountMsg(a)}), nil
 }
 
 func (r rpc) SetWarpEnabled(ctx context.Context, req *connect.Request[adminv1.SetWarpEnabledRequest]) (*connect.Response[adminv1.SetWarpEnabledResponse], error) {

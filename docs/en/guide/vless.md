@@ -1,5 +1,6 @@
 ---
 title: VLESS REALITY
+seoTitle: "VLESS REALITY panel: profiles, users, targets — Mistgate"
 description: "The VLESS profile: REALITY on TCP and XHTTP, or TLS with XHTTP and WebSocket, direct or behind a CDN. When to choose it over Hysteria2, every setting, the REALITY target, ports, and what the apps receive and need."
 ---
 
@@ -72,6 +73,8 @@ What to set on the CDN:
 5. **Origin certificate**: the origin is always TLS, never plain HTTP, because the VLESS header would cross the network in the clear. Let's Encrypt works when the CDN checks the origin's certificate. A self-signed certificate works only if the CDN is set not to verify it, and Mistgate allows it only for a profile that has a CDN host.
 6. **Origin port**: some CDNs forward only to a fixed list of ports. Use one the CDN supports (443 is the safe choice).
 
+Check separately how the CDN passes a long answer. XHTTP receives its data in one long GET, and a CDN that holds the answer back until the origin sends the next piece looks like this: the connection is there, and pages hang after five to ten seconds. According to user reports CDNvideo and the Selectel CDN behave this way, while Yandex Cloud CDN works; we have not tested these CDNs ourselves. If you see such a hang, try the WebSocket transport on the same CDN, or another CDN.
+
 If XHTTP stalls, the CDN may be holding whole request bodies: keep **Packet up**. If it still does not work, make a second profile with WebSocket; people then see both. Against a CDN that cuts idle connections after 60 to 100 seconds, the node sends keep-alive padding on a quiet download; that has not been checked against a real CDN either.
 
 > **Note:** real CDNs are not tested yet. The whole path, from a client through the node's TLS front to the internet, is tested in the project's end-to-end run, with the node itself standing in for the CDN. How a particular CDN treats long downloads, request sizes and idle connections is not known until someone tries it.
@@ -94,6 +97,8 @@ The node does not probe a target for this kind (there is nothing external to pro
 
 Choose **Another site** to have the node pass visitors on to a real site you name. The target is the site your node impersonates. A bad choice makes the node easy to tell from the real site, or makes every handshake fail.
 
+A target that points at this inbound itself (`localhost`, `127.0.0.1`, `[::1]` or the node's own address, with the inbound's own port) would send every handshake back to the node, so it is refused; so are `0.0.0.0` and `::`. A site next to the node on another port, such as `127.0.0.1:8443`, works. Choose **This node's site** when visitors should see the node's decoy site.
+
 - It must speak **TLS 1.3** and offer the post-quantum key exchange **X25519MLKEM768**. Most large modern sites do. You can ask a site with OpenSSL 3.5 or newer: `openssl s_client -connect www.example.org:443 -tls1_3 -groups X25519MLKEM768`.
 - Prefer a site in **the same network (ASN)** as the node, or at least in the same country and close to it: it matches the address the visitor connects to and keeps the handshake fast.
 - Choose a site that stays up and that nobody blocks where your people live. The node connects to it for every visitor.
@@ -104,17 +109,41 @@ When a server starts, the node tries the target once with a TLS 1.3 handshake th
 
 > **Note:** after the agent starts, or when a new target or server name appears for the first time, the first client can wait 5 to 10 seconds to connect. The node measures how the target answers once, then every later connection is quick.
 
+## Finding a site near the node
+
+A site from the node's own subnet is the most natural target: the same network, a millisecond away, a name whose address really is next door. The node can look for such sites by itself. On the node's page, the **Profiles** tab shows a card **Sites near the node** under the servers (the owner's, on the VPS panel, on a node that has a VLESS server).
+
+**What the node does.** Only when you press the button, and only after a window that says what follows: the node walks up to 253 neighbouring addresses of its own /24 subnet on **port 443**, with one or two TLS connections to each, at most 10 new connections a second and about a minute in all. The sites see connections from the node's address, and to a hoster this looks like scanning: some send a complaint or limit the server for a while. The same node can be scanned again no sooner than in 30 minutes. Nothing else is scanned: no other port, no IPv6, no wider network, and never on a schedule. The node scans only when its address is on one of its own network interfaces; a node behind NAT, or one known by a name behind a CDN, answers that it cannot, and the card says so.
+
+**What it keeps.** A site that speaks TLS 1.3, chooses **X25519MLKEM768**, has a certificate valid for its name and for more than 14 more days. The best come first: those whose DNS leads to this very address, then HTTP/2, then a certificate of one site (not a hosting's or a CDN's shared one), then a good answer to `GET /`, then the fastest handshake. The card counts what it went through: checked, answering on 443, TLS 1.3, with MLKEM, suitable.
+
+**How to read the labels.**
+
+- **DNS leads here:** the name resolves to this very address, the site really lives here. **DNS: in the subnet:** another address of the same subnet. **DNS: elsewhere:** another network, usually a CDN or a load balancer, a weaker target. **No DNS record:** the node's resolver does not know the name.
+- **HTTP/2** and **own certificate** are good news; **shared certificate** means the certificate of a hosting or a CDN that names many unrelated sites.
+- **HTTP 200** and the like: the answer to `GET /` without following redirects; **certificate for N d**: days left; **N ms**: the handshake time.
+
+**The names are other people's text.** They come from the certificates of other servers and are shown as plain text, never as a link. Do not open them from your own machine: only the node connects to them, neither the panel nor your browser does. The card leaves out your own nodes and the panel: they are no target (see above).
+
+**Apply…** is offered for sites whose DNS leads here. The window asks which REALITY server of this node should show it (when there are several), says what strangers see now and what they will see after, which server restarts, and that people get the new name only with their next subscription refresh: until then their apps cannot connect through this server. If a Hysteria2 profile stands on TCP 443 of the node, the window also says that its site gives way there, see [VLESS and Hysteria2 on one node](vless-and-hysteria2.md). Nothing is saved before the click. **Copy** puts the name on the clipboard, and you can write it as the target `name:443` of the profile yourself.
+
+**A site on this node.** The target of a profile is one for every node it stands on, and a neighbour belongs to a node. So **Apply…** sets a **site on this node** for that one server: in the **Edit** window of a REALITY server the field **Site on this node** holds `host:port` of the site, with the profile's target as the placeholder. The host is a name (not an IP address), and it becomes the one name REALITY accepts on that server. A profile that shows the node's own site shows the neighbour on this node instead, so a node with no domain can have a working target too. **Back to the profile's target** (or an empty field) undoes it; other nodes of the profile are not touched. The panel refuses an IP address, a target with no port, and the node itself at its own port.
+
+Older agents do not know a site set on a node: the panel withholds that server from them, and it shows as failed with the reason "agent too old" until you update the node. The MCP tool `node_neighbor_sites` reads the same list, and `node_update` sets the site; see [MCP](../reference/mcp.md).
+
+**Hysteria2 and TrustTunnel get no such pick.** With obfuscation (the default) Hysteria2 does not show a name in its packets at all; without it, a stranger's name works only with a self-signed certificate, which gives the node away. TrustTunnel's apps check the certificate against the name, and Let's Encrypt issues it only for your own domain. Use your own domain there, see [Hysteria2](hysteria2.md) and [TrustTunnel](trusttunnel.md).
+
 ## Ports
 
 The default is TCP 443. The node opens the port in UFW itself, with the comment `mistgate-node-managed-tcp-v1-<port>`; on firewalld, or in your provider's firewall, you open it. Port 80 is refused: it is kept for Let's Encrypt.
 
 TCP 443 is also where a Hysteria2 profile serves its web site. A VLESS profile with another site as the target on TCP 443 of the same node pauses that site; with the node's own site as the target, REALITY shows the same site, and nothing is lost. Hysteria2 itself, on UDP, is not affected either way. Read [VLESS and Hysteria2 on one node](vless-and-hysteria2.md) before you do that.
 
-Two profiles cannot listen on the same TCP port of a node. A TCP port and a UDP port with the same number do not clash.
+Two profiles cannot listen on the same TCP port of a node, with one exception: VLESS, TrustTunnel and MTProto can stand together on one TCP port, 443 for example, when each has a name of its own and one of them shows the node's own site (see [One 443 for everyone](shared-port.md)). A TCP port and a UDP port with the same number do not clash.
 
 ## How the node handles destinations
 
-VLESS keeps HTTP, TLS and QUIC sniffing enabled for routing and traffic attribution. If the app asks for a literal IP, the node keeps that IP as the destination even if a sniffed HTTP Host, TLS SNI or QUIC name differs. If the app asks for a domain, the node resolves that name with this node's DNS resolvers; WARP egress uses the same node-side DNS. See [DNS](dns.md) and [WARP](warp.md).
+VLESS does not sniff HTTP, TLS or QUIC: it can hold the first datagram of a flow for up to 200 ms and nothing here routes by a sniffed name. If the app asks for a literal IP, the node keeps that IP as the destination whatever name the traffic carries. If the app asks for a domain, the node resolves that name with this node's DNS resolvers; WARP egress uses the same node-side DNS. See [DNS](dns.md) and [WARP](warp.md).
 
 ## What the apps receive
 
@@ -157,9 +186,13 @@ A server whose node address is not a plain host name or IP address gets no link 
 
 ## What the apps need
 
-- An app that reads VLESS REALITY links (Happ and most apps of the Xray family) or an app on the mihomo core. Mistgate checks its Mihomo output against Mihomo 1.19.32.
+- An app that reads VLESS REALITY links (Happ and most apps of the Xray family) or an app on the mihomo core. Mistgate checks its Mihomo output against Mihomo 1.19.33.
 - XHTTP is newer than TCP with Vision. If an older app does not connect to an XHTTP server, make a second profile with the TCP transport; people then see both.
 - The TCP port must reach the node. If the provider filters it, the app times out.
+
+## The core and older apps
+
+Nodes run the Xray 26.11.9 core. Its REALITY library, as released, sends every app that does not offer a post-quantum key share (X25519MLKEM768) to the cover site as if it were a stranger: sing-box and the apps built on it, Mihomo without its post-quantum option, Xray cores older than 25.5.16, and the `ios`, `edge` and `random` fingerprints in any app. Mistgate nodes carry a small patch to that library and keep accepting those apps, so every app that connected before the update connects after it, and nobody has to update anything. A strict mode that accepts only post-quantum handshakes will come later, as a choice per profile; the **App versions** tab of [Subscriptions](subscriptions.md#app-versions) shows which devices would need an update first.
 
 ## Limits today
 

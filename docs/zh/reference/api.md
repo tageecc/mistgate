@@ -40,6 +40,7 @@ API 定义位于 `proto/mistgate/admin/v1/`。生成的代码也在仓库中：G
 | `WarpService` | `warp.proto` | 节点的 WARP 账户 |
 | `AwgService` | `awg.proto` | AmneziaWG 协议配置编辑器的辅助方法 |
 | `BackupService` | `backup.proto` | 面板加密备份 |
+| `TrustTunnelService` | `trusttunnel.proto` | 用户的 TrustTunnel 密钥和 `tt://` 链接（包 `mistgate.trusttunnel.v1`；管理员写入级别，对 API 令牌和 MCP 关闭） |
 | `TelegramService` | `telegram.proto` | Telegram 机器人和各管理员的聊天（仅所有者和已登录的管理员可用；API 令牌和 MCP 无法访问） |
 | `ApiTokenService`, `ApprovalService` | `integrations.proto` | API 令牌和所有者审批 |
 | `CheburcheckService`, `BsbordService` | `cheburcheck.proto`, `bsbord.proto` | [国家视角检测](../operations/reachability.md)的 cheburcheck 和 bsbord 来源：设置、状态和测试，bsbord 另有单元列表和价格查询（仅所有者；更改或断开来源以及价格查询需要再次验证；API 令牌和 MCP 无法访问） |
@@ -54,7 +55,7 @@ proto 文件中的注释是各字段的参考说明。约定（`common.proto`）
 
 ## API 令牌
 
-所有者在 **集成 → API 令牌 → 新建令牌** 中创建令牌（需要再次验证身份）：
+所有者在 **AI → MCP 与令牌 → 新建令牌** 中创建令牌（需要再次验证身份）：
 
 | 字段 | 规则 |
 |---|---|
@@ -166,6 +167,39 @@ func main() {
 
 对于其他语言，可使用 `buf generate` 和相应语言的 Connect 或 gRPC 插件，从 `proto/` 生成客户端。
 
+## Telegram 代理
+
+[MTProto](../guide/mtproto.md) 协议配置和用户的 Telegram 密钥使用 `ProfileService` 和 `UserService` 的以下部分：
+
+- `ProtocolInfo.experimental`（来自 `ProfileService.ListProtocols`）：对尚属新协议、还没有在实际环境中得到验证的协议为 true。MTProto 会设置它。
+- `AppToggles.telegram`，位于 `CreateUser` 和 `UpdateUser` 中，是用户的 Telegram 开关。开启会生成用户的密钥，关闭则吊销它。`happ` 和 `amnezia` 中至少要保持开启一个。
+- `ListUsers` 接受过滤器 `USER_FILTER_TELEGRAM`：Telegram 开关已开启的用户，不论其密钥或 MTProto 协议配置如何。列表中的每位用户带有 `access_telegram`（开关已开启且有可用的 MTProto 服务器）和 `telegram_issued`（已生成密钥）。
+- `GetTelegramLinks` 读取用户的代理：`has_key`、`key_device_id`、`key_issued_unix` 以及 `tg://proxy` 链接，每个节点和协议配置一条，其中 `ipv6`、`relay` 和 `via` 标出节点的 IPv6 副本和中转的副本。它不写入任何内容。链接带有用户的密钥，所以请像对待密码一样对待返回结果。
+- `IssueTelegramKey` 在用户没有密钥时生成密钥（需要开关已开启且用户未被停用；设备上限不适用），`RotateTelegramKey` 给它换一个新的密钥，使此前的所有链接失效（没有密钥时返回 `not_found` "key"），`RevokeTelegramKey` 吊销它并保持开关开启。每个调用都像 `GetTelegramLinks` 一样返回用户的代理。该密钥是用户的一台设备，类型为 `DEVICE_KIND_TELEGRAM_KEY`，`RevokeDevice` 也能移除它。
+
+这四个调用面向所有者和协作者，并对 API 令牌关闭，与其他返回凭据的调用一样。
+
+## 用户属于多个分组
+
+用户有一个主分组（`User.group_id`，以及 `group_name` 和 `group_color`）和任意多个附加分组：`User.extra_group_ids`，以及与之按顺序对应的 `extra_group_names` 和 `extra_group_colors`（按名称排序）。只有主分组决定 DNS 预设、Mihomo 模板、响应头和颜色；附加分组只按[用户属于多个分组](../guide/users-and-groups.md#用户属于多个分组)中的规则增加访问权限。
+
+- `UpdateUserRequest.add_group_ids` 和 `remove_group_ids` 以增量方式更改附加分组：同时发生的两次修改不会互相覆盖，重复执行不会有任何效果。`group_id` 仍是主分组；`group_id` = B 且 `add_group_ids` = [A] 时，用户的主分组变为 B，并保留 A 作为附加分组；不带 A 则旧的主分组被移出。拒绝情形为 `INVALID_ARGUMENT`：`group_in_both`、`main_group`（不能移出主分组）和 `too_many_groups`（最多 16 个分组，主分组计入），分组不存在时为 `NOT_FOUND`。
+- `UpdateUserResponse.impact`（`dry_run` 时也有）说明新的分组组合会造成什么：用户获得和失去的协议配置，以及 `AccessImpact.gained_node_ids` 和 `lost_node_ids`——用户开始获得内容的节点和不再获得任何内容的节点。一次更改计为令牌[限制](#限制)中对该用户的一次更改。
+- `ListUsersRequest.group_id` 会找到以该分组为主分组或附加分组的用户，每人只出现一次。
+- `Group.user_count` 是以其为主分组的用户数，`Group.extra_user_count` 是以其为附加分组的用户数。只有仍有人以该分组为主分组时，`DeleteGroup` 才会被拒绝（`group_not_empty`）；附加成员只是离开。审计记录 `user_update` 带有 `groups_added` 和 `groups_removed`，`group_delete` 带有离开的附加成员数（`extra_left`）。
+- 旧客户端仍可使用：只认识 `group_id` 的客户端像以前一样更改主分组。遍历 `ListUsers(group_id=X)` 并给所有人设置 `group_id=Y` 的脚本，现在也会移动附加成员并使 Y 成为他们的主分组：这类脚本应按 `User.group_id` 过滤。
+
+## TrustTunnel
+
+[TrustTunnel](../guide/trusttunnel.md) 协议配置和用户的密钥使用 `ProfileService`、`UserService` 和独立的服务 `mistgate.trusttunnel.v1.TrustTunnelService`：
+
+- TrustTunnel 的 `ProtocolInfo.experimental` 为 true，与 MTProto 相同。
+- `CreateUser` 和 `UpdateUser` 中的 `AppToggles.trust_tunnel` 是用户的 TrustTunnel 开关。用户处于活动状态时，开启会生成用户的密钥，关闭会吊销它。`happ` 和 `amnezia` 中至少要保留一个开启。
+- `GetTrustTunnelLinks` 读取用户的链接：`has_key`、`key_device_id`、`key_issued_unix` 以及 `tt://` 链接，每个节点和协议配置一条，其中 `ipv6`、`relay` 和 `via` 标出副本。无法生成的链接（自签名服务器）`url` 为空并带有 `note`。它不写入任何内容。
+- `IssueTrustTunnelKey` 在用户没有密钥时生成密钥（开关必须开启且用户处于活动状态；密钥占用设备上限中的一个名额，达到上限时调用会以 `device_limit` 失败），`RevokeTrustTunnelKey` 吊销密钥并保持开关开启。两者的应答与 `GetTrustTunnelLinks` 相同。
+
+`tt://` 链接带有用户的密钥，所以这三个调用都是管理员写入级别，对 API 令牌和 MCP 关闭，与其他返回凭据的调用一样。在 Cloudflare 版本中它们返回 `unavailable_in_edition`。
+
 ## 令牌权限级别
 
 令牌权限级别对应管理后台角色：**只读**对应只读角色，**操作员**对应协作者，**管理员**对应所有者。除角色权限外，令牌还只能调用固定允许列表中的方法（`internal/panel/auth/policy_tokens.go`）；无论权限级别如何，其他方法都会被拒绝。允许列表中的方法均不会返回凭据。
@@ -181,30 +215,35 @@ func main() {
 | `ProfileService.ListProfiles`, `ProfileService.GetProfile`（密钥已遮蔽） | 是 | 是 | 是 |
 | `ProfileService.ListProtocols`, `ProfileService.PreviewProfile` | 是 | 是 | 是 |
 | `SubscriptionService.GetSubscriptionSettings`, `ListClients`, `TestUserAgent` | 是 | 是 | 是 |
-| `UpdateService.GetUpdates` | 是 | 是 | 是 |
+| `UpdateService.GetUpdates`、`GetOsUpdates` | 是 | 是 | 是 |
 | `UserService.CreateUser`, `UpdateUser`, `SetUsersEnabled`, `ExtendUsers`, `ResetUserTraffic`, `RevokeDevice` | 否 | 是 | 是 |
-| `HealthService.MuteAlert`, `RunChecksNow`, `RunDoctor` | 否 | 是 | 是 |
+| `HealthService.MuteAlert`, `DismissAlert`, `RunChecksNow`, `RunDoctor` | 否 | 是 | 是 |
 | `AuthService.ListAudit` | 否 | 否 | 是 |
 | `HealthService.ApplyFix` | 否 | 否 | 仅可通过已批准的 MCP 计划执行 |
 | `UpdateService.StartRollout`, `PauseRollout`, `ResumeRollout`, `CancelRollout`, `RollbackNode` | 否 | 否 | 仅可通过已批准的 MCP 计划执行 |
-| `UpdateService.ScheduleNodeUpdate`, `CancelNodeUpdateSchedule`, `SetUpdateTimezone` | 否 | 否 | 仅可通过已批准的 MCP 计划执行 |
+| `UpdateService.StartOsRollout`, `CancelOsRollout` | 否 | 否 | 仅可通过已批准的 MCP 计划执行 |
+| `UpdateService.RefreshOsUpdates` | 否 | 否 | 否（所有者在管理后台点击） |
+| `UpdateService.ScheduleNodeUpdate`, `CancelNodeUpdateSchedule`, `SetUpdateTimezone`, `SetUpdateDownloadTimeout` | 否 | 否 | 仅可通过已批准的 MCP 计划执行 |
 | `ProvisioningService.ListNodeServerAccess`（连接元数据，不含密码） | 否 | 否 | 是 |
 | `ProvisioningService.GetSSHFingerprint` | 否 | 否 | 仅在 MCP 服务器制定 `node_install` 计划时可用 |
 | `ProvisioningService.StartNodeProvision`, `RotateNodeServerPassword` | 否 | 否 | 仅可通过已批准的 MCP 计划执行 |
-| `SubscriptionService.UpdateSubscriptionSettings`（用户页面的一个应用） | 否 | 仅可通过已批准的 MCP 计划执行 | 仅可通过已批准的 MCP 计划执行 |
+| `SubscriptionService.UpdateSubscriptionSettings`（共享设置：用户页面的应用、文本、自定义响应头、自有 Mihomo 模板、自有 Happ 和 INCY 路由配置；修改模板或路由配置的保存只属于所有者：协作者会收到 `PERMISSION_DENIED` `mihomo_templates_owner_only` 或 `routing_profiles_owner_only`，令牌只能经所有者批准 `subscription_mihomo_template_set` 或 `subscription_routing_set` 计划后修改） | 否 | 仅可通过已批准的 MCP 计划执行 | 仅可通过已批准的 MCP 计划执行 |
+| `SubscriptionService.PreviewRoutingProfile` | 否 | 否 | 否（管理面板对粘贴配置的读取；智能体在 `subscription_settings_get` 中查看配置，并在 `subscription_preview` 中查看某人得到哪个） |
+| `SubscriptionService.PreviewMihomoTemplate` | 否 | 否 | 否（管理面板的预览；智能体用 `subscription_mihomo_template_get` 读取模板，并在 `subscription_preview` 中查看某人得到哪个模板） |
 | `ProfileService.CreateProfile`, `UpdateProfile`, `DeleteProfile`, `CreateInbound`, `DeleteInbound`; `GroupService.UpdateGroup` | 否 | 否 | 仅可通过已批准的 MCP 计划执行 |
 
-以下操作对所有令牌都不可用：删除用户、获取订阅链接、设备及其密钥、解除设备拉黑（`UserService.UnblockDevice`；令牌可以通过带 `block` 的 `RevokeDevice` 拉黑设备，但只有管理员能解除拉黑）；节点注册、设置、重启、日志和退役；准备 AmneziaWG 内核模块；管理员自己的 SSH 安装步骤（检查服务器、重试任务、显示或清除已保存的凭据）；创建分组、DNS 预设和订阅设置（通过已批准的计划更改用户页面的应用列表除外）；WARP、备份、面板更新和重新扫描发布包；品牌设置、令牌、审批；管理员自己的账户（通行密钥、密码、会话、再次验证）以及人机验证设置。
+以下操作对所有令牌都不可用：删除用户、获取订阅链接、Telegram 代理和 TrustTunnel 的密钥和链接、设备及其密钥、解除设备拉黑（`UserService.UnblockDevice`；令牌可以通过带 `block` 的 `RevokeDevice` 拉黑设备，但只有管理员能解除拉黑）；节点注册、设置、重启、日志和退役；准备 AmneziaWG 内核模块；一次从多个节点移除协议配置（可同时删除，`ProfileService.RemoveProfileFromNodes`）；管理员自己的 SSH 安装步骤（检查服务器、重试任务、显示或清除已保存的凭据）；创建分组、DNS 预设和订阅设置（通过已批准的计划更改用户页面的应用列表除外）；WARP、备份、面板更新和重新扫描发布包；品牌设置、令牌、审批；管理员自己的账户（通行密钥、密码、会话、再次验证）以及人机验证设置。
 
 ## 需要所有者批准的变更
 
 令牌不能通过再次验证。需要再次验证或会更改节点运行内容的方法都不能由令牌直接调用；通过普通 API 调用时会返回 403 和消息 `this needs the owner's approval; it is not available over the API`。
 
-这些方法只能通过持有管理员令牌的 [MCP 服务器](mcp.md)调用（用户页面的应用列表从操作员权限级别起即可调用）：智能体先制定变更计划，所有者在**集成 → 待你审批**中查看并批准计划（所有者需要自行再次验证），之后智能体会通过一次 apply 完成计划所需的调用。系统会在每次调用时检查审批；授权仅允许调用该计划列出的方法。计划会在创建 10 分钟后过期。
+这些方法只能通过持有管理员令牌的 [MCP 服务器](mcp.md)调用（用户页面的应用列表从操作员权限级别起即可调用）：智能体先制定变更计划，所有者在**AI → 等待您处理**中查看并批准计划（所有者需要自行再次验证），之后智能体会通过一次 apply 完成计划所需的调用。系统会在每次调用时检查审批；授权仅允许调用该计划列出的方法。计划会在创建 10 分钟后过期。
 
 ## 限制
 
 - **每个令牌的每分钟请求数**：按令牌设置（1 到 600，默认 120），突发上限为 30。超出限制时返回 429 和 `Retry-After`。
+- **每个令牌的用户更改次数**：从该令牌第一次此类更改起算的一小时内，令牌最多可收回或改写 10 人的访问：停用、重置流量、撤销或封禁设备、修改用户、迁移分组成员，或修改分组而改变其成员所得内容。每次调用中的每个人都会计数；没有实际改动的调用不计入，创建、延期和启用用户也不计入。超出限额的调用会被整体拒绝：返回 429 和代码 `token_user_change_limit`，以及 `limit`、`used`、`asked` 和 `retry_after_seconds`（单次调用请求的人数超过整个限额时为 0，消息中还带有 `reason=over_hourly_limit`：请拆分调用或联系所有者）。所有者可以在 **AI → MCP 与令牌**中为单个令牌解除限额（令牌行中的**限额**，或创建时的开关）；需要重新验证。通过 MCP 时，超出限额的计划不会被拒绝，而是等待所有者批准。更新后，已有的令牌都受此限额约束。
 - **管理后台每个客户端网络**：每秒 30 次请求，突发上限为 200；Cookie 和令牌使用相同限制。
 - **请求大小**：根据服务不同，为 64 KiB 到 1 MiB。
 - **有效期**：每个令牌都会过期（最长 365 天）。
@@ -215,7 +254,7 @@ func main() {
 
 ## 响应中不会包含的内容
 
-- 使用令牌调用 `CreateUser` 时，返回的用户信息不包含订阅链接和页面密码。令牌不能调用 `GetSubscriptionLink`。
+- 使用令牌调用 `CreateUser` 时，返回的用户信息不包含订阅链接和页面密码。令牌不能调用 `GetSubscriptionLink`。`UpdateUser` 接受 `page_password_action`（`CHANGE`、`REMOVE` 或 `RESTORE`）来处理用户页面密码：同一链接换新密码、页面仅凭链接即可打开、重新要求密码并使用新密码。它在令牌的每小时限额中算作对该用户的一次更改，没有实际变化的重复请求不计数，任何响应都不返回密码（所有者通过 `GetSubscriptionLink` 查看）。`User.page_open` 表示密码已被移除。
 - 对所有调用者，协议配置密钥都会以遮蔽形式返回（`••••`）。
 - 令牌不能访问设备密钥和配置（`DeviceService`）及 WARP 账户。
 - 设备 ID（HWID）既不会被保存，也不会被返回：`Device.fingerprint` 是其哈希的前六个字符，足以区分两部相同的手机。

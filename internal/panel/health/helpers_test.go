@@ -13,6 +13,7 @@ import (
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
 	agentv1 "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/internal/agentcap"
 	"github.com/mistgate/mistgate/internal/panel/access"
 	"github.com/mistgate/mistgate/internal/panel/protocols/builtin"
 	panelvless "github.com/mistgate/mistgate/internal/panel/protocols/vless"
@@ -61,7 +62,9 @@ type fakeFleet struct {
 	fixCalls   []fixCall
 	relayCheck func(ctx context.Context, relayID string, stages ...string) (store.RelayCheck, error)
 	relayCalls []string
-	online     map[string]int
+	// relayStages is the stages each of those calls named (none = the default pair).
+	relayStages [][]string
+	online      map[string]int
 }
 
 func (f *fakeFleet) OnlineByInbound(context.Context) map[string]int {
@@ -150,6 +153,7 @@ func (f *fakeFleet) ApplyFix(_ context.Context, node, fix string, dry bool, para
 func (f *fakeFleet) CheckRelay(ctx context.Context, relayID string, stages ...string) (store.RelayCheck, error) {
 	f.mu.Lock()
 	f.relayCalls = append(f.relayCalls, relayID)
+	f.relayStages = append(f.relayStages, stages)
 	check := f.relayCheck
 	f.mu.Unlock()
 	if check == nil {
@@ -227,7 +231,7 @@ func (e *env) node(id, provider string, up bool) {
 	now := e.clock.Now().Unix()
 	e.exec(`INSERT INTO node (id, name, address, provider, state, created_at, last_seen_at, last_connected_at) VALUES (?, ?, ?, ?, 'active', 1, ?, ?)`,
 		id, id, id+".example.com", provider, now, now)
-	e.fl.set(id, liveState{up: up, caps: []string{capDoctor}, lastSeen: time.Unix(now, 0)})
+	e.fl.set(id, liveState{up: up, caps: []string{agentcap.Doctor}, lastSeen: time.Unix(now, 0)})
 }
 
 // inbound deploys a new hy2 profile on a node on the given port and marks it active (as the node reports).

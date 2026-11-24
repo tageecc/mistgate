@@ -5,6 +5,8 @@ description: For maintainers and for anyone who builds Mistgate with a key of th
 
 Mistgate trusts one Ed25519 release key: whoever holds its private half decides what node agents and panels may install. The official binaries carry the project's key, and the maintainers sign every GitHub release with it. If you install the official release, you need nothing on this page; [Updates](updates.md) covers running the fleet. This page is for the maintainers, and for anyone who builds the binaries with a key of their own.
 
+![What an update is trusted for](../diagrams/update-trust.svg)
+
 ## The release key
 
 - The private half stays offline. The public half is stamped into both binaries at build time: `RELEASE_KEY` for `make build`, `--key` for `mistgate release build`, and the repository variable `MISTGATE_RELEASE_PUBLIC_KEY` in the release workflow.
@@ -58,6 +60,17 @@ gh release edit "$VERSION" --repo Mistgate/mistgate --draft=false
 `release sign` refuses unless the checkout is exactly the tag without local changes, then rebuilds every binary with `mistgate release build` and the public half of your key and compares it with the downloaded one. The last command publishes the draft: do not publish it before all seven files have uploaded.
 
 If signing refuses because a binary does not match its rebuild, do not sign: find out why first. The usual causes are a different key in `MISTGATE_RELEASE_PUBLIC_KEY`, a tag moved after the build, or a toolchain difference (below); an unexplained difference may mean a compromised runner.
+
+### Release channels
+
+A tag also says the release's channel (see [Release channels](updates.md#release-channels)): `vX.Y.Z` is stable, `vX.Y.Z-testing.N` testing and `vX.Y.Z-dev.N` development, where `X.Y.Z` is the stable version the work is heading for and `N` counts from 1. The release workflow accepts only these forms. A testing or development tag makes a *prerelease* that is never GitHub's *latest*, so the default installer and older panels keep getting stable releases. A stable or testing tag must point at a commit on `main` or on a `release/*` branch, or the workflow stops; a development tag may point at any commit.
+
+- **Promote a commit, not `main`.** Tag the commit that was tested: the commit of `v0.1.80-testing.2` becomes `v0.1.80`, even when `main` has moved on with unfinished work.
+- **A fix for stable while `main` is not ready**: branch `release/0.1.80` from the stable tag, cherry-pick the fix there, tag `v0.1.81` on that branch, and bring the fix back to `main`.
+- **Signing and publishing** are the same steps for every channel; a development release can use a shorter `--expires` (`30d`).
+- **Notes**: every release gets notes in English, Russian and Chinese separated by `---`; panels show them under **What's new**. The status page names only stable releases.
+
+The design is in `design/adr/0011-release-channels.md`.
 
 ### Reproducible builds
 

@@ -1,5 +1,6 @@
 ---
 title: Install the panel
+seoTitle: "Install a self-hosted VPN panel on Linux — Mistgate"
 description: Download or build Mistgate, prepare the panel with mistgate setup, run it under systemd and sign in for the first time.
 ---
 
@@ -15,7 +16,7 @@ For a fresh Linux server on amd64 or arm64 with systemd, run this as root. The d
 curl -fsSL https://mistgate.app/install.sh | sudo bash -s -- --public-url https://panel.example.com
 ```
 
-The installer requests a Let's Encrypt certificate for the URL host by default. It asks before making changes; add `--yes` for a non-interactive run. Use `--dry-run` to download and verify a release without changing the host, or `--version vX.Y.Z` to install a pinned release. `--admin-host`, `--admin-listen`, `--acme-domain` and `--data-dir` select the setup and service options described below.
+The installer requests a Let's Encrypt certificate for the URL host by default. It asks before making changes; add `--yes` for a non-interactive run. Use `--dry-run` to download and verify a release without changing the host, `--version vX.Y.Z` to install a pinned release, or `--channel testing` or `--channel dev` to install the newest release of an earlier [release channel](../operations/updates.md#release-channels), which the panel then follows. `--restore FILE` with `--identity-file KEY` or `--passphrase-file FILE` restores a backup instead of setting up a new panel: see [Backups](../operations/backups.md#restore-on-a-new-panel). `--admin-host`, `--admin-listen`, `--acme-domain` and `--data-dir` select the setup and service options described below.
 
 When it finishes, open the one-time setup link in a browser and create the owner account. The link expires in 30 minutes. Then add a node from **Nodes → Add node**.
 
@@ -207,7 +208,7 @@ Why it looks like this:
 If another web server must own port 443 on this host, Mistgate can run behind it:
 
 - Run the public listener without TLS on loopback (`--listen 127.0.0.1:8080`, no `--acme-domain`, no `--tls-cert`) and let the proxy terminate TLS for `panel.example.com`, passing the Host header and the path through unchanged.
-- Add `--trusted-proxy 127.0.0.1` so that rate limits, sessions and the audit log see the real client address from `X-Forwarded-For` or `Forwarded`.
+- Add `--trusted-proxy 127.0.0.1` so that rate limits, sessions and the audit log see the real client address from `X-Forwarded-For`. The proxy must set or overwrite that header itself, so a client cannot supply its own; a proxy that only writes `Forwarded` is not supported.
 - Node agents need TLS from the panel itself. Give them a listener of their own and put its address into the install commands: `--agent-listen :8443 --agent-addr panel.example.com:8443`. The proxy must not touch that port.
 
 The agent port is then a port of its own that answers only the secret TLS name; on the shared port 443 it hides behind the decoy site. Prefer the plain setup above when you can.
@@ -216,7 +217,7 @@ The agent port is then a port of its own that answers only the secret TLS name; 
 
 Open the setup link from step 3 in a browser, the whole link including the part after `#`.
 
-1. **Language.** Pick English, Russian or Simplified Chinese. You can change it later.
+1. **Language.** Pick English, Russian, Simplified Chinese, Persian or Turkish. You can change it later.
 2. **Create the admin.** The LOGIN field (it starts as `admin`) is your login and the name the panel shows. Then:
    - **Create passkey**: the browser asks for a fingerprint, a face, a PIN or a security key. The key stays on your device. This is the recommended way.
    - **password + authenticator code**: a password of at least 12 characters, then scan the QR code with an authenticator app (Google Authenticator, 1Password, Aegis and the like), type the 6-digit code and press **Create admin**.

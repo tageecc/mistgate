@@ -4,17 +4,20 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/netip"
 	"sort"
 	"time"
 
 	"github.com/mistgate/mistgate/internal/panel/access"
 	"github.com/mistgate/mistgate/internal/panel/backup"
+	"github.com/mistgate/mistgate/internal/panel/clientapi"
 	"github.com/mistgate/mistgate/internal/panel/clientprobe"
 	"github.com/mistgate/mistgate/internal/panel/cloudusage"
 	"github.com/mistgate/mistgate/internal/panel/fleet"
 	"github.com/mistgate/mistgate/internal/panel/httpserver"
 	nodeprovision "github.com/mistgate/mistgate/internal/panel/provision"
 	"github.com/mistgate/mistgate/internal/panel/subs"
+	"github.com/mistgate/mistgate/internal/panel/update"
 	"github.com/mistgate/mistgate/internal/statehash"
 )
 
@@ -64,8 +67,19 @@ func Build(c Config) (*Panel, error) {
 	if err != nil {
 		return nil, err
 	}
+	k.newAssistantService()
+	k.newTasksService()
 	c = k.c
 	parts := k.base.newSubParts(true)
+	parts.cfg.ClientDebug = k.base.clientDebug(k.tg) // the VPS edition only; the edge edition and the Workers take no logs
+	if !k.base.edge && k.upd != nil {
+		parts.cfg.ClientASN = func(ip netip.Addr) uint32 {
+			if table := k.upd.NetworksTable(); table != nil {
+				return table.Lookup(ip)
+			}
+			return 0
+		}
+	}
 	prov, bkp, err := k.provisionAndBackup()
 	if err != nil {
 		return nil, err
@@ -76,6 +90,9 @@ func Build(c Config) (*Panel, error) {
 	}
 	cfg := k.adminConfig(parts, prov, bkp, c.ProvisionForward)
 	cfg.PublicMounts = map[string]http.Handler{k.in.SubPrefix: parts.mux(k.base, k.acc)}
+	if k.own != nil && k.in.ProbePrefix != "" {
+		cfg.PublicMounts[k.in.ProbePrefix] = k.own.PublicHandler(k.c.DecoyDir)
+	}
 	cfg.AgentSNI, cfg.AgentTLS, cfg.AgentHandler = k.in.AgentSNI, k.fl.AgentTLSConfig, k.fl.AgentHandler()
 	cfg.AgentLinkPrefix, cfg.AgentLinkHandler = k.in.LinkPrefix, link
 	return k.finish(cfg, prov, bkp, true)
@@ -88,13 +105,15 @@ func BuildAdmin(c Config) (*Panel, error) {
 	if err != nil {
 		return nil, err
 	}
+	k.newAssistantService()
+	k.newTasksService()
 	parts := k.base.newSubParts(true)
 	prov, bkp, err := k.provisionAndBackup()
 	if err != nil {
 		return nil, err
 	}
 	cfg := k.adminConfig(parts, prov, bkp, true)
-	cfg.ReservedPrefixes = []string{k.in.SubPrefix, k.in.LinkPrefix}
+	cfg.ReservedPrefixes = []string{k.in.SubPrefix, k.in.LinkPrefix, k.in.ProbePrefix}
 	return k.finish(cfg, prov, bkp, false)
 }
 
@@ -116,7 +135,7 @@ func BuildProvision(c Config) (*Panel, error) {
 	path, handler := forwardProvision(false, prov.Handler)
 	cfg.AdminHandlers = []httpserver.AdminHandler{{Path: path, Handler: handler}}
 	cfg.AdminPages = []httpserver.AdminPage{{Path: nodeprovision.AdminPagePath, Handler: forwardPage(false, prov.PageHandler())}}
-	cfg.ReservedPrefixes = []string{k.in.SubPrefix, k.in.LinkPrefix}
+	cfg.ReservedPrefixes = []string{k.in.SubPrefix, k.in.LinkPrefix, k.in.ProbePrefix}
 	return k.finish(cfg, prov, nil, false)
 }
 
@@ -133,7 +152,7 @@ func BuildLink(c Config) (*Panel, error) {
 	cfg := httpserver.Config{
 		DecoyDir: k.c.DecoyDir, Log: k.log,
 		AgentLinkPrefix: k.in.LinkPrefix, AgentLinkHandler: k.fl.LinkHandler(),
-		ReservedPrefixes: []string{k.in.MuxPrefix(), k.in.SubPrefix},
+		ReservedPrefixes: []string{k.in.MuxPrefix(), k.in.SubPrefix, k.in.ProbePrefix},
 	}
 	srv, err := httpserver.NewPublic(cfg, k.st)
 	if err != nil {
@@ -170,7 +189,7 @@ func BuildPublic(c Config) (*Panel, error) {
 	if err != nil {
 		return nil, err
 	}
-	acc, err = access.New(b.st, b.vlt, b.reg, fl, fl, b.accessConfig(fl))
+	acc, err = access.New(b.st, b.vlt, b.reg, fl, fl, b.accessConfig(fl, nil))
 	if err != nil {
 		return nil, err
 	}
@@ -178,7 +197,7 @@ func BuildPublic(c Config) (*Panel, error) {
 	cfg := httpserver.Config{
 		DecoyDir: b.c.DecoyDir, Log: b.log,
 		PublicMounts:     map[string]http.Handler{b.in.SubPrefix: parts.mux(b, acc)},
-		ReservedPrefixes: []string{b.in.MuxPrefix(), b.in.LinkPrefix},
+		ReservedPrefixes: []string{b.in.MuxPrefix(), b.in.LinkPrefix, b.in.ProbePrefix},
 	}
 	srv, err := httpserver.NewPublic(cfg, b.st)
 	if err != nil {
@@ -206,14 +225,17 @@ func (k *core) adminConfig(parts subParts, prov *nodeprovision.Service, bkp *bac
 	cfg := k.baseHTTP()
 	k.cloud = cloudusage.New(cloudusage.Config{Store: k.st, Vault: k.vlt, StepUp: k.authSvc.RequireStepUp, Log: k.log, Now: k.c.Clock, Edge: k.edge})
 	subSvc := subs.NewService(k.st, parts.cache, k.reg, parts.brand, parts.dns, k.log)
-	subSvc.NotifyWith(k.fl) // a switch to STRICT revokes the shared devices
+	subSvc.NotifyWith(k.fl)                         // a switch to STRICT revokes the shared devices
+	subSvc.RoutingWith(subs.HappRouting(parts.dns)) // the preview of what Happ and INCY receive
+	subSvc.PreviewWith(k.acc)                       // the preview of a Mihomo template reads the person's view, writes nothing
 	// The kl!ck reports: the owner's switch (it rides with the subscription settings, hence their cache) and the counts.
 	probe := clientprobe.New(clientprobe.Config{Store: k.st, StepUp: k.authSvc.RequireStepUp, Invalidate: parts.cache.Invalidate, Log: k.log, Now: k.c.Clock})
+	clientAPI := clientapi.New(clientapi.Config{Store: k.st, StepUp: k.authSvc.RequireStepUp, Invalidate: parts.cache.Invalidate, Log: k.log, Now: k.c.Clock})
 	for _, h := range []func() (string, http.Handler){
 		func() (string, http.Handler) { return k.cloud.Handler() },
 		func() (string, http.Handler) { return k.fl.NodeHandler() },
 		func() (string, http.Handler) { return k.fl.FleetHandler() },
-		k.acc.ProfileHandler, k.acc.UserHandler, k.acc.GroupHandler, k.acc.DeviceHandler, k.acc.AwgHandler, k.acc.RelayHandler, subSvc.Handler, parts.dns.Handler,
+		k.acc.ProfileHandler, k.acc.UserHandler, k.acc.GroupHandler, k.acc.DeviceHandler, k.acc.AwgHandler, k.acc.RelayHandler, k.acc.ClientCompatHandler, subSvc.Handler, parts.dns.Handler,
 		func() (string, http.Handler) { return k.wsv.Handler() },
 		func() (string, http.Handler) { return forwardProvision(forward, prov.Handler) },
 		func() (string, http.Handler) { return k.hl.Handler() },
@@ -227,16 +249,29 @@ func (k *core) adminConfig(parts subParts, prov *nodeprovision.Service, bkp *bac
 		func() (string, http.Handler) { return k.bl.Handler() },
 		func() (string, http.Handler) { return k.cp.Handler() },
 		func() (string, http.Handler) { return probe.Handler() },
+		func() (string, http.Handler) { return clientAPI.Handler() },
+		bkp.DownloadHandler,
 	} {
 		path, handler := h()
 		cfg.AdminHandlers = append(cfg.AdminHandlers, httpserver.AdminHandler{Path: path, Handler: handler})
 	}
+	cfg.AdminHandlers = append(cfg.AdminHandlers, probeAdminHandlers(k.fl)...)     // probes between nodes: the VPS only
+	cfg.AdminHandlers = append(cfg.AdminHandlers, ownProbeAdminHandlers(k.own)...) // the panel's own probes: the VPS only
 	// API tokens and the owner's approvals, then the MCP endpoint over the same admin API.
 	cfg.AdminHandlers = append(cfg.AdminHandlers, integrationHandlers(k.authSvc)...)
+	if path, handler := k.assistantHandler(); path != "" {
+		cfg.AdminHandlers = append(cfg.AdminHandlers, httpserver.AdminHandler{Path: path, Handler: handler})
+	}
+	cfg.AdminAPIReady = func(api http.Handler) { k.attachAssistantRuntime(api) }
 	cfg.AdminPages = []httpserver.AdminPage{{Path: nodeprovision.AdminPagePath, Handler: forwardPage(forward, prov.PageHandler())}}
-	cfg.MCP = mcpEndpoint(k.authSvc, k.st, k.log, k.tg.PlanWaiting, k.c.Clock)
+	cfg.MCP = mcpEndpoint(k.authSvc, k.st, k.limiter, k.log, k.tg.PlanWaiting, k.c.Clock)
 	// The admin's framed preview of the public user page (session and read role are checked by the server).
 	cfg.UserPagePreview = subs.PreviewHandler(k.acc, parts.cfg)
+	k.addOps(&cfg)
+	k.addTasks(&cfg)
+	k.addTrustTunnel(&cfg)
+	k.addDecoySite(&cfg)
+	k.addWarpReach(&cfg)
 	return cfg
 }
 
@@ -249,6 +284,14 @@ func (k *core) provisionAndBackup() (*nodeprovision.Service, *backup.Service, er
 	bkp, err := backup.New(backup.Config{
 		Store: k.st, Vault: k.vlt, DataDir: k.c.DataDir, MasterKey: k.c.MasterKey,
 		Edge: k.edge, StepUp: k.authSvc.RequireStepUp, OnResult: backupResult(k.tg), Log: k.log,
+		RestorePanelData: func(ctx context.Context, request backup.RestoreRequest, beforeStart func() error) error {
+			return k.upd.StartPanelRestore(ctx, update.PanelRestoreRequest{
+				StageDir: request.StageDir, Source: request.Source, FileName: request.FileName,
+				MadeByVersion: request.MadeByVersion, RequestedUnix: request.RequestedUnix,
+			}, beforeStart)
+		},
+		DeleteKeptData:       k.upd.DeleteKeptData,
+		RestoreHelperRunning: k.upd.PanelUpdateRunning,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -290,7 +333,7 @@ func (k *core) finish(cfg httpserver.Config, prov *nodeprovision.Service, bkp *b
 	p.Handler, p.Server, p.Provision, p.Backup, p.Surface = srv.Public(), srv, prov, bkp, surfaceOf(cfg)
 	if jobs {
 		p.BackgroundJobs = backgroundJobs(k.c, jobServices{fleet: k.fl, access: k.acc, health: k.hl, blocklist: k.bl, probe: k.cp,
-			cheburcheck: k.cc, bsbord: k.bs, update: k.upd, backup: bkp, telegram: k.tg, provision: prov, store: k.st, log: k.log})
+			cheburcheck: k.cc, bsbord: k.bs, update: k.upd, warp: k.wsv, backup: bkp, telegram: k.tg, assistant: k.assistantRetention, tasks: k.sched, provision: prov, store: k.st, log: k.log})
 		p.BackgroundJobs = append(p.BackgroundJobs, BackgroundJob{Name: "cloud-usage", Run: k.cloud.Run})
 	}
 	return p, nil

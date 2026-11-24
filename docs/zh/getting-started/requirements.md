@@ -13,7 +13,7 @@ Mistgate 需要一台 Linux 面板服务器、一台或多台 Linux 节点服务
 | 访问权限 | 安装时需要 root。面板运行后只需绑定 TCP 443 和 80，并写入数据目录。 |
 | 域名 | 一个主机名，其 A 记录（以及使用 IPv6 时的 AAAA 记录）指向服务器，例如 `panel.example.com`。 |
 | 入站端口 | TCP 443：用于伪装站点、订阅、用户页面、管理后台（前缀和主机名模式）以及节点 Agent。面板通过 Let’s Encrypt 获取证书时，还需要 TCP 80。除非选择单独的管理后台或 Agent 监听器，否则无需开放其他端口。 |
-| 出站连接 | 使用 Let’s Encrypt 时连接其 HTTPS 服务。节点上服务器的端口：面板会像客户端一样检查每台服务器（通过 UDP 运行的 Hysteria2、通过 UDP 运行的 AmneziaWG）。从管理后台安装节点时，SSH（TCP 22 或指定端口）连接节点服务器。通过 HTTPS 连接 GitHub（`api.github.com`、`github.com` 和其下载主机）获取发布版本：面板每 10 分钟检查新的已签名节点包和面板更新。注册 WARP 账户、启用 Turnstile 人机验证或备份到 R2 时，通过 HTTPS 连接 Cloudflare。 |
+| 出站连接 | 使用 Let’s Encrypt 时连接其 HTTPS 服务。节点上服务器的端口：面板会像客户端一样检查每台服务器（通过 UDP 运行的 Hysteria2、通过 UDP 运行的 AmneziaWG）。从管理后台安装节点时，SSH（TCP 22 或指定端口）连接节点服务器。通过 HTTPS 连接 GitHub（`api.github.com`、`github.com` 和其下载主机）获取发布版本：面板每 10 分钟检查新的已签名节点包和面板更新。注册 WARP 账户、启用 Turnstile 人机验证或备份到 R2 时，通过 HTTPS 连接 Cloudflare。面板还会在你于“从模板创建”窗口填入密钥后，连接模板伪装站点的图片来源：`api.pexels.com` 和 `images.pexels.com`（Pexels），或 `pixabay.com` 和 `cdn.pixabay.com`（Pixabay）。 |
 | 存储 | 默认数据目录为 `/var/lib/mistgate`：包含一个 SQLite 数据库、主密钥、节点包和少量文件。 |
 | 其他软件 | 无。面板是一个静态二进制文件。只有自更新会调用 systemd（`systemctl`、`systemd-run`）。 |
 
@@ -28,7 +28,7 @@ Mistgate 需要一台 Linux 面板服务器、一台或多台 Linux 节点服务
 | 系统 | 使用 systemd 的 Linux：Ubuntu 22.04 或更高版本，或 Debian 12 或更高版本。amd64 或 arm64。 |
 | 访问权限 | 使用 SSH 安装器时：通过 SSH 使用 root 登录，或使用支持非交互式 `sudo -n` 的 SSH 用户，并通过密码登录；面板服务器必须能访问 SSH 端口。安装器以 root 身份更改系统，需要服务器至少有 256 MB 内存，面板中还必须有已签名的节点包；如果 UFW 或 firewalld 已启用，安装器会开放 SSH 端口、TCP 80、TCP 443 和 UDP 443。手动运行 `mistgate-node install` 也需要 root；Agent 以 root 身份运行，但可用能力集受到限制。 |
 | 地址 | 公网 IPv4 地址。客户端连接节点地址：指向服务器的域名，或服务器 IP。 |
-| nftables | `nft` 命令（Debian 12 和 Ubuntu 22.04 及更高版本默认安装）。Agent 通过它管理防火墙规则。端口跳跃需要 `inet` 族中的 `redirect`，Linux 内核 5.2 及更高版本支持此功能。 |
+| nftables | `nft` 命令（软件包 `nftables`）。Debian 12 和 Ubuntu 22.04 及更高版本通常带有它，但 **Debian 13 的云镜像没有**。SSH 安装会检查它，并作为向导中可见的单独一步自行安装该软件包；手动 `mistgate-node install` 会以退出码 3 停止，并给出要运行的命令（`apt-get install -y nftables`）；对已在运行的节点，节点诊断的 `nftables` 检查提供同样的安装作为修复。没有 `nft` 时 Agent 仍会运行，但 SSH 防护、端口跳跃、WARP 路由和 UDP 交付检测都无法工作。Agent 通过它管理防火墙规则。端口跳跃需要 `inet` 族中的 `redirect`，Linux 内核 5.2 及更高版本支持此功能。 |
 | TUN 设备 | 用户态 AmneziaWG 后端和 WARP 需要 `/dev/net/tun`。在容器 VPS（OpenVZ、LXC）上，需要在服务商控制面板中启用 TUN。 |
 | 时钟 | 通过 NTP 同步。Agent 会报告与面板相差超过 30 秒的时钟；诊断中的 `time_sync` 检查也会检查这一点。 |
 | 入站端口 | 节点上每个 Hysteria2 和 AmneziaWG 服务器的 UDP 端口：Hysteria2 默认使用 443，AmneziaWG 协议配置会获得 10000 到 60000 之间的随机端口。每个 VLESS 服务器的 TCP 端口（默认 443，不使用 80）。启用 Hysteria2 协议配置的端口跳跃时，还需开放其范围（从 1024 起，最多 20,000 个端口）。TCP 443 用于向非客户端访问者展示 Hysteria2 HTTPS 站点，也用于 Let’s Encrypt。没有其他服务占用时，TCP 80 用于 Let’s Encrypt。 |
@@ -52,7 +52,7 @@ Mistgate 需要一台 Linux 面板服务器、一台或多台 Linux 节点服务
 
 | 工具 | 版本 |
 |:--|:--|
-| Go | 1.27。`go.mod` 指定工具链版本（`go1.27.1`）；使用默认的 `GOTOOLCHAIN=auto` 时，较旧版本的 Go 会自动下载该工具链。 |
+| Go | 1.27。`go.mod` 指定工具链版本（`go1.27.4`）；使用默认的 `GOTOOLCHAIN=auto` 时，较旧版本的 Go 会自动下载该工具链。 |
 | Node.js | 22（CI 使用的版本）或更高版本：管理后台 SPA 需要构建并嵌入面板二进制文件。 |
 | pnpm | 10：`web/package.json` 固定使用 `pnpm@10.33.2`，启用 Corepack 时由它管理版本。 |
 | make 和 POSIX shell | 在 Windows 上使用 Git Bash 或 WSL。 |

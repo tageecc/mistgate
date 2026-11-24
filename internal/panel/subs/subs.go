@@ -2,23 +2,25 @@
 // client lines (hysteria2:// and vless:// URIs) with the headers Happ and other Xray/sing-box apps read, or, for a client the
 // settings send to the Mihomo format, a Mihomo YAML profile (mihomo.go), to the Xray JSON format an array of Xray configs (xrayjson.go), to the
 // sing-box format a sing-box profile (singbox.go; a hidden ?format=xray-json|sing-box on the link picks one of the two for a request); a browser gets the user page. Under the same
-// prefix the page's self-service endpoints manage the user's AmneziaWG devices (devices.go), and the kl!ck app sends the reports
-// of its local server check (probe.go). Unknown tokens get the decoy, so the endpoint cannot be told from any other path of the site.
+// prefix the page's self-service endpoints manage the user's AmneziaWG devices (devices.go), the kl!ck app sends the reports
+// of its local server check (probe.go) and a client enrols its device by the link (clientenrol.go). Unknown tokens get the decoy, so the endpoint cannot be told from any other path of the site.
 //
 // Abuse protection, all in memory and bounded, none of it logging a token or an address:
-//   - token guessing: after MissLimit unknown tokens from one client network within MissWindow, that
-//     network gets only the decoy for BlockFor, even for valid tokens;
+//   - Per-client-network miss limit: a network that guesses too many unknown links is blocked for a while. A blocked network
+//     still gets every link the process knows to exist (TokenIndex), and a small budget of database checks for the rest.
 //   - per token: fetches within MinInterval are answered from a cache of the rendered response (no
-//     database work), and more than MaxPerHour fetches an hour get a 429;
+//     database work), with hourly limits per token and client network and a larger per-token ceiling;
 //   - link sharing: distinct client networks (/24, /48) seen per token per day are counted (never stored
 //     as addresses), and above SharedNets one subscription_shared_suspect event is written for that day;
-//   - self-service writes (add, configs, rotate, revoke, rename a device, pick a DNS): a separate per-token counter,
-//     MaxWritesPerHour an hour, so that the fetch budget above is not shared with them.
+//   - self-service writes (add, configs, rotate, revoke, rename a device, pick a DNS): a separate per-token-and-network
+//     counter and a larger per-token ceiling, so that the fetch budget above is not shared with them.
 package subs
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"hash/maphash"
 	"io/fs"
@@ -40,6 +42,7 @@ import (
 	"github.com/mistgate/mistgate/internal/panel/instance"
 	"github.com/mistgate/mistgate/internal/panel/securitylimit"
 	"github.com/mistgate/mistgate/internal/panel/store"
+	"github.com/mistgate/mistgate/internal/panel/subhdr"
 	"github.com/mistgate/mistgate/internal/panel/subsettings"
 	"github.com/mistgate/mistgate/internal/plugin"
 )
@@ -50,11 +53,24 @@ type Source interface {
 }
 
 // TokenChecker lets a Source confirm a cached link without building the subscription view.
+//
+// The same one-row read that confirms the link also returns the state of the person's page password (generation, removed). A page
+// answered from a cached view takes its lock from that fresh state, so a changed or removed password counts at once and the
+// check costs no read more than before.
 type TokenChecker interface {
-	CheckSubscriptionToken(ctx context.Context, token string) error
+	CheckSubscriptionToken(ctx context.Context, token string) (access.PageState, error)
 }
 
 var _ TokenChecker = (*access.Service)(nil)
+
+// TokenIndex lets a Source say that a token is one it knows exists, from memory, without a database call. For a request from
+// a network blocked for guessing it is what tells a real link the process has not served yet from a guess: a token the
+// index knows is served normally, and only the others spend the network's small budget of database checks (takeColdLookup).
+type TokenIndex interface {
+	KnownSubscriptionToken(ctx context.Context, token string) bool
+}
+
+var _ TokenIndex = (*access.Service)(nil)
 
 // FormatSource is a Source that can also render a client format (the Mihomo profile needs the proxies of the Mihomo
 // format); *access.Service implements it. A Source without it serves the Mihomo rule the base64 list.
@@ -106,6 +122,9 @@ type Config struct {
 	// context (the public listener resolves it under the trusted-proxy rules). An invalid address
 	// (unknown client) is never limited or counted.
 	ClientIP func(*http.Request) netip.Addr
+	// ClientASN is an in-process lookup against the VPS edition's networks table. It is called only for X-Mistgate-Direct: 1;
+	// nil in the edge edition and when no trusted table is loaded.
+	ClientASN func(netip.Addr) uint32
 	// Events, if set, receives subscription_shared_suspect events. Log, if set, gets their write errors.
 	Events Events
 	Log    *slog.Logger
@@ -116,6 +135,17 @@ type Config struct {
 	// ProbeReports keeps the reports of the kl!ck probe (POST <prefix>/<token>/probe). The owner's switch is read with the
 	// settings (Settings.ProbeReports); while it is on, the app answers carry Probe-Report. Nil = the panel takes none.
 	ProbeReports ProbeStore
+	// ClientDebug keeps the logs people send for support (POST <prefix>/client/debug, internal/panel/clientdebug); sync tells the app
+	// about it. Nil in the Cloudflare edition: sync says debug.intake false and the route answers 403 debug_off.
+	ClientDebug ClientDebug
+	// ClientDebugSlotWait is how long a delivery of logs waits for the one slot of the process (it unpacks, cleans and stores one at a
+	// time); zero = 8 seconds. ClientDebugAttemptsPerHour is how many deliveries a person may bring to the reading of the body in an
+	// hour, broken ones too; zero = 6, negative = no limit.
+	ClientDebugSlotWait        time.Duration
+	ClientDebugAttemptsPerHour int
+	// ClientDebugReaders is how many bodies of deliveries of logs are read at once (each is held in memory up to ClientDebugMaxWire, from
+	// one device at a time); one more is refused with 503 retry before its body is read. Zero = 8.
+	ClientDebugReaders int
 	// Now is the clock (tests); default time.Now.
 	Now func() time.Time
 
@@ -123,20 +153,23 @@ type Config struct {
 	MissWindow  time.Duration // default 1 minute
 	BlockFor    time.Duration // default 15 minutes
 	MinInterval time.Duration // cache lifetime of a token's data; default 10 seconds
-	MaxPerHour  int           // fetches per token per hour; default 60
+	MaxPerHour  int           // fetches per token and client network per hour; default 60; token ceiling is 600
 	SharedNets  int           // distinct client networks per token per day before the event; default 8
 	MaxKeys     int           // clients and tokens tracked per table (memory bound); default securitylimit.DefaultMaxKeysPerName
-	// MaxWritesPerHour is the self-service writes (device add, configs, rotate, revoke, rename, pick a DNS) per token an hour;
-	// default 20, negative = no limit. Separate from MaxPerHour.
+	// MaxWritesPerHour is the self-service writes (device add, configs, rotate, revoke, rename, pick a DNS) per token and client
+	// network an hour; default 20, with a 100 per-token ceiling. Negative disables both. Separate from MaxPerHour.
 	MaxWritesPerHour int
+	// MaxEnrolsPerHour is the client API enrolments (POST <link>/client/enrol) per link an hour, on top of the writes above;
+	// default enrolPerHour, negative = no limit (tests).
+	MaxEnrolsPerHour int
 	BrandTTL         time.Duration // how long a read of the brand is reused; default 5 seconds
 
 	// PageKey is the key of the page passwords and their cookies (vault.Derive(pagepass.KeyLabel)). Empty = the
 	// page never asks for a password. With a key, the page and its self-service calls are gated while the
 	// settings say so (subsettings.PagePassword); the subscription itself never is.
 	PageKey []byte
-	// UnlockTries is how many password entries one token, and one client network, get within UnlockWindow before
-	// the answer is "try later"; defaults 5 and 10 minutes, UnlockTries negative = no limit.
+	// UnlockTries is how many password entries one token and client network get within UnlockWindow before the answer is
+	// "try later"; defaults 5 and 10 minutes, with a 50 per-token ceiling. UnlockTries negative disables both.
 	UnlockTries  int
 	UnlockWindow time.Duration
 }
@@ -172,6 +205,9 @@ func (c *Config) defaults() {
 	if c.MaxWritesPerHour == 0 {
 		c.MaxWritesPerHour = 20
 	}
+	if c.MaxEnrolsPerHour == 0 {
+		c.MaxEnrolsPerHour = enrolPerHour
+	}
 	if c.DNS == nil {
 		c.DNS, _ = c.Routing.(Effective)
 	}
@@ -201,6 +237,15 @@ const (
 	announceMax = 200
 
 	tokenMin, tokenMax = 20, 64 // the issued tokens are 43 characters; anything outside is not ours
+
+	maxFetchesPerTokenHour = 600
+	maxWritesPerTokenHour  = 100
+	maxUnlocksPerToken     = 50
+
+	// The database checks a blocked network may spend on a token nothing vouches for (takeColdLookup): 30 at once, then one
+	// every two seconds, so at most 60 in any minute.
+	coldTokenLookupBurst  = 30
+	coldTokenLookupRefill = 2 * time.Second
 )
 
 // tokenState is what is remembered about one valid token. Nothing in it is an address.
@@ -211,9 +256,6 @@ type tokenState struct {
 	cached map[viewKey]cachedView // the data of the last fetch per view format and device, reused for MinInterval
 	expire *time.Timer            // empties cached MinInterval after the last fetch (see remember)
 
-	winStart time.Time // start of the current hour; hits counts the fetches in it
-	hits     int
-
 	day      int64               // unix day of nets
 	nets     map[uint64]struct{} // keyed hashes of the networks seen today, capped
 	reported bool                // the event for this day was written
@@ -222,8 +264,9 @@ type tokenState struct {
 // viewKey says whose view a cached fetch is. A device has credentials of its own, so a view is the device's: two HWIDs
 // within MinInterval must not be served each other's keys. hwid is the canonical HWID of the request ("" for none).
 type viewKey struct {
-	format plugin.ClientFormat
-	hwid   string
+	format    plugin.ClientFormat
+	hwid      string
+	noLinkAWG bool
 }
 
 // maxCachedViews bounds the views one token keeps: MaxPerHour fetches an hour bound it too, but that limit can be off.
@@ -242,9 +285,14 @@ type handler struct {
 	fsrc   FormatSource // src when it can render a format, else nil
 	dev    Devices      // src when it manages devices, else nil
 	pdns   PageDNS      // src when it takes the DNS pick of the page, else nil
+	enrol  ClientEnrol  // src when it enrols client API devices, else nil
+	client ClientAPI    // src when it serves client API sync and leave, else nil
 	cop    *http.CrossOriginProtection
 	decoy  http.Handler
 	prefix string
+
+	debugBusy    sync.Map      // device id -> struct{}: the devices whose delivery of logs is being read
+	debugReaders chan struct{} // the places of the bodies being read (ClientDebugReaders)
 
 	seed   maphash.Seed
 	tokens *ratelimit.Map[*tokenState]
@@ -264,10 +312,17 @@ func Handler(src Source, decoy http.Handler, cfg Config) http.Handler {
 	h.fsrc, _ = src.(FormatSource)
 	h.dev, _ = src.(Devices)
 	h.pdns, _ = src.(PageDNS)
+	h.enrol, _ = src.(ClientEnrol)
+	h.client, _ = src.(ClientAPI)
+	readers := cfg.ClientDebugReaders
+	if readers <= 0 {
+		readers = 8
+	}
+	h.debugReaders = make(chan struct{}, readers)
 	if o := originOf(cfg.BaseURL); o != "" {
 		// Behind a proxy that rewrites Host the Origin of a browser is still the public address.
 		if err := h.cop.AddTrustedOrigin(o); err != nil {
-			cfg.Log.Warn("subscription base URL is not a usable origin", "err", err)
+			cfg.Log.Warn("subscription base URL is not a usable origin", "code", "subscription_base_origin_invalid", "err", err)
 		}
 	}
 	return h
@@ -288,12 +343,39 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	client := ""
 	if ip.IsValid() {
 		client = auth.SourceKey(ip)
-		if h.blocked(r.Context(), client) {
-			h.decoy.ServeHTTP(w, r) // even for a valid token: guessing gets nothing out of this
-			return
-		}
+	}
+	if route := clientAPIRoute(r, h.prefix); route != "" {
+		h.serveClientAPI(w, r, route, client)
+		return
 	}
 	token, sub, ok := routeOf(r, h.prefix)
+	checkedColdToken := false
+	var coldPage access.PageState // the page password state the cold lookup read
+	if client != "" && h.blocked(r.Context(), client) {
+		if !ok {
+			h.decoy.ServeHTTP(w, r)
+			return
+		}
+		if _, known := h.tokens.Get(token); !known && !h.indexed(r.Context(), token) {
+			// Neither served by this process nor known to its index: a stranger's guess or a link the index has not seen yet.
+			// Both get the decoy, except for the few lookups the network's budget allows, which find the second kind.
+			checker, ok := h.src.(TokenChecker)
+			if !ok || !h.takeColdLookup(r.Context(), client) {
+				h.decoy.ServeHTTP(w, r)
+				return
+			}
+			page, err := checker.CheckSubscriptionToken(r.Context(), token)
+			if errors.Is(err, access.ErrUnknownToken) {
+				h.decoy.ServeHTTP(w, r)
+				return
+			}
+			if err != nil {
+				http.Error(w, "internal error", http.StatusInternalServerError)
+				return
+			}
+			checkedColdToken, coldPage = true, page
+		}
+	}
 	if !ok {
 		h.miss(r.Context(), client)
 		h.decoy.ServeHTTP(w, r)
@@ -315,6 +397,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case sub == "probe":
 		h.serveProbe(w, r, token, client, now)
 		return
+	case sub == "client/enrol":
+		h.serveEnrol(w, r, token, client, now)
+		return
 	case sub != "":
 		h.serveDevices(w, r, token, sub, client, now)
 		return
@@ -327,6 +412,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, sf, _ := Choose(set, r.UserAgent())
 	sf = formatParam(r, sf)
 	format := viewFormat(sf, h.fsrc != nil)
+	noLinkAWG := !subsettings.LinkAWG(set)
 
 	// Only an app counts as "the app received the subscription": a browser (the page, or the decoy) does not.
 	app := sf != adminv1.SubFormat_SUB_FORMAT_USER_PAGE && sf != adminv1.SubFormat_SUB_FORMAT_DECOY
@@ -334,11 +420,11 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if app {
 		hint = deviceHint(r) // a browser has no device to report
 	}
-	key := viewKey{format: format, hwid: hint.HWID}
+	key := viewKey{format: format, hwid: hint.HWID, noLinkAWG: format == plugin.FormatMihomo && noLinkAWG}
 	st, known := h.tokens.Get(token)
 	admitted := false
 	if known {
-		res, retry, suspect := st.admit(h, ip, now, key, app)
+		res, retry, suspect := st.admit(r.Context(), h, token, client, ip, now, key, app)
 		if retry > 0 {
 			tooMany(w, retry)
 			return
@@ -347,17 +433,39 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.suspect(suspect)
 		}
 		if res != nil {
-			h.notSupported(w, r, hint, app)
-			h.respond(w, r, token, *res, set, sf, format)
-			return
+			checker, ok := h.src.(TokenChecker)
+			page := coldPage
+			if !ok {
+				res = nil // a source that cannot confirm the token cannot serve a cached view
+			} else if !checkedColdToken {
+				var err error
+				if page, err = checker.CheckSubscriptionToken(r.Context(), token); errors.Is(err, access.ErrUnknownToken) {
+					h.tokens.Delete(token)
+					h.miss(r.Context(), client)
+					h.decoy.ServeHTTP(w, r)
+					return
+				} else if err != nil {
+					http.Error(w, "internal error", http.StatusInternalServerError)
+					return
+				}
+			}
+			if res != nil {
+				view := *res
+				view.Page = page // the cached view may hold an older password state; the check above just read the current one
+				h.notSupported(w, r, hint, app)
+				h.respond(w, r, token, view, set, sf, format)
+				return
+			}
 		}
 		admitted = true
 	}
 
-	v, err := h.fetch(r.Context(), token, format, hint, app, !app)
+	v, err := h.fetch(r.Context(), token, format, hint, app, !app, noLinkAWG)
 	if errors.Is(err, access.ErrUnknownToken) {
 		h.tokens.Delete(token) // a rotated or deleted link stops being remembered
-		h.miss(r.Context(), client)
+		if !checkedColdToken {
+			h.miss(r.Context(), client)
+		}
 		h.decoy.ServeHTTP(w, r)
 		return
 	}
@@ -369,7 +477,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if !admitted {
 		st = h.tokens.GetOrCreate(token, func() *tokenState { return &tokenState{} })
-		if _, retry, suspect := st.admit(h, ip, now, key, app); retry > 0 {
+		if _, retry, suspect := st.admit(r.Context(), h, token, client, ip, now, key, app); retry > 0 {
 			tooMany(w, retry)
 			return
 		} else if suspect != "" {
@@ -386,7 +494,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // come from the cache), so the header is set apart from it.
 func (h *handler) notSupported(w http.ResponseWriter, r *http.Request, hint access.DeviceHint, app bool) {
 	if app && hint.HWID == "" && firstHeader(r, "X-Hwid") != "" {
-		w.Header().Set("X-Hwid-Not-Supported", "true")
+		w.Header().Set(subhdr.XHwidNotSupported, "true")
 	}
 }
 
@@ -394,12 +502,19 @@ func (h *handler) notSupported(w http.ResponseWriter, r *http.Request, hint acce
 // asked, so its device is made and marked as having received the subscription (the page view and its calls write nothing).
 // device is what the app says about itself. page: the view carries the data only the page shows (the DNS of each server);
 // an app's fetch and the checks of a call do without it.
-func (h *handler) fetch(ctx context.Context, token string, format plugin.ClientFormat, device access.DeviceHint, touch, page bool) (access.SubView, error) {
+func (h *handler) fetch(ctx context.Context, token string, format plugin.ClientFormat, device access.DeviceHint, touch, page, noLinkAWG bool) (access.SubView, error) {
 	if h.fsrc == nil {
 		return h.src.Subscription(ctx, token)
 	}
+	var name func(access.SubServer) string
+	if page {
+		settings, lang := h.settings(ctx), h.brand(ctx).Language
+		template := settings.GetServerNameTemplate()
+		name = func(server access.SubServer) string { return remarks([]access.SubServer{server}, template, lang)[0] }
+	}
 	return h.fsrc.SubscriptionWith(ctx, token, access.SubOptions{
-		Format: format, Device: device, NoTouch: !touch, NoPageData: !page,
+		Format: format, Device: device, NoTouch: !touch, NoPageData: !page, NoLinkAWG: noLinkAWG,
+		IncludeTrustTunnel: page, Name: name,
 		IncludeEffectiveDNS: format != plugin.FormatURIList && h.cfg.DNS != nil,
 	})
 }
@@ -411,6 +526,13 @@ func (st *tokenState) remember(v access.SubView, key viewKey, now time.Time, app
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.userName = v.UserName
+	if key.format == plugin.FormatMihomo {
+		for old := range st.cached {
+			if old.format == key.format && old.hwid == key.hwid && old.noLinkAWG != key.noLinkAWG {
+				delete(st.cached, old) // the switch changed the view; an older response may hold a revoked peer
+			}
+		}
+	}
 	if keep <= 0 {
 		return
 	}
@@ -439,7 +561,7 @@ func (h *handler) respond(w http.ResponseWriter, r *http.Request, token string, 
 		return
 	case adminv1.SubFormat_SUB_FORMAT_USER_PAGE:
 		if h.page != nil {
-			if h.gated(set) && !h.unlocked(r, token) {
+			if h.gated(set, v.Page) && !h.unlocked(r, token, v.Page) {
 				h.writeLocked(w, r, h.link(r, token))
 				return
 			}
@@ -447,7 +569,7 @@ func (h *handler) respond(w http.ResponseWriter, r *http.Request, token string, 
 			return
 		}
 		h.noPage.Do(func() {
-			h.cfg.Log.Warn("user page is not available, serving the base64 list to browsers", "err", h.pageErr)
+			h.cfg.Log.Warn("user page is not available, serving the base64 list to browsers", "code", "subscription_page_unavailable", "err", h.pageErr)
 		})
 	case adminv1.SubFormat_SUB_FORMAT_MIHOMO_YAML:
 		if format == plugin.FormatMihomo { // a Source without formats leaves the rule on the base64 list
@@ -520,15 +642,20 @@ func (h *handler) appNote(v access.SubView, lang string, format plugin.ClientFor
 // linkPreset is the DNS preset the document of a link carries (Mihomo, Xray JSON, sing-box): the one read with the view, else the
 // preset of the user's link apps; nil when there is none (no DNS module, or it failed: the document has no dns section).
 func (h *handler) linkPreset(ctx context.Context, v access.SubView) *dns.Preset {
+	return linkPresetOf(ctx, v, h.cfg.DNS, h.cfg.Log)
+}
+
+// linkPresetOf is linkPreset for whoever has the DNS module (e may be nil).
+func linkPresetOf(ctx context.Context, v access.SubView, e Effective, log *slog.Logger) *dns.Preset {
 	if v.EffectiveDNS != nil {
 		return v.EffectiveDNS
 	}
-	if h.cfg.DNS == nil || v.UserID == "" {
+	if e == nil || v.UserID == "" {
 		return nil
 	}
-	pre, err := h.cfg.DNS.LinkEffective(ctx, v.UserID)
+	pre, err := e.LinkEffective(ctx, v.UserID)
 	if err != nil {
-		h.cfg.Log.Warn("profile: no dns section", "err", err)
+		log.Warn("profile: no dns section", "code", "subscription_dns_unavailable", "err", err)
 		return nil
 	}
 	return &pre
@@ -538,16 +665,15 @@ func (h *handler) linkPreset(ctx context.Context, v access.SubView) *dns.Preset 
 var happPing = map[adminv1.HappPing]string{adminv1.HappPing_HAPP_PING_TCP: "tcp"}
 
 // headers sets what every subscription answer carries: the name, usage and term the apps show, the refresh
-// interval, the user's page and the announcement and support link. format is the one of the answer: the Happ `routing` header goes
-// out with the link list only (the other formats carry their own DNS, and Happ's routing profile is global: it would act on the
-// person's other subscriptions too).
+// interval, the user's page and the announcement and support link. format is the one of the answer (the Happ and INCY `routing`
+// header is set by writeList: it goes out with the link list only).
 func (h *handler) headers(w http.ResponseWriter, r *http.Request, token string, v access.SubView, set *adminv1.SubscriptionSettings, b instance.Settings, format plugin.ClientFormat) {
 	ctx := r.Context()
 	hd := w.Header()
-	hd["Cache-Control"] = headerCacheNoStore[:1:1]
-	hd["X-Content-Type-Options"] = headerNoSniff[:1:1]
-	hd.Set("Profile-Title", b64(h.title(set, b)))
-	hd.Set("Subscription-Userinfo", userinfo(v))
+	hd[subhdr.CacheControl] = headerCacheNoStore[:1:1]
+	hd[subhdr.XContentTypeOptions] = headerNoSniff[:1:1]
+	hd.Set(subhdr.ProfileTitle, b64(h.title(set, b)))
+	hd.Set(subhdr.SubscriptionUserinfo, userinfo(v))
 	hours := int(set.GetUpdateIntervalHours())
 	if hours == 0 {
 		hours = subsettings.DefaultUpdateHours
@@ -555,71 +681,104 @@ func (h *handler) headers(w http.ResponseWriter, r *http.Request, token string, 
 	if v.Status != access.StatusActive || v.Refusal != "" {
 		hours = updateHoursNoAccess
 	}
-	hd.Set("Profile-Update-Interval", strconv.Itoa(hours))
-	hd.Set("Profile-Web-Page-Url", h.link(r, token))
+	hd.Set(subhdr.ProfileUpdateInterval, strconv.Itoa(hours))
+	hd.Set(subhdr.ProfileWebPageURL, h.link(r, token))
 	ann := set.GetAnnouncement()
 	if note := h.appNote(v, b.Language, format); note != "" {
 		ann = note // the reason the app stopped working is the announcement that matters now
 	}
 	if a := cutAnnounce(ann, announceMax); a != "" {
-		hd.Set("Announce", b64(a))
+		hd.Set(subhdr.Announce, b64(a))
 	}
 	if u := set.GetSupportUrl(); u != "" {
-		hd.Set("Support-Url", u)
+		hd.Set(subhdr.SupportURL, u)
 	}
 	if h.probeOn(ctx) {
 		// kl!ck sends the reports of its local server check only to a panel that says it takes them, and of what version.
-		hd.Set("Probe-Report", strconv.Itoa(clientprobe.Version))
+		hd.Set(subhdr.ProbeReport, strconv.Itoa(clientprobe.Version))
+	}
+	if clientCapsPresent(r) && h.cfg.Settings != nil && h.cfg.Settings.ClientAPIEnabled(ctx) {
+		// This is written only by the app response writers; the public HTML page has its own writer above.
+		hd.Set(subhdr.MistgateClientAPI, "1")
 	}
 	if v.Refusal != "" {
 		// The headers of Remnawave, 3x-ui and v2RayTun, so the apps that read them say the same: the HWID check is on, and
 		// the limit is reached or the app has no device ID to give. A blocked device gets neither: the limit is not why,
 		// and an app that reads the flag would tell the person to free a place; the announcement says what happened.
-		hd.Set("X-Hwid-Active", "true")
+		hd.Set(subhdr.XHwidActive, "true")
 		switch v.Refusal {
 		case access.RefusalNoDeviceID:
-			hd.Set("X-Hwid-Not-Supported", "true")
+			hd.Set(subhdr.XHwidNotSupported, "true")
 		case access.RefusalDeviceLimit:
-			hd.Set("X-Hwid-Max-Devices-Reached", "true")
+			hd.Set(subhdr.XHwidMaxDevicesReached, "true")
 		}
-		hd.Set("X-Hwid-Limit", strconv.Itoa(v.DeviceLimit))
+		hd.Set(subhdr.XHwidLimit, strconv.Itoa(v.DeviceLimit))
 	}
 	if ping, ok := happPing[set.GetHappPing()]; ok && isHapp(r.UserAgent()) {
 		// The headers the old Remnawave setups sent Happ: how to ping the servers, show the delay in ms, and whether to ping
 		// when the app opens. Only Happ reads them, and only when the owner chose something other than the app's default.
-		hd.Set("Ping-Type", ping)
-		hd.Set("Ping-Result", "time")
+		hd.Set(subhdr.PingType, ping)
+		hd.Set(subhdr.PingResult, "time")
 		onOpen := "0"
 		if set.GetHappPingOnOpen() {
 			onOpen = "1"
 		}
-		hd.Set("Subscription-Ping-Onopen-Enabled", onOpen)
+		hd.Set(subhdr.SubscriptionPingOnopenEnabled, onOpen)
 	}
-	if format == plugin.FormatURIList && h.cfg.Routing != nil && v.Status == access.StatusActive && v.UserID != "" && isHapp(r.UserAgent()) {
-		if val, err := h.cfg.Routing.HappRouting(ctx, v.UserID); err != nil {
-			h.cfg.Log.Warn("happ routing header skipped", "err", err) // no user id, no token in the log
-		} else if val != "" {
-			hd.Set("Routing", val)
-		}
+	if v.Status == access.StatusActive && v.Refusal == "" {
+		// The owner's own headers go with an answer that serves the person, never with a refusal or a note that says why there are no
+		// servers.
+		setOwnHeaders(hd, subsettings.ResponseHeadersFor(set, v.GroupID, formatOf(format)))
 	}
 }
 
-// writeMihomo answers with the Mihomo YAML profile: the proxies of the view (named like the base64 list names its
-// servers, never with the load percentage: see remarks), one select group, the dns section of the user's effective preset. gzip when the client accepts it.
+// setOwnHeaders puts the owner's headers into the answer under the name the owner wrote (a header name is case-insensitive and the
+// apps that read these may want their own spelling). It is the one place that names a header by data, not by a subhdr constant:
+// the settings do not take a name of subhdr.Reserved, which is every name the code of this package sets.
+func setOwnHeaders(dst http.Header, list []subsettings.SentHeader) {
+	for _, e := range list {
+		dst[e.Name] = []string{e.Value}
+	}
+}
+
+func clientCapsPresent(r *http.Request) bool {
+	for _, value := range r.Header.Values("X-Mistgate-Caps") {
+		if strings.TrimSpace(value) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// mihomoProfileOf is what the Mihomo profile of a view is built from: the proxies of the view (named like the base64 list names its
+// servers, never with the load percentage: see remarks), or the one entry that says why there are none. The preset is the caller's.
+func mihomoProfileOf(v access.SubView, set *adminv1.SubscriptionSettings, title, lang string, now time.Time, log *slog.Logger) mihomoProfile {
+	p := mihomoProfile{title: title, lines: v.Lines, autoSelect: subsettings.LinkAutoSelect(set), log: log}
+	if note := stateNote(v, lang, now); note != "" {
+		p.lines, p.names, p.note = []string{placeholderProxy}, []string{note}, true
+	} else if !subsettings.LinkAWG(set) && len(v.Lines) == 0 && len(v.AWGProfiles) > 0 {
+		p.lines, p.names, p.note = []string{placeholderProxy}, []string{noServersNote(lang)}, true
+	} else if len(v.Servers) == len(v.Lines) && len(v.Servers) > 0 {
+		p.names = remarks(v.Servers, set.GetServerNameTemplate(), lang)
+	}
+	return p
+}
+
+// writeMihomo answers with the Mihomo YAML profile: the template of the person's group around their servers (see
+// subsettings.MihomoTemplateFor), else the built-in profile: the servers, one select group and the dns section of the user's
+// effective preset. A person who gets a note instead of servers, or has none, gets the built-in profile. gzip when the client accepts it.
 func (h *handler) writeMihomo(w http.ResponseWriter, r *http.Request, token string, v access.SubView, set *adminv1.SubscriptionSettings) {
 	ctx := r.Context()
 	b := h.brand(ctx)
-	title := h.title(set, b)
-	p := mihomoProfile{title: title, lines: v.Lines, log: h.cfg.Log}
-	if note := stateNote(v, b.Language, h.cfg.Now()); note != "" {
-		p.lines, p.names = []string{placeholderProxy}, []string{note}
-	} else if len(v.Servers) == len(v.Lines) && len(v.Servers) > 0 {
-		p.names = remarks(v.Servers, set.GetServerNameTemplate(), b.Language)
-	}
+	p := mihomoProfileOf(v, set, h.title(set, b), b.Language, h.cfg.Now(), h.cfg.Log)
 	p.preset = h.linkPreset(ctx, v)
-	body, err := p.build()
+	var tplName, tplText string
+	if t := subsettings.MihomoTemplateFor(set, v.GroupID); t != nil {
+		tplName, tplText = t.Name, t.Yaml
+	}
+	body, _, err := p.render(tplName, tplText)
 	if err != nil {
-		h.cfg.Log.Error("mihomo profile", "err", err)
+		h.cfg.Log.Error("mihomo profile", "code", "subscription_mihomo_render_failed", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -631,16 +790,16 @@ func (h *handler) writeMihomo(w http.ResponseWriter, r *http.Request, token stri
 func (h *handler) writeDocument(w http.ResponseWriter, r *http.Request, token string, v access.SubView, set *adminv1.SubscriptionSettings, b instance.Settings, contentType []string, body []byte, format plugin.ClientFormat) {
 	h.headers(w, r, token, v, set, b, format)
 	hd := w.Header()
-	hd["Content-Type"] = contentType[:1:1]
-	hd.Set("Content-Disposition", "attachment; filename*=UTF-8''"+pctEncode(h.title(set, b)))
-	if _, ok := hd["Vary"]; ok {
-		hd.Add("Vary", "Accept-Encoding")
+	hd[subhdr.ContentType] = contentType[:1:1]
+	hd.Set(subhdr.ContentDisposition, "attachment; filename*=UTF-8''"+pctEncode(h.title(set, b)))
+	if _, ok := hd[subhdr.Vary]; ok {
+		hd.Add(subhdr.Vary, "Accept-Encoding")
 	} else {
-		hd["Vary"] = headerVaryAcceptEncoding[:1:1]
+		hd[subhdr.Vary] = headerVaryAcceptEncoding[:1:1]
 	}
 	if acceptsGzip(r) {
 		body = gzipped(body)
-		hd["Content-Encoding"] = headerContentEncodingGzip[:1:1]
+		hd[subhdr.ContentEncoding] = headerContentEncodingGzip[:1:1]
 	}
 	w.Write(body)
 }
@@ -649,8 +808,18 @@ func (h *handler) writeDocument(w http.ResponseWriter, r *http.Request, token st
 func (h *handler) writeList(w http.ResponseWriter, r *http.Request, token string, v access.SubView, set *adminv1.SubscriptionSettings) {
 	b := h.brand(r.Context())
 	h.headers(w, r, token, v, set, b, plugin.FormatURIList)
-	w.Header()["Content-Type"] = headerContentTypePlainText[:1:1]
-	w.Write([]byte(base64.StdEncoding.EncodeToString([]byte(strings.Join(h.lines(v, set, b, isHapp(r.UserAgent())), "\n")))))
+	// The Happ and INCY routing profile goes with the link list only (the other formats carry their own DNS, and the app's routing
+	// profile is global: it would act on the person's other subscriptions too). A link too long for the header is a line after the servers.
+	rt := h.routing(r, v, set)
+	if rt.Header != "" {
+		w.Header().Set(subhdr.Routing, rt.Header)
+	}
+	lines := h.lines(v, set, b, isHapp(r.UserAgent()))
+	if rt.Body != "" && v.Refusal == "" {
+		lines = append(lines[:len(lines):len(lines)], rt.Body)
+	}
+	w.Header()[subhdr.ContentType] = headerContentTypePlainText[:1:1]
+	w.Write([]byte(base64.StdEncoding.EncodeToString([]byte(strings.Join(lines, "\n")))))
 }
 
 // lines are the share links with their remarks (server names) rendered from the template; a view without
@@ -686,7 +855,7 @@ func tooMany(w http.ResponseWriter, retry time.Duration) {
 	if secs < 1 {
 		secs = 1
 	}
-	w.Header().Set("Retry-After", strconv.Itoa(secs))
+	w.Header().Set(subhdr.RetryAfter, strconv.Itoa(secs))
 	http.Error(w, "too many requests", http.StatusTooManyRequests)
 }
 
@@ -706,7 +875,7 @@ func (h *handler) miss(ctx context.Context, client string) {
 	}
 	_, err := h.cfg.Limiter.Record(ctx, h.missWindow(), "c:"+client)
 	if err != nil && h.cfg.Log != nil {
-		h.cfg.Log.Warn("subscription miss limit unavailable")
+		h.cfg.Log.Warn("subscription miss limit unavailable", "code", "subscription_miss_limit_unavailable")
 	}
 }
 
@@ -716,21 +885,68 @@ func (h *handler) missWindow() securitylimit.Window {
 	}
 }
 
+// indexed reports whether the Source knows the token exists without a database call (see TokenIndex).
+func (h *handler) indexed(ctx context.Context, token string) bool {
+	ix, ok := h.src.(TokenIndex)
+	return ok && ix.KnownSubscriptionToken(ctx, token)
+}
+
+// takeColdLookup spends one of the network's database checks for a token nothing vouches for: coldTokenLookupBurst at once,
+// then one every coldTokenLookupRefill, however many tokens the network sends. A known token never needs one (the index,
+// or this process serving it before); an unknown one is turned away at the decoy as before, so the answer does not tell
+// the two apart. It fails closed: a limiter that cannot answer spends nothing and the request gets the decoy.
+func (h *handler) takeColdLookup(ctx context.Context, client string) bool {
+	d, err := h.cfg.Limiter.Take(ctx, securitylimit.Bucket{
+		Name: "subscription-cold-lookup", Burst: coldTokenLookupBurst, Refill: coldTokenLookupRefill,
+	}, "c:"+client)
+	return err == nil && d.Allowed
+}
+
+func tokenClientLimitKey(token, client string) string {
+	sum := sha256.Sum256([]byte("token-client\x00" + token + "\x00" + client))
+	return "tc:" + hex.EncodeToString(sum[:])
+}
+
+func (h *handler) fetchAdmit(ctx context.Context, token, client string) time.Duration {
+	if h.cfg.MaxPerHour < 0 {
+		return 0
+	}
+	if client != "" {
+		d, err := h.cfg.Limiter.Record(ctx, h.fetchClientWindow(), tokenClientLimitKey(token, client))
+		if err != nil {
+			return time.Hour
+		}
+		if !d.Allowed {
+			return d.RetryAfter
+		}
+	}
+	d, err := h.cfg.Limiter.Record(ctx, h.fetchTokenWindow(), "t:"+token)
+	if err != nil {
+		return time.Hour
+	}
+	if !d.Allowed {
+		return d.RetryAfter
+	}
+	return 0
+}
+
+func (h *handler) fetchClientWindow() securitylimit.Window {
+	return securitylimit.Window{Name: "subscription-fetch-client", Limit: h.cfg.MaxPerHour, Span: time.Hour}
+}
+
+func (h *handler) fetchTokenWindow() securitylimit.Window {
+	return securitylimit.Window{Name: "subscription-fetch-token", Limit: maxFetchesPerTokenHour, Span: time.Hour}
+}
+
 // admit counts one fetch of the token: against the hourly cap (retry > 0: refused), towards the day's
 // distinct networks (suspect is the user name, non-empty once per day when the threshold is crossed), and
 // returns the cached response when it is younger than MinInterval.
-func (st *tokenState) admit(h *handler, ip netip.Addr, now time.Time, key viewKey, app bool) (res *access.SubView, retry time.Duration, suspect string) {
+func (st *tokenState) admit(ctx context.Context, h *handler, token, client string, ip netip.Addr, now time.Time, key viewKey, app bool) (res *access.SubView, retry time.Duration, suspect string) {
+	if retry = h.fetchAdmit(ctx, token, client); retry > 0 {
+		return nil, retry, ""
+	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	if h.cfg.MaxPerHour > 0 {
-		if now.Sub(st.winStart) >= time.Hour {
-			st.winStart, st.hits = now, 0
-		}
-		if st.hits >= h.cfg.MaxPerHour {
-			return nil, st.winStart.Add(time.Hour).Sub(now), ""
-		}
-		st.hits++
-	}
 	if h.cfg.SharedNets > 0 && ip.IsValid() {
 		if day := now.UTC().Unix() / 86400; day != st.day {
 			st.day, st.nets, st.reported = day, nil, false
@@ -793,7 +1009,7 @@ func (h *handler) suspect(user string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := h.cfg.Events.InsertEvent(ctx, e); err != nil && h.cfg.Log != nil {
-			h.cfg.Log.Warn("write subscription event", "err", err)
+			h.cfg.Log.Warn("write subscription event", "code", "subscription_shared_event_write_failed", "err", err)
 		}
 	})
 }
@@ -824,7 +1040,7 @@ func routeOf(r *http.Request, prefix string) (token, sub string, ok bool) {
 	switch {
 	case sub == "" && (r.Method == http.MethodGet || r.Method == http.MethodHead):
 		return token, "", true
-	case r.Method == http.MethodPost && (sub == "unlock" || sub == "dns" || sub == "probe" || sub == "devices" || strings.HasPrefix(sub, "devices/")):
+	case r.Method == http.MethodPost && (sub == "unlock" || sub == "dns" || sub == "probe" || sub == "client/enrol" || sub == "devices" || strings.HasPrefix(sub, "devices/")):
 		return token, sub, true
 	}
 	return "", "", false

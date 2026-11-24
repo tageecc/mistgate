@@ -14,20 +14,70 @@ import { ru as telegramRu } from "./telegram";
 import { ru as portsRu } from "./ports";
 import { ru as editionRu } from "./edition";
 import { ru as decoyRu } from "./decoy";
+import { ru as bulkRu } from "./bulk";
 import { ru as countryRu } from "./country";
+import { ru as probesRu } from "./probes";
 import { ru as connectionsRu } from "./connections";
 import { ru as journalRu } from "./journal";
 import { ru as relayRu } from "./relay";
 import { ru as waysRu } from "./ways";
+import { ru as tgproxyRu } from "./tgproxy";
+import { ru as clientcompatRu } from "./clientcompat";
+import { ru as protocolsRu } from "./protocols";
+import { ru as aiRu } from "./ai";
+import { ru as graphRu } from "./graph";
+import { ru as waysgraphRu } from "./waysgraph";
+import { ru as fleetmapRu } from "./fleetmap";
+import { ru as observabilityRu } from "./observability";
+import { ru as debugRu } from "./debug";
+import { ru as resourcesRu } from "./resources";
+import { ru as tasksRu } from "./tasks";
+import { ru as followupRu } from "./followup";
+import { ru as osupdatesRu } from "./osupdates";
+import { ru as fleetuiRu } from "./fleetui";
+import { ru as clientlogsRu } from "./clientlogs";
+import { ru as trusttunnelRu } from "./trusttunnel";
+import { ru as tcpshareRu } from "./tcpshare";
+import { ru as shellRu } from "./shell";
+import { ru as nodesviewRu } from "./nodesview";
+import { ru as nodeswaysRu } from "./nodesways";
+import { ru as userslistRu } from "./userslist";
+import { ru as userspageRu } from "./userspage";
+import { ru as profilenewRu } from "./profilenew";
+import { ru as settingspageRu } from "./settingspage";
+import { ru as aipageRu } from "./aipage";
+import { ru as igpageRu } from "./igpage";
+import { ru as aspageRu } from "./aspage";
+import { ru as nodeshareRu } from "./nodeshare";
+import { ru as channelRu } from "./channel";
+import { ru as countrynowRu } from "./countrynow";
+import { ru as sniRu } from "./sni";
+import { ru as overviewRu } from "./overview";
+import { ru as windowsRu } from "./windows";
+import { ru as nodepageRu } from "./nodepage";
+import { ru as nodewaysRu } from "./nodeways";
+import { ru as subspnRu } from "./subspn";
+import { ru as subshxRu } from "./subshx";
+import { ru as subsrtRu } from "./subsrt";
+import { ru as subsdnsRu } from "./subsdns";
+import { ru as usersgroupRu } from "./usersgroup";
+import { ru as usersextraRu } from "./usersextra";
+import { ru as decoysitesRu } from "./decoysites";
+import { ru as planwordsRu } from "./planwords";
+import { ru as profilespageRu } from "./profilespage";
+import { ru as healthpageRu } from "./healthpage";
+import { ru as reachpageRu } from "./reachpage";
+import { ru as updatespageRu } from "./updatespage";
+import { ru as profilesrvRu } from "./profilesrv";
 
 // Typed against the English shape: a missing or extra key fails `pnpm typecheck`. The admin UI speaks «ты».
 const core: CoreMessages = {
-  "app.name": "Mistgate",
   "common.loading": "Загрузка…",
   "common.retry": "Повторить",
   "common.undo": "Откатить",
   "common.quoted": "«{name}»",
   "common.labeled": "{label}: {value}",
+  "common.fromTo": "{from} → {to}",
 
   "pager.nav": "Страницы",
   "pager.range": "Показано {from}–{to} из {total}",
@@ -61,8 +111,8 @@ const core: CoreMessages = {
   "nav.more": "Ещё",
   "nav.main": "Основная навигация",
   "nav.skip": "Перейти к содержимому",
-  "nav.group.setup": "НАСТРОЙКА",
-  "nav.group.ops": "ЭКСПЛУАТАЦИЯ",
+  "nav.group.setup": "Настройка",
+  "nav.group.ops": "Эксплуатация",
 
   "section.overview.desc": "Здоровье флота с первого взгляда: карточки нод, трафик и последние события.",
   "section.nodes.desc": "Серверы флота, их протоколы и нагрузка, а также мастер добавления новой ноды.",
@@ -72,15 +122,13 @@ const core: CoreMessages = {
   "section.health.desc": "Алерты, проверки глазами клиента и доктор флота.",
   "section.reachability.desc": "Открываются ли ноды изнутри страны: источники, вердикт каждой ноды и её неделя.",
   "section.updates.desc": "Версии панели и агентов нод, поэтапные выкатки и откат.",
-  "section.integrations.desc": "API-токены для скриптов, MCP для ИИ-агентов и изменения, которые они просят одобрить.",
+  "section.integrations.desc": "Оповещения в Telegram: каждый админ привязывает свой чат.",
   "section.settings.desc": "Админы, безопасность, бэкапы и домены.",
   "section.empty": "Здесь пока пусто",
 
   "header.search": "Поиск нод, пользователей и разделов",
   "header.language": "Язык",
   "header.theme": "Тема",
-  "header.theme.toLight": "Включить светлую тему",
-  "header.theme.toDark": "Включить тёмную тему",
   "header.signOut": "Выйти",
   "header.version": "Версия панели {version}",
   "stale.title": "Панель обновлена до {version}",
@@ -89,8 +137,6 @@ const core: CoreMessages = {
   "stale.expand": "Показать напоминание о перезагрузке",
   "header.source": "Исходный код",
   "header.star": "Поставить звезду на GitHub",
-  "more.theme": "Тёмная тема",
-  "more.language": "Язык",
 
   "health.none": "Нет нод",
   "health.ok": "Флот в порядке",
@@ -98,15 +144,14 @@ const core: CoreMessages = {
   "health.problems": "{n} проблема|{n} проблемы|{n} проблем",
 
   "palette.title": "Командная палитра",
-  "palette.placeholder": "Нода, пользователь, раздел…",
+  "palette.placeholder": "Нода, человек, раздел или действие",
   "palette.empty": "Ничего не нашлось",
   "palette.searching": "Ищу…",
-  "palette.nodes": "НОДЫ",
-  "palette.users": "ПОЛЬЗОВАТЕЛИ",
-  "palette.places": "РАЗДЕЛЫ",
-  "palette.actions": "ДЕЙСТВИЯ",
-  "palette.addNode": "Добавить ноду",
-  "palette.createUser": "Новый пользователь",
+  "palette.nodes": "Ноды",
+  "palette.users": "Люди",
+  "palette.places": "Разделы",
+  "palette.actions": "Действия",
+  "palette.createUser": "Добавить человека",
   "palette.newToken": "Новый API-токен",
   "palette.newProfile": "Новый профиль",
   "palette.approvals": "Одобрения",
@@ -148,6 +193,7 @@ const core: CoreMessages = {
   "settings.accent.rose": "Роза",
   "settings.accent.sage": "Шалфей",
   "settings.local": "Эти настройки хранятся только на этом устройстве.",
+  "settings.fx": "Анимация появления",
   "settings.device": "Только на этом устройстве",
 
   "auth.setup.welcomeTitle": "Привет!",
@@ -156,11 +202,11 @@ const core: CoreMessages = {
   "auth.setup.adminTitle": "Создай админа",
   "auth.setup.adminBody":
     "Лучше всего — passkey: вход отпечатком пальца или Face ID, без паролей. Ключ хранится только на твоём устройстве.",
-  "auth.login": "ЛОГИН",
-  "auth.password": "ПАРОЛЬ",
-  "auth.code": "КОД ИЗ ПРИЛОЖЕНИЯ",
+  "auth.login": "Логин",
+  "auth.password": "Пароль",
+  "auth.code": "Код из приложения",
   "auth.createPasskey": "Создать passkey",
-  "auth.waitingPasskey": "Жду подтверждения на устройстве…",
+  "auth.waitingPasskey": "Жду passkey",
   "auth.setup.passkeyHint": "Браузер попросит подтвердить отпечатком, лицом или PIN-кодом",
   "auth.setup.otherWay": "пароль + код из приложения",
   "auth.setup.totpScan": "Отсканируй в Google Authenticator, 1Password или Aegis",
@@ -178,7 +224,7 @@ const core: CoreMessages = {
   "auth.recover.submit": "Сбросить вход",
   "auth.recover.doneTitle": "Новые данные для входа",
   "auth.recover.doneBody": "Для {admin}. Сохрани пароль и отсканируй QR-код прямо сейчас.",
-  "auth.recover.password": "НОВЫЙ ПАРОЛЬ",
+  "auth.recover.password": "Новый пароль",
   "auth.recover.onceTitle": "Показываются один раз.",
   "auth.recover.onceBody": "После перезагрузки или ухода со страницы их уже не показать.",
   "auth.recover.nextTitle": "Дальше",
@@ -224,8 +270,14 @@ const core: CoreMessages = {
 
   "err.name_taken": "Это имя уже занято — выбери другое.",
   "err.group_not_empty": "В группе ещё {users} чел. — перенеси их в другую группу, потом удаляй.",
+  "err.page_password_removed": "У страницы этого человека сейчас нет пароля. Сначала верни его.",
+  "err.group_in_both": "Одна и та же группа в обоих списках: добавь её или убери, но не то и другое.",
+  "err.main_group": "Основную группу нельзя убрать: сделай основной другую группу.",
+  "err.too_many_groups": "Человек может состоять не больше чем в 16 группах.",
   "err.profile_deployed": "Профиль стоит на нодах {nodes} — сначала убери его с них.",
   "err.stale_version": "Профиль изменили в другой вкладке — обнови страницу.",
+  "err.stale_inbound": "Настройки сервера только что изменили в другом месте. Список обновлён — проверь его и повтори правку.",
+  "err.stale_user": "Этого человека только что изменили в другом месте — выключили, продлили или поправили. Обнови страницу, проверь и повтори правку.",
   "err.node_offline": "Нода не на связи — попробуй, когда агент вернётся.",
   "err.agent_too_old": "Агент на ноде слишком старый для этого — обнови его на странице «Обновления».",
   "err.node_retired": "Нода выведена из флота.",
@@ -234,6 +286,8 @@ const core: CoreMessages = {
   "err.preset_builtin": "Встроенный пресет нельзя удалить.",
 
   "field.port.out_of_range": "Порт — от 1 до 65535",
+  "field.obfuscation.jc.handshake_budget": "Сумма Jc, непустых пакетов I1–I5 и одного пакета рукопожатия не должна превышать 128.",
+  "field.obfuscation.header_protection_key.rt_range_requires_hpk": "При случайных хвостах любой диапазон H1–H4 шире одного значения требует ключ защиты заголовков.",
   "field.hop.from.invalid": "Порт должен быть вне диапазона прыжков",
   "field.hop.from.out_of_range": "Начало диапазона — от 1024 до 65535, чтобы не задеть SSH и служебные порты",
   "field.hop.to.too_wide": "В диапазоне не больше 20 000 портов",
@@ -244,6 +298,9 @@ const core: CoreMessages = {
   "field.reality.target.format": "Запиши как хост:порт, например www.example.org:443",
   "field.reality.target.host": "Хост — простое имя или IP-адрес, без пробелов и слэшей",
   "field.reality.target.port_range": "Порт — от 1 до 65535",
+  "field.reality.target.same_port": "Цель указывает на этот же сервер: выбери другой адрес или порт",
+  "field.reality.target.unspecified": "Неопределённый адрес (0.0.0.0, ::) не сайт: укажи имя или настоящий адрес",
+  "field.reality.target.same_node": "Цель — сама эта нода: выбери другой адрес или порт",
   "field.reality.server_names.required": "Цель — IP-адрес: перечисли имена из её сертификата",
   "field.reality.server_names.length": "Не больше 8 имён",
   "field.reality.server_names.invalid": "Нужно имя хоста без звёздочек, например www.example.org",
@@ -274,6 +331,7 @@ const core: CoreMessages = {
   "field.egress.invalid_enum": "Напрямую или WARP",
   "field.reality.fingerprint.invalid_enum": "Chrome, Firefox, Safari, iOS, Edge или случайный",
   "field.reality.target_kind.invalid_enum": "Сайт этой ноды или другой сайт",
+  "field.hysteria2.tls_mode.unsupported": "Сертификат Let’s Encrypt на IP-адрес пока недоступен: возьми домен или самоподписанный",
 };
 
-export const ru: Messages = { ...cloudRu, ...core, ...opsRu, ...usersRu, ...securityRu, ...profilesRu, ...subsRu, ...healthRu, ...updatesRu, ...awgRu, ...warpRu, ...integrationsRu, ...telegramRu, ...portsRu, ...editionRu, ...decoyRu, ...countryRu, ...connectionsRu, ...journalRu, ...relayRu, ...waysRu };
+export const ru: Messages = { ...cloudRu, ...core, ...opsRu, ...usersRu, ...securityRu, ...profilesRu, ...subsRu, ...healthRu, ...updatesRu, ...awgRu, ...warpRu, ...integrationsRu, ...telegramRu, ...portsRu, ...editionRu, ...decoyRu, ...bulkRu, ...countryRu, ...probesRu, ...connectionsRu, ...journalRu, ...relayRu, ...waysRu, ...tgproxyRu, ...clientcompatRu, ...protocolsRu, ...aiRu, ...graphRu, ...waysgraphRu, ...fleetmapRu, ...observabilityRu, ...debugRu, ...resourcesRu, ...tasksRu, ...followupRu, ...osupdatesRu, ...fleetuiRu, ...clientlogsRu, ...trusttunnelRu, ...tcpshareRu, ...shellRu, ...overviewRu, ...nodesviewRu, ...windowsRu, ...nodepageRu, ...userslistRu, ...userspageRu, ...usersgroupRu, ...usersextraRu, ...decoysitesRu, ...planwordsRu, ...nodeswaysRu, ...nodewaysRu, ...profilespageRu, ...healthpageRu, ...reachpageRu, ...profilesrvRu, ...profilenewRu, ...subspnRu, ...subshxRu, ...subsrtRu, ...subsdnsRu, ...updatespageRu, ...settingspageRu, ...aipageRu, ...igpageRu, ...aspageRu, ...nodeshareRu, ...channelRu, ...countrynowRu, ...sniRu };

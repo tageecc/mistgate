@@ -39,7 +39,7 @@ export function amzActions({ data, st, render, api, reveal, focus, locked, marke
   const linkDevice = (id: string) => (find(id) ? undefined : data.devices.find((x) => x.id === id && x.kind !== "shared"));
   /** Where the calls for a device go: a key's at the Amnezia address, a link app's device at the page's own. */
   const urlFor = (id: string) => (find(id) ? endpoints() : data.devices_endpoint);
-  /** The control that opened a row's question or editor: its "more" button. */
+  /** The control that opened a row's window (its menu, question or editor): its "more" button. */
   const back = (id: string) => `amz-more-${id}`;
 
   const fail = (busy: string, e: unknown) => {
@@ -108,11 +108,13 @@ export function amzActions({ data, st, render, api, reveal, focus, locked, marke
       am().errorAt = "";
       const profiles = data.amnezia?.profiles ?? [];
       if (open && !profiles.some((p) => p.id === am().form.profile)) am().form.profile = mainProfile(profiles);
+      if (open) am().form.list = false;
       render();
       if (!open && was) reveal(`amz-row-${was}`);
     },
     pane(pane) {
       am().pane = pane;
+      am().created = null; // "Back" from the new key: the device stays in the list, the form is there again
       am().error = "";
       am().errorAt = "";
       render();
@@ -155,8 +157,18 @@ export function amzActions({ data, st, render, api, reveal, focus, locked, marke
         render();
       });
     },
+    stale(id) {
+      const was = am().stale;
+      am().stale = id;
+      am().menu = null;
+      am().error = "";
+      am().errorAt = "";
+      render();
+      if (!id && was) focus?.(back(was));
+    },
     renew(id) {
       const open = () => {
+        am().stale = null;
         am().renew = id;
         am().adding = false;
         render();
@@ -168,19 +180,14 @@ export function amzActions({ data, st, render, api, reveal, focus, locked, marke
       am().node[id] = i;
       render();
     },
-    where(id, w) {
-      am().where[id] = w;
-      render();
-    },
     ask(c) {
       const was = am().confirm;
       am().confirm = c;
       am().menu = null;
       am().rename = null;
       render();
-      // the question takes the keyboard to its safe answer; cancelling gives it back to the control that asked
-      if (c) focus?.(`amz-no-${c.id}`);
-      else if (was) focus?.(back(was.id));
+      // the question is a window that puts the keyboard on its safe answer itself; cancelling gives it back to the control that asked
+      if (!c && was) focus?.(back(was.id));
     },
     rotate(id) {
       void run(
@@ -212,9 +219,10 @@ export function amzActions({ data, st, render, api, reveal, focus, locked, marke
       );
     },
     menu(id) {
+      const was = am().menu;
       am().menu = id;
       render();
-      if (id) focus?.(`amz-m-ren-${id}`);
+      if (!id && was) focus?.(back(was));
     },
     renameStart(id) {
       const value = find(id)?.label ?? linkDevice(id)?.model;
@@ -225,7 +233,6 @@ export function amzActions({ data, st, render, api, reveal, focus, locked, marke
       am().errorAt = "";
       am().rename = { id, value };
       render();
-      focus?.(`amz-ren-${id}`);
     },
     renameInput(value) {
       const r = am().rename;

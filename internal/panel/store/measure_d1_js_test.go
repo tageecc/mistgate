@@ -164,6 +164,20 @@ func TestD1BatchShapes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	networkIn := f.statsIn(3, 2, live)
+	networkIn.Seq = 2
+	networkIn.Networks = []FleetNetwork{{InboundID: f.inbound, ASN: 64496, Attempts: 2, Connects: 1, People: 1}}
+	networks := measureD1(binding, "IngestStats with networks", func() { _, err = f.st.IngestStats(ctx, networkIn) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	personIn := f.statsIn(3, 2, live)
+	personIn.Seq = 3
+	personIn.PersonNetworks = []FleetPersonNetwork{{CredID: "crd_00000000000000000000000001", InboundID: f.inbound, ASN: 64496, Connects: 1}}
+	persons := measureD1(binding, "IngestStats with person networks", func() { _, err = f.st.IngestStats(ctx, personIn) })
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, _, err := f.st.NodeHello(ctx, f.enrolledID, 1, HelloInfo{AgentVersion: "test", Instance: "shape-instance-b"}, f.now); err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +192,8 @@ func TestD1BatchShapes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for name, s := range map[string]d1Shape{"NodeHello": hello, "IngestStats (3 users)": stats, "NodeApplied": applied, "RenewCert": renew} {
+	for name, s := range map[string]d1Shape{"NodeHello": hello, "IngestStats (3 users)": stats, "IngestStats (networks)": networks,
+		"IngestStats (person networks)": persons, "NodeApplied": applied, "RenewCert": renew} {
 		t.Logf("%-22s %s", name, s)
 	}
 	// The shapes the edge design depends on (one batch per hot call; IngestStats a read batch and a write batch).
@@ -186,7 +201,8 @@ func TestD1BatchShapes(t *testing.T) {
 		got  d1Shape
 		want []int
 	}{
-		"NodeHello": {hello, []int{5}}, "IngestStats": {stats, []int{4, 11}}, "NodeApplied": {applied, []int{3}}, "RenewCert": {renew, []int{4}},
+		"NodeHello": {hello, []int{5}}, "IngestStats": {stats, []int{4, 11}}, "IngestStats networks": {networks, []int{4, 12}},
+		"IngestStats person networks": {persons, []int{4, 12}}, "NodeApplied": {applied, []int{3}}, "RenewCert": {renew, []int{4}},
 	} {
 		if fmt.Sprint(c.got.BatchSizes) != fmt.Sprint(c.want) {
 			t.Errorf("%s batches = %v, want %v", name, c.got.BatchSizes, c.want)
@@ -290,7 +306,9 @@ func TestD1IngestStatsAtEdgeCap(t *testing.T) {
 		in.Links = append(in.Links, FleetLink{CredID: in.Traffic[i].CredID, InboundID: in.Traffic[i].InboundID, Connects: 1 << 30, Rejects: 1 << 30,
 			Drops: 1 << 30, Stalls: 1 << 30, OnlineS: 1 << 30, UnknownKeys: 1 << 30, Hellos: 1 << 30, Handshakes: 1 << 30,
 			ClientCloses: 1 << 30, Freezes: 1 << 30, Quiet: 1 << 30, Accepted: 1 << 30, HellosForeign: 1 << 30,
-			RttMSSum: ^uint64(0), RttSamples: 1 << 30, PktsSent: ^uint64(0), PktsLost: ^uint64(0)})
+			RttMSSum: ^uint64(0), RttSamples: 1 << 30, PktsSent: ^uint64(0), PktsLost: ^uint64(0),
+			HsUnfinished: 1 << 30, TLSAlertsSent: 1 << 30, TLSAlertsRecv: 1 << 30, TLSCertRefused: 1 << 30, RealityFallback: 1 << 30,
+			AuthFailed: 1 << 30, TCPStalls: 1 << 30, TCPStalls16K: 1 << 30, Initiations: 1 << 30, Responses: 1 << 30, ResponsesUnmatched: 1 << 30})
 	}
 	journalValue := strings.Repeat("界", 160)
 	for i := range maxNodeJournalRows {

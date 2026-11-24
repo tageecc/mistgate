@@ -11,6 +11,7 @@ import (
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
 	"github.com/mistgate/mistgate/internal/panel/access"
 	"github.com/mistgate/mistgate/internal/panel/instance"
+	"github.com/mistgate/mistgate/internal/panel/subhdr"
 	"github.com/mistgate/mistgate/internal/panel/subsettings"
 	"github.com/mistgate/mistgate/web"
 )
@@ -65,7 +66,7 @@ func (c *common) brand(ctx context.Context) instance.Settings {
 			c.brandV, c.brandAt, c.brandOK = v, now, true
 			return v
 		}
-		c.cfg.Log.Warn("read brand for subscription", "err", err)
+		c.cfg.Log.Warn("read brand for subscription", "code", "subscription_brand_read_failed", "err", err)
 		if c.brandOK {
 			return c.brandV
 		}
@@ -112,6 +113,10 @@ func pageLang(r *http.Request, def string) string {
 			return "ru"
 		case strings.HasPrefix(tag, "en"):
 			return "en"
+		case strings.HasPrefix(tag, "fa"):
+			return "fa"
+		case strings.HasPrefix(tag, "tr"):
+			return "tr"
 		}
 	}
 	if def == "" {
@@ -139,21 +144,21 @@ func (c *common) writeLocked(w http.ResponseWriter, r *http.Request, link string
 func (c *common) writeData(w http.ResponseWriter, r *http.Request, d pageData, ancestors string) {
 	html, err := c.page.render(d)
 	if err != nil {
-		c.cfg.Log.Error("render user page", "err", err)
+		c.cfg.Log.Error("render user page", "code", "user_page_render_failed", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	hd := w.Header()
-	hd["Content-Type"] = headerContentTypeHTML[:1:1]
-	hd["Cache-Control"] = headerCacheNoStore[:1:1]
-	hd["X-Content-Type-Options"] = headerNoSniff[:1:1]
-	hd["Referrer-Policy"] = headerNoReferrer[:1:1]
-	hd["X-Robots-Tag"] = headerRobotsNoIndex[:1:1]
-	hd.Set("Content-Security-Policy", c.page.csp(ancestors))
+	hd[subhdr.ContentType] = headerContentTypeHTML[:1:1]
+	hd[subhdr.CacheControl] = headerCacheNoStore[:1:1]
+	hd[subhdr.XContentTypeOptions] = headerNoSniff[:1:1]
+	hd[subhdr.ReferrerPolicy] = headerNoReferrer[:1:1]
+	hd[subhdr.XRobotsTag] = headerRobotsNoIndex[:1:1]
+	hd.Set(subhdr.ContentSecurityPolicy, c.page.csp(ancestors))
 	if ancestors == "'self'" {
-		hd["X-Frame-Options"] = headerFrameSameOrigin[:1:1] // replaces the admin's DENY
+		hd[subhdr.XFrameOptions] = headerFrameSameOrigin[:1:1] // replaces the admin's DENY
 	} else {
-		hd["X-Frame-Options"] = headerFrameDeny[:1:1]
+		hd[subhdr.XFrameOptions] = headerFrameDeny[:1:1]
 	}
 	w.Write(html)
 }
@@ -161,6 +166,12 @@ func (c *common) writeData(w http.ResponseWriter, r *http.Request, d pageData, a
 // Previewer supplies a user's data for the admin preview; *access.Service implements it.
 type Previewer interface {
 	PreviewSubscription(ctx context.Context, userID string) (access.SubView, string, error)
+}
+
+// ProfilePreviewer supplies a user's view for the admin's preview of a Mihomo profile (it writes nothing); *access.Service
+// implements it.
+type ProfilePreviewer interface {
+	PreviewSubscriptionWith(ctx context.Context, userID string, opt access.SubOptions) (access.SubView, error)
 }
 
 // PreviewHandler returns the admin preview of the user page: what the user with this id would see, framed by
@@ -179,7 +190,7 @@ func PreviewHandler(src Previewer, cfg Config) func(w http.ResponseWriter, r *ht
 			return
 		}
 		if err != nil {
-			cfg.Log.Error("user page preview", "err", err)
+			cfg.Log.Error("user page preview", "code", "user_page_preview_failed", "err", err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}

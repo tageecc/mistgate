@@ -6,7 +6,6 @@ import { Button } from "@/components/ui/button";
 import { Segmented } from "@/components/ui/segmented";
 import { Role } from "@/gen/mistgate/admin/v1/auth_pb";
 import { InboundState, NodeStatus, WarpState } from "@/gen/mistgate/admin/v1/common_pb";
-import type { ProfileSummary } from "@/gen/mistgate/admin/v1/profile_pb";
 import { groups as groupsApi, nodes as nodesApi, profiles as profilesApi } from "@/lib/api";
 import { reasons } from "@/lib/port-check";
 import { nodesQuery } from "@/lib/queries";
@@ -14,8 +13,6 @@ import { meQuery } from "@/lib/session";
 import { AddInbound } from "@/screens/node/add-inbound";
 import { ProfilesTab } from "@/screens/node/profiles";
 import { CheckPortsButton, Ports as PortRows, usePortCheck } from "@/screens/node/ports";
-import { DeployDialog } from "@/screens/profiles/deploy";
-import { TwinPanel, twinPlanKey } from "@/screens/profiles/twin";
 import { groupsQuery, profileListQuery } from "@/screens/users/rpc";
 
 // Development only, part of /dev-kit: the port check (design/udp-port-check.md, design/vless.md §7.4) on made-up data — the node's
@@ -40,7 +37,7 @@ const kitNodes = [
 const tcp = (over: object) => ({ port: 80, role: "acme", alpn: false, profile: "", verdict: "ours", reason: "", sender: "de2", checkedUnix: now - 3600, ...over });
 const tcpOk = [tcp({}), tcp({ port: 443, role: "vless", profile: "VLESS · 443 · Vision", alpn: true })];
 
-const baseNode = (over: object = {}) => ({
+export const baseNode = (over: object = {}) => ({
   ...kitNodes[0],
   location: "Frankfurt",
   provider: "examplehost",
@@ -50,7 +47,7 @@ const baseNode = (over: object = {}) => ({
   warp: { state: WarpState.NOT_CONFIGURED },
   ...over,
 });
-const inbound = (over: object) => ({
+export const inbound = (over: object) => ({
   id: "inb_1",
   profileId: "prf_main",
   profileName: "hy2 · 443 · Salamander",
@@ -68,13 +65,56 @@ const inbound = (over: object) => ({
 });
 const check = (over: object) => ({ nodeId: "nod_de1", port: 443, verdict: "ok", sent: 300, got: 300, checkedUnix: now - 7 * 60, badUnix: 0, sender: "de2", reason: "", ...over });
 
+// checked again from a second sender of the other region: minsk1 (BY, CIS) first, then fi1 (outside the CIS)
+const minsk1 = { id: "nod_minsk1", name: "minsk1", status: NodeStatus.ONLINE, countryCode: "BY", address: "minsk1.example.com", protocols: [], awgBackend: "auto" };
+const twice = (over: object) => check({ sender: "minsk1", senderVerdict: "ok", confirmSender: "fi1", confirmSent: 300, confirmGot: 300, confirmVerdict: "ok", blame: "", ...over });
+const blameInbounds = [
+  inbound({}),
+  inbound({ id: "inb_5", profileId: "prf_tuic", profileName: "TUIC · 2053", protocol: "tuic", port: 2053, certNotAfterUnix: 0 }),
+  inbound({ id: "inb_6", profileId: "prf_h2083", profileName: "hy2 · 2083", port: 2083 }),
+  inbound({ id: "inb_2", profileId: "prf_warp", profileName: "hy2 · WARP · 8443", port: 8443, egress: "warp" }),
+];
+const blameChecks = [
+  twice({ got: 299, confirmGot: 300 }),
+  // path: minsk1 lost, fi1 got through, so the port is fine
+  twice({ port: 2053, got: 236, senderVerdict: "lossy", confirmGot: 299, blame: "path" }),
+  // node: both lost
+  twice({ port: 2083, verdict: "lossy", got: 241, senderVerdict: "lossy", confirmGot: 238, confirmVerdict: "lossy", blame: "node", badUnix: now - 7 * 60 }),
+  // path the other way: minsk1 got through, fi1 lost
+  twice({ port: 8443, got: 300, confirmGot: 262, confirmVerdict: "lossy", blame: "path" }),
+];
+
+// a filter on the way to fi1, not a lossy line: from de1 only 443 arrives whole, 2053 and 8443 get nothing; msk1 (CIS) gets all
+const msk1 = { id: "nod_msk1", name: "msk1", status: NodeStatus.ONLINE, countryCode: "RU", address: "msk1.example.com", protocols: [], awgBackend: "auto" };
+const fromDe1 = (over: object) => check({ nodeId: "nod_fi1", sender: "de1", senderVerdict: "ok", confirmSender: "msk1", confirmSent: 300, confirmGot: 300, confirmVerdict: "ok", blame: "", ...over });
+const filterChecks = [fromDe1({}), fromDe1({ port: 2053, got: 0, senderVerdict: "broken", blame: "path" }), fromDe1({ port: 8443, got: 0, senderVerdict: "broken", blame: "path" })];
+const filterNode = baseNode({ id: "nod_fi1", name: "fi1", countryCode: "FI", location: "Helsinki", address: "fi1.example.com" });
+
+// a hoster's DDoS filter in front of nl1: from de1 and fi1 only UDP 443 arrives, the other ports get 0 of 150, while the
+// panel's own AmneziaWG check through 2053 passes (test blocked, people get through); the Hysteria2 check through 8443
+// failed too, so 8443 stays red. Both senders saw it, so the panel marked the node filtered (udpFilteredUnix).
+const nl1 = baseNode({ id: "nod_nl1", name: "nl1", countryCode: "NL", location: "Amsterdam", address: "nl1.example.com" });
+const nl1Inbounds = [
+  inbound({ nodeId: "nod_nl1", nodeName: "nl1" }),
+  inbound({ id: "inb_7", nodeId: "nod_nl1", nodeName: "nl1", profileId: "prf_awg", profileName: "AWG · 2053", protocol: "awg", port: 2053, tlsServerName: "", certNotAfterUnix: 0 }),
+  inbound({ id: "inb_8", nodeId: "nod_nl1", nodeName: "nl1", profileId: "prf_warp", profileName: "hy2 · WARP · 8443", port: 8443, egress: "warp" }),
+];
+const fromBoth = (over: object) => check({ nodeId: "nod_nl1", sent: 150, got: 150, sender: "de1", senderVerdict: "ok", confirmSender: "fi1", confirmSent: 150, confirmGot: 150, confirmVerdict: "ok", blame: "", ...over });
+const dropped = { verdict: "broken", got: 0, senderVerdict: "broken", confirmGot: 0, confirmVerdict: "broken", blame: "node" };
+const blockedChecks = [fromBoth({ protocolOkUnix: now - 60 }), fromBoth({ port: 2053, ...dropped, protocolOkUnix: now - 2 * 60 }), fromBoth({ port: 8443, ...dropped, protocolOkUnix: 0 })];
+// a day later, rechecked from de1 alone: 2053 still blocked for the test with AmneziaWG passing; 51820 lost a fifth while its
+// last good Hysteria2 check is 20 min older than the run, past the 15-minute window, so it reads as a real loss
+const nl1Later = [...nl1Inbounds.filter((i) => i.port !== 8443), inbound({ id: "inb_9", nodeId: "nod_nl1", nodeName: "nl1", profileId: "prf_ext", profileName: "Backup", port: 51820 })];
+const fromDe1Only = (over: object) => check({ nodeId: "nod_nl1", sent: 150, got: 150, sender: "de1", checkedUnix: now - 3 * 60, ...over });
+const laterChecks = [fromDe1Only({}), fromDe1Only({ port: 2053, verdict: "broken", got: 0, protocolOkUnix: now - 10 * 60 }), fromDe1Only({ port: 51820, verdict: "lossy", got: 120, protocolOkUnix: now - 23 * 60 })];
+
 const twoInbounds = [inbound({}), inbound({ id: "inb_2", profileId: "prf_warp", profileName: "hy2 · WARP · 8443", port: 8443, egress: "warp" })];
 const threeInbounds = [...twoInbounds, inbound({ id: "inb_3", profileId: "prf_awg", profileName: "AWG 3.1 · QUIC", protocol: "awg", port: 33183, tlsServerName: "", certNotAfterUnix: 0 }), inbound({ id: "inb_4", profileId: "prf_ext", profileName: "Backup", port: 51820 })];
 
-type Fill = [readonly unknown[], unknown];
+export type Fill = [readonly unknown[], unknown];
 
 /** A private cache: every query the screens ask is answered from here, nothing is fetched. */
-function Cache({ fill = [], role = Role.OWNER, children }: { fill?: Fill[]; role?: Role; children: ReactNode }) {
+export function Cache({ fill = [], role = Role.OWNER, children }: { fill?: Fill[]; role?: Role; children: ReactNode }) {
   const [qc] = useState(() => {
     const c = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity, retry: false, refetchInterval: false } } });
     c.setQueryData(meQuery.queryKey, { admin: { id: "adm_1", role } } as never);
@@ -87,9 +127,9 @@ function Cache({ fill = [], role = Role.OWNER, children }: { fill?: Fill[]; role
   return <QueryClientProvider client={qc}>{children}</QueryClientProvider>;
 }
 
-function Demo({ title, children }: { title: string; children: ReactNode }) {
+export function Demo({ title, shot, children }: { title: string; shot?: string; children: ReactNode }) {
   return (
-    <section className="flex flex-col gap-3">
+    <section data-shot={shot} className="flex flex-col gap-3">
       <SectionLabel>{title}</SectionLabel>
       <div className="rounded-card-lg border border-dashed border-line p-4">{children}</div>
     </section>
@@ -146,11 +186,6 @@ function fakePorts() {
   p.createProfile = async () => ({ profile: { id: "prf_quick", name: "Hysteria2 · 443", version: 1 } });
   p.updateProfile = async () => ({ profile: { id: "prf_quick", version: 2 } });
   (groupsApi as unknown as Record<string, unknown>).updateGroup = async () => ({});
-  p.twinProfile = async (r: { profileId: string }) => {
-    await wait(r.profileId === "prf_slow" ? 5000 : 3000);
-    if (r.profileId === "prf_none") throw new ConnectError("no_clean_port", Code.FailedPrecondition);
-    return twinPlan;
-  };
   (nodesApi as unknown as Record<string, unknown>).checkPorts = async () => {
     await wait(7000);
     const ports = [check({}), check({ port: 8443, verdict: "lossy", got: 270, badUnix: now })];
@@ -203,51 +238,6 @@ function AddDemo({ label, quick, checks, list }: { label: string; quick?: boolea
   );
 }
 
-function DeployDemo() {
-  const [open, setOpen] = useState(false);
-  return (
-    <Cache>
-      <Button
-        onClick={() => {
-          fakePorts();
-          setOpen(true);
-        }}
-      >
-        Put “hy2 · 443” on fi1 / de2 / se1
-      </Button>
-      <DeployDialog open={open} onOpenChange={setOpen} profile={{ id: "prf_main", name: "hy2 · 443 · Salamander", protocol: "hysteria2", tlsMode: "acme_domain", sni: "" }} inbounds={[{ nodeId: "nod_de1" }]} preselect={["nod_fi1", "nod_de2", "nod_se1"]} />
-    </Cache>
-  );
-}
-
-// ---- the twin -----------------------------------------------------------------------------------------------------------
-const twinPlan = {
-  name: "hy2 · 443 · WARP",
-  egress: "warp",
-  port: 2053,
-  nodeIds: ["nod_de1", "nod_fi1"],
-  groupIds: ["grp_all"],
-  hopDropped: false,
-  portChecks: [
-    { nodeId: "nod_de1", port: 2053, verdict: "ok", sent: 300, got: 300, checkedUnix: BigInt(now - 5), badUnix: 0n, sender: "de2", reason: "" },
-    { nodeId: "nod_fi1", port: 2053, verdict: "", sent: 0, got: 0, checkedUnix: 0n, badUnix: 0n, sender: "", reason: "no_sender" },
-    { nodeId: "nod_de1", port: 8443, verdict: "lossy", sent: 300, got: 189, checkedUnix: BigInt(now - 5), badUnix: BigInt(now - 5), sender: "de2", reason: "" },
-  ],
-};
-const twinProfile = (id: string, version: number) => ({ id, name: "hy2 · 443 · Salamander", protocol: "hysteria2", nodeCount: 2, userCount: 12, version, warnings: [] }) as unknown as ProfileSummary;
-
-function TwinDemo({ caption, profile, plan }: { caption: string; profile: ProfileSummary; plan?: object }) {
-  const fill: Fill[] = plan ? [[twinPlanKey(profile.id, "warp", profile.version), plan]] : [];
-  return (
-    <Cache fill={[...fill, [nodesQuery.queryKey, { nodes: kitNodes.map((n) => ({ ...n, warp: { state: WarpState.UP } })) }]]}>
-      <div onClickCapture={fakePorts} className="flex min-w-[260px] flex-col gap-1.5">
-        <span className="text-xs text-muted">{caption}</span>
-        <TwinPanel profile={profile} egress="direct" dirty={false} />
-      </div>
-    </Cache>
-  );
-}
-
 export function PortsKit() {
   const editFill: Fill[] = [[["inbound-check", { kind: "update", inboundId: "inb_1", port: "8443" }], { of: "inb_1", state: "refused", code: "port_lossy", vars: { port: "8443", node: "de1", sent: "300", got: "189", at: String(now - 120), sender: "de2", free: "4443" } }]];
   return (
@@ -258,7 +248,7 @@ export function PortsKit() {
         </Cache>
       </Demo>
 
-      <Demo title="UDP ports: ok with an old loss (clean now) / lossy from the panel / broken / a free port nobody uses / a profile port not in the last check">
+      <Demo shot="ports-profiles" title="UDP ports: ok with an old loss (clean now) / lossy from the panel / broken / Backup's test blocked while its Hysteria2 check passes / a free port nobody uses">
         <Cache>
           <ProfilesTab
             data={
@@ -269,11 +259,36 @@ export function PortsKit() {
                   check({ badUnix: now - 3 * 86400, checkedUnix: now - 2 * 3600 }),
                   check({ port: 8443, verdict: "lossy", got: 270, sender: "panel", checkedUnix: now - 40 }),
                   check({ port: 33183, verdict: "broken", got: 120 }),
+                  check({ port: 51820, verdict: "broken", got: 0, protocolOkUnix: now - 60 }),
                   check({ port: 2053 }),
                 ],
               } as never
             }
           />
+        </Cache>
+      </Demo>
+
+      <Demo title="UDP ports checked from two senders: clean from both / lost on the way from minsk1 (CIS), the port is fine / lost from both sides, the port loses / lost on the way from fi1">
+        <Cache fill={[[nodesQuery.queryKey, { nodes: [...kitNodes, minsk1] }]]}>
+          <Ports data={{ node: baseNode(), inbounds: blameInbounds, portChecks: blameChecks, tcpChecks: tcpOk } as never} />
+        </Cache>
+      </Demo>
+
+      <Demo shot="ports-filter" title="UDP ports of fi1 filtered on the way from de1: only 443 arrives whole, 2053 and 8443 get nothing, msk1 (CIS) gets everything; the ports are fine">
+        <Cache fill={[[nodesQuery.queryKey, { nodes: [...kitNodes, msk1] }]]}>
+          <Ports data={{ node: filterNode, inbounds: blameInbounds.filter((i) => i.port !== 2083), portChecks: filterChecks, tcpChecks: tcpOk } as never} />
+        </Cache>
+      </Demo>
+
+      <Demo shot="ports-blocked" title="UDP ports of nl1 behind the hoster's filter: only 443 arrives from de1 and fi1; 2053's AmneziaWG check passes (test blocked, protocol works), 8443's Hysteria2 check failed too (a real loss); the node is marked filtered">
+        <Cache fill={[[nodesQuery.queryKey, { nodes: [...kitNodes, { ...nl1, protocols: [] }] }]]}>
+          <Ports data={{ node: nl1, inbounds: nl1Inbounds, portChecks: blockedChecks, tcpChecks: tcpOk, udpFilteredUnix: now - 7 * 60 } as never} />
+        </Cache>
+      </Demo>
+
+      <Demo shot="ports-blocked-one" title="UDP ports of nl1 rechecked from de1 alone, no filter mark: 2053 test blocked with AmneziaWG passing 7 min before the run / 51820 loses a fifth, its last good check 20 min before the run (past the 15-minute window)">
+        <Cache>
+          <Ports data={{ node: nl1, inbounds: nl1Later, portChecks: laterChecks, tcpChecks: tcpOk } as never} />
         </Cache>
       </Demo>
 
@@ -332,18 +347,6 @@ export function PortsKit() {
               <p className="pt-2 text-xs text-muted">Edit → type 8443: refused from the stored checks (Take 4443 / Save anyway).</p>
             </div>
           </Cache>
-        </div>
-      </Demo>
-
-      <Demo title="Put a profile on nodes: fi1 loses packets on 443 (clean port offered, or put on anyway), de2 could not be checked, se1 is clean">
-        <DeployDemo />
-      </Demo>
-
-      <Demo title="Twin: UDP badge per node (checked / unchecked: reason), a skipped candidate / checking on 2 nodes, then the plan / no clean port">
-        <div className="flex flex-wrap gap-2">
-          <TwinDemo caption="The plan is here" profile={twinProfile("prf_main", 4)} plan={twinPlan} />
-          <TwinDemo caption="Checking UDP on 2 nodes… (5 s), then the plan" profile={twinProfile("prf_slow", 5)} />
-          <TwinDemo caption="Checking (3 s), then no_clean_port" profile={twinProfile("prf_none", 6)} />
         </div>
       </Demo>
     </div>

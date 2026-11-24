@@ -77,6 +77,12 @@ func (l pageLang) tr(s string) string {
 }
 
 var pageEnglish = map[string]string{
+	"Войти с ключом панели": "Log in with the panel key",
+	"Способ входа":          "Login method",
+	"Пароль":                "Password",
+	"Ключ панели":           "Panel key",
+	"Проверьте причину ошибки. Для повтора выберите SSH-логин и пароль или войдите с ключом панели: root или пользователь с passwordless sudo.":   "Check the cause of the error. To retry, choose the SSH login and password or log in with the panel key: root or a user with passwordless sudo.",
+	"Пароль меняется через сохранённый SSH-доступ. Если сервер принимает SSH-пароли, панель проверит новый пароль и сохранит результат проверки.": "The password is changed through the saved SSH access. If the server accepts SSH passwords, the panel checks the new password and records the result.",
 	// the page
 	"Установка ноды — Mistgate":    "Install a node — Mistgate",
 	"Назад в панель":               "Back to the panel",
@@ -231,11 +237,19 @@ var pageEnglish = map[string]string{
 	"Нода подключилась к панели":                                "The node connected to the panel",
 
 	// job errors
-	"SSH-задание остановлено. Проверьте сервер: часть команд установки могла уже выполниться.":                                           "The SSH job was stopped. Check the server: some installation commands may already have run.",
-	"Укажите публичный адрес сервера, доступный по SSH.":                                                                                 "Enter the server's public address that SSH can reach.",
-	"Ключ SSH изменился после подтверждения. Установка остановлена.":                                                                     "The SSH key changed after you confirmed it. The installation is stopped.",
-	"Сервер отклонил SSH-логин или пароль. Проверьте их и повторите установку.":                                                          "The server refused the SSH login or password. Check them and retry the installation.",
-	"Сервер не принимает вход по паролю, только по ключу. Поставьте ноду командой вручную или временно разрешите вход по паролю в sshd.": "The server does not accept password logins, only keys. Install the node with the manual command, or allow password logins in sshd for the install.",
+	"SSH-задание остановлено. Проверьте сервер: часть команд установки могла уже выполниться.":                         "The SSH job was stopped. Check the server: some installation commands may already have run.",
+	"Укажите публичный адрес сервера, доступный по SSH.":                                                               "Enter the server's public address that SSH can reach.",
+	"Ключ SSH изменился после подтверждения. Установка остановлена.":                                                   "The SSH key changed after you confirmed it. The installation is stopped.",
+	"Сервер отклонил SSH-логин или пароль. Проверьте их и повторите установку.":                                        "The server refused the SSH login or password. Check them and retry the installation.",
+	"Сервер не принимает вход по паролю, только по ключу. Добавьте на сервер ключ панели и повторите установку с ним.": "The server does not accept password logins, only keys. Add the panel key to the server and install with it.",
+	"Сервер не принял ключ панели. Проверьте, что он есть в ~/.ssh/authorized_keys этого логина.":                      "The server did not accept the panel key. Check that it is in ~/.ssh/authorized_keys of this login.",
+	"~/.ssh или authorized_keys на сервере — ссылка или не обычный файл. Панель такой файл не меняет.":                 "~/.ssh or authorized_keys on the server is a link or not a regular file. The panel does not change such a file.",
+	"authorized_keys на сервере изменился во время записи. Повторите установку.":                                       "authorized_keys on the server changed while the panel was writing it. Retry the install.",
+	"authorized_keys на сервере больше 64 КиБ. Панель такой файл не меняет.":                                           "authorized_keys on the server is larger than 64 KiB. The panel does not change such a file.",
+	"Панели не удалось прочитать или записать authorized_keys на сервере.":                                             "The panel could not read or write authorized_keys on the server.",
+	"Установка ключа панели":                             "Installing the panel key",
+	"Установка ключа панели на сервер":                   "Installing the panel key on the server",
+	"Ключ панели не установлен, панель входит по паролю": "The panel key was not installed; the panel logs in with the password",
 	refusedTargetMessage: "The panel's network refused the connection to this address, or the server cannot be reached from it. The panel connects from Cloudflare's network: Cloudflare addresses, names behind Cloudflare's proxy (orange cloud) and private networks are unreachable. Enter the server's own public address, or install the node with the manual command (in the panel: add a node, \"Get a manual install command\").",
 	edgeTimeoutMessage:   "The panel got no answer from the SSH server in time. The panel connects from Cloudflare's network, not from your computer: SSH must accept inbound TCP from the internet (the hoster's and the server's firewall), not only from your IP. Open it for the install, or install the node with the manual command.",
 	edgeTimeoutLabel:     "The server did not answer in time. The panel connects from Cloudflare's network, not from your computer: SSH must accept inbound TCP from the internet, not only from your IP.",
@@ -260,4 +274,10 @@ var pageEnglish = map[string]string{
 	"Имя уже используется. Укажите другое имя ноды.":       "The name is taken. Choose another node name.",
 	"Не удалось установить или запустить службу агента.":   "Could not install or start the agent service.",
 	"Установка остановлена":                                "The installation stopped",
+
+	// A server without the nft command: the install adds the nftables package as a step of its own.
+	"Нет, установка поставит": "No, the install will add it",
+	"Установка nftables":      "Installing nftables",
+	"Установка пакета nftables на сервер (команды nft на нём нет)": "Installing the nftables package on the server (it has no nft command)",
+	"Не удалось установить пакет nftables: на сервере нет команды nft, а агенту она нужна для защиты SSH, прыжков по портам и WARP. Установите его вручную (apt-get install nftables) и повторите установку.": "Could not install the nftables package: the server has no nft command, and the agent needs it for the SSH guard, port hopping and WARP. Install it by hand (apt-get install nftables) and retry.",
 }

@@ -3,7 +3,61 @@
     "type": "index",
     "name": "api_token_live_name",
     "tbl_name": "api_token",
-    "sql": "CREATE UNIQUE INDEX api_token_live_name ON api_token(name_key) WHERE revoked_at = 0"
+    "sql": "CREATE UNIQUE INDEX api_token_live_name ON api_token(name_key) WHERE revoked_at = 0 AND assistant_only = 0"
+  },
+  {
+    "type": "index",
+    "name": "assistant_budget_reservation_month",
+    "tbl_name": "assistant_budget_reservation",
+    "sql": "CREATE INDEX assistant_budget_reservation_month ON assistant_budget_reservation(provider, month, state)"
+  },
+  {
+    "type": "index",
+    "name": "assistant_conversation_admin",
+    "tbl_name": "assistant_conversation",
+    "sql": "CREATE INDEX assistant_conversation_admin ON assistant_conversation(admin_id, updated_at DESC, id DESC)"
+  },
+  {
+    "type": "index",
+    "name": "assistant_follow_up_admin",
+    "tbl_name": "assistant_follow_up",
+    "sql": "CREATE INDEX assistant_follow_up_admin ON assistant_follow_up (admin_id)"
+  },
+  {
+    "type": "index",
+    "name": "assistant_follow_up_conversation",
+    "tbl_name": "assistant_follow_up",
+    "sql": "CREATE INDEX assistant_follow_up_conversation ON assistant_follow_up (conversation_id, due_at)"
+  },
+  {
+    "type": "index",
+    "name": "assistant_follow_up_due",
+    "tbl_name": "assistant_follow_up",
+    "sql": "CREATE INDEX assistant_follow_up_due ON assistant_follow_up (due_at)"
+  },
+  {
+    "type": "index",
+    "name": "assistant_memory_admin",
+    "tbl_name": "assistant_memory",
+    "sql": "CREATE INDEX assistant_memory_admin ON assistant_memory(admin_id, created_at, id)"
+  },
+  {
+    "type": "index",
+    "name": "assistant_message_admin",
+    "tbl_name": "assistant_message",
+    "sql": "CREATE INDEX assistant_message_admin ON assistant_message(admin_id, created_at)"
+  },
+  {
+    "type": "index",
+    "name": "assistant_message_conversation",
+    "tbl_name": "assistant_message",
+    "sql": "CREATE INDEX assistant_message_conversation ON assistant_message(conversation_id, created_at, id)"
+  },
+  {
+    "type": "index",
+    "name": "assistant_plan_conversation",
+    "tbl_name": "assistant_plan",
+    "sql": "CREATE INDEX assistant_plan_conversation ON assistant_plan(conversation_id, admin_id, created_at)"
   },
   {
     "type": "index",
@@ -49,6 +103,30 @@
   },
   {
     "type": "index",
+    "name": "client_debug_device",
+    "tbl_name": "client_debug",
+    "sql": "CREATE INDEX client_debug_device ON client_debug (device_id, state, closed_at)"
+  },
+  {
+    "type": "index",
+    "name": "client_debug_open",
+    "tbl_name": "client_debug",
+    "sql": "CREATE UNIQUE INDEX client_debug_open ON client_debug (device_id) WHERE state = 'open'"
+  },
+  {
+    "type": "index",
+    "name": "client_debug_requested",
+    "tbl_name": "client_debug",
+    "sql": "CREATE INDEX client_debug_requested ON client_debug (requested_at)"
+  },
+  {
+    "type": "index",
+    "name": "client_debug_user",
+    "tbl_name": "client_debug",
+    "sql": "CREATE INDEX client_debug_user ON client_debug (user_id, requested_at)"
+  },
+  {
+    "type": "index",
     "name": "client_probe_report_at",
     "tbl_name": "client_probe_report",
     "sql": "CREATE INDEX client_probe_report_at ON client_probe_report (at)"
@@ -79,9 +157,39 @@
   },
   {
     "type": "index",
+    "name": "debug_capture_node",
+    "tbl_name": "debug_capture",
+    "sql": "CREATE INDEX debug_capture_node ON debug_capture (node_id, started_at)"
+  },
+  {
+    "type": "index",
+    "name": "debug_capture_started",
+    "tbl_name": "debug_capture",
+    "sql": "CREATE INDEX debug_capture_started ON debug_capture (started_at)"
+  },
+  {
+    "type": "index",
+    "name": "decoy_site_name",
+    "tbl_name": "decoy_site",
+    "sql": "CREATE UNIQUE INDEX decoy_site_name ON decoy_site (name)"
+  },
+  {
+    "type": "index",
+    "name": "decoy_site_version_hash",
+    "tbl_name": "decoy_site_version",
+    "sql": "CREATE INDEX decoy_site_version_hash ON decoy_site_version (bundle_hash)"
+  },
+  {
+    "type": "index",
     "name": "device_credential_live",
     "tbl_name": "device_credential",
-    "sql": "CREATE UNIQUE INDEX device_credential_live ON device_credential (device_id, protocol, COALESCE(profile_id, '')) WHERE revoked_at IS NULL"
+    "sql": "CREATE UNIQUE INDEX device_credential_live ON device_credential (device_id, protocol, COALESCE(profile_id, ''), path) WHERE revoked_at IS NULL"
+  },
+  {
+    "type": "index",
+    "name": "device_credential_path",
+    "tbl_name": "device_credential",
+    "sql": "CREATE INDEX device_credential_path ON device_credential (device_id) WHERE path \u003c\u003e '' AND revoked_at IS NULL"
   },
   {
     "type": "index",
@@ -115,6 +223,12 @@
   },
   {
     "type": "index",
+    "name": "device_key_hash",
+    "tbl_name": "device",
+    "sql": "CREATE UNIQUE INDEX device_key_hash ON device (key_hash) WHERE key_hash IS NOT NULL"
+  },
+  {
+    "type": "index",
     "name": "device_user",
     "tbl_name": "device",
     "sql": "CREATE INDEX device_user ON device (user_id)"
@@ -133,6 +247,12 @@
   },
   {
     "type": "index",
+    "name": "event_agent_received",
+    "tbl_name": "event",
+    "sql": "CREATE INDEX event_agent_received ON event (node_id, received_at) WHERE source = 'agent' AND node_id IS NOT NULL"
+  },
+  {
+    "type": "index",
     "name": "event_device_limit",
     "tbl_name": "event",
     "sql": "CREATE INDEX event_device_limit ON event (ts) WHERE code = 'device_limit_reached'"
@@ -142,6 +262,12 @@
     "name": "event_node",
     "tbl_name": "event",
     "sql": "CREATE INDEX event_node ON event (node_id, id DESC) WHERE node_id IS NOT NULL"
+  },
+  {
+    "type": "index",
+    "name": "event_node_daily_limit",
+    "tbl_name": "event",
+    "sql": "CREATE UNIQUE INDEX event_node_daily_limit ON event (node_id, received_at / 86400, json_extract(params_json, '$.level')) WHERE source = 'panel' AND code = 'node_event_daily_limit' AND node_id IS NOT NULL"
   },
   {
     "type": "index",
@@ -172,6 +298,12 @@
     "name": "health_alert_resolved",
     "tbl_name": "health_alert",
     "sql": "CREATE INDEX health_alert_resolved ON health_alert (resolved_at) WHERE resolved_at \u003e 0"
+  },
+  {
+    "type": "index",
+    "name": "health_check_daily_day_inbound",
+    "tbl_name": "health_check_daily",
+    "sql": "CREATE INDEX health_check_daily_day_inbound ON health_check_daily (day, inbound_id)"
   },
   {
     "type": "index",
@@ -217,6 +349,12 @@
   },
   {
     "type": "index",
+    "name": "network_hour_hour_start",
+    "tbl_name": "network_hour",
+    "sql": "CREATE INDEX network_hour_hour_start ON network_hour (hour_start)"
+  },
+  {
+    "type": "index",
     "name": "node_cert_node",
     "tbl_name": "node_cert",
     "sql": "CREATE INDEX node_cert_node ON node_cert (node_id, not_after)"
@@ -226,6 +364,12 @@
     "name": "node_dns_option_default",
     "tbl_name": "node_dns_option",
     "sql": "CREATE UNIQUE INDEX node_dns_option_default ON node_dns_option (node_id) WHERE is_default = 1"
+  },
+  {
+    "type": "index",
+    "name": "node_host_hour_hour",
+    "tbl_name": "node_host_hour",
+    "sql": "CREATE INDEX node_host_hour_hour ON node_host_hour (hour_start)"
   },
   {
     "type": "index",
@@ -265,6 +409,12 @@
   },
   {
     "type": "index",
+    "name": "node_trace_pair",
+    "tbl_name": "node_trace",
+    "sql": "CREATE INDEX node_trace_pair ON node_trace (from_node_id, to_node_id, at_unix)"
+  },
+  {
+    "type": "index",
     "name": "node_traffic_hour_hour",
     "tbl_name": "node_traffic_hour",
     "sql": "CREATE INDEX node_traffic_hour_hour ON node_traffic_hour (hour_start)"
@@ -274,6 +424,36 @@
     "name": "node_update_schedule_due",
     "tbl_name": "node_update_schedule",
     "sql": "CREATE INDEX node_update_schedule_due ON node_update_schedule (scheduled_at, node_id)"
+  },
+  {
+    "type": "index",
+    "name": "os_rollout_active",
+    "tbl_name": "os_rollout",
+    "sql": "CREATE UNIQUE INDEX os_rollout_active ON os_rollout ((1)) WHERE status IN ('running', 'paused')"
+  },
+  {
+    "type": "index",
+    "name": "os_rollout_created",
+    "tbl_name": "os_rollout",
+    "sql": "CREATE INDEX os_rollout_created ON os_rollout (created_at)"
+  },
+  {
+    "type": "index",
+    "name": "own_probe_secret_hash",
+    "tbl_name": "own_probe",
+    "sql": "CREATE UNIQUE INDEX own_probe_secret_hash ON own_probe (secret_hash) WHERE secret_hash IS NOT NULL"
+  },
+  {
+    "type": "index",
+    "name": "own_probe_state_seen",
+    "tbl_name": "own_probe",
+    "sql": "CREATE INDEX own_probe_state_seen ON own_probe (state, last_seen)"
+  },
+  {
+    "type": "index",
+    "name": "own_probe_token_hash",
+    "tbl_name": "own_probe",
+    "sql": "CREATE UNIQUE INDEX own_probe_token_hash ON own_probe (token_hash) WHERE token_hash IS NOT NULL"
   },
   {
     "type": "index",
@@ -289,9 +469,75 @@
   },
   {
     "type": "index",
+    "name": "path_probe_at",
+    "tbl_name": "path_probe",
+    "sql": "CREATE INDEX path_probe_at ON path_probe (at_unix)"
+  },
+  {
+    "type": "index",
+    "name": "path_probe_pair",
+    "tbl_name": "path_probe",
+    "sql": "CREATE INDEX path_probe_pair ON path_probe (from_node_id, to_node_id, at_unix)"
+  },
+  {
+    "type": "index",
+    "name": "path_speed_at",
+    "tbl_name": "path_speed",
+    "sql": "CREATE INDEX path_speed_at ON path_speed (at_unix)"
+  },
+  {
+    "type": "index",
+    "name": "path_speed_pair",
+    "tbl_name": "path_speed",
+    "sql": "CREATE INDEX path_speed_pair ON path_speed (from_node_id, to_node_id, at_unix)"
+  },
+  {
+    "type": "index",
+    "name": "path_speed_start_actor_at",
+    "tbl_name": "path_speed_start",
+    "sql": "CREATE INDEX path_speed_start_actor_at ON path_speed_start (actor_id, at_unix)"
+  },
+  {
+    "type": "index",
+    "name": "path_speed_start_at",
+    "tbl_name": "path_speed_start",
+    "sql": "CREATE INDEX path_speed_start_at ON path_speed_start (at_unix)"
+  },
+  {
+    "type": "index",
+    "name": "path_speed_start_from_at",
+    "tbl_name": "path_speed_start",
+    "sql": "CREATE INDEX path_speed_start_from_at ON path_speed_start (from_node_id, at_unix)"
+  },
+  {
+    "type": "index",
+    "name": "path_speed_start_to_at",
+    "tbl_name": "path_speed_start",
+    "sql": "CREATE INDEX path_speed_start_to_at ON path_speed_start (to_node_id, at_unix)"
+  },
+  {
+    "type": "index",
     "name": "relay_via",
     "tbl_name": "relay",
     "sql": "CREATE INDEX relay_via ON relay (via_node_id)"
+  },
+  {
+    "type": "index",
+    "name": "scheduled_task_due",
+    "tbl_name": "scheduled_task",
+    "sql": "CREATE INDEX scheduled_task_due ON scheduled_task (enabled, next_run_at)"
+  },
+  {
+    "type": "index",
+    "name": "scheduled_task_run_started",
+    "tbl_name": "scheduled_task_run",
+    "sql": "CREATE INDEX scheduled_task_run_started ON scheduled_task_run (started_at)"
+  },
+  {
+    "type": "index",
+    "name": "scheduled_task_run_task",
+    "tbl_name": "scheduled_task_run",
+    "sql": "CREATE INDEX scheduled_task_run_task ON scheduled_task_run (task_id, started_at)"
   },
   {
     "type": "index",
@@ -307,9 +553,21 @@
   },
   {
     "type": "index",
+    "name": "traffic_bucket_hour",
+    "tbl_name": "traffic_bucket",
+    "sql": "CREATE INDEX traffic_bucket_hour ON traffic_bucket (hour_start)"
+  },
+  {
+    "type": "index",
     "name": "traffic_bucket_node_hour",
     "tbl_name": "traffic_bucket",
     "sql": "CREATE INDEX traffic_bucket_node_hour ON traffic_bucket (node_id, hour_start)"
+  },
+  {
+    "type": "index",
+    "name": "udp_path_loss_checked_at",
+    "tbl_name": "udp_path_loss",
+    "sql": "CREATE INDEX udp_path_loss_checked_at ON udp_path_loss(checked_at)"
   },
   {
     "type": "index",
@@ -337,9 +595,21 @@
   },
   {
     "type": "index",
+    "name": "user_extra_group_by_group",
+    "tbl_name": "user_extra_group",
+    "sql": "CREATE INDEX user_extra_group_by_group ON user_extra_group (group_id)"
+  },
+  {
+    "type": "index",
     "name": "user_group_profile_profile",
     "tbl_name": "user_group_profile",
     "sql": "CREATE INDEX user_group_profile_profile ON user_group_profile (profile_id)"
+  },
+  {
+    "type": "index",
+    "name": "user_network_last_hour",
+    "tbl_name": "user_network",
+    "sql": "CREATE INDEX user_network_last_hour ON user_network (last_hour)"
   },
   {
     "type": "index",
@@ -381,13 +651,79 @@
     "type": "table",
     "name": "api_token",
     "tbl_name": "api_token",
-    "sql": "CREATE TABLE api_token ( id TEXT PRIMARY KEY, -- tok_... name TEXT NOT NULL, name_key TEXT NOT NULL, -- lower(name): uniqueness among unrevoked tokens profile TEXT NOT NULL CHECK (profile IN ('readonly', 'operator', 'admin')), secret_hash BLOB NOT NULL UNIQUE, -- SHA-256 of the secret hint TEXT NOT NULL, -- last 4 characters of the secret rate_per_min INTEGER NOT NULL CHECK (rate_per_min BETWEEN 1 AND 600), created_by TEXT NOT NULL, -- admin id (no FK: the row outlives the admin) created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, revoked_at INTEGER NOT NULL DEFAULT 0, revoked_by TEXT NOT NULL DEFAULT '', last_used_at INTEGER NOT NULL DEFAULT 0, last_used_ip TEXT NOT NULL DEFAULT '', last_used_via TEXT NOT NULL DEFAULT '' CHECK (last_used_via IN ('', 'api', 'mcp')) ) STRICT"
+    "sql": "CREATE TABLE api_token ( id TEXT PRIMARY KEY, -- tok_... name TEXT NOT NULL, name_key TEXT NOT NULL, -- lower(name): uniqueness among unrevoked tokens profile TEXT NOT NULL CHECK (profile IN ('readonly', 'operator', 'admin')), secret_hash BLOB NOT NULL UNIQUE, -- SHA-256 of the secret hint TEXT NOT NULL, -- last 4 characters of the secret rate_per_min INTEGER NOT NULL CHECK (rate_per_min BETWEEN 1 AND 600), created_by TEXT NOT NULL, -- admin id (no FK: the row outlives the admin) created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, revoked_at INTEGER NOT NULL DEFAULT 0, revoked_by TEXT NOT NULL DEFAULT '', last_used_at INTEGER NOT NULL DEFAULT 0, last_used_ip TEXT NOT NULL DEFAULT '', last_used_via TEXT NOT NULL DEFAULT '' CHECK (last_used_via IN ('', 'api', 'mcp')) , assistant_only INTEGER NOT NULL DEFAULT 0 CHECK (assistant_only IN (0, 1)), allow_bulk_user_changes INTEGER NOT NULL DEFAULT 0 CHECK (allow_bulk_user_changes IN (0, 1))) STRICT"
+  },
+  {
+    "type": "table",
+    "name": "assistant_budget_reservation",
+    "tbl_name": "assistant_budget_reservation",
+    "sql": "CREATE TABLE assistant_budget_reservation ( id TEXT PRIMARY KEY, month TEXT NOT NULL, admin_id TEXT NOT NULL, provider INTEGER NOT NULL, model TEXT NOT NULL, estimate_usd REAL NOT NULL CHECK (estimate_usd \u003e= 0), state TEXT NOT NULL DEFAULT 'reserved' CHECK (state IN ('reserved', 'settled')), created_at INTEGER NOT NULL, settled_at INTEGER NOT NULL DEFAULT 0 ) STRICT"
+  },
+  {
+    "type": "table",
+    "name": "assistant_conversation",
+    "tbl_name": "assistant_conversation",
+    "sql": "CREATE TABLE assistant_conversation ( id TEXT PRIMARY KEY, admin_id TEXT NOT NULL, title_enc BLOB NOT NULL DEFAULT X'', summary_enc BLOB NOT NULL DEFAULT X'', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, segment INTEGER NOT NULL DEFAULT 0 , task_id TEXT NOT NULL DEFAULT '', unread INTEGER NOT NULL DEFAULT 0 CHECK (unread IN (0, 1))) STRICT"
+  },
+  {
+    "type": "table",
+    "name": "assistant_follow_up",
+    "tbl_name": "assistant_follow_up",
+    "sql": "CREATE TABLE assistant_follow_up ( id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, admin_id TEXT NOT NULL, note_enc BLOB NOT NULL, plan_id TEXT NOT NULL DEFAULT '', delay_s INTEGER NOT NULL DEFAULT 0, notify_telegram INTEGER NOT NULL DEFAULT 0 CHECK (notify_telegram IN (0, 1)), created_at INTEGER NOT NULL, due_at INTEGER NOT NULL DEFAULT 0, lease_id TEXT NOT NULL DEFAULT '', lease_until INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0 ) STRICT"
+  },
+  {
+    "type": "table",
+    "name": "assistant_lock",
+    "tbl_name": "assistant_lock",
+    "sql": "CREATE TABLE assistant_lock ( conversation_id TEXT PRIMARY KEY, admin_id TEXT NOT NULL, lease_id TEXT NOT NULL, expires_at INTEGER NOT NULL, stop_requested INTEGER NOT NULL DEFAULT 0 CHECK (stop_requested IN (0, 1)) ) STRICT"
+  },
+  {
+    "type": "table",
+    "name": "assistant_memory",
+    "tbl_name": "assistant_memory",
+    "sql": "CREATE TABLE assistant_memory ( id TEXT PRIMARY KEY, admin_id TEXT NOT NULL, text_enc BLOB NOT NULL, by_assistant INTEGER NOT NULL DEFAULT 0 CHECK (by_assistant IN (0, 1)), conversation_id TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL ) STRICT"
+  },
+  {
+    "type": "table",
+    "name": "assistant_message",
+    "tbl_name": "assistant_message",
+    "sql": "CREATE TABLE assistant_message ( id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, admin_id TEXT NOT NULL, role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'summary')), segment INTEGER NOT NULL DEFAULT 0, body_enc BLOB NOT NULL, created_at INTEGER NOT NULL ) STRICT"
+  },
+  {
+    "type": "table",
+    "name": "assistant_plan",
+    "tbl_name": "assistant_plan",
+    "sql": "CREATE TABLE assistant_plan ( id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, admin_id TEXT NOT NULL, token_id TEXT NOT NULL REFERENCES api_token(id), tool TEXT NOT NULL, confirm_enc BLOB NOT NULL, card_enc BLOB NOT NULL, inbox_only INTEGER NOT NULL DEFAULT 0 CHECK (inbox_only IN (0, 1)), state TEXT NOT NULL DEFAULT 'proposed', created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, updated_at INTEGER NOT NULL ) STRICT"
+  },
+  {
+    "type": "table",
+    "name": "assistant_provider",
+    "tbl_name": "assistant_provider",
+    "sql": "CREATE TABLE assistant_provider ( provider INTEGER PRIMARY KEY, key_enc BLOB NOT NULL DEFAULT X'', key_hint TEXT NOT NULL DEFAULT '', added_at INTEGER NOT NULL DEFAULT 0, model TEXT NOT NULL DEFAULT '', budget_usd REAL NOT NULL DEFAULT 20 CHECK (budget_usd \u003e= 0), last_error_code TEXT NOT NULL DEFAULT '', last_error_at INTEGER NOT NULL DEFAULT 0 , custom_name TEXT NOT NULL DEFAULT '', custom_url TEXT NOT NULL DEFAULT '', allow_local INTEGER NOT NULL DEFAULT 0 CHECK (allow_local IN (0, 1)), input_usd_per_mtok REAL NOT NULL DEFAULT 0 CHECK (input_usd_per_mtok \u003e= 0), output_usd_per_mtok REAL NOT NULL DEFAULT 0 CHECK (output_usd_per_mtok \u003e= 0)) STRICT"
+  },
+  {
+    "type": "table",
+    "name": "assistant_rate",
+    "tbl_name": "assistant_rate",
+    "sql": "CREATE TABLE assistant_rate ( admin_id TEXT NOT NULL, minute INTEGER NOT NULL, turns INTEGER NOT NULL, PRIMARY KEY(admin_id, minute) ) STRICT"
+  },
+  {
+    "type": "table",
+    "name": "assistant_settings",
+    "tbl_name": "assistant_settings",
+    "sql": "CREATE TABLE assistant_settings ( id INTEGER PRIMARY KEY CHECK (id = 1), enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)), provider INTEGER NOT NULL DEFAULT 0, effort INTEGER NOT NULL DEFAULT 2, audience INTEGER NOT NULL DEFAULT 1, panel_notes TEXT NOT NULL DEFAULT '', retention_days INTEGER NOT NULL DEFAULT 90, updated_at INTEGER NOT NULL DEFAULT 0 , panel_notes_enc BLOB NOT NULL DEFAULT X'', fallback_provider INTEGER NOT NULL DEFAULT 0) STRICT"
+  },
+  {
+    "type": "table",
+    "name": "assistant_usage",
+    "tbl_name": "assistant_usage",
+    "sql": "CREATE TABLE assistant_usage ( month TEXT NOT NULL, admin_id TEXT NOT NULL, provider INTEGER NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, usd REAL NOT NULL DEFAULT 0, turns INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(month, admin_id, provider) ) STRICT"
   },
   {
     "type": "table",
     "name": "audit",
     "tbl_name": "audit",
-    "sql": "CREATE TABLE audit ( id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, actor TEXT NOT NULL, -- admin id or 'anonymous' action TEXT NOT NULL, params TEXT NOT NULL DEFAULT '{}', -- JSON, never contains secrets result TEXT NOT NULL , source TEXT NOT NULL DEFAULT 'panel' CHECK (source IN ('panel', 'bot', 'mcp', 'api')), ip TEXT NOT NULL DEFAULT '') STRICT"
+    "sql": "CREATE TABLE \"audit\" ( id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, params TEXT NOT NULL DEFAULT '{}', result TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'panel' CHECK (source IN ('panel', 'bot', 'mcp', 'api', 'assistant')), ip TEXT NOT NULL DEFAULT '' ) STRICT"
   },
   {
     "type": "table",
@@ -412,6 +748,12 @@
     "name": "batch_guard",
     "tbl_name": "batch_guard",
     "sql": "CREATE TABLE batch_guard ( failed INTEGER NOT NULL, CONSTRAINT batch_guard CHECK (failed = 0) )"
+  },
+  {
+    "type": "table",
+    "name": "client_debug",
+    "tbl_name": "client_debug",
+    "sql": "CREATE TABLE client_debug ( id TEXT PRIMARY KEY, user_id TEXT NOT NULL, device_id TEXT NOT NULL, actor TEXT NOT NULL DEFAULT '', unasked INTEGER NOT NULL DEFAULT 0 CHECK (unasked IN (0, 1)), note TEXT NOT NULL DEFAULT '', level TEXT NOT NULL DEFAULT 'info' CHECK (level IN ('info', 'debug')), requested_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, state TEXT NOT NULL CHECK (state IN ('open', 'received', 'declined', 'cancelled', 'expired')), closed_at INTEGER NOT NULL DEFAULT 0, records INTEGER NOT NULL DEFAULT 0, bytes INTEGER NOT NULL DEFAULT 0, dropped_kv INTEGER NOT NULL DEFAULT 0, first_ms INTEGER NOT NULL DEFAULT 0, last_ms INTEGER NOT NULL DEFAULT 0, app TEXT NOT NULL DEFAULT '', read_at INTEGER NOT NULL DEFAULT 0, read_by TEXT NOT NULL DEFAULT '' ) STRICT"
   },
   {
     "type": "table",
@@ -445,21 +787,45 @@
   },
   {
     "type": "table",
+    "name": "debug_capture",
+    "tbl_name": "debug_capture",
+    "sql": "CREATE TABLE debug_capture ( id TEXT PRIMARY KEY, node_id TEXT NOT NULL, actor TEXT NOT NULL, level TEXT NOT NULL CHECK (level IN ('debug', 'info')), sources TEXT NOT NULL DEFAULT '', duration_s INTEGER NOT NULL, started_at INTEGER NOT NULL, ends_at INTEGER NOT NULL, state TEXT NOT NULL CHECK (state IN ('running', 'done')), end_reason TEXT NOT NULL DEFAULT '', records INTEGER NOT NULL DEFAULT 0, bytes INTEGER NOT NULL DEFAULT 0, dropped INTEGER NOT NULL DEFAULT 0 , last_chunk_seq INTEGER NOT NULL DEFAULT -1) STRICT"
+  },
+  {
+    "type": "table",
+    "name": "debug_capture_line",
+    "tbl_name": "debug_capture_line",
+    "sql": "CREATE TABLE debug_capture_line ( capture_id TEXT NOT NULL, seq INTEGER NOT NULL, at_ms INTEGER NOT NULL, level INTEGER NOT NULL CHECK (level BETWEEN 0 AND 3), source TEXT NOT NULL, message TEXT NOT NULL, attrs_json TEXT NOT NULL DEFAULT '{}', PRIMARY KEY (capture_id, seq) ) STRICT"
+  },
+  {
+    "type": "table",
+    "name": "decoy_site",
+    "tbl_name": "decoy_site",
+    "sql": "CREATE TABLE decoy_site ( id TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE CHECK (length(name) BETWEEN 1 AND 60), note TEXT NOT NULL DEFAULT '' CHECK (length(note) \u003c= 200), source TEXT NOT NULL CHECK (source IN ('upload', 'assistant', 'mcp')), source_label TEXT NOT NULL DEFAULT '', state TEXT NOT NULL CHECK (state IN ('draft', 'ready')), bundle_hash TEXT NOT NULL, created_at INTEGER NOT NULL, created_by TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL, updated_by TEXT NOT NULL DEFAULT '' )"
+  },
+  {
+    "type": "table",
+    "name": "decoy_site_version",
+    "tbl_name": "decoy_site_version",
+    "sql": "CREATE TABLE decoy_site_version ( site_id TEXT NOT NULL, seq INTEGER NOT NULL, bundle_hash TEXT NOT NULL, created_at INTEGER NOT NULL, created_by TEXT NOT NULL DEFAULT '', size_bytes INTEGER NOT NULL DEFAULT 0, file_count INTEGER NOT NULL DEFAULT 0, files_json TEXT NOT NULL DEFAULT '', title TEXT NOT NULL DEFAULT '', checks_json TEXT NOT NULL DEFAULT '', PRIMARY KEY (site_id, seq) )"
+  },
+  {
+    "type": "table",
     "name": "device",
     "tbl_name": "device",
-    "sql": "CREATE TABLE device ( id TEXT PRIMARY KEY, -- dev_... user_id TEXT NOT NULL REFERENCES user (id) ON DELETE CASCADE, -- sha256 of the client HWID header (Happ etc.). NULL = the implicit per-user device used -- for subscription fetches without a HWID (one shared token, counted as 1 device). hwid_hash BLOB, platform TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', os_version TEXT NOT NULL DEFAULT '', first_seen_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL, created_at INTEGER NOT NULL, revoked_at INTEGER -- soft delete: stats of a revoked device must still resolve , kind TEXT NOT NULL DEFAULT 'link' CHECK (kind IN ('link', 'key')), client TEXT NOT NULL DEFAULT '', blocked_at INTEGER, used_bytes INTEGER NOT NULL DEFAULT 0) STRICT"
+    "sql": "CREATE TABLE device ( id TEXT PRIMARY KEY, -- dev_... user_id TEXT NOT NULL REFERENCES user (id) ON DELETE CASCADE, -- sha256 of the client HWID header (Happ etc.). NULL = the implicit per-user device used -- for subscription fetches without a HWID (one shared token, counted as 1 device). hwid_hash BLOB, platform TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', os_version TEXT NOT NULL DEFAULT '', first_seen_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL, created_at INTEGER NOT NULL, revoked_at INTEGER -- soft delete: stats of a revoked device must still resolve , kind TEXT NOT NULL DEFAULT 'link' CHECK (kind IN ('link', 'key')), client TEXT NOT NULL DEFAULT '', blocked_at INTEGER, used_bytes INTEGER NOT NULL DEFAULT 0, key_hash BLOB CHECK (key_hash IS NULL OR length(key_hash) = 32), enrol_token_hash BLOB CHECK (enrol_token_hash IS NULL OR length(enrol_token_hash) = 32), last_connected_at INTEGER NOT NULL DEFAULT 0) STRICT"
   },
   {
     "type": "table",
     "name": "device_credential",
     "tbl_name": "device_credential",
-    "sql": "CREATE TABLE device_credential ( id TEXT PRIMARY KEY, -- crd_... (= Credential.cred_id on the wire) device_id TEXT NOT NULL REFERENCES device (id) ON DELETE CASCADE, user_id TEXT NOT NULL REFERENCES user (id) ON DELETE CASCADE, -- denormalized for the access query protocol TEXT NOT NULL, secret_enc BLOB NOT NULL, -- vault, AAD = id; what the client presents (hy2 token) data_json TEXT NOT NULL CHECK (json_valid(data_json)), -- verifier sent to nodes (hy2: {\"auth_sha256\":...}) created_at INTEGER NOT NULL, revoked_at INTEGER -- soft delete , profile_id TEXT REFERENCES profile (id) ON DELETE CASCADE, config_epoch INTEGER NOT NULL DEFAULT 0, dns_sig TEXT NOT NULL DEFAULT '' CHECK (dns_sig = '' OR json_valid(dns_sig))) STRICT"
+    "sql": "CREATE TABLE device_credential ( id TEXT PRIMARY KEY, -- crd_... (= Credential.cred_id on the wire) device_id TEXT NOT NULL REFERENCES device (id) ON DELETE CASCADE, user_id TEXT NOT NULL REFERENCES user (id) ON DELETE CASCADE, -- denormalized for the access query protocol TEXT NOT NULL, secret_enc BLOB NOT NULL, -- vault, AAD = id; what the client presents (hy2 token) data_json TEXT NOT NULL CHECK (json_valid(data_json)), -- verifier sent to nodes (hy2: {\"auth_sha256\":...}) created_at INTEGER NOT NULL, revoked_at INTEGER -- soft delete , profile_id TEXT REFERENCES profile (id) ON DELETE CASCADE, config_epoch INTEGER NOT NULL DEFAULT 0, dns_sig TEXT NOT NULL DEFAULT '' CHECK (dns_sig = '' OR json_valid(dns_sig)), path TEXT NOT NULL DEFAULT '' CHECK (path = '' OR path = 'ipv6' OR path GLOB 'relay:*')) STRICT"
   },
   {
     "type": "table",
     "name": "dns_preset",
     "tbl_name": "dns_preset",
-    "sql": "CREATE TABLE dns_preset ( id TEXT PRIMARY KEY, -- dns_\u003crandom\u003e, or dns_builtin_\u003cslug\u003e for the built-ins name TEXT NOT NULL COLLATE NOCASE UNIQUE, description TEXT NOT NULL DEFAULT '', builtin INTEGER NOT NULL DEFAULT 0 CHECK (builtin IN (0, 1)), servers TEXT NOT NULL, split TEXT NOT NULL DEFAULT '[]', ipv4_only INTEGER NOT NULL DEFAULT 0 CHECK (ipv4_only IN (0, 1)), created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL , split_direct INTEGER NOT NULL DEFAULT 0 CHECK (split_direct IN (0, 1)), sort INTEGER NOT NULL DEFAULT 0, preferred_transport TEXT NOT NULL DEFAULT 'plain' CHECK (preferred_transport IN ('plain', 'dot', 'doh'))) STRICT"
+    "sql": "CREATE TABLE dns_preset ( id TEXT PRIMARY KEY, -- dns_\u003crandom\u003e, or dns_builtin_\u003cslug\u003e for the built-ins name TEXT NOT NULL COLLATE NOCASE UNIQUE, description TEXT NOT NULL DEFAULT '', builtin INTEGER NOT NULL DEFAULT 0 CHECK (builtin IN (0, 1)), servers TEXT NOT NULL, split TEXT NOT NULL DEFAULT '[]', ipv4_only INTEGER NOT NULL DEFAULT 0 CHECK (ipv4_only IN (0, 1)), created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL , split_direct INTEGER NOT NULL DEFAULT 0 CHECK (split_direct IN (0, 1)), sort INTEGER NOT NULL DEFAULT 0, preferred_transport TEXT NOT NULL DEFAULT 'plain' CHECK (preferred_transport IN ('plain', 'dot', 'doh')), block_ads INTEGER NOT NULL DEFAULT 0 CHECK (block_ads IN (0, 1))) STRICT"
   },
   {
     "type": "table",
@@ -483,7 +849,7 @@
     "type": "table",
     "name": "event",
     "tbl_name": "event",
-    "sql": "CREATE TABLE event ( id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, severity INTEGER NOT NULL CHECK (severity BETWEEN 1 AND 3), -- 1 info, 2 warning, 3 error code TEXT NOT NULL, source TEXT NOT NULL CHECK (source IN ('agent', 'panel', 'admin')), node_id TEXT, user_id TEXT, device_id TEXT, inbound_id TEXT, params_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(params_json)), -- agent events: belt-and-braces dedup on top of node.last_seq src_instance TEXT, src_seq INTEGER ) STRICT"
+    "sql": "CREATE TABLE event ( id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, severity INTEGER NOT NULL CHECK (severity BETWEEN 1 AND 3), -- 1 info, 2 warning, 3 error code TEXT NOT NULL, source TEXT NOT NULL CHECK (source IN ('agent', 'panel', 'admin')), node_id TEXT, user_id TEXT, device_id TEXT, inbound_id TEXT, params_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(params_json)), -- agent events: belt-and-braces dedup on top of node.last_seq src_instance TEXT, src_seq INTEGER , received_at INTEGER NOT NULL DEFAULT 0) STRICT"
   },
   {
     "type": "table",
@@ -501,7 +867,7 @@
     "type": "table",
     "name": "health_check_daily",
     "tbl_name": "health_check_daily",
-    "sql": "CREATE TABLE health_check_daily ( inbound_id TEXT NOT NULL REFERENCES inbound (id) ON DELETE CASCADE, day INTEGER NOT NULL CHECK (day % 86400 = 0), ok INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0, degraded INTEGER NOT NULL DEFAULT 0, p50_ms INTEGER NOT NULL DEFAULT 0, p95_ms INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (inbound_id, day) ) STRICT, WITHOUT ROWID"
+    "sql": "CREATE TABLE health_check_daily ( inbound_id TEXT NOT NULL REFERENCES inbound (id) ON DELETE CASCADE, day INTEGER NOT NULL CHECK (day % 86400 = 0), ok INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0, degraded INTEGER NOT NULL DEFAULT 0, p50_ms INTEGER NOT NULL DEFAULT 0, p95_ms INTEGER NOT NULL DEFAULT 0, connect_p50_ms INTEGER NOT NULL DEFAULT 0, connect_p95_ms INTEGER NOT NULL DEFAULT 0, response_p50_ms INTEGER NOT NULL DEFAULT 0, response_p95_ms INTEGER NOT NULL DEFAULT 0, jitter_ms INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (inbound_id, day) ) STRICT, WITHOUT ROWID"
   },
   {
     "type": "table",
@@ -519,7 +885,7 @@
     "type": "table",
     "name": "inbound",
     "tbl_name": "inbound",
-    "sql": "CREATE TABLE inbound ( id TEXT PRIMARY KEY, -- inb_... profile_id TEXT NOT NULL REFERENCES profile (id) ON DELETE RESTRICT, node_id TEXT NOT NULL REFERENCES node (id) ON DELETE RESTRICT, port_override INTEGER CHECK (port_override BETWEEN 1 AND 65535), tls_server_name_override TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)), spec_version INTEGER NOT NULL DEFAULT 1, -- goes into InboundSpec.spec_version; bumped with profile.version and overrides state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'active', 'failed', 'disabled')), last_error TEXT NOT NULL DEFAULT '', applied_spec_hash TEXT NOT NULL DEFAULT '', -- InboundResult.spec_hash cert_pin_sha256 TEXT NOT NULL DEFAULT '', -- InboundResult, for pinSHA256 in subscriptions cert_not_after INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, plugin_state_enc BLOB, plugin_public_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(plugin_public_json)), awg_health_json TEXT NOT NULL DEFAULT '' CHECK (awg_health_json = '' OR json_valid(awg_health_json)), awg_health_at INTEGER NOT NULL DEFAULT 0, UNIQUE (profile_id, node_id) ) STRICT"
+    "sql": "CREATE TABLE inbound ( id TEXT PRIMARY KEY, -- inb_... profile_id TEXT NOT NULL REFERENCES profile (id) ON DELETE RESTRICT, node_id TEXT NOT NULL REFERENCES node (id) ON DELETE RESTRICT, port_override INTEGER CHECK (port_override BETWEEN 1 AND 65535), tls_server_name_override TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)), spec_version INTEGER NOT NULL DEFAULT 1, -- goes into InboundSpec.spec_version; bumped with profile.version and overrides state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'active', 'failed', 'disabled')), last_error TEXT NOT NULL DEFAULT '', applied_spec_hash TEXT NOT NULL DEFAULT '', -- InboundResult.spec_hash cert_pin_sha256 TEXT NOT NULL DEFAULT '', -- InboundResult, for pinSHA256 in subscriptions cert_not_after INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, plugin_state_enc BLOB, plugin_public_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(plugin_public_json)), awg_health_json TEXT NOT NULL DEFAULT '' CHECK (awg_health_json = '' OR json_valid(awg_health_json)), awg_health_at INTEGER NOT NULL DEFAULT 0, direct_in_subscriptions INTEGER NOT NULL DEFAULT 1 CHECK (direct_in_subscriptions IN (0, 1)), reality_target_override TEXT NOT NULL DEFAULT '', UNIQUE (profile_id, node_id) ) STRICT"
   },
   {
     "type": "table",
@@ -537,7 +903,7 @@
     "type": "table",
     "name": "link_hour",
     "tbl_name": "link_hour",
-    "sql": "CREATE TABLE link_hour ( node_id TEXT NOT NULL, hour_start INTEGER NOT NULL, inbound_id TEXT NOT NULL, cred_id TEXT NOT NULL, user_id TEXT NOT NULL DEFAULT '', connects INTEGER NOT NULL DEFAULT 0, rejects INTEGER NOT NULL DEFAULT 0, drops INTEGER NOT NULL DEFAULT 0, stalls INTEGER NOT NULL DEFAULT 0, online_s INTEGER NOT NULL DEFAULT 0, unknown_keys INTEGER NOT NULL DEFAULT 0, hellos INTEGER NOT NULL DEFAULT 0, handshakes INTEGER NOT NULL DEFAULT 0, probe_handshakes INTEGER NOT NULL DEFAULT 0, client_closes INTEGER NOT NULL DEFAULT 0, freezes INTEGER NOT NULL DEFAULT 0, quiet INTEGER NOT NULL DEFAULT 0, accepted INTEGER NOT NULL DEFAULT 0, hellos_foreign INTEGER NOT NULL DEFAULT 0, rtt_ms_sum INTEGER NOT NULL DEFAULT 0, rtt_samples INTEGER NOT NULL DEFAULT 0, pkts_sent INTEGER NOT NULL DEFAULT 0, pkts_lost INTEGER NOT NULL DEFAULT 0, probe_pkts_sent INTEGER NOT NULL DEFAULT 0, probe_pkts_lost INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (node_id, hour_start, inbound_id, cred_id) ) STRICT"
+    "sql": "CREATE TABLE link_hour ( node_id TEXT NOT NULL, hour_start INTEGER NOT NULL, inbound_id TEXT NOT NULL, cred_id TEXT NOT NULL, user_id TEXT NOT NULL DEFAULT '', connects INTEGER NOT NULL DEFAULT 0, rejects INTEGER NOT NULL DEFAULT 0, drops INTEGER NOT NULL DEFAULT 0, stalls INTEGER NOT NULL DEFAULT 0, online_s INTEGER NOT NULL DEFAULT 0, unknown_keys INTEGER NOT NULL DEFAULT 0, hellos INTEGER NOT NULL DEFAULT 0, handshakes INTEGER NOT NULL DEFAULT 0, probe_handshakes INTEGER NOT NULL DEFAULT 0, client_closes INTEGER NOT NULL DEFAULT 0, freezes INTEGER NOT NULL DEFAULT 0, quiet INTEGER NOT NULL DEFAULT 0, accepted INTEGER NOT NULL DEFAULT 0, hellos_foreign INTEGER NOT NULL DEFAULT 0, rtt_ms_sum INTEGER NOT NULL DEFAULT 0, rtt_samples INTEGER NOT NULL DEFAULT 0, pkts_sent INTEGER NOT NULL DEFAULT 0, pkts_lost INTEGER NOT NULL DEFAULT 0, probe_pkts_sent INTEGER NOT NULL DEFAULT 0, probe_pkts_lost INTEGER NOT NULL DEFAULT 0, hs_unfinished INTEGER NOT NULL DEFAULT 0, tls_alerts_sent INTEGER NOT NULL DEFAULT 0, tls_alerts_recv INTEGER NOT NULL DEFAULT 0, tls_cert_refused INTEGER NOT NULL DEFAULT 0, reality_fallback INTEGER NOT NULL DEFAULT 0, auth_failed INTEGER NOT NULL DEFAULT 0, tcp_stalls INTEGER NOT NULL DEFAULT 0, tcp_stalls_16k INTEGER NOT NULL DEFAULT 0, initiations INTEGER NOT NULL DEFAULT 0, responses INTEGER NOT NULL DEFAULT 0, responses_unmatched INTEGER NOT NULL DEFAULT 0, hello_pq INTEGER NOT NULL DEFAULT 0, hello_classic INTEGER NOT NULL DEFAULT 0, hello_unknown INTEGER NOT NULL DEFAULT 0, tunnel_blocked INTEGER NOT NULL DEFAULT 0, tunnel_no_ipv4 INTEGER NOT NULL DEFAULT 0, tunnel_conn_refused INTEGER NOT NULL DEFAULT 0, tunnel_conn_unreachable INTEGER NOT NULL DEFAULT 0, tunnel_conn_dns INTEGER NOT NULL DEFAULT 0, tunnel_conn_other INTEGER NOT NULL DEFAULT 0, tunnel_timeout INTEGER NOT NULL DEFAULT 0, tunnel_other_deadlines INTEGER NOT NULL DEFAULT 0, tunnel_other_authority INTEGER NOT NULL DEFAULT 0, tunnel_other_icmp INTEGER NOT NULL DEFAULT 0, tunnel_other_dial INTEGER NOT NULL DEFAULT 0, tunnel_stream_closed INTEGER NOT NULL DEFAULT 0, tunnel_stream_cred_gone INTEGER NOT NULL DEFAULT 0, tunnel_stream_conn_limit INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (node_id, hour_start, inbound_id, cred_id) ) STRICT"
   },
   {
     "type": "table",
@@ -553,15 +919,33 @@
   },
   {
     "type": "table",
+    "name": "network_hour",
+    "tbl_name": "network_hour",
+    "sql": "CREATE TABLE network_hour ( node_id TEXT NOT NULL, hour_start INTEGER NOT NULL, inbound_id TEXT NOT NULL, asn INTEGER NOT NULL, attempts INTEGER NOT NULL, unfinished INTEGER NOT NULL, connects INTEGER NOT NULL, broken INTEGER NOT NULL, people INTEGER NOT NULL, PRIMARY KEY (node_id, hour_start, inbound_id, asn) ) STRICT"
+  },
+  {
+    "type": "table",
     "name": "node",
     "tbl_name": "node",
-    "sql": "CREATE TABLE \"node\" ( id TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE, address TEXT NOT NULL, country_code TEXT NOT NULL DEFAULT '', location TEXT NOT NULL DEFAULT '', provider TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '', dns_resolvers TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(dns_resolvers)), liveness_timeout_s INTEGER NOT NULL DEFAULT 90 CHECK (liveness_timeout_s BETWEEN 15 AND 3600), apply_timeout_s INTEGER NOT NULL DEFAULT 120 CHECK (apply_timeout_s BETWEEN 10 AND 3600), dial_timeout_s INTEGER NOT NULL DEFAULT 15 CHECK (dial_timeout_s BETWEEN 5 AND 120), state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'active', 'retired')), cert_serial TEXT, agent_version TEXT NOT NULL DEFAULT '', api_version INTEGER NOT NULL DEFAULT 0, boot_at INTEGER NOT NULL DEFAULT 0, last_seen_at INTEGER NOT NULL DEFAULT 0, last_connected_at INTEGER NOT NULL DEFAULT 0, last_disconnected_at INTEGER NOT NULL DEFAULT 0, agent_instance_id TEXT NOT NULL DEFAULT '', last_seq INTEGER NOT NULL DEFAULT 0, desired_revision INTEGER NOT NULL DEFAULT 0, desired_hash TEXT NOT NULL DEFAULT '', applied_revision INTEGER NOT NULL DEFAULT 0, applied_hash TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, retired_at INTEGER, agent_built INTEGER NOT NULL DEFAULT 0, agent_caps TEXT NOT NULL DEFAULT '', last_update_json TEXT NOT NULL DEFAULT '' CHECK (last_update_json = '' OR json_valid(last_update_json)), awg_backend TEXT NOT NULL DEFAULT 'auto' CHECK (awg_backend IN ('auto', 'kernel', 'userspace')), awg_prepare_json TEXT NOT NULL DEFAULT '' CHECK (awg_prepare_json = '' OR json_valid(awg_prepare_json)) , torrent_blocker_enabled INTEGER NOT NULL DEFAULT 0 CHECK (torrent_blocker_enabled IN (0, 1)), bandwidth_mbps INTEGER NOT NULL DEFAULT 0 CHECK (bandwidth_mbps BETWEEN 0 AND 1000000), client_ipv6 INTEGER NOT NULL DEFAULT 1 CHECK (client_ipv6 IN (0, 1)), decoy_mode TEXT NOT NULL DEFAULT 'builtin' CHECK (decoy_mode IN ('builtin', 'panel', 'own')), decoy_bundle_hash TEXT NOT NULL DEFAULT '', decoy_agent_mode TEXT NOT NULL DEFAULT '', decoy_agent_hash TEXT NOT NULL DEFAULT '') STRICT"
+    "sql": "CREATE TABLE \"node\" ( id TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE, address TEXT NOT NULL, country_code TEXT NOT NULL DEFAULT '', location TEXT NOT NULL DEFAULT '', provider TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '', dns_resolvers TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(dns_resolvers)), liveness_timeout_s INTEGER NOT NULL DEFAULT 90 CHECK (liveness_timeout_s BETWEEN 15 AND 3600), apply_timeout_s INTEGER NOT NULL DEFAULT 120 CHECK (apply_timeout_s BETWEEN 10 AND 3600), dial_timeout_s INTEGER NOT NULL DEFAULT 15 CHECK (dial_timeout_s BETWEEN 5 AND 120), state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'active', 'retired')), cert_serial TEXT, agent_version TEXT NOT NULL DEFAULT '', api_version INTEGER NOT NULL DEFAULT 0, boot_at INTEGER NOT NULL DEFAULT 0, last_seen_at INTEGER NOT NULL DEFAULT 0, last_connected_at INTEGER NOT NULL DEFAULT 0, last_disconnected_at INTEGER NOT NULL DEFAULT 0, agent_instance_id TEXT NOT NULL DEFAULT '', last_seq INTEGER NOT NULL DEFAULT 0, desired_revision INTEGER NOT NULL DEFAULT 0, desired_hash TEXT NOT NULL DEFAULT '', applied_revision INTEGER NOT NULL DEFAULT 0, applied_hash TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, retired_at INTEGER, agent_built INTEGER NOT NULL DEFAULT 0, agent_caps TEXT NOT NULL DEFAULT '', last_update_json TEXT NOT NULL DEFAULT '' CHECK (last_update_json = '' OR json_valid(last_update_json)), awg_backend TEXT NOT NULL DEFAULT 'auto' CHECK (awg_backend IN ('auto', 'kernel', 'userspace')), awg_prepare_json TEXT NOT NULL DEFAULT '' CHECK (awg_prepare_json = '' OR json_valid(awg_prepare_json)) , torrent_blocker_enabled INTEGER NOT NULL DEFAULT 0 CHECK (torrent_blocker_enabled IN (0, 1)), bandwidth_mbps INTEGER NOT NULL DEFAULT 0 CHECK (bandwidth_mbps BETWEEN 0 AND 1000000), client_ipv6 INTEGER NOT NULL DEFAULT 1 CHECK (client_ipv6 IN (0, 1)), decoy_mode TEXT NOT NULL DEFAULT 'builtin' CHECK (decoy_mode IN ('builtin', 'panel', 'own')), decoy_bundle_hash TEXT NOT NULL DEFAULT '', decoy_agent_mode TEXT NOT NULL DEFAULT '', decoy_agent_hash TEXT NOT NULL DEFAULT '', ipv6_entry TEXT NOT NULL DEFAULT '', ipv6_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(ipv6_json)), udp_filtered_at INTEGER NOT NULL DEFAULT 0, udp_filtered_sender TEXT NOT NULL DEFAULT '', udp_filtered_checked_at INTEGER NOT NULL DEFAULT 0, networks_db_sha256 TEXT NOT NULL DEFAULT '', public_label TEXT NOT NULL DEFAULT '' CHECK (length(public_label) \u003c= 40), link_sealed INTEGER NOT NULL DEFAULT 0 CHECK (link_sealed IN (0, 1)), bridge_port INTEGER NOT NULL DEFAULT 0 CHECK (bridge_port BETWEEN 0 AND 65535), bridge_path TEXT NOT NULL DEFAULT '', decoy_site_id TEXT NOT NULL DEFAULT '', hold_new_groups INTEGER NOT NULL DEFAULT 0 CHECK (hold_new_groups IN (0, 1)), share_changed_at INTEGER NOT NULL DEFAULT 0) STRICT"
+  },
+  {
+    "type": "table",
+    "name": "node_apply_meta",
+    "tbl_name": "node_apply_meta",
+    "sql": "CREATE TABLE node_apply_meta ( node_id TEXT PRIMARY KEY REFERENCES node (id) ON DELETE CASCADE, applied_at INTEGER NOT NULL DEFAULT 0, -- the last ApplyResult (or in-sync Hello) of the node status TEXT NOT NULL DEFAULT '', -- applied | partial | in_sync (a Hello that matched, nothing was sent) duration_ms INTEGER NOT NULL DEFAULT 0, drift_since INTEGER NOT NULL DEFAULT 0 -- 0 = no drift; else when the node first applied a state other than the sent one ) STRICT"
   },
   {
     "type": "table",
     "name": "node_cert",
     "tbl_name": "node_cert",
     "sql": "CREATE TABLE node_cert ( serial TEXT PRIMARY KEY, -- hex node_id TEXT NOT NULL REFERENCES node (id) ON DELETE CASCADE, ca_id TEXT NOT NULL REFERENCES panel_ca (id), pem TEXT NOT NULL, -- public material only not_before INTEGER NOT NULL, not_after INTEGER NOT NULL, issued_at INTEGER NOT NULL, revoked_at INTEGER, revoke_reason TEXT NOT NULL DEFAULT '' ) STRICT"
+  },
+  {
+    "type": "table",
+    "name": "node_channel_measure",
+    "tbl_name": "node_channel_measure",
+    "sql": "CREATE TABLE node_channel_measure ( node_id TEXT PRIMARY KEY REFERENCES node(id) ON DELETE CASCADE, started_unix INTEGER NOT NULL, at_unix INTEGER NOT NULL DEFAULT 0, result_json TEXT NOT NULL DEFAULT '' )"
   },
   {
     "type": "table",
@@ -577,9 +961,21 @@
   },
   {
     "type": "table",
+    "name": "node_dns_run",
+    "tbl_name": "node_dns_run",
+    "sql": "CREATE TABLE node_dns_run ( node_id TEXT NOT NULL REFERENCES node (id) ON DELETE CASCADE, at_unix INTEGER NOT NULL, p50_ms INTEGER NOT NULL, p95_ms INTEGER NOT NULL, failed INTEGER NOT NULL, domains INTEGER NOT NULL, PRIMARY KEY (node_id, at_unix) ) WITHOUT ROWID"
+  },
+  {
+    "type": "table",
     "name": "node_facts",
     "tbl_name": "node_facts",
     "sql": "CREATE TABLE node_facts ( node_id TEXT PRIMARY KEY REFERENCES node (id) ON DELETE CASCADE, hostname TEXT NOT NULL DEFAULT '', os TEXT NOT NULL DEFAULT '', kernel TEXT NOT NULL DEFAULT '', arch TEXT NOT NULL DEFAULT '', cpu_count INTEGER NOT NULL DEFAULT 0, ram_total_bytes INTEGER NOT NULL DEFAULT 0, disk_total_bytes INTEGER NOT NULL DEFAULT 0, virt TEXT NOT NULL DEFAULT '', has_ipv6 INTEGER NOT NULL DEFAULT 0 CHECK (has_ipv6 IN (0, 1)), engines_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(engines_json)), -- [{protocol, version}] extra_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(extra_json)), updated_at INTEGER NOT NULL ) STRICT"
+  },
+  {
+    "type": "table",
+    "name": "node_host_hour",
+    "tbl_name": "node_host_hour",
+    "sql": "CREATE TABLE node_host_hour ( node_id TEXT NOT NULL REFERENCES node (id) ON DELETE CASCADE, hour_start INTEGER NOT NULL CHECK (hour_start % 3600 = 0), samples INTEGER NOT NULL DEFAULT 0, cpu_sum_x100 INTEGER NOT NULL DEFAULT 0, cpu_max_x100 INTEGER NOT NULL DEFAULT 0, softirq_max_x100 INTEGER NOT NULL DEFAULT 0, load1_max_x100 INTEGER NOT NULL DEFAULT 0, ram_used_max INTEGER NOT NULL DEFAULT 0, ram_total INTEGER NOT NULL DEFAULT 0, rx_bps_sum INTEGER NOT NULL DEFAULT 0, rx_bps_max INTEGER NOT NULL DEFAULT 0, tx_bps_sum INTEGER NOT NULL DEFAULT 0, tx_bps_max INTEGER NOT NULL DEFAULT 0, sessions_max INTEGER NOT NULL DEFAULT 0, ext_samples INTEGER NOT NULL DEFAULT 0, sessions_sum INTEGER NOT NULL DEFAULT 0, steal_sum_x100 INTEGER NOT NULL DEFAULT 0, steal_max_x100 INTEGER NOT NULL DEFAULT 0, iowait_max_x100 INTEGER NOT NULL DEFAULT 0, swap_used_max INTEGER NOT NULL DEFAULT 0, conntrack_max INTEGER NOT NULL DEFAULT 0, conntrack_limit INTEGER NOT NULL DEFAULT 0, tcp_sockets_max INTEGER NOT NULL DEFAULT 0, nic_speed_mbps INTEGER NOT NULL DEFAULT 0, agent_cpu_sum_x100 INTEGER NOT NULL DEFAULT 0, agent_cpu_max_x100 INTEGER NOT NULL DEFAULT 0, agent_rss_max INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (node_id, hour_start) ) STRICT, WITHOUT ROWID"
   },
   {
     "type": "table",
@@ -601,9 +997,15 @@
   },
   {
     "type": "table",
+    "name": "node_os_status",
+    "tbl_name": "node_os_status",
+    "sql": "CREATE TABLE node_os_status ( node_id TEXT PRIMARY KEY NOT NULL REFERENCES node(id) ON DELETE CASCADE, status_json TEXT NOT NULL CHECK (json_valid(status_json)), measured_at INTEGER NOT NULL, received_at INTEGER NOT NULL ) STRICT"
+  },
+  {
+    "type": "table",
     "name": "node_port_check",
     "tbl_name": "node_port_check",
-    "sql": "CREATE TABLE node_port_check ( node_id TEXT NOT NULL REFERENCES node(id) ON DELETE CASCADE, port INTEGER NOT NULL, address TEXT NOT NULL, sent INTEGER NOT NULL, got INTEGER NOT NULL, verdict TEXT NOT NULL, sender TEXT NOT NULL, checked_at INTEGER NOT NULL, bad_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (node_id, port) )"
+    "sql": "CREATE TABLE node_port_check ( node_id TEXT NOT NULL REFERENCES node(id) ON DELETE CASCADE, port INTEGER NOT NULL, address TEXT NOT NULL, sent INTEGER NOT NULL, got INTEGER NOT NULL, verdict TEXT NOT NULL, sender TEXT NOT NULL, checked_at INTEGER NOT NULL, bad_at INTEGER NOT NULL DEFAULT 0, sender_verdict TEXT NOT NULL DEFAULT '', confirm_sender TEXT NOT NULL DEFAULT '', confirm_sent INTEGER NOT NULL DEFAULT 0, confirm_got INTEGER NOT NULL DEFAULT 0, confirm_verdict TEXT NOT NULL DEFAULT '', blame TEXT NOT NULL DEFAULT '' CHECK (blame IN ('', 'node', 'path')), PRIMARY KEY (node_id, port) )"
   },
   {
     "type": "table",
@@ -615,7 +1017,7 @@
     "type": "table",
     "name": "node_provision_job",
     "tbl_name": "node_provision_job",
-    "sql": "CREATE TABLE \"node_provision_job\" ( id TEXT PRIMARY KEY, node_id TEXT NOT NULL UNIQUE, name TEXT NOT NULL, address TEXT NOT NULL, country_code TEXT NOT NULL DEFAULT '', location TEXT NOT NULL DEFAULT '', provider TEXT NOT NULL DEFAULT '', ssh_host TEXT NOT NULL, ssh_port INTEGER NOT NULL CHECK (ssh_port BETWEEN 1 AND 65535), host_fingerprint TEXT NOT NULL, secret BLOB NOT NULL, state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'cancel_requested', 'cancelled', 'completed', 'failed')), phase TEXT NOT NULL, error_code TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL , attempt INTEGER NOT NULL DEFAULT 0) STRICT"
+    "sql": "CREATE TABLE \"node_provision_job\" ( id TEXT PRIMARY KEY, node_id TEXT NOT NULL UNIQUE, name TEXT NOT NULL, address TEXT NOT NULL, country_code TEXT NOT NULL DEFAULT '', location TEXT NOT NULL DEFAULT '', provider TEXT NOT NULL DEFAULT '', ssh_host TEXT NOT NULL, ssh_port INTEGER NOT NULL CHECK (ssh_port BETWEEN 1 AND 65535), host_fingerprint TEXT NOT NULL, secret BLOB NOT NULL, state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'cancel_requested', 'cancelled', 'completed', 'failed')), phase TEXT NOT NULL, error_code TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL , attempt INTEGER NOT NULL DEFAULT 0, sharing TEXT NOT NULL DEFAULT '') STRICT"
   },
   {
     "type": "table",
@@ -627,13 +1029,37 @@
     "type": "table",
     "name": "node_server_access",
     "tbl_name": "node_server_access",
-    "sql": "CREATE TABLE node_server_access ( node_id TEXT PRIMARY KEY REFERENCES node (id) ON DELETE CASCADE, node_name TEXT NOT NULL, ssh_host TEXT NOT NULL, ssh_port INTEGER NOT NULL CHECK (ssh_port BETWEEN 1 AND 65535), ssh_username TEXT NOT NULL, host_fingerprint TEXT NOT NULL, password BLOB NOT NULL, pending_password BLOB, configured_at INTEGER NOT NULL , password_generated INTEGER NOT NULL DEFAULT 0) STRICT"
+    "sql": "CREATE TABLE node_server_access ( node_id TEXT PRIMARY KEY REFERENCES node (id) ON DELETE CASCADE, node_name TEXT NOT NULL, ssh_host TEXT NOT NULL, ssh_port INTEGER NOT NULL CHECK (ssh_port BETWEEN 1 AND 65535), ssh_username TEXT NOT NULL, host_fingerprint TEXT NOT NULL, password BLOB NOT NULL, pending_password BLOB, configured_at INTEGER NOT NULL , password_generated INTEGER NOT NULL DEFAULT 0, panel_key_fp TEXT NOT NULL DEFAULT '', password_login INTEGER NOT NULL DEFAULT 1) STRICT"
+  },
+  {
+    "type": "table",
+    "name": "node_shared_ports",
+    "tbl_name": "node_shared_ports",
+    "sql": "CREATE TABLE node_shared_ports ( node_id TEXT PRIMARY KEY REFERENCES node(id) ON DELETE CASCADE, at_unix INTEGER NOT NULL, ports_json TEXT NOT NULL )"
+  },
+  {
+    "type": "table",
+    "name": "node_sni_scan",
+    "tbl_name": "node_sni_scan",
+    "sql": "CREATE TABLE node_sni_scan ( node_id TEXT PRIMARY KEY REFERENCES node (id) ON DELETE CASCADE, at_unix INTEGER NOT NULL, result_json TEXT NOT NULL )"
+  },
+  {
+    "type": "table",
+    "name": "node_speed_test",
+    "tbl_name": "node_speed_test",
+    "sql": "CREATE TABLE node_speed_test ( node_id TEXT NOT NULL REFERENCES node(id) ON DELETE CASCADE, at INTEGER NOT NULL, PRIMARY KEY (node_id, at) )"
   },
   {
     "type": "table",
     "name": "node_tcp_check",
     "tbl_name": "node_tcp_check",
     "sql": "CREATE TABLE node_tcp_check ( node_id TEXT NOT NULL REFERENCES node(id) ON DELETE CASCADE, port INTEGER NOT NULL, role TEXT NOT NULL, alpn INTEGER NOT NULL DEFAULT 0, profile TEXT NOT NULL DEFAULT '', verdict TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', sender TEXT NOT NULL, checked_at INTEGER NOT NULL, PRIMARY KEY (node_id, port) )"
+  },
+  {
+    "type": "table",
+    "name": "node_trace",
+    "tbl_name": "node_trace",
+    "sql": "CREATE TABLE node_trace ( id INTEGER PRIMARY KEY AUTOINCREMENT, from_node_id TEXT NOT NULL REFERENCES node (id) ON DELETE CASCADE, to_node_id TEXT NOT NULL REFERENCES node (id) ON DELETE CASCADE, at_unix INTEGER NOT NULL, result_json TEXT NOT NULL )"
   },
   {
     "type": "table",
@@ -649,6 +1075,24 @@
   },
   {
     "type": "table",
+    "name": "os_rollout",
+    "tbl_name": "os_rollout",
+    "sql": "CREATE TABLE os_rollout ( id TEXT PRIMARY KEY, -- osr_... status TEXT NOT NULL CHECK (status IN ('running', 'paused', 'done', 'cancelled', 'failed')), mode TEXT NOT NULL CHECK (mode IN ('security', 'all', 'reboot_only')), reboot TEXT NOT NULL CHECK (reboot IN ('never', 'if_required', 'always')), batch_size INTEGER NOT NULL DEFAULT 1 CHECK (batch_size BETWEEN 1 AND 5), window_start INTEGER NOT NULL DEFAULT -1, -- minute of the day, -1 = no window window_end INTEGER NOT NULL DEFAULT -1, tz_offset INTEGER NOT NULL DEFAULT 0, -- the update time zone when it was created max_online INTEGER NOT NULL DEFAULT 0, -- 0 = ignore pause_key TEXT NOT NULL DEFAULT '', pause_params_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(pause_params_json)), created_by TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, finished_at INTEGER NOT NULL DEFAULT 0 ) STRICT"
+  },
+  {
+    "type": "table",
+    "name": "os_step",
+    "tbl_name": "os_step",
+    "sql": "CREATE TABLE os_step ( rollout_id TEXT NOT NULL REFERENCES os_rollout (id) ON DELETE CASCADE, node_id TEXT NOT NULL, node_name TEXT NOT NULL, stage INTEGER NOT NULL, state TEXT NOT NULL CHECK (state IN ('pending', 'sent', 'rebooting', 'gating', 'passed', 'failed', 'skipped')), job_id TEXT NOT NULL DEFAULT '', -- osj_...; a new attempt is a new id sends INTEGER NOT NULL DEFAULT 0, -- times UpdateOs was sent under job_id (a lost answer is sent again) acked_at INTEGER NOT NULL DEFAULT 0, -- the node answered started / running with this job id phase TEXT NOT NULL DEFAULT '', phase_at INTEGER NOT NULL DEFAULT 0, boot_before INTEGER NOT NULL DEFAULT 0, -- the node's boot time when the job was sent kernel_from TEXT NOT NULL DEFAULT '', kernel_to TEXT NOT NULL DEFAULT '', pre_failed_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(pre_failed_json)), -- inbounds FAILED before the job sent_at INTEGER NOT NULL DEFAULT 0, reboot_at INTEGER NOT NULL DEFAULT 0, back_at INTEGER NOT NULL DEFAULT 0, -- the check window opened (back after the reboot, or the job ended) finished_at INTEGER NOT NULL DEFAULT 0, error_key TEXT NOT NULL DEFAULT '', params_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(params_json)), PRIMARY KEY (rollout_id, node_id) ) STRICT"
+  },
+  {
+    "type": "table",
+    "name": "own_probe",
+    "tbl_name": "own_probe",
+    "sql": "CREATE TABLE own_probe ( id TEXT PRIMARY KEY CHECK (id GLOB 'prb_*'), name TEXT NOT NULL, city TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('home', 'mobile', 'dc')), token_hash BLOB, token_expires INTEGER NOT NULL DEFAULT 0, secret_hash BLOB, state TEXT NOT NULL CHECK (state IN ('pending', 'active', 'network_changed', 'revoked')), asn INTEGER NOT NULL DEFAULT 0, operator TEXT NOT NULL DEFAULT '', pinned_operator TEXT NOT NULL DEFAULT '', version TEXT NOT NULL DEFAULT '', last_seen INTEGER NOT NULL DEFAULT 0, last_result INTEGER NOT NULL DEFAULT 0, checks_day INTEGER NOT NULL DEFAULT 0 CHECK (checks_day \u003e= 0), checks_day_at INTEGER NOT NULL DEFAULT 0, job_id TEXT NOT NULL DEFAULT '', job_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(job_json)), job_due INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, created_by TEXT NOT NULL, CHECK (token_hash IS NULL OR (typeof(token_hash) = 'blob' AND length(token_hash) = 32)), CHECK (secret_hash IS NULL OR (typeof(secret_hash) = 'blob' AND length(secret_hash) = 32)) ) STRICT"
+  },
+  {
+    "type": "table",
     "name": "panel_backup_settings",
     "tbl_name": "panel_backup_settings",
     "sql": "CREATE TABLE panel_backup_settings ( id INTEGER PRIMARY KEY CHECK (id = 1), account_id TEXT NOT NULL DEFAULT '', jurisdiction TEXT NOT NULL DEFAULT 'default', bucket TEXT NOT NULL DEFAULT '', access_key_id TEXT NOT NULL DEFAULT '', secret_access_key BLOB NOT NULL DEFAULT X'', age_recipient TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)), interval_hours INTEGER NOT NULL DEFAULT 24 CHECK (interval_hours BETWEEN 1 AND 168), retention_days INTEGER NOT NULL DEFAULT 0 CHECK (retention_days = 0 OR retention_days BETWEEN 7 AND 3650), last_success INTEGER NOT NULL DEFAULT 0, last_error_code TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL DEFAULT 0 ) STRICT"
@@ -661,9 +1105,33 @@
   },
   {
     "type": "table",
+    "name": "panel_ssh_key",
+    "tbl_name": "panel_ssh_key",
+    "sql": "CREATE TABLE panel_ssh_key ( id INTEGER PRIMARY KEY CHECK (id = 1), private_key BLOB NOT NULL, public_key TEXT NOT NULL, fingerprint TEXT NOT NULL, created_at INTEGER NOT NULL ) STRICT"
+  },
+  {
+    "type": "table",
     "name": "passkey",
     "tbl_name": "passkey",
     "sql": "CREATE TABLE passkey ( id TEXT PRIMARY KEY, admin_id TEXT NOT NULL REFERENCES admin(id) ON DELETE CASCADE, credential_id BLOB NOT NULL UNIQUE, public_key BLOB NOT NULL, -- COSE key attestation_type TEXT NOT NULL DEFAULT '', sign_count INTEGER NOT NULL DEFAULT 0, aaguid BLOB NOT NULL DEFAULT x'', transports TEXT NOT NULL DEFAULT '', -- comma separated flags INTEGER NOT NULL DEFAULT 0, -- raw authenticator data flags byte (UP/UV/BE/BS) name TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, last_used_at INTEGER ) STRICT"
+  },
+  {
+    "type": "table",
+    "name": "path_probe",
+    "tbl_name": "path_probe",
+    "sql": "CREATE TABLE path_probe ( id INTEGER PRIMARY KEY AUTOINCREMENT, from_node_id TEXT NOT NULL REFERENCES node (id) ON DELETE CASCADE, to_node_id TEXT NOT NULL REFERENCES node (id) ON DELETE CASCADE, kind TEXT NOT NULL CHECK (kind IN ('udp', 'tcp', 'tls')), at_unix INTEGER NOT NULL, result_json TEXT NOT NULL )"
+  },
+  {
+    "type": "table",
+    "name": "path_speed",
+    "tbl_name": "path_speed",
+    "sql": "CREATE TABLE path_speed ( id INTEGER PRIMARY KEY AUTOINCREMENT, from_node_id TEXT NOT NULL REFERENCES node (id) ON DELETE CASCADE, to_node_id TEXT NOT NULL REFERENCES node (id) ON DELETE CASCADE, direction TEXT NOT NULL CHECK (direction IN ('down', 'up')), at_unix INTEGER NOT NULL, result_json TEXT NOT NULL )"
+  },
+  {
+    "type": "table",
+    "name": "path_speed_start",
+    "tbl_name": "path_speed_start",
+    "sql": "CREATE TABLE path_speed_start ( id INTEGER PRIMARY KEY AUTOINCREMENT, actor_id TEXT NOT NULL, from_node_id TEXT NOT NULL, to_node_id TEXT NOT NULL, at_unix INTEGER NOT NULL )"
   },
   {
     "type": "table",
@@ -681,7 +1149,19 @@
     "type": "table",
     "name": "relay",
     "tbl_name": "relay",
-    "sql": "CREATE TABLE relay ( id TEXT PRIMARY KEY, inbound_id TEXT NOT NULL REFERENCES inbound (id) ON DELETE CASCADE, via_node_id TEXT NOT NULL REFERENCES node (id) ON DELETE CASCADE, network TEXT NOT NULL CHECK (network IN ('tcp', 'udp')), port INTEGER NOT NULL CHECK (port = 443 OR port BETWEEN 1024 AND 65535), enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)), state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'active', 'failed')), last_error TEXT NOT NULL DEFAULT '', to_ip TEXT NOT NULL DEFAULT '', applied_at INTEGER NOT NULL DEFAULT 0, check_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(check_json)), created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE (inbound_id, via_node_id), UNIQUE (via_node_id, network, port) ) STRICT"
+    "sql": "CREATE TABLE relay ( id TEXT PRIMARY KEY, inbound_id TEXT NOT NULL REFERENCES inbound (id) ON DELETE CASCADE, via_node_id TEXT NOT NULL REFERENCES node (id) ON DELETE CASCADE, network TEXT NOT NULL CHECK (network IN ('tcp', 'udp')), port INTEGER NOT NULL CHECK (port = 443 OR port BETWEEN 1024 AND 65535), enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)), state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'active', 'failed')), last_error TEXT NOT NULL DEFAULT '', to_ip TEXT NOT NULL DEFAULT '', applied_at INTEGER NOT NULL DEFAULT 0, check_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(check_json)), created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, mode TEXT NOT NULL DEFAULT 'auto' CHECK (mode IN ('auto', 'dnat', 'reverse')), active_mode TEXT NOT NULL DEFAULT 'dnat' CHECK (active_mode IN ('dnat', 'reverse')), mode_changed_at INTEGER NOT NULL DEFAULT 0, mode_reason TEXT NOT NULL DEFAULT '', UNIQUE (inbound_id, via_node_id), UNIQUE (via_node_id, network, port) ) STRICT"
+  },
+  {
+    "type": "table",
+    "name": "scheduled_task",
+    "tbl_name": "scheduled_task",
+    "sql": "CREATE TABLE scheduled_task ( id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('check', 'assistant')), enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)), schedule_kind TEXT NOT NULL CHECK (schedule_kind IN ('every', 'daily', 'weekly')), every_minutes INTEGER NOT NULL DEFAULT 0, minute_of_day INTEGER NOT NULL DEFAULT 0, weekday INTEGER NOT NULL DEFAULT 0, steps TEXT NOT NULL DEFAULT '[]', prompt_enc BLOB NOT NULL DEFAULT X'', notify_telegram INTEGER NOT NULL DEFAULT 0 CHECK (notify_telegram IN (0, 1)), conversation_id TEXT NOT NULL DEFAULT '', jitter_s INTEGER NOT NULL DEFAULT 0, created_by TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, next_run_at INTEGER NOT NULL DEFAULT 0, lease_id TEXT NOT NULL DEFAULT '', lease_until INTEGER NOT NULL DEFAULT 0, last_manual_at INTEGER NOT NULL DEFAULT 0, fail_streak INTEGER NOT NULL DEFAULT 0, fail_reason TEXT NOT NULL DEFAULT '', problem INTEGER NOT NULL DEFAULT 0 CHECK (problem IN (0, 1)), problem_summary TEXT NOT NULL DEFAULT '' , version INTEGER NOT NULL DEFAULT 1 CHECK (version \u003e 0)) STRICT"
+  },
+  {
+    "type": "table",
+    "name": "scheduled_task_run",
+    "tbl_name": "scheduled_task_run",
+    "sql": "CREATE TABLE scheduled_task_run ( id TEXT PRIMARY KEY, task_id TEXT NOT NULL, trigger_kind TEXT NOT NULL CHECK (trigger_kind IN ('schedule', 'manual', 'missed')), status TEXT NOT NULL CHECK (status IN ('running', 'ok', 'problem', 'failed', 'skipped')), reason TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '{}', actor TEXT NOT NULL DEFAULT '', started_at INTEGER NOT NULL, finished_at INTEGER NOT NULL DEFAULT 0 ) STRICT"
   },
   {
     "type": "table",
@@ -727,6 +1207,12 @@
   },
   {
     "type": "table",
+    "name": "udp_path_loss",
+    "tbl_name": "udp_path_loss",
+    "sql": "CREATE TABLE udp_path_loss ( sender_id TEXT NOT NULL REFERENCES node(id) ON DELETE CASCADE, target_id TEXT NOT NULL REFERENCES node(id) ON DELETE CASCADE, ports TEXT NOT NULL, sent INTEGER NOT NULL, got INTEGER NOT NULL, other_sender_id TEXT NOT NULL REFERENCES node(id) ON DELETE CASCADE, other_got INTEGER NOT NULL, checked_at INTEGER NOT NULL, open_ports TEXT NOT NULL DEFAULT '', PRIMARY KEY (sender_id, target_id) )"
+  },
+  {
+    "type": "table",
     "name": "update_rollout",
     "tbl_name": "update_rollout",
     "sql": "CREATE TABLE update_rollout ( id TEXT PRIMARY KEY, -- rol_... status TEXT NOT NULL CHECK (status IN ('running', 'paused', 'done', 'cancelled', 'failed')), to_version TEXT NOT NULL, to_built INTEGER NOT NULL, manifest BLOB NOT NULL, -- the signed bytes signature BLOB NOT NULL, batch_size INTEGER NOT NULL CHECK (batch_size BETWEEN 1 AND 10), pause_key TEXT NOT NULL DEFAULT '', pause_params_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(pause_params_json)), created_by TEXT NOT NULL DEFAULT '', -- admin id created_at INTEGER NOT NULL, finished_at INTEGER NOT NULL DEFAULT 0 ) STRICT"
@@ -735,19 +1221,31 @@
     "type": "table",
     "name": "update_step",
     "tbl_name": "update_step",
-    "sql": "CREATE TABLE update_step ( rollout_id TEXT NOT NULL REFERENCES update_rollout (id) ON DELETE CASCADE, node_id TEXT NOT NULL, -- no FK: a retired node keeps its history node_name TEXT NOT NULL, stage INTEGER NOT NULL, -- 0 = canary state TEXT NOT NULL CHECK (state IN ('pending', 'sent', 'gating', 'passed', 'failed', 'rolled_back', 'skipped')), from_version TEXT NOT NULL DEFAULT '', from_built INTEGER NOT NULL DEFAULT 0, pre_failed_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(pre_failed_json)), -- inbounds FAILED before the update sent_at INTEGER NOT NULL DEFAULT 0, acked_at INTEGER NOT NULL DEFAULT 0, -- the agent answered UpdateAgent with ok reconnected_at INTEGER NOT NULL DEFAULT 0, finished_at INTEGER NOT NULL DEFAULT 0, error_key TEXT NOT NULL DEFAULT '', params_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(params_json)), request_id TEXT NOT NULL DEFAULT '', request_at INTEGER NOT NULL DEFAULT 0, answer_json TEXT NOT NULL DEFAULT '', download_sha TEXT NOT NULL DEFAULT '', PRIMARY KEY (rollout_id, node_id) ) STRICT"
+    "sql": "CREATE TABLE update_step ( rollout_id TEXT NOT NULL REFERENCES update_rollout (id) ON DELETE CASCADE, node_id TEXT NOT NULL, -- no FK: a retired node keeps its history node_name TEXT NOT NULL, stage INTEGER NOT NULL, -- 0 = canary state TEXT NOT NULL CHECK (state IN ('pending', 'sent', 'gating', 'passed', 'failed', 'rolled_back', 'skipped')), from_version TEXT NOT NULL DEFAULT '', from_built INTEGER NOT NULL DEFAULT 0, pre_failed_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(pre_failed_json)), -- inbounds FAILED before the update sent_at INTEGER NOT NULL DEFAULT 0, acked_at INTEGER NOT NULL DEFAULT 0, -- the agent answered UpdateAgent with ok reconnected_at INTEGER NOT NULL DEFAULT 0, finished_at INTEGER NOT NULL DEFAULT 0, error_key TEXT NOT NULL DEFAULT '', params_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(params_json)), request_id TEXT NOT NULL DEFAULT '', request_at INTEGER NOT NULL DEFAULT 0, answer_json TEXT NOT NULL DEFAULT '', download_sha TEXT NOT NULL DEFAULT '', progress_phase TEXT NOT NULL DEFAULT '', progress_rank INTEGER NOT NULL DEFAULT -1, progress_downloaded INTEGER NOT NULL DEFAULT 0, progress_total INTEGER NOT NULL DEFAULT 0, progress_speed INTEGER NOT NULL DEFAULT 0, progress_updated_unix INTEGER NOT NULL DEFAULT 0, progress_error TEXT NOT NULL DEFAULT '', answer_wait_seconds INTEGER NOT NULL DEFAULT 0, progress_source TEXT NOT NULL DEFAULT '', PRIMARY KEY (rollout_id, node_id) ) STRICT"
   },
   {
     "type": "table",
     "name": "user",
     "tbl_name": "user",
-    "sql": "CREATE TABLE user ( id TEXT PRIMARY KEY, -- usr_... name TEXT NOT NULL COLLATE NOCASE UNIQUE, group_id TEXT NOT NULL REFERENCES user_group (id) ON DELETE RESTRICT, disabled INTEGER NOT NULL DEFAULT 0 CHECK (disabled IN (0, 1)), -- admin switch -- Derived, maintained by the access module (on usage ingest, on edits, and by a minute timer for -- expiry). Precedence: disabled \u003e expired \u003e limited \u003e active. Stored so that filters are index scans. status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'disabled', 'expired', 'limited')), app_happ INTEGER NOT NULL DEFAULT 1 CHECK (app_happ IN (0, 1)), app_amnezia INTEGER NOT NULL DEFAULT 1 CHECK (app_amnezia IN (0, 1)), all_nodes INTEGER NOT NULL DEFAULT 1 CHECK (all_nodes IN (0, 1)), -- 1 = automatic incl. future nodes; 0 = see user_node quota_bytes INTEGER NOT NULL DEFAULT 0 CHECK (quota_bytes \u003e= 0), -- 0 = unlimited quota_reset TEXT NOT NULL DEFAULT 'month' CHECK (quota_reset IN ('none', 'day', 'week', 'month', 'rolling_month')), period_start INTEGER NOT NULL, -- start of the current quota period used_bytes INTEGER NOT NULL DEFAULT 0, -- up+down in the current period; incremented in the stats transaction expires_at INTEGER, -- NULL = never device_limit INTEGER NOT NULL DEFAULT 5 CHECK (device_limit BETWEEN 1 AND 100), speed_limit_bps INTEGER NOT NULL DEFAULT 0 CHECK (speed_limit_bps \u003e= 0), -- 0 = none (experimental) -- Subscription token: lookup by hash, re-display by decrypting. Rotation replaces both. sub_token_hash BLOB NOT NULL UNIQUE, -- sha256(token) sub_token_enc BLOB NOT NULL, -- vault, AAD = id last_seen_at INTEGER NOT NULL DEFAULT 0, last_node_id TEXT REFERENCES node (id) ON DELETE SET NULL, created_at INTEGER NOT NULL, dns_preset_id TEXT, subscription_name TEXT NOT NULL DEFAULT '', device_speed_limit_bps INTEGER NOT NULL DEFAULT 0 CHECK (device_speed_limit_bps \u003e= 0), CHECK (app_happ = 1 OR app_amnezia = 1) -- \"at least one app\" ) STRICT"
+    "sql": "CREATE TABLE user ( id TEXT PRIMARY KEY, -- usr_... name TEXT NOT NULL COLLATE NOCASE UNIQUE, group_id TEXT NOT NULL REFERENCES user_group (id) ON DELETE RESTRICT, disabled INTEGER NOT NULL DEFAULT 0 CHECK (disabled IN (0, 1)), -- admin switch -- Derived, maintained by the access module (on usage ingest, on edits, and by a minute timer for -- expiry). Precedence: disabled \u003e expired \u003e limited \u003e active. Stored so that filters are index scans. status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'disabled', 'expired', 'limited')), app_happ INTEGER NOT NULL DEFAULT 1 CHECK (app_happ IN (0, 1)), app_amnezia INTEGER NOT NULL DEFAULT 1 CHECK (app_amnezia IN (0, 1)), all_nodes INTEGER NOT NULL DEFAULT 1 CHECK (all_nodes IN (0, 1)), -- 1 = automatic incl. future nodes; 0 = see user_node quota_bytes INTEGER NOT NULL DEFAULT 0 CHECK (quota_bytes \u003e= 0), -- 0 = unlimited quota_reset TEXT NOT NULL DEFAULT 'month' CHECK (quota_reset IN ('none', 'day', 'week', 'month', 'rolling_month')), period_start INTEGER NOT NULL, -- start of the current quota period used_bytes INTEGER NOT NULL DEFAULT 0, -- up+down in the current period; incremented in the stats transaction expires_at INTEGER, -- NULL = never device_limit INTEGER NOT NULL DEFAULT 5 CHECK (device_limit BETWEEN 1 AND 100), speed_limit_bps INTEGER NOT NULL DEFAULT 0 CHECK (speed_limit_bps \u003e= 0), -- 0 = none (experimental) -- Subscription token: lookup by hash, re-display by decrypting. Rotation replaces both. sub_token_hash BLOB NOT NULL UNIQUE, -- sha256(token) sub_token_enc BLOB NOT NULL, -- vault, AAD = id last_seen_at INTEGER NOT NULL DEFAULT 0, last_node_id TEXT REFERENCES node (id) ON DELETE SET NULL, created_at INTEGER NOT NULL, dns_preset_id TEXT, subscription_name TEXT NOT NULL DEFAULT '', device_speed_limit_bps INTEGER NOT NULL DEFAULT 0 CHECK (device_speed_limit_bps \u003e= 0), app_telegram INTEGER NOT NULL DEFAULT 0 CHECK (app_telegram IN (0, 1)), app_mistgate_off INTEGER NOT NULL DEFAULT 0 CHECK (app_mistgate_off IN (0, 1)), app_trusttunnel INTEGER NOT NULL DEFAULT 0 CHECK (app_trusttunnel IN (0, 1)), page_pass_gen INTEGER NOT NULL DEFAULT 0 CHECK (page_pass_gen \u003e= 0), page_open INTEGER NOT NULL DEFAULT 0 CHECK (page_open IN (0, 1)), CHECK (app_happ = 1 OR app_amnezia = 1) -- \"at least one app\" ) STRICT"
+  },
+  {
+    "type": "table",
+    "name": "user_extra_group",
+    "tbl_name": "user_extra_group",
+    "sql": "CREATE TABLE user_extra_group ( user_id TEXT NOT NULL REFERENCES user (id) ON DELETE CASCADE, group_id TEXT NOT NULL REFERENCES user_group (id) ON DELETE CASCADE, PRIMARY KEY (user_id, group_id) ) STRICT, WITHOUT ROWID"
   },
   {
     "type": "table",
     "name": "user_group",
     "tbl_name": "user_group",
     "sql": "CREATE TABLE user_group ( id TEXT PRIMARY KEY, -- grp_... name TEXT NOT NULL COLLATE NOCASE UNIQUE, created_at INTEGER NOT NULL , dns_preset_id TEXT, color TEXT NOT NULL DEFAULT '') STRICT"
+  },
+  {
+    "type": "table",
+    "name": "user_group_disabled_node",
+    "tbl_name": "user_group_disabled_node",
+    "sql": "CREATE TABLE user_group_disabled_node ( group_id TEXT NOT NULL REFERENCES user_group (id) ON DELETE CASCADE, node_id TEXT NOT NULL REFERENCES node (id) ON DELETE CASCADE, PRIMARY KEY (group_id, node_id) ) STRICT, WITHOUT ROWID"
   },
   {
     "type": "table",
@@ -760,6 +1258,12 @@
     "name": "user_link_dns",
     "tbl_name": "user_link_dns",
     "sql": "CREATE TABLE user_link_dns ( user_id TEXT NOT NULL PRIMARY KEY REFERENCES user (id) ON DELETE CASCADE, preset_id TEXT NOT NULL REFERENCES dns_preset (id) ON DELETE CASCADE, updated_at INTEGER NOT NULL ) STRICT"
+  },
+  {
+    "type": "table",
+    "name": "user_network",
+    "tbl_name": "user_network",
+    "sql": "CREATE TABLE user_network ( user_id TEXT NOT NULL, asn INTEGER NOT NULL, connects INTEGER NOT NULL, last_hour INTEGER NOT NULL, PRIMARY KEY (user_id, asn) ) STRICT"
   },
   {
     "type": "table",
@@ -777,7 +1281,7 @@
     "type": "table",
     "name": "warp_account",
     "tbl_name": "warp_account",
-    "sql": "CREATE TABLE warp_account ( -- at most one per node node_id TEXT PRIMARY KEY REFERENCES node (id) ON DELETE CASCADE, source TEXT NOT NULL CHECK (source IN ('registered', 'imported')), -- vault, AAD = node_id: {\"private_key\",\"token\",\"reg_id\",\"license\"}; token, reg_id and license are empty for an -- imported profile that came without wgcf-account.toml. secret_enc BLOB NOT NULL, peer_public_key TEXT NOT NULL, -- always from the account, never a constant endpoint_v4 TEXT NOT NULL, -- IP literal, \":0\" stripped endpoint_v6 TEXT NOT NULL DEFAULT '', ports_json TEXT NOT NULL DEFAULT '[2408,500,1701,4500]' CHECK (json_valid(ports_json)), address_v4 TEXT NOT NULL, -- \"172.16.0.2/32\" address_v6 TEXT NOT NULL DEFAULT '', -- new accounts may have none mtu INTEGER NOT NULL DEFAULT 1280, client_id TEXT NOT NULL DEFAULT '', -- base64; its first 3 bytes are the \"reserved\" bytes use_reserved INTEGER NOT NULL DEFAULT 0 CHECK (use_reserved IN (0, 1)), account_type TEXT NOT NULL DEFAULT '', -- free | plus, informational enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)), tos_url TEXT NOT NULL DEFAULT '', -- what the owner was shown tos_accepted_by TEXT NOT NULL DEFAULT '', -- admin id; '' for an import tos_accepted_at INTEGER NOT NULL DEFAULT 0, registered_with TEXT NOT NULL DEFAULT '', -- API version + user agent at registration (429 diagnosis) attention TEXT NOT NULL DEFAULT '', -- reason code when the owner has to decide (registration failed, revoked); '' = fine health_json TEXT NOT NULL DEFAULT '' CHECK (health_json = '' OR json_valid(health_json)), -- last agent.v1.WarpHealth health_at INTEGER NOT NULL DEFAULT 0, -- when it was reported; 0 = never created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL ) STRICT"
+    "sql": "CREATE TABLE warp_account ( -- at most one per node node_id TEXT PRIMARY KEY REFERENCES node (id) ON DELETE CASCADE, source TEXT NOT NULL CHECK (source IN ('registered', 'imported')), -- vault, AAD = node_id: {\"private_key\",\"token\",\"reg_id\",\"license\"}; token, reg_id and license are empty for an -- imported profile that came without wgcf-account.toml. secret_enc BLOB NOT NULL, peer_public_key TEXT NOT NULL, -- always from the account, never a constant endpoint_v4 TEXT NOT NULL, -- IP literal, \":0\" stripped endpoint_v6 TEXT NOT NULL DEFAULT '', ports_json TEXT NOT NULL DEFAULT '[2408,500,1701,4500]' CHECK (json_valid(ports_json)), address_v4 TEXT NOT NULL, -- \"172.16.0.2/32\" address_v6 TEXT NOT NULL DEFAULT '', -- new accounts may have none mtu INTEGER NOT NULL DEFAULT 1280, client_id TEXT NOT NULL DEFAULT '', -- base64; its first 3 bytes are the \"reserved\" bytes use_reserved INTEGER NOT NULL DEFAULT 0 CHECK (use_reserved IN (0, 1)), account_type TEXT NOT NULL DEFAULT '', -- free | plus, informational enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)), tos_url TEXT NOT NULL DEFAULT '', -- what the owner was shown tos_accepted_by TEXT NOT NULL DEFAULT '', -- admin id; '' for an import tos_accepted_at INTEGER NOT NULL DEFAULT 0, registered_with TEXT NOT NULL DEFAULT '', -- API version + user agent at registration (429 diagnosis) attention TEXT NOT NULL DEFAULT '', -- reason code when the owner has to decide (registration failed, revoked); '' = fine health_json TEXT NOT NULL DEFAULT '' CHECK (health_json = '' OR json_valid(health_json)), -- last agent.v1.WarpHealth health_at INTEGER NOT NULL DEFAULT 0, -- when it was reported; 0 = never created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL , reach_json TEXT NOT NULL DEFAULT '', reach_at INTEGER NOT NULL DEFAULT 0) STRICT"
   },
   {
     "type": "trigger",

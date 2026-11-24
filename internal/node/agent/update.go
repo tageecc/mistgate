@@ -13,10 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"connectrpc.com/connect"
-
 	pb "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
-	"github.com/mistgate/mistgate/gen/mistgate/agent/v1/agentv1connect"
 	"github.com/mistgate/mistgate/internal/node/update"
 	"github.com/mistgate/mistgate/internal/plugin"
 )
@@ -26,8 +23,6 @@ import (
 // UpdateAgent/RollbackAgent, drains the agent before a re-exec, and runs the commit watch of a new build.
 
 const (
-	capUpdateLink = "update-link/1"
-
 	// A new build commits only after it has been connected this long with its state applied: engines need a moment
 	// before a failing inbound shows up in their health.
 	commitSettle = 10 * time.Second
@@ -41,11 +36,32 @@ var errExec = errors.New("re-exec failed")
 
 // updSource is the update package's view of the agent.
 type updSource struct {
-	a     *Agent
-	token string
+	a         *Agent
+	token     string
+	requestID string
+	request   *pb.UpdateAgent
+	touch     func()
+}
+
+// SetActivity lets the updater's common idle timer observe bytes that a link client reads while it is discarding a
+// server's ignored Range prefix. The callback is best effort and is only used during one update.
+func (s *updSource) SetActivity(fn func()) { s.touch = fn }
+
+func (s updSource) Progress(p *pb.UpdateProgress) {
+	if p == nil {
+		return
+	}
+	if p.RequestId == "" {
+		p.RequestId = s.requestID
+	}
+	if session := s.a.cur.Load(); session != nil {
+		session.send(&pb.ConnectRequest{Message: &pb.ConnectRequest_UpdateProgress{UpdateProgress: p}})
+	}
 }
 
 func (s updSource) Now() time.Time { return s.a.now() }
+
+func (updSource) LocalNow() time.Time { return time.Now() }
 
 func (s updSource) Failed() []string { return s.a.failedInbounds() }
 
@@ -53,36 +69,7 @@ func (s updSource) Failed() []string { return s.a.failedInbounds() }
 // use the authenticated link route. Errors are mapped for the updater: busy is ErrRetryLater, unavailable files are
 // ErrPermanent.
 func (s updSource) Fetch(ctx context.Context, name string, offset uint64, w io.Writer) (uint64, error) {
-	a := s.a
-	if a.linkOnly() {
-		return s.fetchLink(ctx, name, offset, w)
-	}
-	st := a.settings.Load()
-	client := newHTTPClient(a.mtlsConfig(), dialTimeout(st), &http.HTTP2Config{
-		SendPingTimeout: secs(st.KeepaliveIntervalS, 20*time.Second),
-		PingTimeout:     secs(st.KeepaliveTimeoutS, 45*time.Second),
-	})
-	defer client.CloseIdleConnections()
-	cl := agentv1connect.NewAgentServiceClient(client, "https://"+a.meta.Panel, connect.WithReadMaxBytes(1<<20))
-	stream, err := cl.FetchUpdate(ctx, connect.NewRequest(&pb.FetchUpdateRequest{Name: name, Offset: offset}))
-	if err != nil {
-		return 0, mapFetchErr(err)
-	}
-	defer stream.Close()
-	var total uint64
-	for stream.Receive() {
-		m := stream.Msg()
-		total = m.TotalSize
-		if len(m.Data) > 0 {
-			if _, err := w.Write(m.Data); err != nil {
-				return total, err
-			}
-		}
-	}
-	if err := stream.Err(); err != nil {
-		return total, mapFetchErr(err)
-	}
-	return total, nil
+	return s.fetchPanelSource(ctx, name, offset, w)
 }
 
 func (s updSource) fetchLink(ctx context.Context, name string, offset uint64, w io.Writer) (uint64, error) {
@@ -94,11 +81,13 @@ func (s updSource) fetchLink(ctx context.Context, name string, offset uint64, w 
 	if err != nil {
 		return 0, fmt.Errorf("%w: invalid link download URL: %v", update.ErrPermanent, err)
 	}
-	keepaliveTimeout := 45 * time.Second
-	if st := a.settings.Load(); st != nil {
-		keepaliveTimeout = secs(st.KeepaliveTimeoutS, keepaliveTimeout)
+	idle := update.DefaultIdleTimeout
+	if a.upd != nil {
+		idle = a.upd.IdleTimeout()
 	}
-	idle := durOr(a.linkPingTimeout, keepaliveTimeout)
+	if a.updateLinkIdle > 0 {
+		idle = a.updateLinkIdle
+	}
 	requestCtx, cancel := context.WithCancel(ctx)
 	var stallFired atomic.Bool
 	stall := time.AfterFunc(idle, func() {
@@ -109,83 +98,50 @@ func (s updSource) fetchLink(ctx context.Context, name string, offset uint64, w 
 		stall.Stop()
 		cancel()
 	}()
-	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, rawURL, nil)
-	if err != nil {
-		return 0, fmt.Errorf("%w: cannot build link download request", update.ErrPermanent)
-	}
-	req.Header.Set("Authorization", "Bearer "+s.token)
-	req.Header.Set("Accept-Encoding", "identity")
-	if offset > 0 {
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
-	}
 	client, cleanup := a.newLinkHTTPClient()
 	if cleanup != nil {
 		defer cleanup()
 	}
 	requestClient := *client
 	requestClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	resp, err := requestClient.Do(req)
-	if err != nil {
-		if stallFired.Load() && ctx.Err() == nil {
-			return 0, fmt.Errorf("link download stalled for %s", idle)
-		}
-		var urlErr *url.Error
-		if errors.As(err, &urlErr) {
-			err = urlErr.Err
-		}
-		return 0, fmt.Errorf("link download request failed: %w", err)
-	}
-	defer resp.Body.Close()
-	body := linkStallReader{r: resp.Body, stall: stall, idle: idle}
-
-	var total uint64
-	switch resp.StatusCode {
-	case http.StatusOK:
-		if resp.ContentLength >= 0 {
-			total = uint64(resp.ContentLength)
-		}
-		if offset > 0 {
-			if offset > uint64(1<<63-1) {
-				return total, errors.New("link download offset is too large")
+	headers := make(http.Header)
+	headers.Set("Authorization", "Bearer "+s.token)
+	total, err := rangedGET(requestCtx, &requestClient, rawURL, offset, w, rangedGETPolicy{
+		headers: headers,
+		parseRange: func(value string, offset uint64) (uint64, error) {
+			return parseRangedContentRange(value, offset, 0, false)
+		},
+		statusError: func(status int) error {
+			return &httpStatusError{status: status}
+		},
+		requestError: func(err error) error {
+			if stallFired.Load() && ctx.Err() == nil {
+				return errLinkStalled
 			}
-			if _, err := io.CopyN(io.Discard, body, int64(offset)); err != nil {
-				if stallFired.Load() && ctx.Err() == nil {
-					return total, fmt.Errorf("link download stalled for %s", idle)
-				}
-				return total, fmt.Errorf("discard ranged response prefix: %w", err)
-			}
-		}
-	case http.StatusPartialContent:
-		total, err = linkContentRange(resp.Header.Get("Content-Range"), offset)
-		if err != nil {
-			return 0, err
-		}
-	case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound:
-		return 0, fmt.Errorf("%w: link download returned HTTP %d", update.ErrPermanent, resp.StatusCode)
-	case http.StatusTooManyRequests, http.StatusServiceUnavailable:
-		return 0, fmt.Errorf("%w: link download returned HTTP %d", update.ErrRetryLater, resp.StatusCode)
-	default:
-		return 0, fmt.Errorf("link download returned HTTP %d", resp.StatusCode)
+			return err
+		},
+		bodyReader: func(r io.Reader) io.Reader { return linkStallReader{r: r, stall: stall, idle: idle, touch: s.touch} },
+	})
+	if err != nil && stallFired.Load() && ctx.Err() == nil {
+		return total, errLinkStalled
 	}
-	if _, err := io.Copy(w, body); err != nil {
-		if stallFired.Load() && ctx.Err() == nil {
-			return total, fmt.Errorf("link download stalled for %s", idle)
-		}
-		return total, err
-	}
-	return total, nil
+	return total, err
 }
 
 type linkStallReader struct {
 	r     io.Reader
 	stall *time.Timer
 	idle  time.Duration
+	touch func()
 }
 
 func (r linkStallReader) Read(p []byte) (int, error) {
 	n, err := r.r.Read(p)
 	if n > 0 {
 		r.stall.Reset(r.idle)
+		if r.touch != nil {
+			r.touch()
+		}
 	}
 	return n, err
 }
@@ -207,47 +163,6 @@ func linkDownloadURL(linkBase, nodeID, name string) (string, error) {
 	u.Fragment = ""
 	u.Opaque = ""
 	return u.String(), nil
-}
-
-func linkContentRange(value string, offset uint64) (total uint64, err error) {
-	unit, value, ok := strings.Cut(strings.TrimSpace(value), " ")
-	if !ok || unit != "bytes" {
-		return 0, errors.New("link download returned an invalid Content-Range")
-	}
-	byteRange, size, ok := strings.Cut(value, "/")
-	if !ok {
-		return 0, errors.New("link download returned an invalid Content-Range")
-	}
-	startText, endText, ok := strings.Cut(byteRange, "-")
-	if !ok {
-		return 0, errors.New("link download returned an invalid Content-Range")
-	}
-	start, err := strconv.ParseUint(startText, 10, 64)
-	if err != nil || start != offset {
-		return 0, fmt.Errorf("link download Content-Range starts at %q, want %d", startText, offset)
-	}
-	end, err := strconv.ParseUint(endText, 10, 64)
-	if err != nil || end < start {
-		return 0, errors.New("link download returned an invalid Content-Range")
-	}
-	if size == "*" {
-		return 0, nil
-	}
-	total, err = strconv.ParseUint(size, 10, 64)
-	if err != nil || total == 0 || end >= total {
-		return 0, errors.New("link download returned an invalid Content-Range")
-	}
-	return total, nil
-}
-
-func mapFetchErr(err error) error {
-	switch connect.CodeOf(err) {
-	case connect.CodeResourceExhausted:
-		return fmt.Errorf("%w: %v", update.ErrRetryLater, err)
-	case connect.CodeNotFound, connect.CodeFailedPrecondition, connect.CodePermissionDenied, connect.CodeUnimplemented:
-		return fmt.Errorf("%w: %v", update.ErrPermanent, err)
-	}
-	return err
 }
 
 // failedInbounds lists the inbounds the engines report FAILED or whose last apply carried an error (a blocked inbound has
@@ -325,7 +240,7 @@ func (a *Agent) commitWatch(ctx context.Context, m *update.Marker) {
 	switch {
 	case err != nil:
 		if ctx.Err() == nil {
-			a.log.Error("update watch", "err", err)
+			a.log.Error("update watch", "code", "update_watch_failed", "err", err)
 		}
 	case o != nil:
 		a.event(pb.Severity_SEVERITY_INFO, "update_committed", "", map[string]string{
@@ -340,6 +255,10 @@ func (a *Agent) commitWatch(ctx context.Context, m *update.Marker) {
 // applyUpdate answers one UpdateAgent. Everything but the exec itself happens here; the CommandResult is on the wire
 // before the engines are drained and the process is replaced.
 func (a *Agent) applyUpdate(s *session, r *pb.UpdateAgent) {
+	if a.osJobActive() { // dpkg is busy and the host may reboot: not the time to replace this binary
+		s.send(cmdResult(&pb.CommandResult{RequestId: r.RequestId, Error: "busy", Detail: "an OS update job is running"}))
+		return
+	}
 	if a.upd == nil {
 		s.send(cmdResult(&pb.CommandResult{RequestId: r.RequestId, Error: "unsigned_build"}))
 		return
@@ -348,11 +267,16 @@ func (a *Agent) applyUpdate(s *session, r *pb.UpdateAgent) {
 	if a.linkOnly() && a.runCtx != nil {
 		ctx = a.runCtx
 	}
-	res, fin := a.upd.Apply(ctx, r, updSource{a: a, token: r.GetDownloadToken()})
+	source := &updSource{a: a, token: r.GetDownloadToken(), requestID: r.RequestId, request: r}
+	res, fin := a.upd.Apply(ctx, r, source)
 	a.finishCommand(s, res, fin)
 }
 
 func (a *Agent) rollbackUpdate(s *session, r *pb.RollbackAgent) {
+	if a.osJobActive() {
+		s.send(cmdResult(&pb.CommandResult{RequestId: r.RequestId, Error: "busy", Detail: "an OS update job is running"}))
+		return
+	}
 	if a.upd == nil {
 		s.send(cmdResult(&pb.CommandResult{RequestId: r.RequestId, Error: "unsigned_build"}))
 		return
@@ -362,6 +286,11 @@ func (a *Agent) rollbackUpdate(s *session, r *pb.RollbackAgent) {
 }
 
 func (a *Agent) finishCommand(s *session, res *pb.CommandResult, fin update.Finish) {
+	if res == nil {
+		// A redelivery of a command that is still running: it gets no answer, the original
+		// run sends the terminal one for that request id.
+		return
+	}
 	if fin == nil {
 		s.send(cmdResult(res))
 		return
@@ -380,7 +309,7 @@ func (a *Agent) execVia(s *session, fin update.Finish) {
 	}
 	a.closeEngines()
 	if err := fin(); err != nil {
-		a.log.Error("re-exec failed, exiting", "err", err)
+		a.log.Error("re-exec failed, exiting", "code", "update_exec_failed", "err", err)
 		a.cancel(fmt.Errorf("%w: %v", errExec, err))
 	}
 }

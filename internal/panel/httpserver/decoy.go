@@ -7,27 +7,27 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"mime"
 	"net/http"
 	"os"
 	"path"
 	"strconv"
 	"strings"
 	"time"
+
+	nodedecoy "github.com/mistgate/mistgate/internal/decoy"
+	"github.com/mistgate/mistgate/internal/panel/store"
 )
 
 // Built-in decoy pages. Every install ships the same ones, so they are recognisable;
-// --decoy-dir with your own site is the recommended setup.
+// --decoy-dir with your own site is the recommended setup. The first two are the node's own (internal/decoy): one text, so the
+// library's preview shows what is served.
+var (
+	comingSoonHTML = nodedecoy.BuiltinHTML()
+	notFoundHTML   = nodedecoy.NotFoundHTML()
+)
+
 const (
-	comingSoonHTML = `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Coming soon</title>
-<style>html,body{height:100%;margin:0}body{display:flex;align-items:center;justify-content:center;font:16px/1.5 system-ui,sans-serif;color:#444;background:#fafafa}main{text-align:center;padding:1rem}h1{font-weight:500;margin:0 0 .5rem}p{margin:0;color:#888}</style>
-</head><body><main><h1>Coming soon</h1><p>Something new is on its way.</p></main></body></html>
-`
-	notFoundHTML = `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>404 Not Found</title></head>
-<body><h1>Not Found</h1><p>The requested URL was not found on this server.</p></body></html>
-`
 	tooManyHTML = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>429 Too Many Requests</title></head>
 <body><h1>Too Many Requests</h1><p>Too many requests. Please try again later.</p></body></html>
@@ -63,6 +63,28 @@ func withStart(r *http.Request) *http.Request {
 // up in the same two code paths (serve / notFound), so they cannot be told apart.
 type decoy struct {
 	dir fs.FS // nil means built-in
+	// lib, when set, lets the owner choose the panel's own site in the library of decoy sites (setting decoy_panel_source): the
+	// built-in page, dir or a library site, changed without a restart. Nil on the edge, which keeps no library.
+	lib librarySource
+}
+
+// librarySource says what the library chose for the panel: kind "builtin" (the built-in page), "site" (fsys is the site) or
+// anything else for the directory (or the built-in page when there is no directory).
+type librarySource interface {
+	resolve() (kind string, fsys fs.FS)
+}
+
+// site is the file system the decoy serves now; nil is the built-in page.
+func (d *decoy) site() fs.FS {
+	if d.lib != nil {
+		switch kind, fsys := d.lib.resolve(); kind {
+		case "builtin":
+			return nil
+		case "site":
+			return fsys
+		}
+	}
+	return d.dir
 }
 
 type emptyFS struct{}
@@ -112,11 +134,34 @@ func (f *rootedFile) Close() error {
 // not its own: the same 404 the public listener gives every unknown path, for any path and method. It is
 // not the decoy site itself: a mount sees its prefix stripped, so the site's "/" page would answer the
 // bare prefix with 200 and tell a guessed prefix from a wrong one.
-func NewDecoy(dir string) http.Handler {
-	return http.HandlerFunc(newDecoy(dir, nil).notFound)
+func NewDecoy(dir string) http.Handler { return NewDecoyFor(dir, nil) }
+
+// NewDecoyFor is NewDecoy for a panel that has the library of decoy sites: the 404 is the one of the site the owner chose for the
+// panel, like the public listener's, so a secret mount cannot be told from a stranger's path.
+func NewDecoyFor(dir string, st *store.Store) http.Handler {
+	return http.HandlerFunc(newDecoy(dir, nil, st).notFound)
 }
 
-func newDecoy(dir string, log *slog.Logger) *decoy {
+// NewTooMany returns the 429 of the decoy site (429.html of the decoy dir, else the built-in page, Retry-After in whole
+// seconds). A secret mount answers with it when a stranger has failed too often, so the limit looks like the one of the site.
+func NewTooMany(dir string) func(w http.ResponseWriter, r *http.Request, retry time.Duration) {
+	return NewTooManyFor(dir, nil)
+}
+
+// NewTooManyFor is NewTooMany for a panel that has the library of decoy sites (see NewDecoyFor).
+func NewTooManyFor(dir string, st *store.Store) func(w http.ResponseWriter, r *http.Request, retry time.Duration) {
+	return newDecoy(dir, nil, st).tooMany
+}
+
+func newDecoy(dir string, log *slog.Logger, st *store.Store) *decoy {
+	d := newDirDecoy(dir, log)
+	if st != nil {
+		d.lib = newLibrary(st)
+	}
+	return d
+}
+
+func newDirDecoy(dir string, log *slog.Logger) *decoy {
 	if dir == "" {
 		return &decoy{}
 	}
@@ -139,7 +184,8 @@ func (d *decoy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p := r.URL.Path
-	if d.dir == nil {
+	dir := d.site()
+	if dir == nil {
 		switch p {
 		case "/":
 			writeHTML(w, r, http.StatusOK, comingSoonHTML)
@@ -158,10 +204,10 @@ func (d *decoy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d.notFound(w, r)
 		return
 	}
-	if st, err := fs.Stat(d.dir, name); err == nil && st.IsDir() {
+	if st, err := fs.Stat(dir, name); err == nil && st.IsDir() {
 		name = path.Join(name, "index.html")
 	}
-	f, err := d.dir.Open(name)
+	f, err := dir.Open(name)
 	if err != nil {
 		if p == "/robots.txt" {
 			d.robots(w, r)
@@ -175,7 +221,7 @@ func (d *decoy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d.notFound(w, r)
 		return
 	}
-	if !serveFile(w, r, name, f) {
+	if !serveFile(d, w, r, name, f) {
 		d.notFound(w, r)
 	}
 }
@@ -188,12 +234,22 @@ func (d *decoy) robots(w http.ResponseWriter, r *http.Request) {
 // notFound answers with 404.html from the decoy dir if there is one, else the built-in page. It does not
 // return before notFoundFloor has passed since the request arrived.
 func (d *decoy) notFound(w http.ResponseWriter, r *http.Request) {
+	w.Header().Del("Service-Worker-Allowed")
 	if start, ok := r.Context().Value(startKey{}).(time.Time); ok {
 		if wait := notFoundFloor - time.Since(start); wait > 0 {
 			time.Sleep(wait)
 		}
 	}
 	writeHTML(w, r, http.StatusNotFound, d.notFoundBody())
+}
+
+func hasServiceWorkerHeader(r *http.Request) bool {
+	for name := range r.Header {
+		if strings.EqualFold(name, "Service-Worker") {
+			return true
+		}
+	}
+	return false
 }
 
 // tooMany answers 429 in the style of the decoy (429.html from the decoy dir, else the built-in page),
@@ -211,8 +267,8 @@ func (d *decoy) notFoundBody() string { return d.pageBody("404.html", notFoundHT
 
 // pageBody is the named file of the decoy dir if there is one, else builtin.
 func (d *decoy) pageBody(name, builtin string) string {
-	if d.dir != nil {
-		if f, err := d.dir.Open(name); err == nil {
+	if dir := d.site(); dir != nil {
+		if f, err := dir.Open(name); err == nil {
 			defer f.Close()
 			if b, err := io.ReadAll(io.LimitReader(f, 1<<20)); err == nil {
 				return string(b)
@@ -245,9 +301,9 @@ func writeBody(w http.ResponseWriter, r *http.Request, status int, contentType [
 	}
 }
 
-// serveFile serves an opened file without Last-Modified/ETag, so nothing about the
-// filesystem leaks and every decoy response carries the same header set.
-func serveFile(w http.ResponseWriter, r *http.Request, name string, f fs.File) bool {
+// serveFile sends opened files without Last-Modified or ETag so filesystem details do not leak. Both the decoy and SPA
+// use this point to hide JavaScript from Service-Worker requests.
+func serveFile(d *decoy, w http.ResponseWriter, r *http.Request, name string, f fs.File) bool {
 	rs, ok := f.(io.ReadSeeker)
 	if !ok {
 		b, err := io.ReadAll(f)
@@ -256,8 +312,32 @@ func serveFile(w http.ResponseWriter, r *http.Request, name string, f fs.File) b
 		}
 		rs = bytes.NewReader(b)
 	}
+	contentType := w.Header().Get("Content-Type")
+	if contentType == "" {
+		contentType = mime.TypeByExtension(path.Ext(name))
+	}
+	if hasServiceWorkerHeader(r) && isJavaScriptMIMEType(contentType) {
+		d.notFound(w, r)
+		return true
+	}
 	http.ServeContent(w, r, name, time.Time{}, rs)
 	return true
+}
+
+func isJavaScriptMIMEType(contentType string) bool {
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(mediaType) {
+	case "application/ecmascript", "application/javascript", "application/x-ecmascript", "application/x-javascript",
+		"text/ecmascript", "text/javascript", "text/javascript1.0", "text/javascript1.1", "text/javascript1.2",
+		"text/javascript1.3", "text/javascript1.4", "text/javascript1.5", "text/jscript", "text/livescript",
+		"text/x-ecmascript", "text/x-javascript":
+		return true
+	default:
+		return false
+	}
 }
 
 // swapErrors wraps a secret mount so that nothing it answers with 404 or 405 differs from the decoy's 404:

@@ -14,21 +14,71 @@ import { zh as telegramZh } from "./telegram";
 import { zh as portsZh } from "./ports";
 import { zh as editionZh } from "./edition";
 import { zh as decoyZh } from "./decoy";
+import { zh as bulkZh } from "./bulk";
 import { zh as countryZh } from "./country";
+import { zh as probesZh } from "./probes";
 import { zh as connectionsZh } from "./connections";
 import { zh as journalZh } from "./journal";
 import { zh as relayZh } from "./relay";
 import { zh as waysZh } from "./ways";
+import { zh as tgproxyZh } from "./tgproxy";
+import { zh as clientcompatZh } from "./clientcompat";
+import { zh as protocolsZh } from "./protocols";
+import { zh as aiZh } from "./ai";
+import { zh as graphZh } from "./graph";
+import { zh as waysgraphZh } from "./waysgraph";
+import { zh as fleetmapZh } from "./fleetmap";
+import { zh as observabilityZh } from "./observability";
+import { zh as debugZh } from "./debug";
+import { zh as resourcesZh } from "./resources";
+import { zh as tasksZh } from "./tasks";
+import { zh as followupZh } from "./followup";
+import { zh as osupdatesZh } from "./osupdates";
+import { zh as fleetuiZh } from "./fleetui";
+import { zh as clientlogsZh } from "./clientlogs";
+import { zh as trusttunnelZh } from "./trusttunnel";
+import { zh as tcpshareZh } from "./tcpshare";
+import { zh as shellZh } from "./shell";
+import { zh as nodesviewZh } from "./nodesview";
+import { zh as nodeswaysZh } from "./nodesways";
+import { zh as userslistZh } from "./userslist";
+import { zh as userspageZh } from "./userspage";
+import { zh as profilenewZh } from "./profilenew";
+import { zh as settingspageZh } from "./settingspage";
+import { zh as aipageZh } from "./aipage";
+import { zh as igpageZh } from "./igpage";
+import { zh as aspageZh } from "./aspage";
+import { zh as nodeshareZh } from "./nodeshare";
+import { zh as channelZh } from "./channel";
+import { zh as countrynowZh } from "./countrynow";
+import { zh as sniZh } from "./sni";
+import { zh as overviewZh } from "./overview";
+import { zh as windowsZh } from "./windows";
+import { zh as nodepageZh } from "./nodepage";
+import { zh as nodewaysZh } from "./nodeways";
+import { zh as subspnZh } from "./subspn";
+import { zh as subshxZh } from "./subshx";
+import { zh as subsrtZh } from "./subsrt";
+import { zh as subsdnsZh } from "./subsdns";
+import { zh as usersgroupZh } from "./usersgroup";
+import { zh as usersextraZh } from "./usersextra";
+import { zh as decoysitesZh } from "./decoysites";
+import { zh as planwordsZh } from "./planwords";
+import { zh as profilespageZh } from "./profilespage";
+import { zh as healthpageZh } from "./healthpage";
+import { zh as reachpageZh } from "./reachpage";
+import { zh as updatespageZh } from "./updatespage";
+import { zh as profilesrvZh } from "./profilesrv";
 
 // Simplified Chinese (zh-CN). Typed against the English shape: a missing or extra key fails `pnpm typecheck`. Plurals: one form, no "|".
 // `core` is the shell, auth and navigation copy (what ru.ts keeps in its own `core`).
 const core: CoreMessages = {
-  "app.name": "Mistgate",
   "common.loading": "正在加载…",
   "common.retry": "重试",
   "common.undo": "撤销",
   "common.quoted": "「{name}」",
   "common.labeled": "{label}：{value}",
+  "common.fromTo": "{from} → {to}",
 
   "pager.nav": "分页",
   "pager.range": "显示第 {from}–{to} 条，共 {total} 条",
@@ -73,15 +123,13 @@ const core: CoreMessages = {
   "section.health.desc": "告警、客户端视角检测和集群诊断。",
   "section.reachability.desc": "能否从某个国家境内访问节点：各个来源、每个节点的结论及其最近一周。",
   "section.updates.desc": "面板和节点 Agent 的版本、分批滚动更新与回滚。",
-  "section.integrations.desc": "脚本使用的 API 令牌、供 AI 智能体使用的 MCP，以及需要你审批的变更。",
+  "section.integrations.desc": "Telegram 提醒：每位管理员都可以绑定自己的聊天。",
   "section.settings.desc": "管理员、安全、备份和域名。",
   "section.empty": "这里还没有内容",
 
   "header.search": "搜索节点、用户和页面",
   "header.language": "语言",
   "header.theme": "主题",
-  "header.theme.toLight": "切换到浅色主题",
-  "header.theme.toDark": "切换到深色主题",
   "header.signOut": "退出登录",
   "header.version": "面板版本 {version}",
   "stale.title": "面板已更新到 {version}",
@@ -90,8 +138,6 @@ const core: CoreMessages = {
   "stale.expand": "显示刷新提示",
   "header.source": "源代码",
   "header.star": "在 GitHub 上标星",
-  "more.theme": "深色主题",
-  "more.language": "语言",
 
   "health.none": "暂无节点",
   "health.ok": "集群运行正常",
@@ -99,15 +145,14 @@ const core: CoreMessages = {
   "health.problems": "{n} 个问题",
 
   "palette.title": "命令面板",
-  "palette.placeholder": "节点、用户、页面…",
+  "palette.placeholder": "节点、用户、页面或操作",
   "palette.empty": "未找到结果",
   "palette.searching": "正在搜索…",
   "palette.nodes": "节点",
   "palette.users": "用户",
   "palette.places": "页面",
   "palette.actions": "操作",
-  "palette.addNode": "添加节点",
-  "palette.createUser": "新建用户",
+  "palette.createUser": "添加用户",
   "palette.newToken": "新建 API 令牌",
   "palette.newProfile": "新建协议配置",
   "palette.approvals": "审批",
@@ -149,6 +194,7 @@ const core: CoreMessages = {
   "settings.accent.rose": "玫瑰红",
   "settings.accent.sage": "鼠尾草绿",
   "settings.local": "这些选择只保存在此设备上。",
+  "settings.fx": "出现动画",
   "settings.device": "仅限此设备",
 
   "auth.setup.welcomeTitle": "你好！",
@@ -160,7 +206,7 @@ const core: CoreMessages = {
   "auth.password": "密码",
   "auth.code": "身份验证器验证码",
   "auth.createPasskey": "创建通行密钥",
-  "auth.waitingPasskey": "正在等待你的设备…",
+  "auth.waitingPasskey": "正在等待通行密钥",
   "auth.setup.passkeyHint": "浏览器会请求指纹、面部识别或 PIN",
   "auth.setup.otherWay": "改用密码 + 身份验证器验证码",
   "auth.setup.totpScan": "使用 Google Authenticator、1Password 或 Aegis 扫描",
@@ -220,8 +266,14 @@ const core: CoreMessages = {
 
   "err.name_taken": "此名称已被占用。请换一个。",
   "err.group_not_empty": "分组中仍有用户：{users}。先把他们移到其他分组，再删除此分组。",
+  "err.page_password_removed": "此人的页面目前没有密码。请先恢复密码。",
+  "err.group_in_both": "同一个分组同时出现在两个列表中：请只选择加入或移出其中一种。",
+  "err.main_group": "不能移出主分组：请改为将另一个分组设为主分组。",
+  "err.too_many_groups": "一个用户最多属于 16 个分组。",
   "err.profile_deployed": "此协议配置已部署在节点 {nodes} 上。请先从这些节点移除。",
   "err.stale_version": "此协议配置已在另一个标签页中被修改。请刷新页面。",
+  "err.stale_inbound": "此服务器的设置刚刚在别处被修改。列表已刷新：请检查后再重复这次修改。",
+  "err.stale_user": "此用户刚刚在别处被修改（已停用、已延期或已编辑）。请刷新页面，检查后再重复这次修改。",
   "err.node_offline": "节点未连接。请在它的 Agent 重新上线后再试。",
   "err.agent_too_old": "此节点的 Agent 版本过旧，无法执行此操作。请在「更新」页面更新它。",
   "err.node_retired": "此节点已从集群退役。",
@@ -230,6 +282,8 @@ const core: CoreMessages = {
   "err.preset_builtin": "内置预设无法删除。",
 
   "field.port.out_of_range": "端口范围为 1–65535",
+  "field.obfuscation.jc.handshake_budget": "Jc、非空的 I1–I5 特征包和一个握手包的总数不得超过 128。",
+  "field.obfuscation.header_protection_key.rt_range_requires_hpk": "启用随机尾部时，任何宽于单个值的 H1–H4 范围都需要头部保护密钥。",
   "field.hop.from.invalid": "端口必须在跳跃范围之外",
   "field.hop.from.out_of_range": "范围起点须在 1024–65535 之间，且避开 SSH 和其他常用端口",
   "field.hop.to.too_wide": "范围最多包含 20,000 个端口",
@@ -240,6 +294,9 @@ const core: CoreMessages = {
   "field.reality.target.format": "格式为「主机:端口」，例如 www.example.org:443",
   "field.reality.target.host": "主机是普通名称或 IP 地址，不含空格和斜杠",
   "field.reality.target.port_range": "端口范围为 1–65535",
+  "field.reality.target.same_port": "目标指向本入口自身：请换一个地址或端口",
+  "field.reality.target.unspecified": "未指定地址（0.0.0.0、::）不是站点：请使用域名或真实地址",
+  "field.reality.target.same_node": "目标就是本节点：请换一个地址或端口",
   "field.reality.server_names.required": "目标是 IP 地址：请列出其证书中的名称",
   "field.reality.server_names.length": "最多 8 个名称",
   "field.reality.server_names.invalid": "不带通配符的主机名，例如 www.example.org",
@@ -270,6 +327,7 @@ const core: CoreMessages = {
   "field.egress.invalid_enum": "直连或 WARP",
   "field.reality.fingerprint.invalid_enum": "Chrome、Firefox、Safari、iOS、Edge 或随机",
   "field.reality.target_kind.invalid_enum": "本节点站点或其他站点",
+  "field.hysteria2.tls_mode.unsupported": "暂不支持为 IP 地址申请 Let’s Encrypt 证书：请使用域名或自签名证书",
 };
 
-export const zh: Messages = { ...cloudZh, ...core, ...opsZh, ...usersZh, ...securityZh, ...profilesZh, ...subsZh, ...healthZh, ...updatesZh, ...awgZh, ...warpZh, ...integrationsZh, ...telegramZh, ...portsZh, ...editionZh, ...decoyZh, ...countryZh, ...connectionsZh, ...journalZh, ...relayZh, ...waysZh };
+export const zh: Messages = { ...cloudZh, ...core, ...opsZh, ...usersZh, ...securityZh, ...profilesZh, ...subsZh, ...healthZh, ...updatesZh, ...awgZh, ...warpZh, ...integrationsZh, ...telegramZh, ...portsZh, ...editionZh, ...decoyZh, ...bulkZh, ...countryZh, ...probesZh, ...connectionsZh, ...journalZh, ...relayZh, ...waysZh, ...tgproxyZh, ...clientcompatZh, ...protocolsZh, ...aiZh, ...graphZh, ...waysgraphZh, ...fleetmapZh, ...observabilityZh, ...debugZh, ...resourcesZh, ...tasksZh, ...followupZh, ...osupdatesZh, ...fleetuiZh, ...clientlogsZh, ...trusttunnelZh, ...tcpshareZh, ...shellZh, ...overviewZh, ...nodesviewZh, ...windowsZh, ...nodepageZh, ...userslistZh, ...userspageZh, ...usersgroupZh, ...usersextraZh, ...decoysitesZh, ...planwordsZh, ...nodeswaysZh, ...nodewaysZh, ...profilespageZh, ...healthpageZh, ...reachpageZh, ...profilesrvZh, ...profilenewZh, ...subspnZh, ...subshxZh, ...subsrtZh, ...subsdnsZh, ...updatespageZh, ...settingspageZh, ...aipageZh, ...igpageZh, ...aspageZh, ...nodeshareZh, ...channelZh, ...countrynowZh, ...sniZh };

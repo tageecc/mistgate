@@ -31,7 +31,9 @@ type ProtocolInfo struct {
 	// Settings for a brand-new profile, secrets already generated (shown masked).
 	DefaultSettingsJson string `protobuf:"bytes,4,opt,name=default_settings_json,json=defaultSettingsJson,proto3" json:"default_settings_json,omitempty"`
 	// Which user-facing app can consume the protocol (drives the user's Happ/Amnezia toggles).
-	Apps          []App `protobuf:"varint,5,rep,packed,name=apps,proto3,enum=mistgate.admin.v1.App" json:"apps,omitempty"`
+	Apps []App `protobuf:"varint,5,rep,packed,name=apps,proto3,enum=mistgate.admin.v1.App" json:"apps,omitempty"`
+	// The protocol is new and not proven in the field (MTProto today): the list marks it, and the owner knows it may change.
+	Experimental  bool `protobuf:"varint,6,opt,name=experimental,proto3" json:"experimental,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -99,6 +101,13 @@ func (x *ProtocolInfo) GetApps() []App {
 		return x.Apps
 	}
 	return nil
+}
+
+func (x *ProtocolInfo) GetExperimental() bool {
+	if x != nil {
+		return x.Experimental
+	}
+	return false
 }
 
 type ListProtocolsRequest struct {
@@ -1264,7 +1273,12 @@ func (x *ScoreItem) GetParams() map[string]string {
 // "sni_needs_domain: name=1.2.3.4" (an IP where Let's Encrypt wants a domain), "sni_invalid: name=..." (neither a domain
 // nor an IP), "already_on_node", "node_retired", "port_lossy: port=8443&node=de1&sent=300&got=190&at=<unix>&sender=nl1&free=2053"
 // (FAILED_PRECONDITION: the UDP delivery check of design/udp-port-check.md found the port losing packets on that node;
-// free = a port the same run proved, else the picker's choice from stored checks, 0 = none; allow_lossy_port saves anyway).
+// free = a port the same run proved, else the picker's choice from stored checks, 0 = none; allow_lossy_port saves anyway),
+// "reality_target_unsupported" (a REALITY target override on an inbound that is not VLESS REALITY), "reality_target_invalid:
+// target=..." (not a host name and a port), "reality_target_same_node: target=...&node=de1" (the node itself at its own port),
+// "reality_target_own: target=...&node=de1" (the host is one of the panel's own: the address of a node, the panel, a name a service of the
+// fleet holds a certificate for). A warning that is not a refusal: "bridge_site_lost: node=fi1&port=443" (the node's own site on 443, which
+// the bridge of reverse relays rides, would give way to another site).
 type CreateInboundRequest struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	ProfileId string                 `protobuf:"bytes,1,opt,name=profile_id,json=profileId,proto3" json:"profile_id,omitempty"`
@@ -1282,10 +1296,14 @@ type CreateInboundRequest struct {
 	AllowLossyPort bool `protobuf:"varint,6,opt,name=allow_lossy_port,json=allowLossyPort,proto3" json:"allow_lossy_port,omitempty"`
 	// With an empty profile_id, validate_only must be true and these fields describe a new profile that is not stored.
 	// This lets the add-profile plan run the same per-node checks without creating a temporary profile.
-	Protocol      string `protobuf:"bytes,7,opt,name=protocol,proto3" json:"protocol,omitempty"`
-	SettingsJson  string `protobuf:"bytes,8,opt,name=settings_json,json=settingsJson,proto3" json:"settings_json,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Protocol     string `protobuf:"bytes,7,opt,name=protocol,proto3" json:"protocol,omitempty"`
+	SettingsJson string `protobuf:"bytes,8,opt,name=settings_json,json=settingsJson,proto3" json:"settings_json,omitempty"`
+	// VLESS REALITY only: "host:port" of a site this node shows instead of the profile's target (the host is a name, not an IP);
+	// the host becomes the one name REALITY accepts there. Empty = the profile's target. Refusals: reality_target_unsupported,
+	// reality_target_invalid, reality_target_same_node, reality_target_own (as listed above).
+	RealityTargetOverride string `protobuf:"bytes,9,opt,name=reality_target_override,json=realityTargetOverride,proto3" json:"reality_target_override,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *CreateInboundRequest) Reset() {
@@ -1374,6 +1392,13 @@ func (x *CreateInboundRequest) GetSettingsJson() string {
 	return ""
 }
 
+func (x *CreateInboundRequest) GetRealityTargetOverride() string {
+	if x != nil {
+		return x.RealityTargetOverride
+	}
+	return ""
+}
+
 type CreateInboundResponse struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	Inbound *Inbound               `protobuf:"bytes,1,opt,name=inbound,proto3" json:"inbound,omitempty"`
@@ -1451,8 +1476,13 @@ type UpdateInboundRequest struct {
 	ValidateOnly bool `protobuf:"varint,5,opt,name=validate_only,json=validateOnly,proto3" json:"validate_only,omitempty"`
 	// As CreateInboundRequest.allow_lossy_port.
 	AllowLossyPort bool `protobuf:"varint,6,opt,name=allow_lossy_port,json=allowLossyPort,proto3" json:"allow_lossy_port,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Whether the server at the node's own address is included in subscriptions; absent = leave unchanged.
+	DirectInSubscriptions *bool `protobuf:"varint,7,opt,name=direct_in_subscriptions,json=directInSubscriptions,proto3,oneof" json:"direct_in_subscriptions,omitempty"`
+	// As CreateInboundRequest.reality_target_override; absent = leave unchanged, "" = back to the profile's target. A change
+	// restarts the server and clients get the new name with their next subscription update.
+	RealityTargetOverride *string `protobuf:"bytes,8,opt,name=reality_target_override,json=realityTargetOverride,proto3,oneof" json:"reality_target_override,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *UpdateInboundRequest) Reset() {
@@ -1525,6 +1555,20 @@ func (x *UpdateInboundRequest) GetAllowLossyPort() bool {
 		return x.AllowLossyPort
 	}
 	return false
+}
+
+func (x *UpdateInboundRequest) GetDirectInSubscriptions() bool {
+	if x != nil && x.DirectInSubscriptions != nil {
+		return *x.DirectInSubscriptions
+	}
+	return false
+}
+
+func (x *UpdateInboundRequest) GetRealityTargetOverride() string {
+	if x != nil && x.RealityTargetOverride != nil {
+		return *x.RealityTargetOverride
+	}
+	return ""
 }
 
 type UpdateInboundResponse struct {
@@ -1935,17 +1979,152 @@ func (*DeleteInboundResponse) Descriptor() ([]byte, []int) {
 	return file_mistgate_admin_v1_profile_proto_rawDescGZIP(), []int{28}
 }
 
+type RemoveProfileFromNodesRequest struct {
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	ProfileId string                 `protobuf:"bytes,1,opt,name=profile_id,json=profileId,proto3" json:"profile_id,omitempty"`
+	// The nodes to take the profile off; at least one.
+	NodeIds []string `protobuf:"bytes,2,rep,name=node_ids,json=nodeIds,proto3" json:"node_ids,omitempty"`
+	// Delete the profile too, when this call takes it off its last nodes. The groups lose it, as with DeleteProfile.
+	DeleteProfile bool `protobuf:"varint,3,opt,name=delete_profile,json=deleteProfile,proto3" json:"delete_profile,omitempty"`
+	// With delete_profile: the profile name typed by the admin; must equal the current name.
+	ConfirmName   string `protobuf:"bytes,4,opt,name=confirm_name,json=confirmName,proto3" json:"confirm_name,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RemoveProfileFromNodesRequest) Reset() {
+	*x = RemoveProfileFromNodesRequest{}
+	mi := &file_mistgate_admin_v1_profile_proto_msgTypes[29]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RemoveProfileFromNodesRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RemoveProfileFromNodesRequest) ProtoMessage() {}
+
+func (x *RemoveProfileFromNodesRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_mistgate_admin_v1_profile_proto_msgTypes[29]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RemoveProfileFromNodesRequest.ProtoReflect.Descriptor instead.
+func (*RemoveProfileFromNodesRequest) Descriptor() ([]byte, []int) {
+	return file_mistgate_admin_v1_profile_proto_rawDescGZIP(), []int{29}
+}
+
+func (x *RemoveProfileFromNodesRequest) GetProfileId() string {
+	if x != nil {
+		return x.ProfileId
+	}
+	return ""
+}
+
+func (x *RemoveProfileFromNodesRequest) GetNodeIds() []string {
+	if x != nil {
+		return x.NodeIds
+	}
+	return nil
+}
+
+func (x *RemoveProfileFromNodesRequest) GetDeleteProfile() bool {
+	if x != nil {
+		return x.DeleteProfile
+	}
+	return false
+}
+
+func (x *RemoveProfileFromNodesRequest) GetConfirmName() string {
+	if x != nil {
+		return x.ConfirmName
+	}
+	return ""
+}
+
+type RemoveProfileFromNodesResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// How many inbounds were removed (nodes the profile was not on do not count).
+	Removed uint32 `protobuf:"varint,1,opt,name=removed,proto3" json:"removed,omitempty"`
+	// The profile is gone.
+	ProfileDeleted bool `protobuf:"varint,2,opt,name=profile_deleted,json=profileDeleted,proto3" json:"profile_deleted,omitempty"`
+	// Relay links through the removed inbounds that went with them.
+	RelaysRemoved uint32 `protobuf:"varint,3,opt,name=relays_removed,json=relaysRemoved,proto3" json:"relays_removed,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RemoveProfileFromNodesResponse) Reset() {
+	*x = RemoveProfileFromNodesResponse{}
+	mi := &file_mistgate_admin_v1_profile_proto_msgTypes[30]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RemoveProfileFromNodesResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RemoveProfileFromNodesResponse) ProtoMessage() {}
+
+func (x *RemoveProfileFromNodesResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_mistgate_admin_v1_profile_proto_msgTypes[30]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RemoveProfileFromNodesResponse.ProtoReflect.Descriptor instead.
+func (*RemoveProfileFromNodesResponse) Descriptor() ([]byte, []int) {
+	return file_mistgate_admin_v1_profile_proto_rawDescGZIP(), []int{30}
+}
+
+func (x *RemoveProfileFromNodesResponse) GetRemoved() uint32 {
+	if x != nil {
+		return x.Removed
+	}
+	return 0
+}
+
+func (x *RemoveProfileFromNodesResponse) GetProfileDeleted() bool {
+	if x != nil {
+		return x.ProfileDeleted
+	}
+	return false
+}
+
+func (x *RemoveProfileFromNodesResponse) GetRelaysRemoved() uint32 {
+	if x != nil {
+		return x.RelaysRemoved
+	}
+	return 0
+}
+
 var File_mistgate_admin_v1_profile_proto protoreflect.FileDescriptor
 
 const file_mistgate_admin_v1_profile_proto_rawDesc = "" +
 	"\n" +
-	"\x1fmistgate/admin/v1/profile.proto\x12\x11mistgate.admin.v1\x1a\x1emistgate/admin/v1/common.proto\x1a$mistgate/admin/v1/subscription.proto\"\xd3\x01\n" +
+	"\x1fmistgate/admin/v1/profile.proto\x12\x11mistgate.admin.v1\x1a\x1emistgate/admin/v1/common.proto\x1a$mistgate/admin/v1/subscription.proto\"\xf7\x01\n" +
 	"\fProtocolInfo\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12!\n" +
 	"\fdisplay_name\x18\x02 \x01(\tR\vdisplayName\x120\n" +
 	"\x14settings_schema_json\x18\x03 \x01(\tR\x12settingsSchemaJson\x122\n" +
 	"\x15default_settings_json\x18\x04 \x01(\tR\x13defaultSettingsJson\x12*\n" +
-	"\x04apps\x18\x05 \x03(\x0e2\x16.mistgate.admin.v1.AppR\x04apps\"\x16\n" +
+	"\x04apps\x18\x05 \x03(\x0e2\x16.mistgate.admin.v1.AppR\x04apps\x12\"\n" +
+	"\fexperimental\x18\x06 \x01(\bR\fexperimental\"\x16\n" +
 	"\x14ListProtocolsRequest\"V\n" +
 	"\x15ListProtocolsResponse\x12=\n" +
 	"\tprotocols\x18\x01 \x03(\v2\x1f.mistgate.admin.v1.ProtocolInfoR\tprotocols\"\xbb\x02\n" +
@@ -2033,7 +2212,7 @@ const file_mistgate_admin_v1_profile_proto_rawDesc = "" +
 	"\x06params\x18\x04 \x03(\v2(.mistgate.admin.v1.ScoreItem.ParamsEntryR\x06params\x1a9\n" +
 	"\vParamsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xbc\x02\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xf4\x02\n" +
 	"\x14CreateInboundRequest\x12\x1d\n" +
 	"\n" +
 	"profile_id\x18\x01 \x01(\tR\tprofileId\x12\x17\n" +
@@ -2043,11 +2222,12 @@ const file_mistgate_admin_v1_profile_proto_rawDesc = "" +
 	"\rvalidate_only\x18\x05 \x01(\bR\fvalidateOnly\x12(\n" +
 	"\x10allow_lossy_port\x18\x06 \x01(\bR\x0eallowLossyPort\x12\x1a\n" +
 	"\bprotocol\x18\a \x01(\tR\bprotocol\x12#\n" +
-	"\rsettings_json\x18\b \x01(\tR\fsettingsJson\"\xa7\x01\n" +
+	"\rsettings_json\x18\b \x01(\tR\fsettingsJson\x126\n" +
+	"\x17reality_target_override\x18\t \x01(\tR\x15realityTargetOverride\"\xa7\x01\n" +
 	"\x15CreateInboundResponse\x124\n" +
 	"\ainbound\x18\x01 \x01(\v2\x1a.mistgate.admin.v1.InboundR\ainbound\x12;\n" +
 	"\bwarnings\x18\x02 \x03(\v2\x1f.mistgate.admin.v1.StatusReasonR\bwarnings\x12\x1b\n" +
-	"\tfree_port\x18\x03 \x01(\rR\bfreePort\"\xc6\x02\n" +
+	"\tfree_port\x18\x03 \x01(\rR\bfreePort\"\xf8\x03\n" +
 	"\x14UpdateInboundRequest\x12\x1d\n" +
 	"\n" +
 	"inbound_id\x18\x01 \x01(\tR\tinboundId\x12(\n" +
@@ -2055,11 +2235,15 @@ const file_mistgate_admin_v1_profile_proto_rawDesc = "" +
 	"\x18tls_server_name_override\x18\x03 \x01(\tH\x01R\x15tlsServerNameOverride\x88\x01\x01\x12\x1d\n" +
 	"\aenabled\x18\x04 \x01(\bH\x02R\aenabled\x88\x01\x01\x12#\n" +
 	"\rvalidate_only\x18\x05 \x01(\bR\fvalidateOnly\x12(\n" +
-	"\x10allow_lossy_port\x18\x06 \x01(\bR\x0eallowLossyPortB\x10\n" +
+	"\x10allow_lossy_port\x18\x06 \x01(\bR\x0eallowLossyPort\x12;\n" +
+	"\x17direct_in_subscriptions\x18\a \x01(\bH\x03R\x15directInSubscriptions\x88\x01\x01\x12;\n" +
+	"\x17reality_target_override\x18\b \x01(\tH\x04R\x15realityTargetOverride\x88\x01\x01B\x10\n" +
 	"\x0e_port_overrideB\x1b\n" +
 	"\x19_tls_server_name_overrideB\n" +
 	"\n" +
-	"\b_enabled\"\xa7\x01\n" +
+	"\b_enabledB\x1a\n" +
+	"\x18_direct_in_subscriptionsB\x1a\n" +
+	"\x18_reality_target_override\"\xa7\x01\n" +
 	"\x15UpdateInboundResponse\x124\n" +
 	"\ainbound\x18\x01 \x01(\v2\x1a.mistgate.admin.v1.InboundR\ainbound\x12;\n" +
 	"\bwarnings\x18\x02 \x03(\v2\x1f.mistgate.admin.v1.StatusReasonR\bwarnings\x12\x1b\n" +
@@ -2089,7 +2273,17 @@ const file_mistgate_admin_v1_profile_proto_rawDesc = "" +
 	"\x14DeleteInboundRequest\x12\x1d\n" +
 	"\n" +
 	"inbound_id\x18\x01 \x01(\tR\tinboundId\"\x17\n" +
-	"\x15DeleteInboundResponse2\xcd\b\n" +
+	"\x15DeleteInboundResponse\"\xa3\x01\n" +
+	"\x1dRemoveProfileFromNodesRequest\x12\x1d\n" +
+	"\n" +
+	"profile_id\x18\x01 \x01(\tR\tprofileId\x12\x19\n" +
+	"\bnode_ids\x18\x02 \x03(\tR\anodeIds\x12%\n" +
+	"\x0edelete_profile\x18\x03 \x01(\bR\rdeleteProfile\x12!\n" +
+	"\fconfirm_name\x18\x04 \x01(\tR\vconfirmName\"\x8a\x01\n" +
+	"\x1eRemoveProfileFromNodesResponse\x12\x18\n" +
+	"\aremoved\x18\x01 \x01(\rR\aremoved\x12'\n" +
+	"\x0fprofile_deleted\x18\x02 \x01(\bR\x0eprofileDeleted\x12%\n" +
+	"\x0erelays_removed\x18\x03 \x01(\rR\rrelaysRemoved2\xcc\t\n" +
 	"\x0eProfileService\x12b\n" +
 	"\rListProtocols\x12'.mistgate.admin.v1.ListProtocolsRequest\x1a(.mistgate.admin.v1.ListProtocolsResponse\x12_\n" +
 	"\fListProfiles\x12&.mistgate.admin.v1.ListProfilesRequest\x1a'.mistgate.admin.v1.ListProfilesResponse\x12Y\n" +
@@ -2101,7 +2295,8 @@ const file_mistgate_admin_v1_profile_proto_rawDesc = "" +
 	"\rDeleteProfile\x12'.mistgate.admin.v1.DeleteProfileRequest\x1a(.mistgate.admin.v1.DeleteProfileResponse\x12b\n" +
 	"\rCreateInbound\x12'.mistgate.admin.v1.CreateInboundRequest\x1a(.mistgate.admin.v1.CreateInboundResponse\x12b\n" +
 	"\rUpdateInbound\x12'.mistgate.admin.v1.UpdateInboundRequest\x1a(.mistgate.admin.v1.UpdateInboundResponse\x12b\n" +
-	"\rDeleteInbound\x12'.mistgate.admin.v1.DeleteInboundRequest\x1a(.mistgate.admin.v1.DeleteInboundResponse\x12\\\n" +
+	"\rDeleteInbound\x12'.mistgate.admin.v1.DeleteInboundRequest\x1a(.mistgate.admin.v1.DeleteInboundResponse\x12}\n" +
+	"\x16RemoveProfileFromNodes\x120.mistgate.admin.v1.RemoveProfileFromNodesRequest\x1a1.mistgate.admin.v1.RemoveProfileFromNodesResponse\x12\\\n" +
 	"\vTwinProfile\x12%.mistgate.admin.v1.TwinProfileRequest\x1a&.mistgate.admin.v1.TwinProfileResponseB\xc7\x01\n" +
 	"\x15com.mistgate.admin.v1B\fProfileProtoP\x01Z:github.com/mistgate/mistgate/gen/mistgate/admin/v1;adminv1\xa2\x02\x03MAX\xaa\x02\x11Mistgate.Admin.V1\xca\x02\x11Mistgate\\Admin\\V1\xe2\x02\x1dMistgate\\Admin\\V1\\GPBMetadata\xea\x02\x13Mistgate::Admin::V1b\x06proto3"
 
@@ -2117,70 +2312,72 @@ func file_mistgate_admin_v1_profile_proto_rawDescGZIP() []byte {
 	return file_mistgate_admin_v1_profile_proto_rawDescData
 }
 
-var file_mistgate_admin_v1_profile_proto_msgTypes = make([]protoimpl.MessageInfo, 31)
+var file_mistgate_admin_v1_profile_proto_msgTypes = make([]protoimpl.MessageInfo, 33)
 var file_mistgate_admin_v1_profile_proto_goTypes = []any{
-	(*ProtocolInfo)(nil),           // 0: mistgate.admin.v1.ProtocolInfo
-	(*ListProtocolsRequest)(nil),   // 1: mistgate.admin.v1.ListProtocolsRequest
-	(*ListProtocolsResponse)(nil),  // 2: mistgate.admin.v1.ListProtocolsResponse
-	(*ProfileSummary)(nil),         // 3: mistgate.admin.v1.ProfileSummary
-	(*ProfileFormat)(nil),          // 4: mistgate.admin.v1.ProfileFormat
-	(*ListProfilesRequest)(nil),    // 5: mistgate.admin.v1.ListProfilesRequest
-	(*ListProfilesResponse)(nil),   // 6: mistgate.admin.v1.ListProfilesResponse
-	(*GetProfileRequest)(nil),      // 7: mistgate.admin.v1.GetProfileRequest
-	(*GetProfileResponse)(nil),     // 8: mistgate.admin.v1.GetProfileResponse
-	(*CreateProfileRequest)(nil),   // 9: mistgate.admin.v1.CreateProfileRequest
-	(*CreateProfileResponse)(nil),  // 10: mistgate.admin.v1.CreateProfileResponse
-	(*UpdateProfileRequest)(nil),   // 11: mistgate.admin.v1.UpdateProfileRequest
-	(*ProfileImpact)(nil),          // 12: mistgate.admin.v1.ProfileImpact
-	(*UpdateProfileResponse)(nil),  // 13: mistgate.admin.v1.UpdateProfileResponse
-	(*FieldError)(nil),             // 14: mistgate.admin.v1.FieldError
-	(*PreviewProfileRequest)(nil),  // 15: mistgate.admin.v1.PreviewProfileRequest
-	(*PreviewProfileResponse)(nil), // 16: mistgate.admin.v1.PreviewProfileResponse
-	(*ObfuscationScore)(nil),       // 17: mistgate.admin.v1.ObfuscationScore
-	(*ScoreItem)(nil),              // 18: mistgate.admin.v1.ScoreItem
-	(*CreateInboundRequest)(nil),   // 19: mistgate.admin.v1.CreateInboundRequest
-	(*CreateInboundResponse)(nil),  // 20: mistgate.admin.v1.CreateInboundResponse
-	(*UpdateInboundRequest)(nil),   // 21: mistgate.admin.v1.UpdateInboundRequest
-	(*UpdateInboundResponse)(nil),  // 22: mistgate.admin.v1.UpdateInboundResponse
-	(*TwinProfileRequest)(nil),     // 23: mistgate.admin.v1.TwinProfileRequest
-	(*TwinProfileResponse)(nil),    // 24: mistgate.admin.v1.TwinProfileResponse
-	(*DeleteProfileRequest)(nil),   // 25: mistgate.admin.v1.DeleteProfileRequest
-	(*DeleteProfileResponse)(nil),  // 26: mistgate.admin.v1.DeleteProfileResponse
-	(*DeleteInboundRequest)(nil),   // 27: mistgate.admin.v1.DeleteInboundRequest
-	(*DeleteInboundResponse)(nil),  // 28: mistgate.admin.v1.DeleteInboundResponse
-	nil,                            // 29: mistgate.admin.v1.FieldError.ParamsEntry
-	nil,                            // 30: mistgate.admin.v1.ScoreItem.ParamsEntry
-	(App)(0),                       // 31: mistgate.admin.v1.App
-	(*StatusReason)(nil),           // 32: mistgate.admin.v1.StatusReason
-	(SubFormat)(0),                 // 33: mistgate.admin.v1.SubFormat
-	(*Inbound)(nil),                // 34: mistgate.admin.v1.Inbound
-	(*PortCheck)(nil),              // 35: mistgate.admin.v1.PortCheck
+	(*ProtocolInfo)(nil),                   // 0: mistgate.admin.v1.ProtocolInfo
+	(*ListProtocolsRequest)(nil),           // 1: mistgate.admin.v1.ListProtocolsRequest
+	(*ListProtocolsResponse)(nil),          // 2: mistgate.admin.v1.ListProtocolsResponse
+	(*ProfileSummary)(nil),                 // 3: mistgate.admin.v1.ProfileSummary
+	(*ProfileFormat)(nil),                  // 4: mistgate.admin.v1.ProfileFormat
+	(*ListProfilesRequest)(nil),            // 5: mistgate.admin.v1.ListProfilesRequest
+	(*ListProfilesResponse)(nil),           // 6: mistgate.admin.v1.ListProfilesResponse
+	(*GetProfileRequest)(nil),              // 7: mistgate.admin.v1.GetProfileRequest
+	(*GetProfileResponse)(nil),             // 8: mistgate.admin.v1.GetProfileResponse
+	(*CreateProfileRequest)(nil),           // 9: mistgate.admin.v1.CreateProfileRequest
+	(*CreateProfileResponse)(nil),          // 10: mistgate.admin.v1.CreateProfileResponse
+	(*UpdateProfileRequest)(nil),           // 11: mistgate.admin.v1.UpdateProfileRequest
+	(*ProfileImpact)(nil),                  // 12: mistgate.admin.v1.ProfileImpact
+	(*UpdateProfileResponse)(nil),          // 13: mistgate.admin.v1.UpdateProfileResponse
+	(*FieldError)(nil),                     // 14: mistgate.admin.v1.FieldError
+	(*PreviewProfileRequest)(nil),          // 15: mistgate.admin.v1.PreviewProfileRequest
+	(*PreviewProfileResponse)(nil),         // 16: mistgate.admin.v1.PreviewProfileResponse
+	(*ObfuscationScore)(nil),               // 17: mistgate.admin.v1.ObfuscationScore
+	(*ScoreItem)(nil),                      // 18: mistgate.admin.v1.ScoreItem
+	(*CreateInboundRequest)(nil),           // 19: mistgate.admin.v1.CreateInboundRequest
+	(*CreateInboundResponse)(nil),          // 20: mistgate.admin.v1.CreateInboundResponse
+	(*UpdateInboundRequest)(nil),           // 21: mistgate.admin.v1.UpdateInboundRequest
+	(*UpdateInboundResponse)(nil),          // 22: mistgate.admin.v1.UpdateInboundResponse
+	(*TwinProfileRequest)(nil),             // 23: mistgate.admin.v1.TwinProfileRequest
+	(*TwinProfileResponse)(nil),            // 24: mistgate.admin.v1.TwinProfileResponse
+	(*DeleteProfileRequest)(nil),           // 25: mistgate.admin.v1.DeleteProfileRequest
+	(*DeleteProfileResponse)(nil),          // 26: mistgate.admin.v1.DeleteProfileResponse
+	(*DeleteInboundRequest)(nil),           // 27: mistgate.admin.v1.DeleteInboundRequest
+	(*DeleteInboundResponse)(nil),          // 28: mistgate.admin.v1.DeleteInboundResponse
+	(*RemoveProfileFromNodesRequest)(nil),  // 29: mistgate.admin.v1.RemoveProfileFromNodesRequest
+	(*RemoveProfileFromNodesResponse)(nil), // 30: mistgate.admin.v1.RemoveProfileFromNodesResponse
+	nil,                                    // 31: mistgate.admin.v1.FieldError.ParamsEntry
+	nil,                                    // 32: mistgate.admin.v1.ScoreItem.ParamsEntry
+	(App)(0),                               // 33: mistgate.admin.v1.App
+	(*StatusReason)(nil),                   // 34: mistgate.admin.v1.StatusReason
+	(SubFormat)(0),                         // 35: mistgate.admin.v1.SubFormat
+	(*Inbound)(nil),                        // 36: mistgate.admin.v1.Inbound
+	(*PortCheck)(nil),                      // 37: mistgate.admin.v1.PortCheck
 }
 var file_mistgate_admin_v1_profile_proto_depIdxs = []int32{
-	31, // 0: mistgate.admin.v1.ProtocolInfo.apps:type_name -> mistgate.admin.v1.App
+	33, // 0: mistgate.admin.v1.ProtocolInfo.apps:type_name -> mistgate.admin.v1.App
 	0,  // 1: mistgate.admin.v1.ListProtocolsResponse.protocols:type_name -> mistgate.admin.v1.ProtocolInfo
-	32, // 2: mistgate.admin.v1.ProfileSummary.warnings:type_name -> mistgate.admin.v1.StatusReason
+	34, // 2: mistgate.admin.v1.ProfileSummary.warnings:type_name -> mistgate.admin.v1.StatusReason
 	4,  // 3: mistgate.admin.v1.ProfileSummary.formats:type_name -> mistgate.admin.v1.ProfileFormat
-	33, // 4: mistgate.admin.v1.ProfileFormat.format:type_name -> mistgate.admin.v1.SubFormat
+	35, // 4: mistgate.admin.v1.ProfileFormat.format:type_name -> mistgate.admin.v1.SubFormat
 	3,  // 5: mistgate.admin.v1.ListProfilesResponse.profiles:type_name -> mistgate.admin.v1.ProfileSummary
 	3,  // 6: mistgate.admin.v1.GetProfileResponse.profile:type_name -> mistgate.admin.v1.ProfileSummary
-	34, // 7: mistgate.admin.v1.GetProfileResponse.inbounds:type_name -> mistgate.admin.v1.Inbound
+	36, // 7: mistgate.admin.v1.GetProfileResponse.inbounds:type_name -> mistgate.admin.v1.Inbound
 	3,  // 8: mistgate.admin.v1.CreateProfileResponse.profile:type_name -> mistgate.admin.v1.ProfileSummary
 	3,  // 9: mistgate.admin.v1.UpdateProfileResponse.profile:type_name -> mistgate.admin.v1.ProfileSummary
 	12, // 10: mistgate.admin.v1.UpdateProfileResponse.impact:type_name -> mistgate.admin.v1.ProfileImpact
-	29, // 11: mistgate.admin.v1.FieldError.params:type_name -> mistgate.admin.v1.FieldError.ParamsEntry
+	31, // 11: mistgate.admin.v1.FieldError.params:type_name -> mistgate.admin.v1.FieldError.ParamsEntry
 	14, // 12: mistgate.admin.v1.PreviewProfileResponse.errors:type_name -> mistgate.admin.v1.FieldError
 	14, // 13: mistgate.admin.v1.PreviewProfileResponse.warnings:type_name -> mistgate.admin.v1.FieldError
 	17, // 14: mistgate.admin.v1.PreviewProfileResponse.obfuscation_score:type_name -> mistgate.admin.v1.ObfuscationScore
 	4,  // 15: mistgate.admin.v1.PreviewProfileResponse.formats:type_name -> mistgate.admin.v1.ProfileFormat
 	18, // 16: mistgate.admin.v1.ObfuscationScore.items:type_name -> mistgate.admin.v1.ScoreItem
-	30, // 17: mistgate.admin.v1.ScoreItem.params:type_name -> mistgate.admin.v1.ScoreItem.ParamsEntry
-	34, // 18: mistgate.admin.v1.CreateInboundResponse.inbound:type_name -> mistgate.admin.v1.Inbound
-	32, // 19: mistgate.admin.v1.CreateInboundResponse.warnings:type_name -> mistgate.admin.v1.StatusReason
-	34, // 20: mistgate.admin.v1.UpdateInboundResponse.inbound:type_name -> mistgate.admin.v1.Inbound
-	32, // 21: mistgate.admin.v1.UpdateInboundResponse.warnings:type_name -> mistgate.admin.v1.StatusReason
+	32, // 17: mistgate.admin.v1.ScoreItem.params:type_name -> mistgate.admin.v1.ScoreItem.ParamsEntry
+	36, // 18: mistgate.admin.v1.CreateInboundResponse.inbound:type_name -> mistgate.admin.v1.Inbound
+	34, // 19: mistgate.admin.v1.CreateInboundResponse.warnings:type_name -> mistgate.admin.v1.StatusReason
+	36, // 20: mistgate.admin.v1.UpdateInboundResponse.inbound:type_name -> mistgate.admin.v1.Inbound
+	34, // 21: mistgate.admin.v1.UpdateInboundResponse.warnings:type_name -> mistgate.admin.v1.StatusReason
 	3,  // 22: mistgate.admin.v1.TwinProfileResponse.profile:type_name -> mistgate.admin.v1.ProfileSummary
-	35, // 23: mistgate.admin.v1.TwinProfileResponse.port_checks:type_name -> mistgate.admin.v1.PortCheck
+	37, // 23: mistgate.admin.v1.TwinProfileResponse.port_checks:type_name -> mistgate.admin.v1.PortCheck
 	1,  // 24: mistgate.admin.v1.ProfileService.ListProtocols:input_type -> mistgate.admin.v1.ListProtocolsRequest
 	5,  // 25: mistgate.admin.v1.ProfileService.ListProfiles:input_type -> mistgate.admin.v1.ListProfilesRequest
 	7,  // 26: mistgate.admin.v1.ProfileService.GetProfile:input_type -> mistgate.admin.v1.GetProfileRequest
@@ -2191,20 +2388,22 @@ var file_mistgate_admin_v1_profile_proto_depIdxs = []int32{
 	19, // 31: mistgate.admin.v1.ProfileService.CreateInbound:input_type -> mistgate.admin.v1.CreateInboundRequest
 	21, // 32: mistgate.admin.v1.ProfileService.UpdateInbound:input_type -> mistgate.admin.v1.UpdateInboundRequest
 	27, // 33: mistgate.admin.v1.ProfileService.DeleteInbound:input_type -> mistgate.admin.v1.DeleteInboundRequest
-	23, // 34: mistgate.admin.v1.ProfileService.TwinProfile:input_type -> mistgate.admin.v1.TwinProfileRequest
-	2,  // 35: mistgate.admin.v1.ProfileService.ListProtocols:output_type -> mistgate.admin.v1.ListProtocolsResponse
-	6,  // 36: mistgate.admin.v1.ProfileService.ListProfiles:output_type -> mistgate.admin.v1.ListProfilesResponse
-	8,  // 37: mistgate.admin.v1.ProfileService.GetProfile:output_type -> mistgate.admin.v1.GetProfileResponse
-	10, // 38: mistgate.admin.v1.ProfileService.CreateProfile:output_type -> mistgate.admin.v1.CreateProfileResponse
-	13, // 39: mistgate.admin.v1.ProfileService.UpdateProfile:output_type -> mistgate.admin.v1.UpdateProfileResponse
-	16, // 40: mistgate.admin.v1.ProfileService.PreviewProfile:output_type -> mistgate.admin.v1.PreviewProfileResponse
-	26, // 41: mistgate.admin.v1.ProfileService.DeleteProfile:output_type -> mistgate.admin.v1.DeleteProfileResponse
-	20, // 42: mistgate.admin.v1.ProfileService.CreateInbound:output_type -> mistgate.admin.v1.CreateInboundResponse
-	22, // 43: mistgate.admin.v1.ProfileService.UpdateInbound:output_type -> mistgate.admin.v1.UpdateInboundResponse
-	28, // 44: mistgate.admin.v1.ProfileService.DeleteInbound:output_type -> mistgate.admin.v1.DeleteInboundResponse
-	24, // 45: mistgate.admin.v1.ProfileService.TwinProfile:output_type -> mistgate.admin.v1.TwinProfileResponse
-	35, // [35:46] is the sub-list for method output_type
-	24, // [24:35] is the sub-list for method input_type
+	29, // 34: mistgate.admin.v1.ProfileService.RemoveProfileFromNodes:input_type -> mistgate.admin.v1.RemoveProfileFromNodesRequest
+	23, // 35: mistgate.admin.v1.ProfileService.TwinProfile:input_type -> mistgate.admin.v1.TwinProfileRequest
+	2,  // 36: mistgate.admin.v1.ProfileService.ListProtocols:output_type -> mistgate.admin.v1.ListProtocolsResponse
+	6,  // 37: mistgate.admin.v1.ProfileService.ListProfiles:output_type -> mistgate.admin.v1.ListProfilesResponse
+	8,  // 38: mistgate.admin.v1.ProfileService.GetProfile:output_type -> mistgate.admin.v1.GetProfileResponse
+	10, // 39: mistgate.admin.v1.ProfileService.CreateProfile:output_type -> mistgate.admin.v1.CreateProfileResponse
+	13, // 40: mistgate.admin.v1.ProfileService.UpdateProfile:output_type -> mistgate.admin.v1.UpdateProfileResponse
+	16, // 41: mistgate.admin.v1.ProfileService.PreviewProfile:output_type -> mistgate.admin.v1.PreviewProfileResponse
+	26, // 42: mistgate.admin.v1.ProfileService.DeleteProfile:output_type -> mistgate.admin.v1.DeleteProfileResponse
+	20, // 43: mistgate.admin.v1.ProfileService.CreateInbound:output_type -> mistgate.admin.v1.CreateInboundResponse
+	22, // 44: mistgate.admin.v1.ProfileService.UpdateInbound:output_type -> mistgate.admin.v1.UpdateInboundResponse
+	28, // 45: mistgate.admin.v1.ProfileService.DeleteInbound:output_type -> mistgate.admin.v1.DeleteInboundResponse
+	30, // 46: mistgate.admin.v1.ProfileService.RemoveProfileFromNodes:output_type -> mistgate.admin.v1.RemoveProfileFromNodesResponse
+	24, // 47: mistgate.admin.v1.ProfileService.TwinProfile:output_type -> mistgate.admin.v1.TwinProfileResponse
+	36, // [36:48] is the sub-list for method output_type
+	24, // [24:36] is the sub-list for method input_type
 	24, // [24:24] is the sub-list for extension type_name
 	24, // [24:24] is the sub-list for extension extendee
 	0,  // [0:24] is the sub-list for field type_name
@@ -2225,7 +2424,7 @@ func file_mistgate_admin_v1_profile_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_mistgate_admin_v1_profile_proto_rawDesc), len(file_mistgate_admin_v1_profile_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   31,
+			NumMessages:   33,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

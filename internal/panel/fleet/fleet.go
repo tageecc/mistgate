@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"connectrpc.com/connect"
@@ -74,6 +75,8 @@ type Config struct {
 	ExpectedAgentVersion string
 	// DecoyDir is the panel's own --decoy-dir bundle. Empty means new nodes default to builtin.
 	DecoyDir string
+	// PublicURL is the panel's public address (its public listener shows the panel's decoy site there). Empty = not known.
+	PublicURL string
 	// Debounce is the StateChanged coalescing window. Default 200 ms.
 	Debounce time.Duration
 	// Desired is the desired-state source, required: it returns the enabled inbounds of a node with their
@@ -86,9 +89,13 @@ type Config struct {
 	// OnUsage is called after a stats batch added usage to these users (new used_bytes are committed), e.g.
 	// access.Service.Recompute, so a quota overrun takes effect within one stats interval.
 	OnUsage func(ctx context.Context, userIDs []string)
-	// OnAwgPrepareFailed is called when a node reports that the build of its AmneziaWG kernel module failed (the Telegram
-	// alerts hang on it). at is the time the node gave; a replay of the same report carries the same value. Must not block.
+	// OnAwgPrepareFailed is called once when a panel-requested AmneziaWG build transitions from running to failed. at is
+	// the panel time. Must not block.
 	OnAwgPrepareFailed func(nodeID, code string, at int64)
+	// GlobalpingTCP6 asks Globalping for a TCP ping of port on an IPv6 address from probes around the world, and says how many
+	// probes answered and how many of them connected. It is the last resort of CheckIPv6, when no node can send over IPv6. Nil means
+	// there is no Globalping source; ErrGlobalpingOff distinguishes an explicitly disabled source from a failed check.
+	GlobalpingTCP6 func(ctx context.Context, addr string, port uint16) (answered, connected int, err error)
 	// Actor returns the admin id for audit rows. Default: the signed-in admin from the auth interceptor.
 	Actor func(context.Context) string
 	Log   *slog.Logger
@@ -103,6 +110,14 @@ type sessionOwner struct {
 	cancel     context.CancelCauseFunc
 }
 
+type networkASNCacheEntry struct {
+	address   string
+	bundleSHA string
+	builtUnix int64
+	asn       uint32
+	expires   time.Time
+}
+
 // Fleet is the fleet module.
 type Fleet struct {
 	st  *store.Store
@@ -113,19 +128,28 @@ type Fleet struct {
 	now func() time.Time
 	ca  *ca
 
+	networkMode          atomic.Uint32
+	networkOperator      func(string, uint32) string // optional test seam; production uses health.NetworkOperator
+	networkTableOverride networkTableReader          // optional test seam for names that need output cleaning
+	networkASNMu         sync.Mutex
+	networkASNs          map[string]networkASNCacheEntry
+
 	tlsMu  sync.Mutex
 	tlsCfg *tls.Config
 	tlsExp time.Time
 
 	mu                     sync.Mutex
-	health                 Health                  // set by SetHealth (health.go); guarded by mu
-	upd                    Updates                 // set by SetUpdates (update.go); guarded by mu
-	warp                   Warp                    // set by SetWarp (l3.go); guarded by mu
-	sessions               map[string]*session     // node id -> the one live agent session
-	owners                 map[string]sessionOwner // authenticated streams claim a generation before Hello
-	stuck                  map[string]stuckSeq     // node id -> the stats batch the database refused last (statsguard.go)
-	liveProjectionWarnings sync.Map                // node id -> struct{}; avoids repeating oversized projection warnings
-	sentSizeWarnings       sync.Map                // node id -> struct{}; the same for the node_sent digest
+	statsBudgetMapMu       sync.Mutex
+	statsBudgets           map[string]*statsBudgetEntry // node id -> panel-time traffic budget, retained across sessions
+	health                 Health                       // set by SetHealth (health.go); guarded by mu
+	upd                    Updates                      // set by SetUpdates (update.go); guarded by mu
+	warp                   Warp                         // set by SetWarp (l3.go); guarded by mu
+	sessions               map[string]*session          // node id -> the one live agent session
+	own                    ownGap                       // frames the panel itself heard: tells a silence of the panel from a blip of a node (own_gap.go)
+	owners                 map[string]sessionOwner      // authenticated streams claim a generation before Hello
+	stuck                  map[string]stuckSeq          // node id -> the stats batch the database refused last (statsguard.go)
+	liveProjectionWarnings sync.Map                     // node id -> struct{}; avoids repeating oversized projection warnings
+	sentSizeWarnings       sync.Map                     // node id -> struct{}; the same for the node_sent digest
 
 	kick                 chan struct{}
 	pokeMu               sync.Mutex
@@ -139,21 +163,71 @@ type Fleet struct {
 	// start the automatic measurement waits. Test seams.
 	measureWait, measureDelay time.Duration
 
-	portCheckMu    sync.Mutex
-	portCheckLocks map[string]*portCheckLock
-	decoySyncMu    sync.Mutex
-	decoySyncing   map[string]bool
-	decoySyncDirty map[string]bool
-	decoyAttempts  map[string]decoyAttempt
+	portCheckMu     sync.Mutex
+	portCheckLocks  map[string]*portCheckLock
+	bridgeSeenMu    sync.Mutex
+	bridgeSeen      map[string]bridgeSeen
+	sharedSeenMu    sync.Mutex
+	sharedSeen      map[string]sharedSeen
+	bridgeControlMu sync.RWMutex
+	relayControl    func(context.Context, string)
+	decoySyncMu     sync.Mutex
+	decoySyncing    map[string]bool
+	decoySyncDirty  map[string]bool
+	decoyAttempts   map[string]decoyAttempt
 
-	panelDecoyMu  sync.Mutex
-	panelDecoyDir string
-	panelDecoyAt  time.Time
-	panelDecoyB   *decoy.Bundle
-	panelDecoyErr error
-	sendUDP       func(context.Context, string, []uint16, [8]byte, int, int, int) (string, int, error)
-	probeTCP      func(context.Context, string, []tcpcheck.Target) (string, map[uint16]string, error)
-	settleUDP     func(context.Context) error
+	// The previews of sites made from templates and the photo maker for Pexels and Pixabay (decoy_templates.go; nothing is made in the Cloudflare edition,
+	// so the state is an any here). Guarded by panelDecoyMu. photoTransport carries the client's requests: a test seam.
+	decoyTemplates any
+	photoTransport http.RoundTripper
+	panelDecoyMu   sync.Mutex
+	panelDecoyDir  string
+	panelDecoyAt   time.Time
+	panelDecoyB    *decoy.Bundle
+	panelDecoyErr  error
+	sendUDP        func(context.Context, string, []uint16, [8]byte, int, int, int) (string, int, error)
+	probeTCP       func(context.Context, string, []tcpcheck.Target) (string, map[uint16]string, error)
+	settleUDP      func(context.Context) error
+	probes         probeState                 // on-demand probes between nodes (path_probe.go); its zero value is ready
+	ownProbes      ownProbes                  // the panel's own TLS checks of REALITY ports, taken off the counters (ports_tcp.go)
+	panelIPv6      func(context.Context) bool // tests: whether the panel itself can send over IPv6; default panelHasIPv6
+}
+
+// SetRelayControl attaches the access module's mode controller after both services are built.
+func (f *Fleet) SetRelayControl(control func(context.Context, string)) {
+	f.bridgeControlMu.Lock()
+	f.relayControl = control
+	f.bridgeControlMu.Unlock()
+}
+
+// controlRelayLater asks the mode controller to look at a relay after the work of the session that found something new (a bridge
+// report, a change of capabilities). It never runs in the session's own path: the controller may check, or run a minute long proof.
+func (f *Fleet) controlRelayLater(relayID string) {
+	f.bridgeControlMu.RLock()
+	control := f.relayControl
+	f.bridgeControlMu.RUnlock()
+	if control == nil {
+		return
+	}
+	f.afterResponse(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), relayControlBudget)
+		defer cancel()
+		control(ctx, relayID)
+	})
+}
+
+// relayControlBudget bounds one pass of the controller, the 8 MB proof of the direct way included.
+const relayControlBudget = 3 * time.Minute
+
+func (f *Fleet) controlRelaysForNode(ctx context.Context, nodeID string) {
+	links, err := f.st.RelayLinks(ctx, store.RelayFilter{NodeID: nodeID, EnabledOnly: true})
+	if err != nil {
+		f.log.Warn("read relays after agent capability change", "code", "relay_capability_read_failed", "node", nodeID, "err", err)
+		return
+	}
+	for _, link := range links {
+		f.controlRelayLater(link.ID)
+	}
 }
 
 // HasSession reports whether this process currently owns the node's agent stream.
@@ -197,7 +271,10 @@ func New(st *store.Store, v *vault.Vault, reg *protocols.Registry, cfg Config) (
 		sessions:             map[string]*session{},
 		owners:               map[string]sessionOwner{},
 		stuck:                map[string]stuckSeq{},
+		statsBudgets:         map[string]*statsBudgetEntry{},
 		portCheckLocks:       map[string]*portCheckLock{},
+		bridgeSeen:           map[string]bridgeSeen{},
+		sharedSeen:           map[string]sharedSeen{},
 		decoySyncing:         map[string]bool{},
 		decoySyncDirty:       map[string]bool{},
 		decoyAttempts:        map[string]decoyAttempt{},
@@ -211,6 +288,15 @@ func New(st *store.Store, v *vault.Vault, reg *protocols.Registry, cfg Config) (
 		// state and settled: it saturates the link for a moment.
 		measureWait: 50 * time.Second, measureDelay: 45 * time.Second,
 	}
+	mode := uint32(0)
+	if cfg.Remote != nil {
+		mode = 0
+	} else if stored, err := st.NetworkMode(context.Background()); err != nil {
+		cfg.Log.Error("fleet: read network setting; network statistics are disabled", "code", "network_setting_read_failed", "err", err)
+	} else {
+		mode = stored
+	}
+	f.networkMode.Store(mode)
 	c, err := loadCA(context.Background(), st, v, cfg.Now().UTC())
 	if err != nil {
 		return nil, fmt.Errorf("fleet: panel CA: %w", err)
@@ -298,7 +384,7 @@ func (f *Fleet) runPokeConnected() {
 		// column; switch to a `ConnectedNodeIDs` query if that read becomes limiting.
 		rows, err := f.Live(ctx)
 		if err != nil {
-			f.log.Warn("read live nodes for remote fan-out", "err", err)
+			f.log.Warn("read live nodes for remote fan-out", "code", "remote_fanout_live_read_failed", "err", err)
 		} else {
 			nodeIDs := make([]string, 0, len(rows))
 			for _, row := range rows {
@@ -307,7 +393,7 @@ func (f *Fleet) runPokeConnected() {
 				}
 			}
 			if err := f.cfg.Remote.Poke(ctx, nodeIDs); err != nil {
-				f.log.Warn("poke connected remote nodes", "err", err)
+				f.log.Warn("poke connected remote nodes", "code", "remote_node_poke_failed", "err", err)
 			}
 		}
 		cancel()
@@ -363,7 +449,7 @@ func (f *Fleet) Online(ctx context.Context) []OnlineSession {
 	var out []OnlineSession
 	rows, err := f.liveView(ctx)
 	if err != nil {
-		f.log.Warn("read live nodes", "err", err)
+		f.log.Warn("read live nodes", "code", "live_nodes_read_failed", "err", err)
 		return nil
 	}
 	for _, row := range rows {
@@ -384,7 +470,7 @@ func (f *Fleet) OnlineUsers() map[string]string {
 	newest := map[string]int64{}
 	rows, err := f.Live(context.Background())
 	if err != nil {
-		f.log.Warn("read live nodes", "err", err)
+		f.log.Warn("read live nodes", "code", "live_nodes_read_failed", "err", err)
 		return out
 	}
 	for _, row := range rows {
@@ -410,7 +496,7 @@ func (f *Fleet) OnlineDevices() map[string][]string {
 	out := map[string][]string{}
 	pairs, err := f.st.OnlineDevices(context.Background(), f.now().UTC())
 	if err != nil {
-		f.log.Warn("read online devices", "err", err)
+		f.log.Warn("read online devices", "code", "online_devices_read_failed", "err", err)
 		return out
 	}
 	for _, p := range pairs {
@@ -438,7 +524,7 @@ func (f *Fleet) session(nodeID string) *session {
 func (f *Fleet) drop(ctx context.Context, nodeID, reason string) {
 	if f.cfg.Remote != nil {
 		if err := f.cfg.Remote.Close(ctx, nodeID, reason); err != nil {
-			f.log.Warn("close remote node link", "node", nodeID, "err", err)
+			f.log.Warn("close remote node link", "code", "remote_node_close_failed", "node", nodeID, "err", err)
 		}
 		return
 	}
@@ -478,12 +564,12 @@ func (f *Fleet) Sweep(ctx context.Context) { f.sweep(ctx) }
 func (f *Fleet) sweep(ctx context.Context) {
 	nodes, err := f.st.Nodes(ctx, false)
 	if err != nil {
-		f.log.Warn("sweep", "err", err)
+		f.log.Warn("sweep", "code", "node_sweep_failed", "err", err)
 		return
 	}
 	liveRows, err := f.Live(ctx)
 	if err != nil {
-		f.log.Warn("sweep live nodes", "err", err)
+		f.log.Warn("sweep live nodes", "code", "live_nodes_sweep_read_failed", "err", err)
 		return
 	}
 	liveByID := liveRowsByID(liveRows)
@@ -502,7 +588,9 @@ func (f *Fleet) sweep(ctx context.Context) {
 		if err != nil || code == "node_down" {
 			continue
 		}
-		f.event(ctx, 3, "node_down", n.ID, map[string]string{"minutes": fmt.Sprint(int(now.Sub(last).Minutes()))})
+		params := map[string]string{"minutes": fmt.Sprint(int(now.Sub(last).Minutes()))}
+		_ = f.st.AddTrafficParams(ctx, n.ID, now, params) // how busy the node was when it went silent, as the node_down alert says
+		f.event(ctx, 3, "node_down", n.ID, params)
 	}
 }
 
@@ -522,4 +610,13 @@ func (f *Fleet) event(ctx context.Context, sev int, code, nodeID string, params 
 	if err != nil {
 		f.log.Warn("write event", "code", code, "err", err)
 	}
+}
+
+func (f *Fleet) allowStatsRejectEvent(ctx context.Context, nodeID string) bool {
+	d, err := f.cfg.Limiter.Take(ctx, securitylimit.Bucket{Name: "fleet-stats-reject-event", Burst: 1, Refill: rejectEventEvery}, nodeID)
+	if err != nil {
+		f.log.Warn("stats rejection event limiter failed", "code", "stats_reject_limiter_failed", "node", nodeID, "err", err)
+		return false
+	}
+	return d.Allowed
 }

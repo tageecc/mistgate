@@ -338,7 +338,7 @@ func TestFreePortForTCPKeepsTCPAndUDPPortsSeparate(t *testing.T) {
 	}
 	checks := map[uint16]store.PortCheck{4443: {Port: 4443, Verdict: "broken", BadAt: now}}
 
-	if got := freePortFor("vless", listen, others, checks, now); got != 4443 {
+	if got := freePortFor(plugin.InboundSpec{Protocol: "vless", Listen: listen}, others, checks, now); got != 4443 {
 		t.Fatalf("free TCP port = %d, want UDP-only port 4443", got)
 	}
 }
@@ -504,6 +504,28 @@ func TestUpdateProfileChecksChangedPortPerNode(t *testing.T) {
 	assertLossyOverrideAudit(t, e)
 	if calls, _ := checker.snapshot(); len(calls) != 3 {
 		t.Fatalf("CheckPorts calls = %d, want 3 (one before refusal and one per node when allowed)", len(calls))
+	}
+}
+
+func TestUpdateProfileRejectsTCPPortCollisionOnEveryPlacement(t *testing.T) {
+	e := newEnv(t)
+	e.node("nod_de1", "de1", "de1.example.com", "active")
+	e.node("nod_nl1", "nl1", "nl1.example.com", "active")
+	main := must(e.s.CreateProfile(e.ctx, req(&adminv1.CreateProfileRequest{
+		Protocol: "vless", Name: "main", SettingsJson: `{"port":8443,"reality":{"target":"www.example.org:443"}}`,
+	}))).Msg.Profile
+	other := e.vlessProfile("other")
+	e.inbound(main.Id, "nod_de1")
+	e.inbound(main.Id, "nod_nl1")
+	e.inbound(other.Id, "nod_nl1")
+	settings := `{"port":443,"reality":{"target":"www.example.org:443"}}`
+	_, err := e.s.UpdateProfile(e.ctx, req(&adminv1.UpdateProfileRequest{
+		ProfileId: main.Id, ExpectedVersion: main.Version, SettingsJson: &settings, DryRun: true,
+	}))
+	// two services on 443 are told apart by their names now (plugin.TCPSharePlan): REALITY of the same site twice has one name
+	wantCoded(t, err, connect.CodeAlreadyExists, "sni_taken", map[string]string{"node": "nl1", "port": "443", "profile": "other", "name": "www.example.org"})
+	if current := must(e.st.Access().Profile(e.ctx, main.Id)); current.Version != main.Version {
+		t.Fatalf("refused dry run changed profile version to %d", current.Version)
 	}
 }
 

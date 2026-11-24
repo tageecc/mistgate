@@ -11,17 +11,16 @@ import (
 	"time"
 
 	pb "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	nodebridge "github.com/mistgate/mistgate/internal/node/bridge"
 	"github.com/mistgate/mistgate/internal/node/doctor"
 	"github.com/mistgate/mistgate/internal/node/hostctl"
+	"github.com/mistgate/mistgate/internal/node/unit"
 	"github.com/mistgate/mistgate/internal/plugin"
 )
 
 // The doctor (agent.proto "DOCTOR") is internal/node/doctor; this file is the wiring:
 // the capability string, the periodic DoctorReport, RunDoctor and ApplyFix handling, and the agent-side facts
 // the checks need. Runs and fixes happen in their own goroutines, so the stream reader never waits for them.
-
-// capDoctor is listed in Hello.capabilities: the panel sends RunDoctor and ApplyFix only to agents that have it.
-const capDoctor = "doctor/1"
 
 const (
 	// First report 30 s after every connect (engines need a moment to settle), then every 10 min +-60 s.
@@ -46,15 +45,49 @@ func (a *Agent) doctorEnv() doctor.Env {
 		return doctor.Settings{Country: st.CountryCode, Resolvers: st.DnsResolvers, ClientIPv6Disabled: st.GetClientIpv6Disabled()}
 	}
 	e.Inbounds = a.doctorInbounds
+	e.OwnedIPv6 = a.doctorOwnedIPv6
 	e.Samples = func(w time.Duration) []doctor.Sample { return a.hostRing.Since(a.now(), w) }
 	e.Offset = a.offsetNow
 	e.AgentCertNotAfter = func() time.Time { return a.id.Load().notAfter() }
 	e.UnitGen = a.cfg.UnitGen
 	e.UnderSystemd = a.cfg.UnitUnderSystemd
 	e.UnitSkipReason = a.cfg.UnitSkipReason
-	e.UnitRefreshBusy = a.cfg.UnitRefreshBusy
-	e.UnitRefreshReserve = a.cfg.UnitRefreshReserve
+	e.UnitRefreshBusy, e.UnitRefreshReserve = a.cfg.UnitRefreshBusy, a.cfg.UnitRefreshReserve
+	if base := a.cfg.UnitRefreshBusy; base != nil {
+		e.UnitRefreshBusy = func(ctx context.Context) error {
+			if a.osJobActive() { // the refresh restarts this service; an OS job may be in the middle of dpkg
+				return unit.ErrBusy
+			}
+			return base(ctx)
+		}
+	}
+	if base := a.cfg.UnitRefreshReserve; base != nil {
+		e.UnitRefreshReserve = func(ctx context.Context) (func(bool), error) {
+			if a.osJobActive() {
+				return nil, unit.ErrBusy
+			}
+			return base(ctx)
+		}
+	}
 	e.LaunchUnitRefresh = a.cfg.UnitRefreshLauncher
+	e.LaunchSecurityUpdates = a.cfg.SecurityUpdatesLauncher
+	if base := a.cfg.SecurityUpdatesLauncher; base != nil {
+		e.LaunchSecurityUpdates = func(ctx context.Context) error {
+			if a.osJobActive() {
+				return unit.ErrBusy
+			}
+			return base(ctx)
+		}
+	}
+	e.LaunchInstallNftables = a.cfg.NftInstallLauncher
+	if base := a.cfg.NftInstallLauncher; base != nil {
+		e.LaunchInstallNftables = func(ctx context.Context) error {
+			if a.osJobActive() { // an OS job may be in the middle of dpkg
+				return unit.ErrBusy
+			}
+			return base(ctx)
+		}
+	}
 	e.AgentStartedAt = a.startedAt
 	e.ApplyBaseline = a.host.ApplyBaseline
 	e.RestartInbound = a.doctorRestart
@@ -66,8 +99,9 @@ func (a *Agent) doctorEnv() doctor.Env {
 	if bs, ok := a.awgStatuser(); ok {
 		e.AwgBackend = func() doctor.AwgBackend {
 			st := bs.BackendStatus() // only called when the node has an awg inbound (the check skips otherwise)
-			return doctor.AwgBackend{Mode: st.Mode, Name: st.Name, Version: st.Version, Available: st.Available, Reason: st.Reason}
+			return doctor.AwgBackend{Mode: st.Mode, Name: st.Name, Version: st.Version, Available: st.Available, Fallback: st.Fallback, Reason: st.Reason}
 		}
+		e.AwgModuleRepair = a.cfg.AwgKmodRepair
 	}
 	if w := a.cfg.Warp; w != nil {
 		e.Warp = func(ctx context.Context) doctor.WarpInfo {
@@ -123,6 +157,10 @@ func (a *Agent) doctorInbounds() []doctor.Inbound {
 			TLSMode: tlsModeName(sp.TLS.Mode), ServerName: sp.TLS.ServerName, State: "stopped", CertNotAfter: na[id],
 		}
 		in.TLSPort = tlsPortOf(sp)
+		in.RealityTarget, in.RealityName, _ = plugin.RealityTarget(sp)
+		for _, side := range plugin.SideListens(sp) {
+			in.SideListens = append(in.SideListens, doctor.InboundListen{Network: side.Network, Port: int(side.Port)})
+		}
 		if h, ok := health[id]; ok {
 			if h.CertNotAfter.After(in.CertNotAfter) { // an ACME leaf issued or renewed after the last apply
 				in.CertNotAfter = h.CertNotAfter
@@ -166,10 +204,11 @@ func runStateName(s plugin.RunState) string {
 	return "stopped"
 }
 
-// tlsPortOf is the TCP port whose served certificate the doctor can read, 0 = none. Hysteria2: its HTTPS masquerade
-// listener, settings.masquerade.tcp_port, 443 when absent, 0 = none (hysteria2/settings.go). VLESS with security tls: the
-// inbound's own port. VLESS with REALITY, whatever its target: nothing, because the certificate of a "self" site is behind
-// REALITY (a visitor of the port gets it, but the doctor's own handshake is not one of them), and before the first
+// tlsPortOf is the TCP port whose served certificate the doctor can read, 0 = none. Hysteria2: its HTTPS site
+// (plugin.Hy2SitePort). VLESS with security tls: the
+// inbound's own port. TrustTunnel: its own TCP port, where the site and the tunnel share one certificate (the QUIC listener
+// on the same number serves the same one). VLESS with REALITY, whatever its target: nothing, because the certificate of a
+// "self" site is behind REALITY (a visitor of the port gets it, but the doctor's own handshake is not one of them), and before the first
 // issuance that site shows a self-signed certificate that would read as a healthy 10-year one; the engine reports the
 // issued certificate instead (Inbound.CertNotAfter). The agent peeks into the engines' settings; an engine-provided
 // accessor replaces this when a third protocol has a TLS listener.
@@ -179,25 +218,12 @@ func tlsPortOf(sp plugin.InboundSpec) int {
 	}
 	switch sp.Protocol {
 	case "hysteria2":
-		var j struct {
-			Masquerade struct {
-				TCPPort *int `json:"tcp_port"`
-			} `json:"masquerade"`
-		}
-		if len(sp.Settings) > 0 && json.Unmarshal(sp.Settings, &j) != nil {
-			return 0
-		}
-		if p := j.Masquerade.TCPPort; p != nil {
-			return max(*p, 0)
-		}
-		return 443
+		return int(plugin.Hy2SitePort(sp))
 	case "vless":
-		var j struct {
-			Security string `json:"security"`
+		if v, _ := plugin.VLESSOf(sp); v.TLS() {
+			return int(sp.Listen.Port)
 		}
-		if json.Unmarshal(sp.Settings, &j) != nil || j.Security != "tls" {
-			return 0
-		}
+	case "trusttunnel":
 		return int(sp.Listen.Port)
 	}
 	return 0
@@ -283,7 +309,13 @@ func (a *Agent) doctorReportMsg(ctx context.Context, requestID string, rep *doct
 	if rep == nil {
 		return reportMsg(requestID, nil, errText)
 	}
-	counters := relayCounterResults(ctx, a.doctorRun, a.snapshotModel().relays, a.now())
+	model := a.snapshotModel()
+	counters := relayCounterResults(ctx, a.doctorRun, model.relays, a.now())
+	var reverseCounters map[string]nodebridge.RelayCounters
+	if a.bridgeEntry != nil {
+		reverseCounters = a.bridgeEntry.RelayCounters()
+	}
+	counters = append(counters, reverseRelayCounterResults(model.relays, reverseCounters, a.now())...)
 	if len(counters) == 0 {
 		return reportMsg(requestID, rep, errText)
 	}
@@ -312,6 +344,17 @@ func relayCounterResults(ctx context.Context, run func(context.Context, string, 
 	if run == nil || len(forwards) == 0 {
 		return nil
 	}
+	// Reverse TCP listeners report counters from the bridge and must never
+	// inspect the nftables DNAT counters used by ordinary forwards.
+	dnatForwards := make([]plugin.RelayForward, 0, len(forwards))
+	for _, f := range forwards {
+		if f.Mode != "reverse" && f.ID != "" && (f.Network == "tcp" || f.Network == "udp") && f.Port != 0 {
+			dnatForwards = append(dnatForwards, f)
+		}
+	}
+	if len(dnatForwards) == 0 {
+		return nil
+	}
 	out, err := run(ctx, "nft", "-j", "list", "counters", "table", "inet", hostctl.NftRelayTable)
 	if err != nil {
 		return nil
@@ -326,12 +369,12 @@ func relayCounterResults(ctx context.Context, run func(context.Context, string, 
 			counts[c.Name] = *c
 		}
 	}
-	items := append([]plugin.RelayForward(nil), forwards...)
+	items := dnatForwards
 	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
 	results := make([]doctor.Result, 0, len(items))
 	seen := map[string]bool{}
 	for _, f := range items {
-		if f.ID == "" || (f.Network != "tcp" && f.Network != "udp") || f.Port == 0 {
+		if f.Mode == "reverse" || f.ID == "" || (f.Network != "tcp" && f.Network != "udp") || f.Port == 0 {
 			continue
 		}
 		name := f.Network + "_" + strconv.FormatUint(uint64(f.Port), 10)
@@ -340,9 +383,27 @@ func relayCounterResults(ctx context.Context, run func(context.Context, string, 
 			continue
 		}
 		seen[name] = true
+		back := counts[name+"_back"]
 		results = append(results, doctor.Result{ID: "relay", Status: doctor.OK, Measured: now,
 			Params: map[string]string{"relay": f.ID, "network": f.Network, "port": strconv.FormatUint(uint64(f.Port), 10),
-				"bytes": strconv.FormatUint(counter.Bytes, 10), "packets": strconv.FormatUint(counter.Packets, 10)}})
+				"bytes": strconv.FormatUint(counter.Bytes, 10), "packets": strconv.FormatUint(counter.Packets, 10),
+				"bytes_back": strconv.FormatUint(back.Bytes, 10), "packets_back": strconv.FormatUint(back.Packets, 10)}})
+	}
+	return results
+}
+
+func reverseRelayCounterResults(forwards []plugin.RelayForward, counters map[string]nodebridge.RelayCounters, now time.Time) []doctor.Result {
+	items := append([]plugin.RelayForward(nil), forwards...)
+	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
+	results := make([]doctor.Result, 0, len(items))
+	for _, f := range items {
+		if f.Mode != "reverse" || f.ID == "" || f.Network != "tcp" || f.Port == 0 {
+			continue
+		}
+		c := counters[f.ID]
+		results = append(results, doctor.Result{ID: "relay", Status: doctor.OK, Measured: now,
+			Params: map[string]string{"relay": f.ID, "network": f.Network, "port": strconv.FormatUint(uint64(f.Port), 10),
+				"bytes": strconv.FormatUint(c.Bytes, 10), "bytes_back": strconv.FormatUint(c.BytesBack, 10)}})
 	}
 	return results
 }

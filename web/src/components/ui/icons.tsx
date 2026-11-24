@@ -1,7 +1,7 @@
 import type { SVGProps } from "react";
 import { cx } from "@/lib/cx";
 
-// Inline stroke icons on a 24 grid, stroke 2.2, round caps and joins.
+// Inline stroke icons on a 24 grid, stroke 1.5, round caps and joins.
 const paths = {
   search: "M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14Z M20 20l-4-4",
   back: "M15 5l-7 7 7 7",
@@ -11,7 +11,7 @@ const paths = {
   ellipsis: "M5 12h.01M12 12h.01M19 12h.01",
   check: "M5 12.5l4.5 4.5L19 7.5",
   x: "M6 6l12 12M18 6L6 18",
-  copy: "M9 9h10v11H9zM5 15V4h10",
+  copy: "M9 9h10v11H9zM15 9V4H5v11h4",
   upload: "M12 16V4M12 4L8 8M12 4l4 4M4 20h16",
   share: "M12 15V4M12 4L8 8M12 4l4 4M6 11H5v9h14v-9h-1",
   externalLink: "M14 4h6v6M20 4l-9 9M18 14v5H5V6h5",
@@ -46,6 +46,7 @@ const paths = {
   warn: "M12 4l9 16H3L12 4zM12 10v4M12 17h.01",
   traffic: "M8 4v16M8 4L4 8M8 4l4 4M16 20V4M16 20l-4-4M16 20l4-4",
   gauge: "M4 17a8 8 0 1 1 16 0M12 17l4-5M7 17h.01",
+  image: "M4 5h16v14H4zM4 16l5-5 4 4 3-3 4 4M15.5 9.5h.01",
   key: "M8 19a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM11 12l9-9M16 7l3 3M14 9l2 2",
   phone: "M7 3h10v18H7zM11 18h2",
   // the platforms of a device: phone (iPhone), android, tablet (iPad), monitor (Windows), laptop (Mac), terminal (Linux)
@@ -60,15 +61,38 @@ const paths = {
   memory: "M3 8h18v8H3zM7 11v2M11 11v2M15 11v2M7 19v-3M12 19v-3M17 19v-3",
   disk: "M4 7c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3zM4 7v10c0 1.7 3.6 3 8 3s8-1.3 8-3V7M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3",
   bolt: "M13 3L5 14h6l-1 7 8-11h-6l1-7z",
-  gear: "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.3 5.3l2.1 2.1M16.6 16.6l2.1 2.1M5.3 18.7l2.1-2.1M16.6 7.4l2.1-2.1",
+  gear: "M9.92 5.21L10.33 2.55L13.67 2.55L14.08 5.21A7.1 7.1 0 0 1 16.84 6.81L19.35 5.83L21.02 8.72L18.92 10.4A7.1 7.1 0 0 1 18.92 13.6L21.02 15.28L19.35 18.17L16.84 17.19A7.1 7.1 0 0 1 14.08 18.79L13.67 21.45L10.33 21.45L9.92 18.79A7.1 7.1 0 0 1 7.16 17.19L4.65 18.17L2.98 15.28L5.08 13.6A7.1 7.1 0 0 1 5.08 10.4L2.98 8.72L4.65 5.83L7.16 6.81A7.1 7.1 0 0 1 9.92 5.21zM12 14.8a2.8 2.8 0 1 0 0-5.6 2.8 2.8 0 0 0 0 5.6z",
   terminal: "M4 5h16v14H4zM8 10l3 2-3 2M13 14h3",
+  file: "M7 3h7l4 4v14H7zM14 3v4h4M10 12h5M10 16h5",
+  chat: "M4 5h16v11H9l-5 4V5z",
+  bookmark: "M7 4h10v17l-5-4-5 4V4z",
+  stop: "M7 7h10v10H7z",
+  // lines of text: the docs site draws it on a ```text block (site/src/markdown.mjs reads this table)
   text: "M4 6h16M4 10h16M4 14h10M4 18h7",
+  // a note: a leaf with a folded corner and two lines of text (the line under a node of the list)
+  note: "M5 4h14v11l-5 5H5zM14 20v-5h5M8.5 9h7M8.5 12.5h4",
   filter: "M4 5h16l-6 8v6l-4-2v-4L4 5z",
   palette: "M12 3a9 9 0 1 0 0 18c1.1 0 2-.9 2-2 0-.6-.3-1-.5-1.4-.3-.4-.5-.8-.5-1.3 0-1.1.9-2 2-2h2.3A3.7 3.7 0 0 0 21 10.6C21 6.4 17 3 12 3zM7.5 11h.01M10 7.5h.01M14.5 7.5h.01",
   plug: "M9 3v4M15 3v4M6 7h12v4a6 6 0 0 1-12 0zM12 17v4",
   dns: "M4 6h16v5H4zM4 14h16v5H4zM8 8.5h.01M8 16.5h.01M12 8.5h4M12 16.5h4",
-  sparkle: "M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3z",
+  sparkle: "M12 3.5Q12.9 11.1 20.5 12Q12.9 12.9 12 20.5Q11.1 12.9 3.5 12Q11.1 11.1 12 3.5z",
   video: "M3 6h12v12H3zM15 10l6-3v10l-6-3",
+  // the paper plane of Telegram (the MTProto proxy)
+  plane: "M21 3 3 10.5l5.5 2L10 20l3-5 5 4z",
+  // the mouth of a tunnel (TrustTunnel)
+  tunnel: "M4 20V11a8 8 0 0 1 16 0v9M8.5 20v-8.5a3.5 3.5 0 0 1 7 0V20M2.5 20h19",
+  // WARP (Cloudflare's exit) and a pinned (self-signed) certificate
+  cloud: "M7 18h10a4 4 0 0 0 .6-7.96A6 6 0 0 0 6.2 9.1 4.5 4.5 0 0 0 7 18z",
+  pin: "M9 3h6l-1 6 3 3H7l3-3-1-6zM12 12v9",
+  qr: "M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h2v2h-2zM18 14h2v2h-2zM14 18h2v2h-2zM18 18h2v2h-2z",
+  // the graph editor's toolbar
+  minus: "M5 12h14",
+  fit: "M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5",
+  expand: "M14 4h6v6M10 20H4v-6M20 4l-7 7M4 20l7-7",
+  arrange: "M3 8h5v8H3zM16 4h5v5h-5zM16 15h5v5h-5zM8 12h4M12 6.5h4M12 17.5h4M12 6.5v11",
+  // the theme switch of the top bar
+  sun: "M12 16a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6L7 7M17 17l1.4 1.4M5.6 18.4L7 17M17 7l1.4-1.4",
+  moon: "M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z",
 } as const;
 
 export type IconName = keyof typeof paths;
@@ -81,11 +105,12 @@ export function Icon({ name, size = 16, ...rest }: { name: IconName; size?: numb
       viewBox="0 0 24 24"
       fill="none"
       stroke="currentColor"
-      strokeWidth={2.2}
+      strokeWidth={1.5}
       strokeLinecap="round"
       strokeLinejoin="round"
       aria-hidden
       className="block flex-none"
+      data-flip={name === "back" || name === "chevronRight" || undefined}
       {...rest}
     >
       <path d={paths[name]} />
@@ -109,35 +134,40 @@ export function IconChip({ icon, tone, size = 22, className }: { icon: IconName;
   );
 }
 
-// Sections and their pastel. Light theme darkens each through --_text-pct.
+// Sections and their pastel (the section tones of index.css: a colour and a darker one for the light theme).
 export const navPaths = {
-  overview: ["M3 3h8v10H3zM13 3h8v6h-8zM13 13h8v8h-8zM3 17h8v4H3z", "lavender"],
-  nodes: ["M4 4h16v6H4zM4 14h16v6H4zM8 7h.01M8 17h.01M12 7h4M12 17h4", "sky"],
+  overview: ["M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z", "lavender"],
+  nodes: ["M4 5h16v6H4zM4 13h16v6H4zM8 8h.01M8 16h.01", "sky"],
   users: [
-    "M15 20v-1.5a4 4 0 0 0-4-4H7a4 4 0 0 0-4 4V20M9 11a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7zM21 20v-1.5a4 4 0 0 0-3-3.9M15.5 4.2a3.5 3.5 0 0 1 0 6.6",
+    "M9 11a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7zM3 20c0-3.3 2.7-6 6-6s6 2.7 6 6M16 4.5a3.5 3.5 0 0 1 0 6.5M21 20c0-2.6-1.6-4.8-4-5.6",
     "sand",
   ],
-  profiles: ["M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1M15 4v4M9 10v4M17 16v4", "sage"],
-  subscriptions: [
-    "M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1",
-    "mint",
+  profiles: ["M4 7h10M18 7h2M4 17h2M10 17h10M16 5v4M8 15v4", "sage"],
+  subscriptions: ["M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1", "mint"],
+  decoys: ["M3.5 6a2 2 0 0 1 2-2h13a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2zM3.5 9h17M6.5 6.5h.01M9 6.5h.01", "sand"],
+  health: ["M3 12h4l2.5-6 4 12 2.5-6h5", "rose"],
+  reachability: [
+    "M12 13a1 1 0 1 0 0-2 1 1 0 0 0 0 2zM8.5 15.5a5 5 0 0 1 0-7M15.5 8.5a5 5 0 0 1 0 7M5.6 18.4a9 9 0 0 1 0-12.8M18.4 5.6a9 9 0 0 1 0 12.8",
+    "sky",
   ],
-  health: ["M3 12h4l3-7 4 14 3-7h4", "rose"],
-  reachability: ["M12 12h.01M8.5 8.5a5 5 0 0 0 0 7M15.5 8.5a5 5 0 0 1 0 7M5.6 5.6a9 9 0 0 0 0 12.8M18.4 5.6a9 9 0 0 1 0 12.8", "mint"],
-  updates: ["M20 12a8 8 0 1 1-2.4-5.7M20 4v5h-5", "sky"],
-  integrations: ["M9 3v4M15 3v4M6 7h12v4a6 6 0 0 1-12 0zM12 17v4", "lavender"],
+  updates: ["M20 12a8 8 0 1 1-2.3-5.6M20 4v4h-4", "sky"],
+  ai: [
+    "M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8zM18 16l.8 2.2L21 19l-2.2.8L18 22l-.8-2.2L15 19l2.2-.8z",
+    "lavender",
+  ],
+  integrations: ["M9 3v5M15 3v5M6 8h12v3a6 6 0 0 1-12 0zM12 17v4", "lavender"],
   settings: [
-    "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.3 5.3l2.1 2.1M16.6 16.6l2.1 2.1M5.3 18.7l2.1-2.1M16.6 7.4l2.1-2.1",
+    "M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2zM12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z",
     "sand",
   ],
-  more: ["M5 12h.01M12 12h.01M19 12h.01M5 6h.01M12 6h.01M19 6h.01M5 18h.01M12 18h.01M19 18h.01", "muted"],
+  more: ["M5 12h.01M12 12h.01M19 12h.01", "muted"],
 } as const;
 
 export type NavIconName = keyof typeof navPaths;
 
 export function NavIcon({ name, size = 16, dim }: { name: NavIconName; size?: number; dim?: boolean }) {
   const [d, tone] = navPaths[name];
-  const color = tone === "muted" ? "var(--muted)" : `color-mix(in oklch, var(--accent-${tone}) var(--_text-pct), #000)`;
+  const color = tone === "muted" ? "var(--muted)" : `var(--tone-${tone})`;
   return (
     <svg
       width={size}
@@ -145,7 +175,7 @@ export function NavIcon({ name, size = 16, dim }: { name: NavIconName; size?: nu
       viewBox="0 0 24 24"
       fill="none"
       stroke={color}
-      strokeWidth={2.2}
+      strokeWidth={1.5}
       strokeLinecap="round"
       strokeLinejoin="round"
       aria-hidden

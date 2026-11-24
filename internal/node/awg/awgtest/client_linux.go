@@ -112,35 +112,9 @@ var clientSeq atomic.Int32
 // It does not wait for a handshake.
 func StartClient(t testing.TB, ns NS, cfg ClientCfg) *Client {
 	t.Helper()
-	bin := ClientBin(t, cfg.Flavor)
-	iface := fmt.Sprintf("mg3c%d", clientSeq.Add(1)+int32(os.Getpid()%1000)*100)
-	c := &Client{NS: ns, Iface: iface}
-	c.proc = ns.Start(t, []string{"WG_PROCESS_FOREGROUND=1", "LOG_LEVEL=error"}, bin, iface)
-	for _, d := range []string{"/var/run/amneziawg", "/var/run/wireguard"} {
-		s := filepath.Join(d, iface+".sock")
-		if Wait(3*time.Second, func() bool { _, err := os.Stat(s); return err == nil }) {
-			c.sock = s
-			break
-		}
-	}
-	if c.sock == "" {
-		t.Fatalf("amneziawg-go %s did not open its UAPI socket: %s", cfg.Flavor, c.proc.Output())
-	}
-
-	version := awgcfg.Version31
-	if cfg.Flavor == Flavor20 {
-		version = awgcfg.Version20
-	}
-	text := awguapi.DeviceSet(version, cfg.Priv, 0, cfg.Obf)
-	if cfg.Flavor == Flavor30 { // the 3.0 tools know no RandomTrailers/DisableCookies: "invalid UAPI device key"
-		var keep []string
-		for _, l := range strings.Split(text, "\n") {
-			if !strings.HasPrefix(l, "random_trailers=") && !strings.HasPrefix(l, "disable_cookies=") {
-				keep = append(keep, l)
-			}
-		}
-		text = strings.Join(keep, "\n")
-	}
+	c := startDaemon(t, ns, cfg.Flavor, "mg3c")
+	iface := c.Iface
+	text := deviceText(cfg.Flavor, cfg.Priv, 0, cfg.Obf)
 	ka, err := awgcfg.ParseRange(cfg.Keepalive)
 	if err != nil {
 		t.Fatal(err)
@@ -175,6 +149,20 @@ func StartClient(t testing.TB, ns NS, cfg ClientCfg) *Client {
 	}
 	t.Cleanup(c.Stop)
 	return c
+}
+
+// ReplacePeer configures the server peer again from scratch (the old one is removed first): the session keys are gone and the next
+// packet makes the client start a new handshake. The benchmark suite uses it to count handshakes.
+func (c *Client) ReplacePeer(cfg ClientCfg) error {
+	ka, err := awgcfg.ParseRange(cfg.Keepalive)
+	if err != nil {
+		return err
+	}
+	return c.uapi("set=1\n" + awguapi.PeersSet(true, []awgcfg.Peer{{
+		PublicKey: cfg.ServerPub, PSK: cfg.PSK, Endpoint: cfg.Endpoint,
+		AllowedIPs: []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")},
+		Keepalive:  ka,
+	}}))
 }
 
 // uapi sends one request to the client's socket and checks "errno=0".
@@ -248,3 +236,42 @@ func (c *Client) Stop() {
 
 // Output is what the client process printed (errors only: LOG_LEVEL=error).
 func (c *Client) Output() string { return c.proc.Output() }
+
+// startDaemon starts amneziawg-go (interface name prefix+number) in ns and waits for its UAPI socket.
+func startDaemon(t testing.TB, ns NS, flavor, prefix string) *Client {
+	t.Helper()
+	bin := ClientBin(t, flavor)
+	iface := fmt.Sprintf("%s%d", prefix, clientSeq.Add(1)+int32(os.Getpid()%1000)*100)
+	c := &Client{NS: ns, Iface: iface}
+	c.proc = ns.Start(t, []string{"WG_PROCESS_FOREGROUND=1", "LOG_LEVEL=error"}, bin, iface)
+	for _, d := range []string{"/var/run/amneziawg", "/var/run/wireguard"} {
+		s := filepath.Join(d, iface+".sock")
+		if Wait(3*time.Second, func() bool { _, err := os.Stat(s); return err == nil }) {
+			c.sock = s
+			break
+		}
+	}
+	if c.sock == "" {
+		t.Fatalf("amneziawg-go %s did not open its UAPI socket: %s", flavor, c.proc.Output())
+	}
+	return c
+}
+
+// deviceText is the device part of a UAPI set for the flavor.
+func deviceText(flavor string, priv [32]byte, port uint16, obf awgcfg.Obfuscation) string {
+	version := awgcfg.Version31
+	if flavor == Flavor20 {
+		version = awgcfg.Version20
+	}
+	text := awguapi.DeviceSet(version, priv, port, obf)
+	if flavor == Flavor30 { // the 3.0 tools know no RandomTrailers/DisableCookies: "invalid UAPI device key"
+		var keep []string
+		for _, l := range strings.Split(text, "\n") {
+			if !strings.HasPrefix(l, "random_trailers=") && !strings.HasPrefix(l, "disable_cookies=") {
+				keep = append(keep, l)
+			}
+		}
+		text = strings.Join(keep, "\n")
+	}
+	return text
+}

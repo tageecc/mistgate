@@ -14,6 +14,7 @@ import (
 	"time"
 
 	pb "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/internal/agentcap"
 	"github.com/mistgate/mistgate/internal/node/engine"
 	"github.com/mistgate/mistgate/internal/node/hostctl"
 	"github.com/mistgate/mistgate/internal/plugin"
@@ -31,10 +32,36 @@ func TestCapabilitiesAdvertiseWebSocketLink(t *testing.T) {
 	}
 }
 
+func TestCapabilitiesAdvertiseTrustTunnelHTTP3OnlyWithEngine(t *testing.T) {
+	without := (&Agent{engines: map[string]engine.Engine{}}).capabilities()
+	if slices.Contains(without, agentcap.TrustTunnel) || slices.Contains(without, agentcap.TrustTunnelH3) {
+		t.Fatalf("TrustTunnel capabilities without engine = %v", without)
+	}
+	with := (&Agent{engines: map[string]engine.Engine{"trusttunnel": newFakeEngine("trusttunnel")}}).capabilities()
+	if !slices.Contains(with, agentcap.TrustTunnel) || !slices.Contains(with, agentcap.TrustTunnelH3) {
+		t.Fatalf("TrustTunnel capabilities = %v, want %s and %s", with, agentcap.TrustTunnel, agentcap.TrustTunnelH3)
+	}
+	if !slices.Contains(with, agentcap.TrustTunnelRefusals) ||
+		slices.Contains(without, agentcap.TrustTunnelRefusals) {
+		t.Fatalf("trusttunnel-refusals/1 must be listed with the engine and not without it: %v", with)
+	}
+	if !slices.Contains(with, agentcap.TrustTunnelTCPStalls) ||
+		slices.Contains(without, agentcap.TrustTunnelTCPStalls) {
+		t.Fatalf("trusttunnel-tcp-stalls/1 must be listed with the engine and not without it: %v", with)
+	}
+}
+
 func TestCapabilitiesAdvertiseVLESSWhenEngineIsRegistered(t *testing.T) {
 	a := &Agent{engines: map[string]engine.Engine{"vless": newFakeEngine("vless")}}
-	if !slices.Contains(a.capabilities(), "vless/1") {
-		t.Fatal("Hello.capabilities does not advertise vless/1 for a registered engine")
+	caps := a.capabilities()
+	if !slices.Contains(caps, "vless/1") || !slices.Contains(caps, agentcap.VLESSUnknownKeys) {
+		t.Fatalf("Hello.capabilities = %v, want vless/1 and %s for a registered engine", caps, agentcap.VLESSUnknownKeys)
+	}
+	if slices.Contains((&Agent{engines: map[string]engine.Engine{}}).capabilities(), agentcap.VLESSUnknownKeys) {
+		t.Fatal("VLESS unknown-key capability is advertised without a VLESS engine")
+	}
+	if !slices.Contains(caps, "vless-hello-kex/1") || slices.Contains((&Agent{engines: map[string]engine.Engine{}}).capabilities(), "vless-hello-kex/1") {
+		t.Fatalf("vless-hello-kex/1 must be listed with a VLESS engine and without it not: %v", caps)
 	}
 }
 
@@ -51,6 +78,17 @@ func TestCapabilitiesAdvertiseVLESSSelfWithACertificateSource(t *testing.T) {
 	}
 	if slices.Contains((&Agent{cfg: Config{Certs: &markCerts{}}, engines: map[string]engine.Engine{}}).capabilities(), "vless-self/1") {
 		t.Fatal("vless-self/1 is advertised without a VLESS engine")
+	}
+}
+
+// vless-target/1 says the engine takes a REALITY target set on its node (the other site's name in the TLS block, no certificate): it
+// needs no certificate source, only the VLESS engine.
+func TestCapabilitiesAdvertiseVLESSTargetWithTheVLESSEngine(t *testing.T) {
+	if slices.Contains((&Agent{engines: map[string]engine.Engine{}}).capabilities(), "vless-target/1") {
+		t.Fatal("vless-target/1 is advertised without a VLESS engine")
+	}
+	if !slices.Contains((&Agent{engines: map[string]engine.Engine{"vless": newFakeEngine("vless")}}).capabilities(), "vless-target/1") {
+		t.Fatal("vless-target/1 is missing with a VLESS engine and no certificate source")
 	}
 }
 
@@ -456,13 +494,13 @@ func TestDesiredStateFullDeltaAndHash(t *testing.T) {
 	case <-time.After(150 * time.Millisecond):
 	}
 
-	// 7. rejected: unknown protocol. Nothing changes.
+	// 7. an unknown protocol fails only its own inbound; the message is still applied partially.
 	bad := inb("inb_2", 0, 0, cred("crd_q"))
 	bad.Spec.Protocol = "nosuch"
 	h.panel.push(&pb.DesiredState{Revision: 12, BaseRevision: 11, Inbounds: []*pb.InboundState{bad}})
 	r = h.panel.nextApply()
-	if r.Status != pb.ApplyStatus_APPLY_STATUS_REJECTED || r.Error == "" || h.eng.has("inb_2") {
-		t.Fatalf("reject: %v", r)
+	if r.Status != pb.ApplyStatus_APPLY_STATUS_PARTIAL || len(r.Inbounds) != 2 || r.Inbounds[1].InboundId != "inb_2" || r.Inbounds[1].State != pb.InboundRunState_INBOUND_RUN_STATE_FAILED || h.eng.has("inb_2") {
+		t.Fatalf("partial parse failure: %v", r)
 	}
 
 	// 8. a full state without inb_1 removes it

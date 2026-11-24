@@ -17,7 +17,7 @@ type NodeInbound struct {
 // Desired computes what a node should run: its enabled inbounds and, for each, the credentials allowed by
 // the effective-access rule written at the top of user.proto:
 //
-//	user ACTIVE AND profile in the user's group AND (all nodes OR node selected)
+//	user ACTIVE AND profile in the user's group AND node enabled for the group AND (all nodes OR node selected)
 //	AND one of the user's enabled apps consumes the protocol AND the inbound is enabled.
 //
 // The fleet module turns the result into the agent's DesiredState. An inbound whose settings cannot be
@@ -59,7 +59,9 @@ func (s *Service) Desired(ctx context.Context, nodeID string) ([]NodeInbound, er
 	}
 	for _, r := range rows {
 		i, ok := at[r.InboundID]
-		if !ok || !s.allowed(r.Protocol, r.AppHapp, r.AppAmnezia) {
+		// Official-app credentials follow their dedicated switch. Mistgate client API devices may also use the protocol;
+		// the store has already left those credentials out when the person switched Mistgate off.
+		if !ok || !s.allowed(r.Protocol, r.AppHapp, r.AppAmnezia, r.AppTelegram, r.AppTrustTunnel) && !(r.MistgateDevice && s.mistgateConsumes(r.Protocol)) {
 			continue
 		}
 		out[i].Creds = append(out[i].Creds, plugin.UserCred{

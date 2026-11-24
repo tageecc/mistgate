@@ -1,3 +1,5 @@
+//go:build !js
+
 package mcp
 
 import (
@@ -16,6 +18,7 @@ import (
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
 	"github.com/mistgate/mistgate/gen/mistgate/admin/v1/adminv1connect"
 	"github.com/mistgate/mistgate/internal/decoy"
+	panelupdate "github.com/mistgate/mistgate/internal/panel/update"
 	"github.com/mistgate/mistgate/internal/panel/warp"
 )
 
@@ -24,18 +27,85 @@ import (
 // for its approved grant. A summary never embeds untrusted text: names go in the facts, marked untrusted.
 
 const (
-	dangerStepUp = "step_up" // the operation itself asks for a step-up
-	dangerFleet  = "fleet"   // it changes what runs on the nodes
-	dangerBulk   = "bulk"    // many users at once
+	dangerStepUp          = "step_up"            // the operation itself asks for a step-up
+	dangerFleet           = "fleet"              // it changes what runs on the nodes
+	dangerBulk            = "bulk"               // many users at once
+	dangerUserChangeLimit = "user_change_limit"  // this plan exceeds the token's unattended user-change limit
+	dangerPanelSite       = "panel_site"         // it changes the site the panel shows at its own address (no node)
+	dangerLibrary         = "decoy_library"      // it changes the library of decoy sites only: nothing running moves yet
+	dangerIrreversible    = "irreversible"       // it cannot be undone
+	dangerSSHKeyEdit      = "ssh_key_edit"       // the panel edits one login's authorized_keys and checks the result
+	dangerSSHKeysAdd      = "ssh_keys_add"       // the panel adds a key to each selected login and checks it
+	dangerSSHPassword     = "ssh_password_login" // the panel logs in with the saved password after removing its own key
+	maxMCPNodeTargets     = 20
 )
+
+const tokenUserChangeDescription = "A token may make at most 10 user changes without owner approval during the fixed one-hour window that starts with its first counted change."
+
+// failedPreconditionMessage returns only the panel's exact precondition text. Retry classification is intentionally limited
+// to the known rollout-start blockers below; other failures keep the normal failed-plan behavior.
+func failedPreconditionMessage(err error) (string, bool) {
+	var ce *connect.Error
+	if !errors.As(err, &ce) || ce.Code() != connect.CodeFailedPrecondition {
+		return "", false
+	}
+	return ce.Message(), true
+}
+
+func retryRolloutStart(err error) error {
+	message, ok := failedPreconditionMessage(err)
+	if !ok {
+		return nil
+	}
+	switch message {
+	case "a rollout is already active",
+		"the active rollout is paused; resume or cancel it before adding a node",
+		"the active rollout uses a different release; finish it before updating this node":
+		return retryLater("rollout_active", "an agent rollout is active now", retryLaterDelay)
+	case "an OS update of a node is running; wait for it to finish":
+		return retryLater("rollout_active", "an OS rollout is active now", retryLaterDelay)
+	case "the GitHub node bundle is being installed":
+		return retryLater("node_bundle_busy", "the GitHub node bundle is being installed or synced", retryLaterDelay)
+	case "a panel update is being installed":
+		return retryLater("panel_busy", "a panel update is being installed", retryLaterDelay)
+	default:
+		return nil
+	}
+}
+
+func (c *call) userChangeBudget(asked int) ([]string, []Fact, error) {
+	if c.e.cfg.UserChangeBudget == nil {
+		return nil, nil, nil
+	}
+	used, limit, exempt, err := c.e.cfg.UserChangeBudget(c.ctx)
+	if err != nil {
+		return nil, nil, errors.New("cannot check the token's fixed one-hour user-change limit")
+	}
+	if exempt || used+asked <= limit {
+		return nil, nil, nil
+	}
+	fact := codedFact("user_change_limit", fmt.Sprintf("this token has used %d of %d user changes in its fixed one-hour window", used, limit),
+		"user_change_limit", "used", strconv.Itoa(used), "limit", strconv.Itoa(limit))
+	return []string{dangerUserChangeLimit}, []Fact{fact}, nil
+}
+
+func mergeDanger(dst []string, add ...string) []string {
+	for _, v := range add {
+		if v != "" && !slices.Contains(dst, v) {
+			dst = append(dst, v)
+		}
+	}
+	return dst
+}
 
 func changeTools() []toolDef {
 	var out []toolDef
 	for _, g := range [][]toolDef{
-		change(userCreate), change(userUpdate), change(userDisable), change(userEnable), change(userResetTraffic), change(deviceRevoke), change(alertMute),
+		change(userCreate), change(userUpdate), change(userDisable), change(userEnable), change(userResetTraffic), change(deviceRevoke), change(alertMute), change(alertClose),
 		change(warpRestart), change(warpReregister),
-		change(nodeFix), change(rolloutStart), change(nodeUpdateSchedule), change(nodeUpdateScheduleCancel), change(updateTimezone),
+		change(nodeFix), change(rolloutStart), change(nodeUpdateSchedule), change(nodeUpdateScheduleCancel), change(updateTimezone), change(updateDownloadTimeout),
 		change(rolloutPause), change(rolloutResume), change(rolloutCancel), change(nodeRollback),
+		change(osRolloutStart), change(osRolloutPause), change(osRolloutResume), change(osRolloutCancel),
 		change(nodeDecoy),
 	} {
 		out = append(out, g...)
@@ -45,16 +115,22 @@ func changeTools() []toolDef {
 
 type nodeDecoyArgs struct {
 	ReasonField
-	Node         string `json:"node" jsonschema:"node id or exact name"`
-	Mode         string `json:"mode" jsonschema:"builtin, panel or own"`
-	BundleBase64 string `json:"bundle_base64,omitempty" jsonschema:"base64 ZIP or TAR static site up to 2 MiB; required for own, omitted otherwise"`
+	Node         string         `json:"node" jsonschema:"node id or exact name"`
+	Mode         string         `json:"mode" jsonschema:"builtin, panel or own"`
+	BundleBase64 string         `json:"bundle_base64,omitempty" jsonschema:"base64 ZIP or TAR static site up to 2 MiB; for own, give this or files, omitted otherwise"`
+	Files        []decoyFileArg `json:"files,omitempty" jsonschema:"the own site as a list of files, when you cannot make an archive: at most 64 files and 2 MiB, one must be index.html at the top; give this or bundle_base64, omitted for other modes"`
 }
 
 var nodeDecoy = changeSpec[nodeDecoyArgs]{
 	name: "node_decoy", min: ProfileAdmin, danger: true, maxArgs: maxUploadArgsJSON,
 	procs: procs(adminv1connect.NodeServiceListNodesProcedure, adminv1connect.NodeServiceGetNodeProcedure,
 		adminv1connect.NodeServiceSetNodeDecoyModeProcedure),
-	desc: "Choose builtin, the panel's decoy site, or upload an own static site for one node. When generating an own site, never repeat the subject or look of sites already made for other nodes.",
+	desc: "Choose builtin, the panel's decoy site, or an own static site for one node. " +
+		"For own, give the site as files (a list of {path, content} text files, or content_base64 for a small image: use this when you cannot make an archive) or as bundle_base64 (a ZIP or TAR), one of the two. " +
+		"The site is small, static and self-contained: plain HTML and one style sheet, 3 to 5 pages with index.html at the top and a 404.html in the same style, every link a path from the root, " +
+		"no external scripts, fonts, images, analytics, embeds or links to other sites, no forms, nothing that names a VPN, a proxy or this panel. " +
+		"A model's answer is length-capped, so keep the files under about 20 KB in total (the limit is 2 MiB) and send them in one call. " +
+		"When generating an own site, never repeat the subject or look of sites already made for other nodes.",
 	plan: func(c *call, a nodeDecoyArgs) (*planned, error) {
 		id, name, err := c.nodeRef(a.Node)
 		if err != nil {
@@ -71,12 +147,12 @@ var nodeDecoy = changeSpec[nodeDecoyArgs]{
 		var bundle *decoy.Bundle
 		switch a.Mode {
 		case decoy.ModeBuiltin:
-			if a.BundleBase64 != "" {
-				return nil, errors.New("bundle_base64 is only allowed with own mode")
+			if a.BundleBase64 != "" || len(a.Files) > 0 {
+				return nil, errors.New("bundle_base64 and files are only allowed with own mode")
 			}
 		case decoy.ModePanel:
-			if a.BundleBase64 != "" {
-				return nil, errors.New("bundle_base64 is only allowed with own mode")
+			if a.BundleBase64 != "" || len(a.Files) > 0 {
+				return nil, errors.New("bundle_base64 and files are only allowed with own mode")
 			}
 			if !node.GetDecoyPanelAvailable() {
 				return nil, errors.New("panel decoy site is unavailable")
@@ -85,33 +161,34 @@ var nodeDecoy = changeSpec[nodeDecoyArgs]{
 			if !node.GetDecoyOwnAvailable() {
 				return nil, errors.New("own decoy sites are unavailable in this edition")
 			}
-			if a.BundleBase64 == "" {
-				return nil, errors.New("bundle_base64 is required for own mode")
+			var archive []byte
+			if bundle, archive, err = a.ownBundle(); err != nil {
+				return nil, err
 			}
-			archive, err := base64.StdEncoding.Strict().DecodeString(a.BundleBase64)
-			if err != nil {
-				return nil, errors.New("bundle_base64 must encode a ZIP or TAR archive")
-			}
-			bundle, err = decoy.ParseArchive(archive)
-			if err != nil {
-				return nil, errors.New(decoy.ClientMessage(err))
-			}
+			// what is stored and applied is the archive, whichever way the site came
+			a.BundleBase64, a.Files = base64.StdEncoding.EncodeToString(archive), nil
 		default:
 			return nil, errors.New("mode must be builtin, panel or own")
 		}
 		facts := []Fact{{Key: "node", Value: nm(name), Untrusted: true}, {Key: "mode", Value: a.Mode}}
+		summary := "Change the decoy site for one node. The owner must approve this change before it is applied."
 		if bundle != nil {
 			var size int
 			files := bundle.Files()
 			for _, f := range files {
 				size += len(f.Content)
 			}
-			facts = append(facts, Fact{Key: "bundle", Value: bundle.Hash()},
+			listing, err := decoyFileFacts(bundle)
+			if err != nil {
+				return nil, err
+			}
+			facts = append(facts, Fact{Key: "bundle", Value: spacedHash(bundle.Hash())},
 				Fact{Key: "files", Value: fmt.Sprint(len(files))}, Fact{Key: "bytes", Value: fmt.Sprint(size)})
+			facts = append(facts, listing...)
+			summary = fmt.Sprintf("Change the decoy site for one node to an own static site of %d files, %d bytes. The owner must approve this change before it is applied.", len(files), size)
 		}
 		a.Node = id
-		return &planned{Summary: "Change the decoy site for one node. The owner must approve this change before it is applied.",
-			Facts: facts, Danger: []string{dangerFleet}, Params: a}, nil
+		return &planned{Summary: summary, Facts: facts, Danger: []string{dangerFleet}, Params: a}, nil
 	},
 	apply: func(c *call, a nodeDecoyArgs, _ Plan) (done, error) {
 		var archive []byte
@@ -128,7 +205,7 @@ var nodeDecoy = changeSpec[nodeDecoyArgs]{
 		if err != nil {
 			return done{}, apiError(err)
 		}
-		return done{text: "Node decoy site change applied."}, nil
+		return doneWith("node_decoy_applied", "Node decoy site change applied."), nil
 	},
 }
 
@@ -194,9 +271,9 @@ var warpRestart = changeSpec[warpRestartArgs]{
 			return done{}, apiError(err)
 		}
 		if !r.Msg.GetConfirmed() {
-			return done{text: "Restart sent, but the node did not confirm the pause before resume."}, nil
+			return doneWith("warp_restart_unconfirmed", "Restart sent, but the node did not confirm the pause before resume."), nil
 		}
-		return done{text: "WARP tunnel restarted."}, nil
+		return doneWith("warp_restarted", "WARP tunnel restarted."), nil
 	},
 }
 
@@ -251,7 +328,7 @@ var warpReregister = changeSpec[warpReregisterArgs]{
 		if err != nil {
 			return done{}, apiError(err)
 		}
-		return done{text: "New WARP device registered, replacing the previous account."}, nil
+		return doneWith("warp_registered", "New WARP device registered, replacing the previous account."), nil
 	},
 }
 
@@ -310,6 +387,14 @@ func termFact(days uint32) Fact {
 	return codedFact("term", plural(int(days), "day", "days"), "days", "n", strconv.Itoa(int(days)))
 }
 
+// appsFact is the apps of a new user: "default" when the request named none.
+func appsFact(named *appsArg, resolved appsOn) Fact {
+	if named == nil {
+		return codedFact("apps", "default", "default")
+	}
+	return codedFact("apps", resolved.text(), resolved.code())
+}
+
 func nodesFact(key string, n *nodesArg) Fact {
 	if w := n.word(); w != "all" {
 		return codedFact(key, n.text(), "some", "n", w)
@@ -345,6 +430,23 @@ func uniqueIDs(what string, ids []string, allowEmpty bool) ([]string, error) {
 	return out, nil
 }
 
+func nodeTargetIDs(what string, ids []string) ([]string, error) {
+	if len(ids) == 0 {
+		return nil, errors.New(what + ": at least one node id")
+	}
+	if len(ids) > maxMCPNodeTargets {
+		return nil, fmt.Errorf("%s: at most %d nodes at once", what, maxMCPNodeTargets)
+	}
+	out, err := uniqueIDs(what, ids, false)
+	if err != nil {
+		return nil, err
+	}
+	if len(out) != len(ids) {
+		return nil, errors.New(what + ": duplicate node id")
+	}
+	return out, nil
+}
+
 func quotaReset(s string) (adminv1.QuotaReset, error) {
 	switch s {
 	case "":
@@ -363,9 +465,61 @@ func quotaReset(s string) (adminv1.QuotaReset, error) {
 	return 0, errors.New("quota_reset: none, day, week, month or rolling_month")
 }
 
+// appsArg names the apps to switch. A field left out keeps the user's current value (on a new user: Happ and AmneziaVPN on,
+// Telegram off), so turning one app on or off touches that app alone.
 type appsArg struct {
-	Happ    bool `json:"happ"`
-	Amnezia bool `json:"amnezia"`
+	Happ     *bool `json:"happ,omitempty" jsonschema:"the subscription link (Happ and the other link apps)"`
+	Amnezia  *bool `json:"amnezia,omitempty" jsonschema:"AmneziaVPN keys"`
+	Telegram *bool `json:"telegram,omitempty" jsonschema:"the Telegram proxy (MTProto): the person gets a key and tg:// links; switching it off revokes the key"`
+	Mistgate *bool `json:"mistgate,omitempty" jsonschema:"the Mistgate desktop app, a key for each device; it rides on the subscription link and works only while happ is on too; switching it off refuses new connections and gives the devices already connected no servers (their keys are kept)"`
+}
+
+// appsOn is the three toggles of a user, every one decided.
+type appsOn struct{ Happ, Amnezia, Telegram, Mistgate bool }
+
+// newUserApps is what a user gets when the apps are not named.
+var newUserApps = appsOn{Happ: true, Amnezia: true, Mistgate: true}
+
+func appsOf(u *adminv1.User) appsOn {
+	return appsOn{Happ: u.GetApps().GetHapp(), Amnezia: u.GetApps().GetAmnezia(), Telegram: u.GetApps().GetTelegram(), Mistgate: mistgateOn(u.GetApps())}
+}
+
+// over is the toggles with the fields of a laid over base; a == nil is base.
+func (a *appsArg) over(base appsOn) appsOn {
+	if a == nil {
+		return base
+	}
+	if a.Happ != nil {
+		base.Happ = *a.Happ
+	}
+	if a.Amnezia != nil {
+		base.Amnezia = *a.Amnezia
+	}
+	if a.Telegram != nil {
+		base.Telegram = *a.Telegram
+	}
+	if a.Mistgate != nil {
+		base.Mistgate = *a.Mistgate
+	}
+	return base
+}
+
+// mistgateOn is the Mistgate app switch of the toggles a user came with; the panel always sends it, and a toggle set without it
+// (an older panel) is the default: on.
+func mistgateOn(a *adminv1.AppToggles) bool { return a == nil || a.Mistgate == nil || a.GetMistgate() }
+
+// onOff is a switch as the facts word it.
+func onOff(on bool) string {
+	if on {
+		return "on"
+	}
+	return "off"
+}
+
+// explicit is a with every toggle set to the value of o: what a plan stores, so that the apply does what the plan said whatever
+// the user looks like by then.
+func (o appsOn) explicit() *appsArg {
+	return &appsArg{Happ: &o.Happ, Amnezia: &o.Amnezia, Telegram: &o.Telegram, Mistgate: &o.Mistgate}
 }
 
 type nodesArg struct {
@@ -373,11 +527,14 @@ type nodesArg struct {
 	NodeIDs []string `json:"node_ids,omitempty"`
 }
 
+// proto is the toggles to send; nil (the panel's default) when the apps were not named at all. On a change, give a plan's
+// explicit toggles.
 func (a *appsArg) proto() *adminv1.AppToggles {
 	if a == nil {
 		return nil
 	}
-	return &adminv1.AppToggles{Happ: a.Happ, Amnezia: a.Amnezia}
+	o := a.over(newUserApps)
+	return &adminv1.AppToggles{Happ: o.Happ, Amnezia: o.Amnezia, Telegram: o.Telegram, Mistgate: &o.Mistgate}
 }
 
 func (n *nodesArg) proto() *adminv1.NodeSelection {
@@ -387,9 +544,10 @@ func (n *nodesArg) proto() *adminv1.NodeSelection {
 	return &adminv1.NodeSelection{All: n.All, NodeIds: n.NodeIDs}
 }
 
-func (a *appsArg) check() error {
-	if a != nil && !a.Happ && !a.Amnezia {
-		return errors.New("apps: at least one app must be on")
+// check refuses toggles with neither Happ nor AmneziaVPN on (Telegram is added to one of them, it cannot stand alone).
+func (o appsOn) check() error {
+	if !o.Happ && !o.Amnezia {
+		return errors.New("apps: at least one of happ and amnezia must be on (telegram comes in addition)")
 	}
 	return nil
 }
@@ -408,16 +566,20 @@ func (n *nodesArg) check() error {
 	return err
 }
 
-func (a *appsArg) text() string {
+func (o appsOn) text() string {
+	var s string
 	switch {
-	case a == nil:
-		return "default"
-	case a.Happ && a.Amnezia:
-		return "Subscription link and AmneziaVPN keys"
-	case a.Happ:
-		return "Subscription link only"
+	case o.Happ && o.Amnezia:
+		s = "Subscription link and AmneziaVPN keys"
+	case o.Happ:
+		s = "Subscription link only"
+	default:
+		s = "AmneziaVPN keys only"
 	}
-	return "AmneziaVPN keys only"
+	if o.Telegram {
+		s += " and the Telegram proxy"
+	}
+	return s
 }
 
 func (n *nodesArg) text() string {
@@ -428,17 +590,20 @@ func (n *nodesArg) text() string {
 	return plural(len(n.NodeIDs), "node", "nodes")
 }
 
-// code is the ways as the owner's UI words them: default, both, happ (the subscription link), amnezia (the keys).
-func (a *appsArg) code() string {
+// code is the ways as the owner's UI words them: both, happ (the subscription link), amnezia (the keys), each with
+// "+telegram" when the Telegram proxy is on.
+func (o appsOn) code() string {
+	c := "amnezia"
 	switch {
-	case a == nil:
-		return "default"
-	case a.Happ && a.Amnezia:
-		return "both"
-	case a.Happ:
-		return "happ"
+	case o.Happ && o.Amnezia:
+		c = "both"
+	case o.Happ:
+		c = "happ"
 	}
-	return "amnezia"
+	if o.Telegram {
+		c += "+telegram"
+	}
+	return c
 }
 
 // word is "all" or how many nodes.
@@ -450,6 +615,9 @@ func (n *nodesArg) word() string {
 }
 
 func checkName(s string) error {
+	if uuidShape.MatchString(s) {
+		return errors.New("name looks like a credential id")
+	}
 	if clean(s, 1000) != strings.TrimSpace(s) || s == "" || len([]rune(s)) > 64 {
 		return errors.New("name: 1 to 64 characters, no control characters")
 	}
@@ -467,7 +635,7 @@ type userCreateArgs struct {
 	QuotaReset    string    `json:"quota_reset,omitempty" jsonschema:"none, day, week, month (default) or rolling_month"`
 	TermDays      uint32    `json:"term_days,omitempty" jsonschema:"valid for this many days from now; 0 = never expires"`
 	DeviceLimit   uint32    `json:"device_limit,omitempty" jsonschema:"0 = the panel's default"`
-	Apps          *appsArg  `json:"apps,omitempty" jsonschema:"absent = both apps on"`
+	Apps          *appsArg  `json:"apps,omitempty" jsonschema:"absent = Happ and AmneziaVPN on, Telegram off; a field left out of it keeps that default"`
 	Nodes         *nodesArg `json:"nodes,omitempty" jsonschema:"absent = all nodes"`
 	SpeedLimitBps uint64    `json:"speed_limit_bps,omitempty" jsonschema:"per person: all the devices of the user together on one node (so two nodes at once can reach twice this); 0 = no limit"`
 	// DeviceSpeedLimitBps is the other limit: each device of the user alone. Both can be set; a device is held to the lower.
@@ -477,8 +645,10 @@ type userCreateArgs struct {
 
 var userCreate = changeSpec[userCreateArgs]{
 	name: "user_create", min: ProfileOperator,
-	procs: procs(adminv1connect.UserServiceListUsersProcedure, adminv1connect.UserServiceCreateUserProcedure),
-	desc:  "Create a user. The subscription link is never shown to agents: the owner copies it in the admin panel.",
+	procs: procs(adminv1connect.UserServiceListUsersProcedure, adminv1connect.UserServiceCreateUserProcedure,
+		adminv1connect.GroupServiceListGroupsProcedure, adminv1connect.DnsServiceListDnsPresetsProcedure,
+		adminv1connect.SubscriptionServiceGetSubscriptionSettingsProcedure),
+	desc: "Create a user. The subscription link is never shown to agents: the owner copies it in the admin panel.",
 	plan: func(c *call, a userCreateArgs) (*planned, error) {
 		if err := checkName(a.Name); err != nil {
 			return nil, err
@@ -492,16 +662,57 @@ var userCreate = changeSpec[userCreateArgs]{
 		if err := validID("group_id", a.GroupID); err != nil {
 			return nil, err
 		}
+		group, err := c.groupByID(a.GroupID)
+		if err != nil {
+			return nil, err
+		}
 		if a.DNSPresetID != "" {
 			if err := validID("dns_preset_id", a.DNSPresetID); err != nil {
 				return nil, err
 			}
 		}
-		if err := a.Apps.check(); err != nil {
+		apps := a.Apps.over(newUserApps)
+		if err := apps.check(); err != nil {
 			return nil, err
 		}
 		if err := a.Nodes.check(); err != nil {
 			return nil, err
+		}
+		dnsPresetID := a.DNSPresetID
+		dnsSource := "user override"
+		if dnsPresetID == "" {
+			dnsPresetID = group.GetDnsPresetId()
+			dnsSource = "group default"
+		}
+		if dnsPresetID == "" {
+			settings, err := c.subscriptionSnapshot()
+			if err != nil {
+				return nil, err
+			}
+			dnsPresetID = settings.settings.GetDefaultDnsPresetId()
+			dnsSource = "instance default"
+		}
+		dnsPresetName := ""
+		if dnsPresetID != "" {
+			preset, err := c.dnsPreset(dnsPresetID)
+			if err != nil {
+				return nil, err
+			}
+			dnsPresetName = preset.GetName()
+		} else {
+			presets, err := c.cl.DNS.ListDnsPresets(c.ctx, connect.NewRequest(&adminv1.ListDnsPresetsRequest{}))
+			if err != nil {
+				return nil, apiError(err)
+			}
+			for _, preset := range presets.Msg.GetPresets() {
+				if preset.GetIsDefault() {
+					dnsPresetName = preset.GetName()
+					break
+				}
+			}
+			if dnsPresetName == "" {
+				dnsPresetName = "bundled default"
+			}
 		}
 		r, err := c.cl.User.ListUsers(c.ctx, connect.NewRequest(&adminv1.ListUsersRequest{Query: a.Name, PageSize: maxUsersPage}))
 		if err != nil {
@@ -521,12 +732,23 @@ var userCreate = changeSpec[userCreateArgs]{
 			term = plural(int(a.TermDays), "day", "days")
 		}
 		summary := fmt.Sprintf("Create one user with a %s quota (reset: %s), term: %s, on %s.", fmtBytes(a.QuotaBytes), reset, term, a.Nodes.text())
+		deviceLimit := a.DeviceLimit
+		deviceLimitLabel := strconv.FormatUint(uint64(deviceLimit), 10)
+		if deviceLimit == 0 {
+			deviceLimitLabel = "5 (panel default)"
+		}
 		facts := []Fact{
 			{Key: "name", Value: nm(a.Name), Untrusted: true},
+			{Key: "group", Value: nm(group.GetName()), Untrusted: true},
+			{Key: "device_limit", Value: deviceLimitLabel},
+			{Key: "dns_preset", Value: nm(dnsPresetName) + " (" + dnsSource + ")", Untrusted: true},
 			quotaFact(a.QuotaBytes, reset),
 			termFact(a.TermDays),
-			codedFact("apps", a.Apps.text(), a.Apps.code()),
+			appsFact(a.Apps, apps),
 			nodesFact("nodes", a.Nodes),
+		}
+		if a.Apps != nil && a.Apps.Mistgate != nil {
+			facts = append(facts, codedFact("app_mistgate", onOff(apps.Mistgate), onOff(apps.Mistgate)))
 		}
 		if a.SpeedLimitBps > 0 || a.DeviceSpeedLimitBps > 0 {
 			summary += " Speed limits: " + speedLimitsText(a.SpeedLimitBps, a.DeviceSpeedLimitBps) + "."
@@ -570,7 +792,9 @@ type userUpdateArgs struct {
 	UserID           string    `json:"user_id"`
 	Name             *string   `json:"name,omitempty"`
 	SubscriptionName *string   `json:"subscription_name,omitempty" jsonschema:"name shown on the public subscription page; empty uses the account name"`
-	GroupID          *string   `json:"group_id,omitempty" jsonschema:"a group id (users_search shows the group of each user)"`
+	GroupID          *string   `json:"group_id,omitempty" jsonschema:"the MAIN group id (users_search shows it as group_id): it decides DNS, the Mihomo template, the response headers and the colour as well as access. The old main group is left unless add_group_ids names it"`
+	AddGroupIDs      []string  `json:"add_group_ids,omitempty" jsonschema:"group ids to add as EXTRA groups (groups_list): the person also gets what each gives, a profile on a node when one and the same group holds the profile and gets the node. An extra group adds access only. A group that is the main group is skipped; at most 16 groups in all"`
+	RemoveGroupIDs   []string  `json:"remove_group_ids,omitempty" jsonschema:"extra group ids to take the person out of (not the main group: change group_id for that). With group_id and add_group_ids it makes B the main group and keeps A: group_id B, add_group_ids [A]"`
 	QuotaBytes       *uint64   `json:"quota_bytes,omitempty" jsonschema:"0 = unlimited"`
 	QuotaReset       *string   `json:"quota_reset,omitempty" jsonschema:"none, day, week, month or rolling_month"`
 	ExpiresUnix      *int64    `json:"expires_unix,omitempty" jsonschema:"unix seconds; 0 = never. A future date lifts 'expired'"`
@@ -581,6 +805,21 @@ type userUpdateArgs struct {
 	// DeviceSpeedLimitBps is the per-device limit: each device of the user alone.
 	DeviceSpeedLimitBps *uint64 `json:"device_speed_limit_bps,omitempty" jsonschema:"per device: no single device goes faster than this; 0 = remove the limit"`
 	DNSPresetID         *string `json:"dns_preset_id,omitempty" jsonschema:"empty string = inherit"`
+	// PagePassword changes the password of the person's own page. The password is never shown to you or stored: the owner reads a new one in the admin panel.
+	PagePassword *string `json:"page_password,omitempty" jsonschema:"what to do with the password the person's own page asks for: change (a new password, the link and the apps stay the same; the old password and every browser that entered it stop working), remove (the page opens on the link alone, with no question) or restore (ask for a password again, a new one). You never see the password; the owner reads it in the admin panel"`
+}
+
+// pagePasswordAction is the API's word for what user_update does to the page password.
+func pagePasswordAction(word string) (adminv1.PagePasswordAction, error) {
+	switch word {
+	case "change":
+		return adminv1.PagePasswordAction_PAGE_PASSWORD_ACTION_CHANGE, nil
+	case "remove":
+		return adminv1.PagePasswordAction_PAGE_PASSWORD_ACTION_REMOVE, nil
+	case "restore":
+		return adminv1.PagePasswordAction_PAGE_PASSWORD_ACTION_RESTORE, nil
+	}
+	return 0, errors.New("page_password must be change, remove or restore")
 }
 
 func checkSubscriptionName(name string) error {
@@ -593,8 +832,8 @@ func checkSubscriptionName(name string) error {
 
 var userUpdate = changeSpec[userUpdateArgs]{
 	name: "user_update", min: ProfileOperator,
-	procs: procs(adminv1connect.UserServiceGetUserProcedure, adminv1connect.UserServiceUpdateUserProcedure),
-	desc:  "Change a user's account name, public subscription-page name, group, quota, expiry, device limit, apps, nodes, speed limit or DNS preset. Only the fields you give change.",
+	procs: procs(adminv1connect.UserServiceGetUserProcedure, adminv1connect.UserServiceUpdateUserProcedure, adminv1connect.GroupServiceListGroupsProcedure, adminv1connect.NodeServiceListNodesProcedure),
+	desc:  "Change a user's account name, public subscription-page name, main group, extra groups (add_group_ids, remove_group_ids: the person gets what all their groups give; the plan lists the profiles and nodes they gain and lose), quota, expiry, device limit, apps (Happ link, AmneziaVPN keys, Telegram proxy, Mistgate app), nodes, speed limit or DNS preset. Only the fields you give change, inside apps too. The password of the person's own page can be changed, removed or restored (page_password); you never see it. " + tokenUserChangeDescription,
 	plan: func(c *call, a userUpdateArgs) (*planned, error) {
 		cur, err := c.getUser(a.UserID)
 		if err != nil {
@@ -629,6 +868,65 @@ var userUpdate = changeSpec[userUpdateArgs]{
 			add("group", nm(u.GetGroupName())+" -> group id "+clean(*a.GroupID, 80), true)
 			n++
 		}
+		if len(a.AddGroupIDs)+len(a.RemoveGroupIDs) > 0 {
+			addIDs, err := uniqueIDs("add_group_ids", a.AddGroupIDs, true)
+			if err != nil {
+				return nil, err
+			}
+			removeIDs, err := uniqueIDs("remove_group_ids", a.RemoveGroupIDs, true)
+			if err != nil {
+				return nil, err
+			}
+			a.AddGroupIDs, a.RemoveGroupIDs = addIDs, removeIDs
+			groups, err := c.groups()
+			if err != nil {
+				return nil, err
+			}
+			names := map[string]string{}
+			for _, g := range groups {
+				names[g.GetId()] = g.GetName()
+			}
+			list := func(ids []string) (string, error) {
+				var out []string
+				for _, id := range ids {
+					name, ok := names[id]
+					if !ok {
+						return "", fmt.Errorf("no group with id %s (group ids are in groups_list)", clean(id, 60))
+					}
+					out = append(out, nm(name))
+				}
+				return strings.Join(out, ", "), nil
+			}
+			if len(addIDs) > 0 {
+				v, err := list(addIDs)
+				if err != nil {
+					return nil, err
+				}
+				facts = append(facts, Fact{Key: "groups_added", Value: v, Untrusted: true})
+			}
+			if len(removeIDs) > 0 {
+				v, err := list(removeIDs)
+				if err != nil {
+					return nil, err
+				}
+				facts = append(facts, Fact{Key: "groups_removed", Value: v, Untrusted: true})
+			}
+			n++
+		}
+		if a.GroupID != nil || len(a.AddGroupIDs)+len(a.RemoveGroupIDs) > 0 {
+			// what the groups do to the person: the panel checks the change (refusals come as they are) and says the profiles and nodes
+			r, err := c.cl.User.UpdateUser(c.e.cfg.Auth.WithPlanning(c.ctx), connect.NewRequest(&adminv1.UpdateUserRequest{
+				UserId: a.UserID, GroupId: a.GroupID, AddGroupIds: a.AddGroupIDs, RemoveGroupIds: a.RemoveGroupIDs, DryRun: true,
+			}))
+			if err != nil {
+				return nil, apiError(err)
+			}
+			nodeFacts, err := c.accessImpactFacts(r.Msg.GetImpact())
+			if err != nil {
+				return nil, err
+			}
+			facts = append(facts, nodeFacts...)
+		}
 		if a.QuotaBytes != nil {
 			change("quota", fmtBytes(u.GetQuotaBytes())+" -> "+fmtBytes(*a.QuotaBytes), strconv.FormatUint(u.GetQuotaBytes(), 10), strconv.FormatUint(*a.QuotaBytes, 10))
 			n++
@@ -656,11 +954,19 @@ var userUpdate = changeSpec[userUpdateArgs]{
 			n++
 		}
 		if a.Apps != nil {
-			if err := a.Apps.check(); err != nil {
+			was := appsOf(u)
+			now := a.Apps.over(was) // a field left out keeps the user's value
+			if err := now.check(); err != nil {
 				return nil, err
 			}
-			was := &appsArg{Happ: u.GetApps().GetHapp(), Amnezia: u.GetApps().GetAmnezia()}
-			change("apps", was.text()+" -> "+a.Apps.text(), was.code(), a.Apps.code())
+			// The Mistgate app has a fact of its own (the three words of "apps" would otherwise double): named alone, it is the only one.
+			if a.Apps.Happ != nil || a.Apps.Amnezia != nil || a.Apps.Telegram != nil || a.Apps.Mistgate == nil {
+				change("apps", was.text()+" -> "+now.text(), was.code(), now.code())
+			}
+			if a.Apps.Mistgate != nil {
+				change("app_mistgate", onOff(was.Mistgate)+" -> "+onOff(now.Mistgate), onOff(was.Mistgate), onOff(now.Mistgate))
+			}
+			a.Apps = now.explicit()
 			n++
 		}
 		if a.Nodes != nil {
@@ -690,25 +996,103 @@ var userUpdate = changeSpec[userUpdateArgs]{
 			add("dns_preset", clean(u.GetDnsPresetId(), 80)+" -> "+clean(*a.DNSPresetID, 80), false)
 			n++
 		}
+		if a.PagePassword != nil {
+			if _, err := pagePasswordAction(*a.PagePassword); err != nil {
+				return nil, err
+			}
+			switch word := *a.PagePassword; {
+			case word == "change" && u.GetPageOpen():
+				return nil, errors.New("the person's page has no password now (it was removed): use page_password restore to ask for one again")
+			case word == "remove" && u.GetPageOpen(), word == "restore" && !u.GetPageOpen():
+				return nil, errors.New("nothing to change: the page password is already " + map[string]string{"remove": "removed", "restore": "asked for"}[word])
+			}
+			// The password is computed from the link and a number, so the plan has none to show; the owner copies a new one in the admin panel.
+			switch *a.PagePassword {
+			case "change":
+				facts = append(facts, codedFact("page_password", "change", "page_password_change"))
+			case "remove":
+				facts = append(facts, codedFact("page_password", "remove", "page_password_remove"))
+			default:
+				facts = append(facts, codedFact("page_password", "restore", "page_password_restore"))
+			}
+			n++
+		}
 		if n == 0 {
 			return nil, errors.New("nothing to change: give at least one field")
 		}
-		return &planned{Summary: "Change " + plural(n, "setting", "settings") + " of one user.", Facts: facts}, nil
+		danger, budgetFacts, err := c.userChangeBudget(1)
+		if err != nil {
+			return nil, err
+		}
+		facts = append(facts, budgetFacts...)
+		return &planned{Summary: "Change " + plural(n, "setting", "settings") + " of one user.", Facts: facts, Danger: danger, Params: a}, nil
 	},
 	apply: func(c *call, a userUpdateArgs, _ Plan) (done, error) {
 		req := &adminv1.UpdateUserRequest{
-			UserId: a.UserID, Name: a.Name, SubscriptionName: a.SubscriptionName, GroupId: a.GroupID, QuotaBytes: a.QuotaBytes, ExpiresUnix: a.ExpiresUnix,
+			UserId: a.UserID, Name: a.Name, SubscriptionName: a.SubscriptionName, GroupId: a.GroupID, AddGroupIds: a.AddGroupIDs, RemoveGroupIds: a.RemoveGroupIDs, QuotaBytes: a.QuotaBytes, ExpiresUnix: a.ExpiresUnix,
 			DeviceLimit: a.DeviceLimit, Apps: a.Apps.proto(), Nodes: a.Nodes.proto(), SpeedLimitBps: a.SpeedLimitBps, DeviceSpeedLimitBps: a.DeviceSpeedLimitBps, DnsPresetId: a.DNSPresetID,
 		}
 		if a.QuotaReset != nil {
 			q, _ := quotaReset(*a.QuotaReset)
 			req.QuotaReset = &q
 		}
+		if a.PagePassword != nil {
+			req.PagePasswordAction, _ = pagePasswordAction(*a.PagePassword)
+		}
 		if _, err := c.cl.User.UpdateUser(c.ctx, connect.NewRequest(req)); err != nil {
+			if connect.CodeOf(err) == connect.CodeAborted { // the panel refuses a write over a person who changed after the read (stale_user)
+				return done{}, failure("changed_since_plan", "the user changed after the plan; make a new plan")
+			}
 			return done{}, apiError(err)
 		}
 		return doneWith("user_updated", "User updated."), nil
 	},
+}
+
+// accessImpactFacts words what a change of a person's groups does to their access, by name: the profiles and the nodes they
+// gain and lose (profiles_gained, nodes_gained, profiles_lost, nodes_lost). Nothing for no impact.
+func (c *call) accessImpactFacts(imp *adminv1.AccessImpact) ([]Fact, error) {
+	if imp == nil {
+		return nil, nil
+	}
+	nodeNames := map[string]string{}
+	if len(imp.GetGainedNodeIds())+len(imp.GetLostNodeIds()) > 0 {
+		nodes, err := c.listNodes()
+		if err != nil {
+			return nil, err
+		}
+		for _, n := range nodes {
+			nodeNames[n.GetId()] = n.GetName()
+		}
+	}
+	var facts []Fact
+	profiles := func(ps []*adminv1.ImpactProfile) string {
+		var out []string
+		for _, p := range ps {
+			out = append(out, nm(p.GetName()))
+		}
+		return strings.Join(out, ", ")
+	}
+	nodes := func(ids []string) string {
+		var out []string
+		for _, id := range ids {
+			out = append(out, nm(valueOrDefault(nodeNames[id], id)))
+		}
+		return strings.Join(out, ", ")
+	}
+	if v := profiles(imp.GetGained()); v != "" {
+		facts = append(facts, Fact{Key: "profiles_gained", Value: v, Untrusted: true})
+	}
+	if v := nodes(imp.GetGainedNodeIds()); v != "" {
+		facts = append(facts, Fact{Key: "nodes_gained", Value: v, Untrusted: true})
+	}
+	if v := profiles(imp.GetLost()); v != "" {
+		facts = append(facts, Fact{Key: "profiles_lost", Value: v, Untrusted: true})
+	}
+	if v := nodes(imp.GetLostNodeIds()); v != "" {
+		facts = append(facts, Fact{Key: "nodes_lost", Value: v, Untrusted: true})
+	}
+	return facts, nil
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -725,34 +1109,40 @@ func usersPlan(enable bool) func(c *call, a usersArgs) (*planned, error) {
 		if err != nil {
 			return nil, err
 		}
-		var names []string
+		var facts []Fact
+		changes := 0 // the people a disable really disables: what the panel will count
 		for _, id := range ids {
 			r, err := c.getUser(id)
 			if err != nil {
 				return nil, err
 			}
-			if len(names) < 10 {
-				names = append(names, nm(r.GetUser().GetName()))
+			if r.GetUser().GetStatus() != adminv1.UserStatus_USER_STATUS_DISABLED {
+				changes++
 			}
+			facts = append(facts, Fact{Key: "users", Value: nm(r.GetUser().GetName()), Untrusted: true})
 		}
 		verb, effect, code := "Disable", "their connections end and their devices are dropped from the nodes", "disable"
+		// Enabling gives access back: it is not counted against the token's hourly limit and never waits for the owner
+		// because of how many people it names. Disabling is counted, and more than MaxUnattendedBulk at once waits.
 		var danger []string
+		var budgetFacts []Fact
 		if enable {
 			verb, effect, code = "Enable", "they can connect again", "enable"
-		} else if len(ids) > MaxUnattendedBulk {
-			danger = []string{dangerBulk}
-		}
-		list := strings.Join(names, ", ")
-		if len(ids) > len(names) {
-			list += fmt.Sprintf(" and %d more", len(ids)-len(names))
+		} else {
+			var err error
+			if danger, budgetFacts, err = c.userChangeBudget(changes); err != nil {
+				return nil, err
+			}
+			if len(ids) > MaxUnattendedBulk {
+				danger = mergeDanger(danger, dangerBulk)
+			}
 		}
 		return &planned{
 			Summary: verb + " " + plural(len(ids), "user", "users") + ": " + effect + ".",
-			Facts: []Fact{
+			Facts: append([]Fact{
 				{Key: "count", Value: strconv.Itoa(len(ids))},
-				{Key: "users", Value: list, Untrusted: true},
 				codedFact("effect", effect, code),
-			},
+			}, append(facts, budgetFacts...)...),
 			Danger: danger, Params: usersArgs{UserIDs: ids},
 		}, nil
 	}
@@ -775,7 +1165,7 @@ func usersApply(enable bool) func(c *call, a usersArgs, _ Plan) (done, error) {
 var userDisable = changeSpec[usersArgs]{
 	name: "user_disable", min: ProfileOperator, danger: true,
 	procs: procs(adminv1connect.UserServiceGetUserProcedure, adminv1connect.UserServiceSetUsersEnabledProcedure),
-	desc:  fmt.Sprintf("Disable up to 50 users: their connections end and their devices leave the nodes. More than %d users at once needs the owner's approval.", MaxUnattendedBulk),
+	desc:  fmt.Sprintf("Disable up to 50 users: their connections end and their devices leave the nodes. More than %d users at once needs the owner's approval. %s", MaxUnattendedBulk, tokenUserChangeDescription),
 	plan:  usersPlan(false), apply: usersApply(false),
 }
 
@@ -793,40 +1183,40 @@ var userResetTraffic = changeSpec[usersArgs]{
 	name: "user_reset_traffic", min: ProfileOperator, danger: true,
 	procs: procs(adminv1connect.UserServiceGetUserProcedure, adminv1connect.UserServiceResetUserTrafficProcedure),
 	desc: fmt.Sprintf("Zero the traffic counter of the current quota period for up to 50 users (a user that hit the quota is active again). "+
-		"History is kept; the counter cannot be restored. More than %d users at once needs the owner's approval.", MaxUnattendedBulk),
+		"History is kept; the counter cannot be restored. More than %d users at once needs the owner's approval. %s", MaxUnattendedBulk, tokenUserChangeDescription),
 	plan: func(c *call, a usersArgs) (*planned, error) {
 		ids, err := uniqueIDs("user_ids", a.UserIDs, false)
 		if err != nil {
 			return nil, err
 		}
-		var list []string
+		var facts []Fact
 		var used uint64
+		changes := 0 // the people whose counter or status the reset really changes: what the panel will count
 		for _, id := range ids {
 			r, err := c.getUser(id)
 			if err != nil {
 				return nil, err
 			}
 			used += r.GetUser().GetUsedBytes()
-			if len(list) < 10 {
-				list = append(list, nm(r.GetUser().GetName()))
+			if r.GetUser().GetUsedBytes() > 0 || r.GetUser().GetStatus() == adminv1.UserStatus_USER_STATUS_LIMITED {
+				changes++
 			}
+			facts = append(facts, Fact{Key: "users", Value: nm(r.GetUser().GetName()), Untrusted: true})
 		}
-		var danger []string
+		danger, budgetFacts, err := c.userChangeBudget(changes)
+		if err != nil {
+			return nil, err
+		}
 		if len(ids) > MaxUnattendedBulk {
-			danger = []string{dangerBulk}
-		}
-		names := strings.Join(list, ", ")
-		if len(ids) > len(list) {
-			names += fmt.Sprintf(" and %d more", len(ids)-len(list))
+			danger = mergeDanger(danger, dangerBulk)
 		}
 		return &planned{
 			Summary: "Reset the traffic counter of " + plural(len(ids), "user", "users") + " to zero.",
-			Facts: []Fact{
+			Facts: append([]Fact{
 				{Key: "count", Value: strconv.Itoa(len(ids))},
-				{Key: "users", Value: names, Untrusted: true},
 				codedFact("used", fmtBytes(used)+" in all", "bytes", "bytes", strconv.FormatUint(used, 10)),
 				codedFact("effect", "the used traffic of the current period becomes 0; a user stopped by the quota can connect again", "traffic_reset"),
-			},
+			}, append(facts, budgetFacts...)...),
 			Danger: danger, Params: usersArgs{UserIDs: ids},
 		}, nil
 	},
@@ -854,7 +1244,7 @@ var deviceRevoke = changeSpec[deviceRevokeArgs]{
 	name: "device_revoke", min: ProfileOperator,
 	procs: procs(adminv1connect.UserServiceGetUserProcedure, adminv1connect.UserServiceRevokeDeviceProcedure),
 	desc: "Revoke one device of a user: its credentials are dropped from every node and the device must be set up again. With block, its device ID is refused " +
-		"until the owner unblocks it in the admin panel (unblocking is not offered here); an app reporting another ID would be a new device.",
+		"until the owner unblocks it in the admin panel (unblocking is not offered here); an app reporting another ID would be a new device. " + tokenUserChangeDescription,
 	plan: func(c *call, a deviceRevokeArgs) (*planned, error) {
 		if err := validID("device_id", a.DeviceID); err != nil {
 			return nil, err
@@ -884,7 +1274,12 @@ var deviceRevoke = changeSpec[deviceRevokeArgs]{
 					facts = append(facts, Fact{Key: "fingerprint", Value: d.GetFingerprint()})
 				}
 			}
-			return &planned{Summary: summary, Facts: facts}, nil
+			danger, budgetFacts, err := c.userChangeBudget(1)
+			if err != nil {
+				return nil, err
+			}
+			facts = append(facts, budgetFacts...)
+			return &planned{Summary: summary, Facts: facts, Danger: danger}, nil
 		}
 		return nil, errors.New("this user has no such device")
 	},
@@ -954,6 +1349,49 @@ var alertMute = changeSpec[alertMuteArgs]{
 			return doneWith("alert_unmuted", "Alert unmuted."), nil
 		}
 		return doneWith("alert_muted", "Alert muted.", "seconds", strconv.FormatUint(uint64(a.DurationS), 10)), nil
+	},
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// alert_close
+
+type alertCloseArgs struct {
+	ReasonField
+	AlertID string `json:"alert_id"`
+}
+
+var alertClose = changeSpec[alertCloseArgs]{
+	name: "alert_close", min: ProfileOperator,
+	procs: procs(adminv1connect.HealthServiceListAlertsProcedure, adminv1connect.HealthServiceDismissAlertProcedure),
+	desc:  "Close an active alert. It is resolved now (\"dismissed\" in the history), sends no notification and stays closed while the same problem continues; it opens again only if the problem stops and returns, or gets worse.",
+	plan: func(c *call, a alertCloseArgs) (*planned, error) {
+		if err := validID("alert_id", a.AlertID); err != nil {
+			return nil, err
+		}
+		r, err := c.cl.Health.ListAlerts(c.ctx, connect.NewRequest(&adminv1.ListAlertsRequest{}))
+		if err != nil {
+			return nil, apiError(err)
+		}
+		for _, al := range r.Msg.GetActive() {
+			if al.GetId() != a.AlertID {
+				continue
+			}
+			kind, sev := enumName("ALERT_KIND_", al.GetKind().String()), enumName("ALERT_SEVERITY_", al.GetSeverity().String())
+			return &planned{
+				Summary: "Close one active alert: it stays closed while the problem continues.",
+				Facts: []Fact{
+					codedFact("alert", kind+", "+sev, "alert", "kind", kind, "severity", sev),
+					{Key: "node", Value: nm(al.GetNodeName()), Untrusted: true},
+				},
+			}, nil
+		}
+		return nil, errors.New("no such active alert")
+	},
+	apply: func(c *call, a alertCloseArgs, _ Plan) (done, error) {
+		if _, err := c.cl.Health.DismissAlert(c.ctx, connect.NewRequest(&adminv1.DismissAlertRequest{AlertId: a.AlertID})); err != nil {
+			return done{}, apiError(err)
+		}
+		return doneWith("alert_closed", "Alert closed."), nil
 	},
 }
 
@@ -1253,10 +1691,42 @@ var updateTimezone = changeSpec[updateTimezoneArgs]{
 	},
 }
 
+type updateDownloadTimeoutArgs struct {
+	ReasonField
+	TimeoutSeconds uint32 `json:"timeout_seconds" jsonschema:"maximum time for an agent update download, from 300 to 7200 seconds"`
+}
+
+var updateDownloadTimeout = changeSpec[updateDownloadTimeoutArgs]{
+	name: "update_download_timeout", min: ProfileAdmin, danger: true,
+	procs: procs(adminv1connect.UpdateServiceGetUpdatesProcedure, adminv1connect.UpdateServiceSetUpdateDownloadTimeoutProcedure),
+	desc:  "Set the maximum time an agent may spend downloading its signed update binary.",
+	plan: func(c *call, a updateDownloadTimeoutArgs) (*planned, error) {
+		if a.TimeoutSeconds < 300 || a.TimeoutSeconds > 7200 {
+			return nil, errors.New("timeout_seconds must be from 300 to 7200")
+		}
+		u, err := c.updates()
+		if err != nil {
+			return nil, err
+		}
+		return &planned{Summary: "Change the maximum agent update download time.", Facts: []Fact{
+			codedFact("from", "seconds", "seconds", "n", strconv.FormatUint(uint64(u.GetUpdateDownloadTimeoutSeconds()), 10)),
+			codedFact("to", "seconds", "seconds", "n", strconv.FormatUint(uint64(a.TimeoutSeconds), 10)),
+		}, Danger: []string{dangerStepUp}, Params: a}, nil
+	},
+	apply: func(c *call, a updateDownloadTimeoutArgs, _ Plan) (done, error) {
+		r, err := c.cl.Update.SetUpdateDownloadTimeout(c.ctx, connect.NewRequest(&adminv1.SetUpdateDownloadTimeoutRequest{TimeoutSeconds: a.TimeoutSeconds}))
+		if err != nil {
+			return done{}, apiError(err)
+		}
+		return doneWith("update_download_timeout_changed", "Agent update download timeout changed.", "timeout_seconds", strconv.FormatUint(uint64(r.Msg.GetTimeoutSeconds()), 10)), nil
+	},
+}
+
 type rolloutStartArgs struct {
 	ReasonField
-	// No batch size: one node is its own canary, and StartRollout's batch limit has nothing to split.
-	NodeIDs []string `json:"node_ids" jsonschema:"exactly one node id from updates_status to update now"`
+	// NodeIDs preserves the original input shape; Nodes is the preferred multi-node form.
+	NodeIDs []string `json:"node_ids,omitempty" jsonschema:"one to 20 node ids from updates_status to update now (legacy input)"`
+	Nodes   []string `json:"nodes,omitempty" jsonschema:"one to 20 node ids from updates_status to update now"`
 	// The bundle of the plan, pinned so the owner approves one exact release (set by the plan, not the agent).
 	ExpectedVersion string `json:"expected_version,omitempty" jsonschema:"-"`
 	ExpectedBuilt   int64  `json:"expected_built,omitempty" jsonschema:"-"`
@@ -1265,14 +1735,18 @@ type rolloutStartArgs struct {
 var rolloutStart = changeSpec[rolloutStartArgs]{
 	name: "rollout_start", min: ProfileAdmin, danger: true,
 	procs: procs(adminv1connect.UpdateServiceGetUpdatesProcedure, adminv1connect.UpdateServiceStartRolloutProcedure),
-	desc:  "Update one selected node now to the signed bundle. For a future time use node_update_schedule. Needs the owner's approval in the admin panel.",
+	desc:  "Update one to 20 selected nodes now to the signed bundle, in the panel's canary order. For a future time use node_update_schedule. Needs the owner's approval in the admin panel.",
 	plan: func(c *call, a rolloutStartArgs) (*planned, error) {
-		ids, err := uniqueIDs("node_ids", a.NodeIDs, true)
+		if a.NodeIDs != nil && a.Nodes != nil {
+			return nil, errors.New("provide either nodes or node_ids, not both")
+		}
+		requested, field := a.Nodes, "nodes"
+		if a.Nodes == nil {
+			requested, field = a.NodeIDs, "node_ids"
+		}
+		ids, err := nodeTargetIDs(field, requested)
 		if err != nil {
 			return nil, err
-		}
-		if len(ids) != 1 {
-			return nil, errors.New("node_ids must contain exactly one node; schedule or update nodes individually")
 		}
 		u, err := c.updates()
 		if err != nil {
@@ -1284,30 +1758,45 @@ var rolloutStart = changeSpec[rolloutStartArgs]{
 		if r := u.GetRollout(); r.GetStatus() == adminv1.RolloutStatus_ROLLOUT_STATUS_RUNNING || r.GetStatus() == adminv1.RolloutStatus_ROLLOUT_STATUS_PAUSED {
 			return nil, errors.New("a rollout is already active (running or paused): wait for it to finish or cancel it first")
 		}
-		var chosen *adminv1.NodeUpdate
+		chosen := make([]*adminv1.NodeUpdate, 0, len(ids))
 		for _, n := range u.GetNodes() {
-			if n.GetNodeId() == ids[0] {
-				chosen = n
-				break
+			if slices.Contains(ids, n.GetNodeId()) {
+				chosen = append(chosen, n)
 			}
 		}
-		if chosen == nil {
-			return nil, errors.New("node_id is not a node of this panel")
+		if len(chosen) != len(ids) {
+			return nil, errors.New("a node id is not a node of this panel")
 		}
-		if !chosen.GetSupportsUpdate() || chosen.GetBuilt() >= u.GetBundle().GetBuilt() ||
-			(chosen.GetState() != adminv1.NodeUpdateState_NODE_UPDATE_STATE_OUTDATED &&
-				chosen.GetState() != adminv1.NodeUpdateState_NODE_UPDATE_STATE_ROLLED_BACK &&
-				chosen.GetState() != adminv1.NodeUpdateState_NODE_UPDATE_STATE_FAILED) {
-			return nil, errors.New("the selected node has no supported online agent older than this bundle")
+		for _, n := range chosen {
+			if !n.GetSupportsUpdate() || n.GetBuilt() >= u.GetBundle().GetBuilt() ||
+				(n.GetState() != adminv1.NodeUpdateState_NODE_UPDATE_STATE_OUTDATED &&
+					n.GetState() != adminv1.NodeUpdateState_NODE_UPDATE_STATE_ROLLED_BACK &&
+					n.GetState() != adminv1.NodeUpdateState_NODE_UPDATE_STATE_FAILED) {
+				return nil, errors.New("a selected node has no supported online agent older than this bundle")
+			}
+		}
+		batchSize := panelupdate.SortRolloutCandidates(chosen)
+		orderedIDs := make([]string, 0, len(chosen))
+		facts := []Fact{{Key: "version", Value: clean(u.GetBundle().GetVersion(), 60)},
+			{Key: "batch_size", Value: strconv.Itoa(batchSize)},
+			codedFact("effect", "each node restarts its agent and passes the update health gate", "restart")}
+		for i, n := range chosen {
+			orderedIDs = append(orderedIDs, n.GetNodeId())
+			facts = append(facts,
+				Fact{Key: "canary_position", Value: strconv.Itoa(i + 1)},
+				Fact{Key: "node", Value: nm(n.GetName()), Untrusted: true},
+				Fact{Key: "agent_version", Value: clean(n.GetVersion(), 60)},
+				Fact{Key: "people_online", Value: strconv.FormatUint(uint64(n.GetOnlineUsers()), 10)},
+			)
+		}
+		danger := slices.Clone(rolloutDanger)
+		if len(ids) > 1 {
+			danger = mergeDanger(danger, dangerBulk)
 		}
 		return &planned{
-			Summary: "Update node " + nm(chosen.GetName()) + " to the signed agent bundle now. The owner has to approve it first.",
-			Facts: []Fact{
-				{Key: "version", Value: clean(u.GetBundle().GetVersion(), 60)},
-				{Key: "node", Value: nm(chosen.GetName()), Untrusted: true},
-				codedFact("effect", "the selected node restarts its agent and passes the update health gate", "restart"),
-			},
-			Danger: rolloutDanger, Params: rolloutStartArgs{NodeIDs: ids, ExpectedVersion: u.GetBundle().GetVersion(), ExpectedBuilt: u.GetBundle().GetBuilt()},
+			Summary: "Update " + plural(len(ids), "selected node", "selected nodes") + " to the signed agent bundle in the panel's canary order. The owner has to approve it first.",
+			Facts:   facts, Danger: danger,
+			Params: rolloutStartArgs{NodeIDs: orderedIDs, ExpectedVersion: u.GetBundle().GetVersion(), ExpectedBuilt: u.GetBundle().GetBuilt()},
 		}, nil
 	},
 	apply: func(c *call, a rolloutStartArgs, _ Plan) (done, error) {
@@ -1316,15 +1805,31 @@ var rolloutStart = changeSpec[rolloutStartArgs]{
 			return done{}, err
 		}
 		if r := u.GetRollout(); r.GetStatus() == adminv1.RolloutStatus_ROLLOUT_STATUS_RUNNING || r.GetStatus() == adminv1.RolloutStatus_ROLLOUT_STATUS_PAUSED {
-			return done{}, failure("changed_since_plan", "changed since the plan (a rollout is active now): make a new plan")
+			return done{}, retryLater("rollout_active", "an agent rollout is active now", retryLaterDelay)
 		}
 		if u.GetBundle().GetVersion() != a.ExpectedVersion || u.GetBundle().GetBuilt() != a.ExpectedBuilt {
 			return done{}, failure("changed_since_plan", "the release changed after planning; make a new plan")
+		}
+		current := make(map[string]*adminv1.NodeUpdate, len(u.GetNodes()))
+		for _, n := range u.GetNodes() {
+			current[n.GetNodeId()] = n
+		}
+		for _, id := range a.NodeIDs {
+			n := current[id]
+			if n == nil || !n.GetSupportsUpdate() || n.GetBuilt() >= a.ExpectedBuilt ||
+				(n.GetState() != adminv1.NodeUpdateState_NODE_UPDATE_STATE_OUTDATED &&
+					n.GetState() != adminv1.NodeUpdateState_NODE_UPDATE_STATE_ROLLED_BACK &&
+					n.GetState() != adminv1.NodeUpdateState_NODE_UPDATE_STATE_FAILED) {
+				return done{}, failure("changed_since_plan", "the selected node set changed after planning; make a new plan")
+			}
 		}
 		r, err := c.cl.Update.StartRollout(c.ctx, connect.NewRequest(&adminv1.StartRolloutRequest{
 			NodeIds: a.NodeIDs, ExpectedVersion: a.ExpectedVersion, ExpectedBuilt: a.ExpectedBuilt,
 		}))
 		if err != nil {
+			if retry := retryRolloutStart(err); retry != nil {
+				return done{}, retry
+			}
 			return done{}, apiError(err)
 		}
 		n := len(r.Msg.GetRollout().GetSteps())
@@ -1374,8 +1879,12 @@ func rolloutAction(name, verb, proc, desc string, fits func(adminv1.RolloutStatu
 					finished++
 				}
 			}
+			summary := "Ask to " + verb + " the running staged update. The owner has to approve it first."
+			if verb == "cancel" {
+				summary = "Cancel the running staged update. Any step already in progress finishes and is checked; steps that have not started are skipped. The owner has to approve it first."
+			}
 			return &planned{
-				Summary: "Ask to " + verb + " the running staged update. The owner has to approve it first.",
+				Summary: summary,
 				Facts: []Fact{
 					{Key: "rollout", Value: clean(r.GetId(), 60)},
 					{Key: "version", Value: clean(r.GetToVersion(), 60)},
@@ -1411,7 +1920,7 @@ var (
 			_, err := c.cl.Update.ResumeRollout(c.ctx, connect.NewRequest(&adminv1.ResumeRolloutRequest{RolloutId: id}))
 			return err
 		})
-	rolloutCancel = rolloutAction("rollout_cancel", "cancel", adminv1connect.UpdateServiceCancelRolloutProcedure, "Cancel the rollout: nodes not yet updated are skipped.",
+	rolloutCancel = rolloutAction("rollout_cancel", "cancel", adminv1connect.UpdateServiceCancelRolloutProcedure, "Cancel the rollout: a step already in progress finishes and is checked; steps that have not started are skipped.",
 		func(s adminv1.RolloutStatus) bool {
 			return s == adminv1.RolloutStatus_ROLLOUT_STATUS_RUNNING || s == adminv1.RolloutStatus_ROLLOUT_STATUS_PAUSED
 		},

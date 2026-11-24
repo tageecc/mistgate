@@ -3,13 +3,17 @@ title: Health
 description: How the panel checks every profile as a real client, what the node doctor looks at and can fix, and how alerts open, close and stay quiet.
 ---
 
+![The client-eye checks table: nodes against protocols with the delay through each tunnel, and a failing node opened to show why](../../images/readme/health-dark-en.webp)
+
 Mistgate watches the fleet from two sides. The panel connects to every profile on every node the way a client app does (client-eye checks), and the agent on every node checks its own host (the node doctor). Alerts are derived from both and from the state of the nodes. Everything is on the **Health** page, in the tabs **Alerts**, **Checks** and **Doctor**; the node page has its own **Doctor** tab and shows the checks of that node on its **Overview** tab.
+
+![Health: the folded alerts, the doctor's one-click fix and the check turning green](../../images/video/health-poster-en.webp)
 
 ## Client-eye checks
 
 ### How a check works
 
-For every profile on a node the panel opens a tunnel with a built-in client and, through that tunnel, requests two pages:
+For every profile on a node the panel opens a tunnel with a built-in client and, through that tunnel, requests two pages (an MTProto profile is the exception: see [MTProto](#mtproto)):
 
 | Request | What it proves |
 |---|---|
@@ -28,7 +32,9 @@ The client depends on the protocol:
 
 - **Hysteria2.** The official Hysteria2 client, running inside the panel. It dials the node's address and the profile's own port (not the port-hopping range, so a blocked hop range is not seen). It uses the profile's obfuscation (Salamander or Gecko) and the certificate rules of a real client: a self-signed certificate is pinned to the fingerprint the node reported, any other is checked against the profile's **Domain (SNI)**.
 - **AmneziaWG.** amneziawg-go inside the panel process on a user-space network stack: no network interface, no root, nothing added to the panel server's routes. It uses the same configuration a real device gets. Every round is a fresh device, so every round also tests the handshake. A node does not answer an unknown peer or a packet with the wrong obfuscation, so a missing handshake and a blocked UDP port look the same: both are reported as a timeout.
-- **VLESS.** Each attempt runs xray-core in a short-lived helper process and uses the same resolved client parameters as the subscription link. REALITY checks server authentication; TLS verifies the certificate chain for the profile's server name. A profile with a CDN override is dialed at the CDN host and port, using that host for SNI and HTTP Host; without a CDN, the check dials the node address and inbound port. TLS verification stays enabled for the CDN certificate, so a self-signed origin certificate behind the CDN is not presented to the panel. The check covers REALITY over TCP Vision or XHTTP, and TLS over XHTTP or WebSocket. A failed CDN path is reported as a `via_cdn` check failure with the CDN host; CDN inbounds do not count toward the node's critical all-checks-failed alert. Fleet keeps the inbound pending until the connected node reports its required capability: `vless/1` or `vless-self/1` for REALITY, and `vless-tls/1` for TLS. No client-eye check runs while the inbound is pending.
+- **VLESS.** Each attempt runs xray-core in a short-lived helper process and uses the same resolved client parameters as the subscription link. REALITY checks server authentication; TLS verifies the certificate chain for the profile's server name. A profile with a CDN override is dialed at the CDN host and port, using that host for SNI and HTTP Host; without a CDN, the check dials the node address and inbound port. TLS verification stays enabled for the CDN certificate, so a self-signed origin certificate behind the CDN is not presented to the panel. The check covers REALITY over TCP Vision or XHTTP, and TLS over XHTTP or WebSocket. A failed CDN path is reported as a `via_cdn` check failure with the CDN host; CDN inbounds do not count toward the node's critical all-checks-failed alert. Fleet keeps the inbound pending until the connected node reports its required capability: `vless/1`, `vless-self/1` (the node's own site) or `vless-target/1` (a site chosen on the node) for REALITY, and `vless-tls/1` for TLS. No client-eye check runs while the inbound is pending.
+
+- **MTProto.** A Fake TLS client of the panel's own, which asks Telegram instead of the two pages. See [MTProto](#mtproto).
 
 A protocol without a test client is shown as **not checked**.
 
@@ -93,6 +99,24 @@ All three numbers are measured on the panel's server, not on a person's device.
 
 Hover a cell, or move to it with Tab, to see the response and connect medians of the hour, the last round with its time, response and connect, and the passed and failed rounds of the last 24 hours. On the node page, the rows of **Client-eye checks** show the same.
 
+### MTProto
+
+A Telegram proxy is not a general tunnel, so its check asks Telegram instead of the two pages above. Each attempt, with the profile's hidden check key:
+
+1. connects over TCP to the profile's port on the node;
+2. completes the Fake TLS handshake with the profile's name, as Telegram does, and checks the node's answer;
+3. opens the obfuscated2 stream to Telegram's data centre 2 through the proxy, sends a first request (`req_pq_multi`) and checks that a valid `resPQ` answer comes back.
+
+It proves that the node accepts a client with a valid key, reaches Telegram, and that Telegram answers through the proxy. The cell shows the time of the whole attempt; there is no exit IP. It does not prove that a network inside a country that blocks MTProto lets the traffic through. The failures use the same codes:
+
+| Code | What it means for MTProto |
+|---|---|
+| `refused` | The TCP connection failed: nothing listens on the port, or a firewall is in the way |
+| `timeout` | A step did not answer in time: the connection, the Fake TLS handshake or Telegram's data centre |
+| `auth` | The node did not accept the check key and answered with its fallback site: the profile was just changed and the node has not applied it, or the node's clock is off |
+| `tls` | The answer to the Fake TLS hello was not a valid ServerHello |
+| `exit_unreachable` | The proxy accepted the client, but Telegram's data centre did not answer: the node cannot reach Telegram's addresses (a hoster filter, a route) |
+
 ### When the panel's server loses UDP
 
 Some hosters drop bursts of UDP. A Hysteria2 or AmneziaWG check from the panel's server then pays for every lost packet with a retry timer: a second or more for QUIC and for TCP inside an AmneziaWG tunnel, 5 s for a WireGuard handshake. When these checks take a second or more longer than VLESS to the same nodes, the panel's network is the cause, not the nodes.
@@ -115,9 +139,11 @@ A green cell means that, within the last few minutes, a client from the panel's 
 
 Whether the nodes open from inside a country (Russia by default) is checked by Globalping, the block lists, the TSPU probe, cheburcheck and bsbord, and has a section of its own in the admin, **Reachability**: see [Reachability](reachability.md). Here, **Health → Checks** shows the verdict as its last column, *From Russia*, and the node page as a row.
 
+![Two points of view on a node](../diagrams/two-views.svg)
+
 ## Node doctor
 
-Every node agent runs 17 checks of its own host. They only read: files under `/proc` and `/sys`, a few configuration files and read-only commands (`systemctl list-*`, `nft list`, `timedatectl show`, `dmesg`, `journalctl -k`). Changing anything is a separate, confirmed step (see "Fixes" below).
+Every node agent runs 23 checks of its own host. They only read: files under `/proc` and `/sys`, a few configuration files and read-only commands (`systemctl list-*`, `nft list`, `timedatectl show`, `dmesg`, `journalctl -k`). Changing anything is a separate, confirmed step (see "Fixes" below).
 
 ### When it runs
 
@@ -137,19 +163,25 @@ Each item has one of four states: **OK**, **Attention** (a warning), **Problem**
 | System journal size (`journald_size`) | Size of the systemd journal on disk. The baseline caps it at 200 MB. | Over 300 MB (the cap does not work) | Over 1 GB | Trim the journal |
 | Hung processes (`dstate_tasks`) | Processes stuck in uninterruptible sleep in three samples 2 s apart, QXL/TTM errors in the kernel log, and a load equal to the CPU count while the CPU idles for 10 minutes. | A stuck process | Stuck at two runs in a row, a QXL/TTM hang, or the idle-load pattern | None: reboot the server from the hoster's panel |
 | Clock (`time_sync`) | Offset against the panel's clock and whether NTP is synchronised. | More than 2 s off, or NTP not synchronised | More than 30 s off | None: turn NTP on (`timedatectl set-ntp true`) |
-| Server resolver (`resolver`) | Whether the host's own resolver answers for `www.cloudflare.com`, `www.gstatic.com` and `www.google.com`, plus `gosuslugi.ru` on nodes whose country is Russia. 3 s per name, one retry. | One name fails, or the median answer takes over 500 ms | Two or more names fail, or `gosuslugi.ru` fails on a node in Russia | Fix the resolver, only when the recommended resolvers answered in the same run |
+| Server resolver (`resolver`) | Whether the host's own resolver answers for `www.cloudflare.com`, `www.gstatic.com` and `www.google.com`, plus `gosuslugi.ru` on nodes in Russia or `www.baidu.com` on nodes in China. 3 s per name, one retry. | One name fails, or the median answer takes over 500 ms | Two or more names fail, or the country-specific domain fails | Fix the resolver, only when the recommended resolvers answered in the same run |
 | IPv6 (`ipv6`) | A global IPv6 address, and an outbound IPv6 connection to two public resolvers on port 443. | An IPv6 address that cannot connect out (clients that get AAAA answers stall) | None | None |
 | Leftovers of other VPNs (`foreign_vpn`) | systemd units of x-ui, Xray, remnanode, hysteria-server and `wg-quick@`, Docker containers of VPN images, `wg*` and `awg*` interfaces that are not Mistgate's, running `xray`, `x-ui` and `sing-box` processes. | Any of them found | One of them holds a port of a profile | None: removing them is your decision |
 | Foreign firewall rules (`foreign_nft`) | nftables tables that are not Mistgate's. Legacy iptables rules are not visible to this check. | A foreign table has a nat hook | A foreign rule redirects, rewrites or drops a port or hop range of a profile | None |
 | Ports in use (`port_conflicts`) | Listening sockets on the profiles' ports, their hop ranges and the TCP port of the HTTPS decoy and ACME of a Hysteria2 profile. | A foreign listener inside a hop range, a foreign process on the TCP port, or a profile that failed to bind while the port is free now | A foreign process holds a profile's port | Restart profile, only for the profile that failed to bind |
-| Base network settings (`net_baseline`) | `fq` as the default qdisc, BBR congestion control, UDP buffer maxima (`net.core.rmem_max` and `net.core.wmem_max`) of at least 16 MiB, Mistgate's sysctl file and its journald drop-in. New UDP relay sockets inherit at least 1 MiB from `net.core.rmem_default` and `net.core.wmem_default`; `net.ipv4.udp_mem` still caps total UDP memory. The conntrack table has at least 65,536 entries and 16,384 buckets, preserving higher live values. | Something differs, or the conntrack table is at least 80% full | None | Restore baseline settings when they differ |
+| Base network settings (`net_baseline`) | `fq` as the default qdisc, BBR congestion control, UDP buffer maxima (`net.core.rmem_max` and `net.core.wmem_max`) of at least 16 MiB, Mistgate's sysctl file and its journald drop-in. New UDP relay sockets inherit at least 1 MiB from `net.core.rmem_default` and `net.core.wmem_default`; `net.ipv4.udp_mem` still caps total UDP memory. The conntrack table has at least 65,536 entries and 16,384 buckets, preserving higher live values. | Something differs (a full conntrack table is `conntrack_fill`'s) | None | Restore baseline settings when they differ |
 | Certificates (`cert_expiry`) | The certificate each TLS profile actually serves, whether it matches the domain, and the agent's own certificate for the panel connection. | A profile certificate has less than 14 days; the agent certificate less than 5 days | Less than 3 days, expired or not matching the domain; the agent certificate less than 1 day | Restart profile, for a self-signed certificate only |
 | Memory (`memory_pressure`) | Available memory, swap, memory pressure (PSI) and OOM kills in the kernel log of the last 24 hours. | Less than 12% available, swap over 50% under pressure, or an OOM kill | Less than 5% available, heavy pressure, or the OOM killer hit the agent or a VPN engine | None |
 | CPU softirq (`cpu_softirq`) | Mean softirq share and total CPU over 10 minutes. Skipped until 30 samples are collected. | Softirq 50% or more | Softirq 90% or more, or CPU 97% or more | None |
+| CPU steal (`cpu_steal`) | Mean share of CPU time the hypervisor gave to other virtual machines on the same host, over the same 10 minutes. Skipped until 30 samples are collected. | 10% or more | 25% or more | None: ask the provider to move the server, or move the node |
+| Connection tracking (`conntrack_fill`) | Entries of the kernel's connection-tracking table against `nf_conntrack_max`, and the drops when the kernel counts them. A full table drops every new connection. Skipped where conntrack is not loaded. | 80% full | 95% full | None: raise `net.netfilter.nf_conntrack_max`, or move people |
+| Agent's open files (`agent_fds`) | The agent's open file descriptors (every connection is one) against its soft limit; the service allows 65,536. | 80% of the limit | 95% of the limit | None: run the agent as the service, or move people |
+| REALITY target (`reality_target`) | Every enabled VLESS REALITY profile that shows another site: the target answers, speaks TLS 1.3 and chooses the post-quantum key exchange `X25519MLKEM768` (new clients offer it and the handshake with a target that lacks it breaks), and its certificate is issued for the name, trusted and valid. A failed handshake is retried once. Skipped when no profile shows another site. | The certificate is not for the name, is not trusted, has expired or has less than 7 days left | The target does not answer, does not speak TLS 1.3, or lacks `X25519MLKEM768` | None: pick another target in the profile |
 | Kernel headers (`kernel_headers`) | Headers, `dkms`, `make` and `gcc` for the AmneziaWG kernel module. Skipped without an AmneziaWG profile; only a fact while AmneziaWG runs in userspace. | Kernel mode is requested and the module does not run while tools are missing | None | None: see [AmneziaWG](../guide/amneziawg.md) |
-| AmneziaWG backend (`awg_backend`) | Which backend runs AmneziaWG: the kernel module or userspace. Skipped without an AmneziaWG profile. | The host firewall drops forwarded traffic (often Docker) | No working backend: no `/dev/net/tun`, an outdated service file, or no module in kernel mode | Refresh the service when `unit_outdated` is reported and the agent offers the fix |
+| AmneziaWG backend (`awg_backend`) | Which backend runs AmneziaWG: the kernel module or userspace. Skipped without an AmneziaWG profile. | The host firewall drops forwarded traffic (often Docker); kernel mode runs on the userspace fallback because the module does not load | No working backend: no `/dev/net/tun`, an outdated service file, or no module in kernel mode | Refresh the service when `unit_outdated` is reported and the agent offers the fix; Switch back to the module on the fallback |
 | WARP exit (`warp_path`) | The node's WARP tunnel and its routes. Skipped when the node has no WARP account and no profile exits through WARP. | WARP is paused while profiles exit through it, or the tunnel is up but its latest check failed | Profiles exit through WARP but the node has no account, the host clashes with WARP's routing table, rule priority or interface name, no WireGuard backend, or WARP is down | Check WARP / reconnect if down, when the tunnel is down or its latest check failed |
 | Unit generation (`unit_generation`) | Whether the systemd unit running the agent matches this build. Skipped when the agent was started by hand. | The unit is older than this build | None | Refresh the service; the agent restarts and connections can drop for a few seconds |
+| Security updates (`security_updates`) | On Debian and Ubuntu, checks whether unattended-upgrades is installed, whether the effective APT::Periodic settings enable package-list updates and unattended upgrades, and whether both apt-daily timers are enabled and running. It only reads; it never runs an upgrade. On Debian, the package's default origin pattern can include stable point releases too. | The package is missing or a setting/timer is off | None | Turn on security updates, with owner confirmation (offered when the agent runs as root under systemd; otherwise the Doctor shows a manual command) |
+| nftables (`nftables`) | Whether the `nft` command is installed. A cloud image of Debian 13 ships without the nftables package, and then the SSH guard, port hopping, the WARP masquerade and the UDP delivery check cannot work: the node runs, but half of it does not. The agent also says so once, as the node event `nft_missing`, instead of one log line at every sweep, and `nft_restored` when it works again. | `nft` is missing, or the last install failed | None | Install nftables, with owner confirmation (offered when the agent runs as root under systemd on Debian or Ubuntu; otherwise the Doctor shows the manual command `apt-get install -y nftables`) |
 
 A node without IPv6 that runs WARP is fine: WARP uses its IPv4 endpoint, and the admin shows the IPv6 item as OK.
 
@@ -157,17 +189,26 @@ A warning or problem opens an alert (see "Kinds of alerts" below). The certifica
 
 ### Fixes
 
-There are exactly seven fixes. They are compiled into the agent: the panel sends only the fix id, and the agent checks the parameters (a profile must be one the node runs). None of them installs packages or deletes data.
+There are exactly ten fixes. They are compiled into the agent: the panel sends only the fix id, and the agent checks the parameters (a profile must be one the node runs). `enable_security_updates` and `install_nftables` are the only fixes that can install a package, and both require owner confirmation. No fix deletes data.
 
 | Button | What it does | Offered by |
 |---|---|---|
 | Trim the journal | `journalctl --vacuum-size=200M --vacuum-time=7d` | System journal size, Disk space |
 | Restore the base settings | Writes Mistgate's sysctl file (`/etc/sysctl.d/90-mistgate.conf`: fq, BBR and UDP buffer maxima of at least 16 MiB) and journald drop-in (`/etc/systemd/journald.conf.d/90-mistgate.conf`: the 200 MB cap) again, and the SSH guard (a per-address rate limit on new SSH connections). | Base network settings |
 | Restart profile | Restarts one profile on the node, or every profile that failed to start. Connections through it drop for a couple of seconds and come back by themselves. | Ports in use, Certificates (self-signed) |
-| Fix the resolver | Points the host resolver at the node's **DNS resolvers for this node** (the node's **Exit** tab) or, when that is the server's own resolver, at the default for the node's country: Yandex DNS (`77.88.8.8`, `77.88.8.1`) on nodes in Russia, `1.1.1.1` and `8.8.8.8` elsewhere. With systemd-resolved it writes a drop-in (`/etc/systemd/resolved.conf.d/90-mistgate.conf`); otherwise it rewrites `/etc/resolv.conf` and keeps the original as `/etc/resolv.conf.mistgate.bak`. | Server resolver |
+| Fix the resolver | Points the host resolver at the node's **DNS resolvers for this node** (the node's **Exit** tab) or, when that is the server's own resolver, at the default for the node's country: Yandex DNS (`77.88.8.8`, `77.88.8.1`) in Russia, AliDNS and DNSPod (`223.5.5.5`, `119.29.29.29`) in China, and `1.1.1.1` and `8.8.8.8` elsewhere. With systemd-resolved it writes a drop-in (`/etc/systemd/resolved.conf.d/90-mistgate.conf`); otherwise it rewrites `/etc/resolv.conf` and keeps the original as `/etc/resolv.conf.mistgate.bak`. | Server resolver |
 | Check WARP / reconnect if down | Runs the WARP checks again at once. Only when the tunnel is down, or this check takes it to its failure threshold, it rebuilds the configured tunnel and its routes with the same account; otherwise nothing changes. During a reconnect, profiles using WARP may briefly lose traffic. If the tunnel recovered before Apply, nothing is changed. | WARP exit |
 | Refresh the service | Runs the installed binary from a fixed transient systemd unit to write its compiled unit template, reload systemd and restart the agent. The node identity and state stay in place; connections can drop for a few seconds. | Unit generation; AmneziaWG backend when it reports `unit_outdated` |
 | Allow Mistgate forwarding | Adds tagged accepts at the start of each host `FORWARD` chain with policy `DROP`. They match only traffic that enters through a `mgawg*` tunnel (new connections from clients, except towards container bridges `docker*` and `br-*`), what leaves through `mgawg*` as part of a connection the client began (never a new connection towards a client; WARP-routed client traffic is covered the same way), and the DNAT flows to current Mistgate relay targets, both directions. Other traffic stays under the host firewall. The agent reasserts the rules during its sweep after firewall reloads and removes them on node retirement. | AmneziaWG backend when forwarded traffic is dropped |
+| Turn on security updates | Runs the compiled `host enable-security-updates` helper in a separate transient root systemd unit. It installs unattended-upgrades from the node's existing apt sources if missing, writes only disabled APT::Periodic settings to `/etc/apt/apt.conf.d/99mistgate-security-updates`, and unmasks, enables and starts the apt-daily timers on their usual schedule (a daily run missed while they were off does not start at once). It never runs `apt-get upgrade` or `unattended-upgrade`, reboots, changes `Automatic-Reboot` or edits `50unattended-upgrades`. It can take up to 20 minutes while another apt process holds the lock. | Security updates |
+| Install nftables | Runs the compiled `host install-nftables` helper in a separate transient root systemd unit (`mistgate-install-nftables`). It waits for another package manager to finish (up to 20 minutes), runs `apt-get install nftables` (once more after `apt-get update` if the first try fails) and installs nothing else. The agent is not restarted: it finds `nft` by itself at its next sweep, within a minute, and sets up the SSH guard, port hopping and WARP routing. If it fails, the check shows why and offers the fix again. | nftables |
+| Switch back to the module | Asks the node again whether the AmneziaWG module for the running kernel is loaded. If it is, the AmneziaWG profiles are rebuilt on the module and connected devices pause for up to about 20 seconds; if it is not, nothing changes and the node says to build it first. It builds and installs nothing. | AmneziaWG backend, on the userspace fallback |
+
+To undo this fix by hand, remove `/etc/apt/apt.conf.d/99mistgate-security-updates`. For each timer that was disabled before the fix, run `systemctl disable --now <timer>` (`apt-daily.timer` or `apt-daily-upgrade.timer`). If this fix installed unattended-upgrades, remove it with `apt-get remove unattended-upgrades`. The task's journal (`journalctl -u mistgate-security-updates`) records what it did.
+
+The job runs on after Apply: the re-check shows **Turning automatic security updates on…** while it works, and the result comes with the next scheduled doctor run (within 10 minutes) or with **Run again**. If the job fails, the item says why and offers the fix again.
+
+An `apt-get install` that has started is never stopped by the job's 20-minute limit; only the unit's own limit of 30 minutes or a reboot can stop it in the middle. If that happens, apt reports "dpkg was interrupted": run `dpkg --configure -a` as root, then **Run again**.
 
 A fix always takes two steps:
 
@@ -213,21 +254,27 @@ An alert that fires again within an hour of closing reopens with its original id
 
 | Title in the admin | Kind | Severity | Opens when |
 |---|---|---|---|
-| Node is unreachable | `node_down` | Critical | The agent has had no connection for 10 minutes. A shorter outage is an event, not an alert. |
-| Host blip | `host_blip` | Info | History only: written when the link came back within 10 minutes without a reboot. It is never active. |
+| Node is unreachable | `node_down` | Critical | The agent has had no connection for 10 minutes. A shorter outage is an event, not an alert. The alert and the `node_down` event carry `traffic_24h_bytes` and `traffic_7d_bytes`, the node's traffic over the last 24 hours and 7 days as it was when the node went silent (the `country_blocked` alert carries the same two numbers from the moment it opened). The Cloudflare edition leaves them out. |
+| Host blip | `host_blip` | Info | History only: written when the link came back within 10 minutes without a reboot. It is never active. If the panel itself heard no node at all for longer than about 35 seconds (its own network dropped, or its server froze), the nodes that come back after that are not blamed: no record and no blip count per node, one `panel_link_gap` event is written instead. |
 | The panel lost contact with most nodes | `node_down` (fleet-wide) | Critical | At once, at least 80% of active nodes at three or more values of **Hoster** have had no connection for 10 minutes. That points at the panel's own connection: the per-node "Node is unreachable" alerts are held, and one alert stands for all. |
 | The node keeps dropping | `host_blip` (flapping) | Warning | In the last hour the agent's link dropped briefly, or the agent restarted soon after its previous start, three times or more. Each break is shorter than a "Node is unreachable", but connections on the node drop every time. |
 | "<profile>" did not start on the node | `check_failed` | Warning; Critical when it is the node's only profile of that protocol | The node reported that the profile failed to start, so it serves no one (and is left out of subscriptions). The reason is on the node page. A profile with the WARP exit is left to the WARP alert while WARP is down. |
 | Alive, but no traffic | `no_traffic` | Critical | The agent is connected and the profiles run, but every checked profile of the node failed two rounds in a row. The node's status turns to "no traffic". |
 | "<profile>" fails the client-eye check | `check_failed` | Warning; Critical when it is the node's only profile of that protocol | Some, not all, profiles of an online node failed two rounds in a row. |
-| UDP packet loss on a profile port | `port_lossy` | Warning | The latest check finds loss on the current port of an enabled inbound. Closes after a clean re-check, or when the inbound changes port, is disabled or removed, or the node is retired. |
-| A node is unreachable from the country | `country_blocked` | Warning | The [country check](reachability.md) saw `blocked` or `tcp_blocked` twice in a row: two measurements (a Globalping round, a run of the [TSPU probe](reachability.md#tspu-probe), a [cheburcheck](reachability.md#cheburcheck) or [bsbord](reachability.md#bsbord) row) that say so themselves and still do when combined with the fresh rows of the other sources. Only Globalping, public cheburcheck and the TSPU probe, which look across the whole country, can open it; your own cheburcheck probe and bsbord see part of it and raise only the partial alert. Closes after two measurements with `ok` or `partial`; `unknown` rows change nothing. The same kind with the subject `partial` (*unreachable from some networks*, warning) opens when one network, unit or probe was dark for the node in its two newest observations while it reached another of your nodes, and closes when it reaches this one again; a full block supersedes it ([details](reachability.md#the-alert)). Muting works as for any other alert. |
+| UDP packet loss on a profile port | `port_lossy` | Warning | The latest check finds loss on the current port of an enabled inbound, from both senders when a second one confirmed it (see [Ports](../guide/nodes.md#ports)). Closes after a clean re-check, or when the inbound changes port, is disabled or removed, or the node is retired. Suppressed when the panel's protocol probe for that inbound passed after the UDP check or at most 15 minutes before it. |
+| UDP from <node> to <target> loses packets | `path_lossy` | Warning | On the sender: a port check of another node lost packets from this node, while a second sender on the other side (CIS or not) got them through. The loss is on the way out of this node, not on the target. Names the target, the ports, both senders and their regions. It stays 30 hours from that check, or until a later check of the target clears it. When the lost ports got nothing at all and other ports arrived whole, it is worded as a filter on the way (often the target hoster's DDoS protection, which admits only UDP 443 from data centres): the target is fine, but port checks from this node cannot pass. |
+| The node agent keeps crashing | `agent_crash_loop` | Warning | The agent restarted after an unclean end (killed, crashed, out of memory) three or more times in 30 minutes. The `agent_started` events carry `prev_exit`, `crash`, `crash_loop` and, when systemd or the journal say so, `exit_code`, `exit_signal`, `exit_result`, `oom` and `systemd_restarts`. Restarts after a host boot or an update do not count. It closes by itself when fewer than three crash restarts are left in the window. |
+| Scheduled check found a problem | `scheduled_check` | Warning | A run of one of the owner's [scheduled tasks](../guide/assistant.md#scheduled-tasks) found a problem: a condition of a check held, or the assistant's verdict said so. It names the task and a short summary. It closes by itself when a later run is clean, or when the task is switched off or deleted. Goes to Telegram only when the task asks for it. VPS edition. |
+| Scheduled task keeps failing | `scheduled_task_failing` | Warning | A scheduled task failed three runs in a row (a tool did not answer, the provider failed, no verdict), with the last reason. It closes with the next run that works, or when the task is switched off or deleted. Goes to Telegram only when the task asks for it. VPS edition. |
+| A node is unreachable from the country | `country_blocked` | Warning | The [country check](reachability.md) saw `blocked` or `tcp_blocked` twice in a row: two measurements (a Globalping round, a run of the [TSPU probe](reachability.md#tspu-probe), a [cheburcheck](reachability.md#cheburcheck) or [bsbord](reachability.md#bsbord) row) that say so themselves and still do when combined with the fresh rows of the other sources. Only Globalping, public cheburcheck and the TSPU probe, which look across the whole country, can open it; your own cheburcheck probe and bsbord see part of it and raise only the partial alert. Closes after two measurements with `ok` or `partial`; `unknown` rows change nothing. The same kind with the subject `partial` (*unreachable from some networks*, warning) opens when one network, unit or probe was dark for the node in its two newest observations while it reached another of your nodes, and closes when it reaches this one again; a full block supersedes it ([details](reachability.md#the-alert)). When every server of the node that people are given has a healthy [relay](../guide/relays.md) in front of it, the full alert is **Info** with the reason *People reach this node through relays* (parameter `why=reached_through_relays`) and is not sent to Telegram. Muting works as for any other alert. |
 | Relay <exit> via <entry> is down | `relay_down` | Warning | Every relay that is on joins the client-eye rounds through the entry's forwarded port. Two failed rounds in a row open it, with the stage: `leg` (the entry does not reach the exit), `entry` (the forward on the entry is not installed), `path` (nothing comes through from outside) or `freeze` (the transfer stalls after the first kilobytes). It waits while the exit's own check alert or a `node_down` of either node is open, and closes when the relay works again. **Open the way in** opens the exit node's **Ways in** tab on that lane ([Relays](../guide/relays.md#supervision)). |
 | The panel cannot reach many nodes | `check_failed` (fleet-wide) | Warning | The last round failed for at least 80% of the checked profiles, on nodes of at least three different **Provider** values. The panel's own connection is the suspect: per-node check alerts are paused until a round passes. Fresh failures (streaks 1–3) on nodes from at least two providers also open one fleet-wide warning; they do not open per-node alerts, existing alerts stay unchanged, and failures that reach streak 4 (about 20 minutes) are judged per node. |
 | The doctor item's title | `doctor_warn` / `doctor_fail` | Warning / Critical | A doctor check reports Attention / Problem. A kernel headers warning on a node without an AmneziaWG profile is Info. |
 | The node's state differs from the panel's | `state_drift` | Warning | The configuration the node applied differs from the panel's even after an automatic full resend. |
 | Certificate is about to expire | `cert_expiry` | Warning; Critical under 3 days, expired or not matching the domain | From the doctor's certificate check. For an agent without the doctor, from the panel's own view of the profile certificates (under 14 days). |
 | The node update stopped | `update_failed` | Warning | A rollout paused because a node rejected the update, failed the check after updating, or the panel lost track of a step after a restart. Closes when the rollout is resumed, cancelled or replaced. See [Updates](updates.md). |
+| The OS update of a node stopped | `os_update_failed` | Warning, Critical when the node did not come back | An OS update started from the panel ([Update one server's system](updates.md#update-one-servers-system)) stopped: the node refused the job, the job failed, the node would not reboot, it did not return within 15 minutes after the reboot, or it failed the check after it. The alert carries the reason and the node's code. Packages cannot be rolled back, so the update waits for you; it closes when you press **Close** on the node's row. |
+| A site blocks the WARP exit of a node | `warp_reach` | Warning | A site of the [WARP reach list](../guide/warp.md#sites-that-refuse-warp) showed a block page through the node's WARP in two runs, with no `ok` between them. One alert per node and site, with the Cloudflare colo of the latest run (`colo`), its HTTP status and the count of blocked runs (`streak`). Restarting WARP may give another exit. Closes when a run says `ok` for the site (a timeout or an error does not close it), the site leaves the list, the check is switched off, or no run renews the result for 3 hours. |
 | A user keeps trying after access ended | `access_ended` | Warning | A user with an expired subscription or exhausted quota fetched a subscription in the last six hours. |
 | A user may have a connection problem | `user_connection` | Info | An AWG device has never connected or has a stale key, or an active user keeps fetching a subscription despite having no recent traffic. |
 | An app was turned away at the device limit | `device_limit` | Warning | Someone was actually refused at the device limit in the last 24 hours: a new app in the **Limit** or **Strict** mode, or a key that could not be made. One alert per person. It closes after 24 hours without a refusal. In the **Only count** mode nobody is refused: the events "the device limit is reached" are history only and open no alert. Telegram tells it once when it opens, with no message when it closes. See [Subscriptions](../guide/subscriptions.md#device-limit-for-apps-on-the-link). |
@@ -244,6 +291,7 @@ The reason under a traffic alert names the likely cause:
 |---|---|
 | UDP port blocked | A profile times out while another profile of the node answers on another port, or the whole node times out on one port: the hoster seems to cut that UDP port. |
 | All UDP blocked | Every profile times out, on port 443 or on two and more ports: the hoster seems to cut incoming UDP. |
+| Panel's UDP path | A UDP profile times out, but a clean UDP delivery check from another node reached its port after the failures began: the port is open and works for people, and the loss is on the path from the panel's server. Warning at most; there is no need to change the port. |
 | WARP exit dead | A profile with WARP egress fails while a direct profile of the same protocol on the node works. |
 | auth, tls, refused, exit unreachable, test sites answer errors | The error code of the check, explained in plain words. |
 | Mixed | Every profile fails, each in its own way. |
@@ -267,11 +315,13 @@ The **History · 7 days** list says how each alert closed:
 | replaced by a bigger alert | `superseded` | A bigger alert says the same: "Alive, but no traffic" replaces the per-profile ones, a doctor problem replaces the warning of the same check, the doctor's WARP problem replaces the failing WARP profile, the fleet-wide alert replaces the per-node check alerts. |
 | accepted as normal | `accepted` | The owner accepted the doctor warning as normal for the node. |
 
-Closed alerts are kept for 90 days. The API returns up to 30 days of history, at most 200 alerts. A long history is paged under the list (20, 50 or 100 rows); the page number is kept in the address.
+Closed alerts are kept for 90 days. The API returns up to 30 days of history, at most 200 alerts. The list shows one row per event: alerts of one kind that opened within the same minute on several nodes or ports are one row with the node names, and a click shows each of them. Rows are grouped by day, how each one closed is an icon with its words in a tooltip, and the newest 20 rows are shown with **Show more** for the rest.
 
 ### Buttons on an alert
 
-Depending on what the alert says, its card offers:
+An alert folds to one line: its severity, the node, what is wrong, the key number (the worst loss, the number of networks) and how long it has lasted; a click opens it. Critical alerts start open. The UDP-loss and client-check alerts of one node share one card, with a table of their ports, profiles and losses and one **Mute** for all of them. A long list of networks reads as a short line, with every network, grouped by operator, behind **Show all**.
+
+A card has at most one primary button, and only when it is the fix. Depending on what the alert says, its card offers:
 
 - the doctor's fix (only while the doctor still offers it and the node is connected);
 - **Restart profile** or **Restart the profiles**, with the number of connections that drop;
@@ -279,16 +329,21 @@ Depending on what the alert says, its card offers:
 - the node's WARP card;
 - **Open node**;
 - **This is normal for this node**, for a doctor warning;
-- **Mute**.
+- **Mute**;
+- **Close**.
 
 ### Muting
 
 **Mute** offers: For 1 hour, Until morning (08:00), For a day, For 7 days. The longest mute is 7 days; **Unmute** ends it.
 
-- A muted alert stays on the list with "Muted until …". It is still evaluated and still closes by itself.
+- Muted alerts fold into their own **Muted** section after the live ones, each with "until …". They are still evaluated and still close by themselves.
 - It is not counted in the badges.
 - If its severity rises, the mute ends and the alert counts again.
 - Muting is written to the audit log.
+
+### Closing
+
+**Mute** keeps the alert on the list and only quiets it for a while; **Close** takes it off the list. A closed alert is resolved at once, shows in the history as "Closed by an admin", sends no message and is written to the audit log. It stays closed for as long as the same problem continues: the panel keeps seeing the condition and does not open the alert again. It opens again only if the problem stops for more than an hour and then returns, or if it gets worse (its severity rises). A toast after Close offers **Undo**, and **Close all shown** closes every alert of the list at once after a confirmation that names the count; it is useful for the "never connected" notices on the People tab. Closing has the same permissions as muting.
 
 > **Note:** Alerts are seen in the admin (the header badge, the Overview, the Health page) and through the [API](../reference/api.md) and [MCP](../reference/mcp.md). The panel can also send them to Telegram when they open and when they resolve: see [Telegram alerts](telegram-alerts.md). A muted alert stays quiet there too.
 
@@ -308,6 +363,7 @@ The node's **History → Events** and the Overview's event feed keep a timeline 
 | "<profile>" passes the check again (…) | It closed as cleared or fixed. |
 | Possible BitTorrent attempt by … | The node's torrent protection blocked a flow that a client started and that it recognised as BitTorrent. A uTP SYN alone is not reported: it takes at least five of them to three destination ports from the same user and profile within 10 minutes; the other matches are reported at once. The line under it names the protocol, what the node matched and the destination port. The user is named only when the client's tunnel address belongs to exactly one account, otherwise it says "an unknown user". Neither the client's address nor the destination address is stored, only the port. See [Torrent protection](../guide/torrent-protection.md). |
 | updated to … / update failed / update rolled back | A rollout step ended. |
+| nft is not installed on the server … / nft is installed now … | The server has no `nft` command (written once, when the agent finds out), and the command is there again and the firewall steps went through. |
 
 A few warnings of the agent have no sentence of their own yet and are shown by their code, with the error text under it:
 
@@ -323,8 +379,8 @@ Events of severity info are kept for 90 days, warnings and errors for 400 days. 
 | Action | Owner | Helper | Read-only |
 |---|---|---|---|
 | See alerts, checks and doctor reports | yes | yes | yes |
-| Mute an alert, Check now, Run again | yes | yes | no |
+| Mute or close an alert, Check now, Run again | yes | yes | no |
 | This is normal for this node, Count it again | yes | yes | no |
 | Apply a doctor fix | yes | no | no |
 
-An API token with the operator profile can mute alerts, start checks and run the doctor. A doctor fix through a token is possible only via MCP, as a plan the owner approves (see [MCP](../reference/mcp.md)).
+An API token with the operator profile can mute and close alerts, start checks and run the doctor. A doctor fix through a token is possible only via MCP, as a plan the owner approves (see [MCP](../reference/mcp.md)).

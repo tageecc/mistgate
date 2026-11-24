@@ -13,8 +13,10 @@ import (
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
 	agentv1 "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/internal/agentcap"
 	accesssvc "github.com/mistgate/mistgate/internal/panel/access"
 	"github.com/mistgate/mistgate/internal/panel/protocols"
+	mtprotoProto "github.com/mistgate/mistgate/internal/panel/protocols/mtproto"
 	"github.com/mistgate/mistgate/internal/panel/store"
 	"github.com/mistgate/mistgate/internal/plugin"
 	"github.com/mistgate/mistgate/internal/tcpcheck"
@@ -38,7 +40,7 @@ type checkEnv struct {
 func newCheckEnv(t *testing.T, online ...string) *checkEnv {
 	t.Helper()
 	reg, err := protocols.NewRegistry(fakeProto{"fakehy", plugin.ClientHapp}, fakeProto{"fakewg", plugin.ClientAmnezia},
-		tcpProto{fakeProto{"vless", plugin.ClientMihomo}})
+		tcpProto{fakeProto{"vless", plugin.ClientMihomo}}, mtprotoProto.New())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,13 +59,21 @@ func newCheckEnv(t *testing.T, online ...string) *checkEnv {
 	}
 	e.f.settleUDP = func(context.Context) error { return nil }
 	e.run()
-	caps := []string{capUDPCheck, capTCPCheck}
+	caps := []string{agentcap.UDPCheck, agentcap.TCPCheck}
 	for _, name := range online {
 		switch name {
 		case "entry":
-			x.ec, x.em, _ = connectCaps(x.entry, "entry", append([]string{plugin.CapRelayForward}, caps...)...)
+			x.ec, x.em, _ = connectCaps(x.entry, "entry", append([]string{agentcap.RelayForward}, caps...)...)
 		case "exit":
-			x.xc, _, _ = connectCaps(x.exit, "exit", caps...)
+			// The exit can run an MTProto server (mtprotoRelay); without the capability the panel withholds that inbound from it and
+			// marks it failed, and a failed server is not forwarded to.
+			// It serves the VLESS inbound of these tests too: without vless/1 the panel withheld that inbound and the tests ran
+			// against a server marked failed.
+			x.xc, _, _ = connectCaps(x.exit, "exit", append([]string{agentcap.MTProto, agentcap.VLESS}, caps...)...)
+			// connectCaps only SENDS the ApplyResult. When the panel stores it, it also writes the outcome of the inbounds it
+			// withheld from this agent (state, an empty certificate pin), so a test that sets a pin right after connecting
+			// lost it about once in forty runs under the race detector. Wait until the result is stored.
+			x.waitApplied(x.exit.nodeID)
 		case "s1":
 			x.c1, _, _ = connectCaps(x.s1, "s1", caps...)
 		case "s2":
@@ -71,6 +81,23 @@ func newCheckEnv(t *testing.T, online ...string) *checkEnv {
 		}
 	}
 	return x
+}
+
+// waitApplied returns once the panel has stored the node's ApplyResult.
+func (x *checkEnv) waitApplied(nodeID string) {
+	x.t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		var hash string
+		if err := x.st.W.QueryRowContext(x.ctx, `SELECT applied_hash FROM node WHERE id = ?`, nodeID).Scan(&hash); err != nil {
+			x.t.Fatal(err)
+		}
+		if hash != "" {
+			return
+		}
+		if time.Now().After(deadline) {
+			x.t.Fatal("the node's ApplyResult was not stored")
+		}
+	}
 }
 
 // tcpRelay stores a relay of the entry to the exit's TCP server, on port 7443.
@@ -81,6 +108,26 @@ func (x *checkEnv) tcpRelay(on bool) {
 	}
 	if on {
 		x.live("rly_t")
+	}
+}
+
+func (x *checkEnv) mtprotoRelay(on bool, kind string) {
+	x.t.Helper()
+	now := time.Now().Unix()
+	settings := `{"port":443,"fake_tls":{"kind":"own"}}`
+	serverName := "tg.example.com"
+	if kind == "site" {
+		settings = `{"port":443,"fake_tls":{"kind":"site","domain":"www.example.org"}}`
+		serverName = ""
+	}
+	x.exec(`INSERT INTO profile (id, protocol, name, settings_json, version, created_at, updated_at) VALUES ('prf_mt', 'mtproto', 'Telegram', ?, 1, ?, ?)`, settings, now, now)
+	x.exec(`INSERT INTO inbound (id, profile_id, node_id, tls_server_name_override, spec_version, state, created_at, updated_at)
+		VALUES ('inb_mt', 'prf_mt', ?, ?, 1, 'active', ?, ?)`, x.exit.nodeID, serverName, now, now)
+	if err := x.st.CreateRelay(x.ctx, store.Relay{ID: "rly_mt", InboundID: "inb_mt", ViaNodeID: x.entry.nodeID, Network: "tcp", Port: 57893}, time.Now()); err != nil {
+		x.t.Fatal(err)
+	}
+	if on {
+		x.live("rly_mt")
 	}
 }
 
@@ -122,12 +169,12 @@ func result(t *testing.T, ch <-chan checked) store.RelayCheck {
 	return store.RelayCheck{}
 }
 
-// udpRun answers one UDP run: the exit arms its counter, the sender sends, the exit reports got of the 300 packets on countPort.
+// udpRun answers one UDP run: the exit arms its counter, the sender sends, the exit reports the packets on countPort.
 func udpRun(exit, sender *conn, countPort uint16, got uint64) (*agentv1.UdpCount, *agentv1.UdpSend) {
 	arm := waitUDPCount(exit, false)
 	replyPortCommand(exit, arm.RequestId, &agentv1.CommandResult{Ok: true})
 	send := waitUDPSend(sender)
-	replyPortCommand(sender, send.RequestId, &agentv1.CommandResult{Ok: true, Params: map[string]string{"family": "4", "sent": "300"}})
+	replyPortCommand(sender, send.RequestId, &agentv1.CommandResult{Ok: true, Params: map[string]string{"family": "4", "sent": strconv.Itoa(udpCheckSendCount)}})
 	stop := waitUDPCount(exit, true)
 	replyPortStop(exit, stop, "4", map[uint16]uint64{countPort: got}, map[uint16]uint64{countPort: got})
 	return arm, send
@@ -147,7 +194,7 @@ func tcpRun(c *conn, verdict string, port uint16) *agentv1.TcpProbe {
 	return p
 }
 
-// idle fails if any of the connections is sent a port-check command within d.
+// idle fails if any of the connections is sent a probe or speed-test command within d.
 func idle(t *testing.T, d time.Duration, conns ...*conn) {
 	t.Helper()
 	deadline := time.After(d)
@@ -158,8 +205,8 @@ func idle(t *testing.T, d time.Duration, conns ...*conn) {
 			}
 			select {
 			case m := <-c.in:
-				if m.GetHttpMark() != nil || m.GetTcpProbe() != nil || m.GetUdpCount() != nil || m.GetUdpSend() != nil {
-					t.Fatalf("a port check command was sent: %+v", m)
+				if m.GetHttpMark() != nil || m.GetTcpProbe() != nil || m.GetUdpCount() != nil || m.GetUdpSend() != nil || m.GetSpeedTest() != nil {
+					t.Fatalf("a measurement command was sent: %+v", m)
 				}
 			default:
 			}
@@ -179,12 +226,12 @@ func TestCheckRelayUDPLegThenPathCountedAtTheExit(t *testing.T) {
 	res := x.start("rly_u")
 
 	// The leg: the entry sends to the exit's address and server port; the exit counts that port.
-	arm, send := udpRun(x.xc, x.ec, 4443, 300)
-	if len(arm.Ports) != 1 || arm.Ports[0] != 4443 || arm.HoldS != 30 || send.Host != addrExit || len(send.Ports) != 1 || send.Ports[0] != 4443 || send.Count != 300 {
+	arm, send := udpRun(x.xc, x.ec, 4443, udpCheckSendCount)
+	if len(arm.Ports) != 1 || arm.Ports[0] != 4443 || arm.HoldS != 30 || send.Host != addrExit || len(send.Ports) != 1 || send.Ports[0] != 4443 || send.Count != udpCheckSendCount {
 		t.Fatalf("leg: arm %+v send %+v", arm, send)
 	}
 	// The path: s1 sends to the entry's address and forwarded port; the exit counts its own port.
-	arm2, send2 := udpRun(x.xc, x.c1, 4443, 300)
+	arm2, send2 := udpRun(x.xc, x.c1, 4443, udpCheckSendCount)
 	if len(arm2.Ports) != 1 || arm2.Ports[0] != 4443 || send2.Host != addrEntry || len(send2.Ports) != 1 || send2.Ports[0] != 8443 || string(send2.Tag) != string(arm2.Tag) {
 		t.Fatalf("path: arm %+v send %+v", arm2, send2)
 	}
@@ -192,10 +239,10 @@ func TestCheckRelayUDPLegThenPathCountedAtTheExit(t *testing.T) {
 	if !c.OK || !c.Verified() || c.Stage != "" || c.Network != "udp" || c.Port != 8443 || c.To != addrExit+":4443" {
 		t.Fatalf("check = %+v", c)
 	}
-	if c.Leg.Status != "ok" || c.Leg.Sender != x.entry.nodeID || c.Leg.Sent != 300 || c.Leg.Got != 300 || c.Leg.Verdict != "ok" {
+	if c.Leg.Status != "ok" || c.Leg.Sender != x.entry.nodeID || c.Leg.Sent != udpCheckSendCount || c.Leg.Got != udpCheckSendCount || c.Leg.Verdict != "ok" {
 		t.Errorf("leg = %+v", c.Leg)
 	}
-	if c.Path.Status != "ok" || c.Path.Sender != x.s1.nodeID || c.Path.Got != 300 {
+	if c.Path.Status != "ok" || c.Path.Sender != x.s1.nodeID || c.Path.Got != udpCheckSendCount {
 		t.Errorf("path = %+v", c.Path)
 	}
 	// Never the entry or the exit as the path's sender: the entry sent once (the leg), the exit sent nothing, s2 was not needed.
@@ -215,7 +262,7 @@ func TestCheckRelayLegFailureStopsBeforeThePath(t *testing.T) {
 		name string
 		got  uint64
 		code string
-	}{{"nothing arrives", 0, "broken"}, {"two thirds arrive", 200, "broken"}, {"a fifth is lost", 240, "lossy"}} {
+	}{{"nothing arrives", 0, "broken"}, {"two thirds arrive", 100, "broken"}, {"a fifth is lost", 120, "lossy"}} {
 		t.Run(tc.name, func(t *testing.T) {
 			x := newCheckEnv(t, "entry", "exit", "s1")
 			x.relay("rly_u", 8443, false)
@@ -248,7 +295,7 @@ func TestCheckRelayLegNeedsTheEntryOnlineWithTheCapability(t *testing.T) {
 
 	// An entry whose agent has no UDP check cannot send.
 	x = newCheckEnv(t, "exit", "s1")
-	x.ec, _, _ = connectCaps(x.entry, "entry-old", plugin.CapRelayForward)
+	x.ec, _, _ = connectCaps(x.entry, "entry-old", agentcap.RelayForward)
 	x.relay("rly_u", 8443, false)
 	if c, err = x.f.CheckRelay(x.ctx, "rly_u"); err != nil || c.Leg.Code != "agent_too_old" {
 		t.Fatalf("old entry: %+v %v", c, err)
@@ -265,13 +312,13 @@ func TestCheckRelayPathTriesAnotherSenderAndNeverTheEntryOrTheExit(t *testing.T)
 		mu.Lock()
 		panelCalls++
 		mu.Unlock()
-		return "4", 300, nil
+		return "4", udpCheckSendCount, nil
 	}
 
 	// s1 cannot get through, s2 can: the path passes, from s2.
 	res := x.start("rly_u", store.RelayStagePath)
 	_, send1 := udpRun(x.xc, x.c1, 4443, 0)
-	_, send2 := udpRun(x.xc, x.c2, 4443, 300)
+	_, send2 := udpRun(x.xc, x.c2, 4443, udpCheckSendCount)
 	c := result(t, res)
 	if send1.Host != addrEntry || send2.Host != addrEntry || c.Path.Status != "ok" || c.Path.Sender != x.s2.nodeID {
 		t.Fatalf("second sender: %+v / %+v / %+v", send1, send2, c.Path)
@@ -283,10 +330,10 @@ func TestCheckRelayPathTriesAnotherSenderAndNeverTheEntryOrTheExit(t *testing.T)
 
 	// Both fail: the first finding stands, and the panel is not asked (nodes could, and found it broken).
 	res = x.start("rly_u", store.RelayStagePath)
-	udpRun(x.xc, x.c1, 4443, 100)
-	udpRun(x.xc, x.c2, 4443, 250)
+	udpRun(x.xc, x.c1, 4443, udpCheckSendCount/3)
+	udpRun(x.xc, x.c2, 4443, udpCheckSendCount*5/6)
 	c = result(t, res)
-	if c.Path.Status != "fail" || c.Path.Code != "broken" || c.Path.Sender != x.s1.nodeID || c.Path.Got != 100 || c.Stage != "path" {
+	if c.Path.Status != "fail" || c.Path.Code != "broken" || c.Path.Sender != x.s1.nodeID || c.Path.Got != udpCheckSendCount/3 || c.Stage != "path" {
 		t.Fatalf("both fail: %+v", c.Path)
 	}
 	idle(t, 100*time.Millisecond, x.ec, x.xc)
@@ -306,7 +353,7 @@ func TestCheckRelayPathFallsBackToThePanelOnlyWhenNoNodeCan(t *testing.T) {
 		mu.Lock()
 		defer mu.Unlock()
 		host, ports, sends = h, p, sends+1
-		return "4", 300, nil
+		return "4", udpCheckSendCount, nil
 	}
 
 	t.Run("only the entry and the exit are online", func(t *testing.T) {
@@ -315,8 +362,8 @@ func TestCheckRelayPathFallsBackToThePanelOnlyWhenNoNodeCan(t *testing.T) {
 		x.live("rly_u")
 		x.f.sendUDP = panel
 		res := x.start("rly_u")
-		udpRun(x.xc, x.ec, 4443, 300) // the leg, by the entry
-		udpRunByPanel(x.xc, 4443, 300)
+		udpRun(x.xc, x.ec, 4443, udpCheckSendCount) // the leg, by the entry
+		udpRunByPanel(x.xc, 4443, udpCheckSendCount)
 		c := result(t, res)
 		mu.Lock()
 		defer mu.Unlock()
@@ -341,7 +388,7 @@ func TestCheckRelayPathFallsBackToThePanelOnlyWhenNoNodeCan(t *testing.T) {
 		replyPortCommand(x.c1, send.RequestId, &agentv1.CommandResult{Error: "busy"})
 		stop := waitUDPCount(x.xc, true)
 		replyPortStop(x.xc, stop, "4", map[uint16]uint64{}, map[uint16]uint64{})
-		udpRunByPanel(x.xc, 4443, 300)
+		udpRunByPanel(x.xc, 4443, udpCheckSendCount)
 		c := result(t, res)
 		mu.Lock()
 		defer mu.Unlock()
@@ -375,7 +422,7 @@ func TestCheckRelayPathFallsBackToThePanelOnlyWhenNoNodeCan(t *testing.T) {
 		x.live("rly_u")
 		x.f.sendUDP = func(context.Context, string, []uint16, [8]byte, int, int, int) (string, int, error) {
 			t.Error("the panel sent from the entry's own host")
-			return "4", 300, nil
+			return "4", udpCheckSendCount, nil
 		}
 		c, err := x.f.CheckRelay(x.ctx, "rly_u", store.RelayStagePath)
 		if err != nil || c.Path.Status != "fail" || c.Path.Code != "same_host" {
@@ -389,7 +436,7 @@ func TestCheckRelayPathOfARelayThatIsNotForwardingYet(t *testing.T) {
 	x.relay("rly_u", 8443, false)
 	// off: there is no forward to reach
 	res := x.start("rly_u")
-	udpRun(x.xc, x.ec, 4443, 300)
+	udpRun(x.xc, x.ec, 4443, udpCheckSendCount)
 	c := result(t, res)
 	if !c.OK || c.Verified() || c.Leg.Status != "ok" || c.Path.Status != "skipped" || c.Path.Code != "off" {
 		t.Fatalf("off: %+v", c)
@@ -415,14 +462,14 @@ func TestCheckRelayPathOnlyKeepsTheLegOfTheSameTarget(t *testing.T) {
 	x := newCheckEnv(t, "entry", "exit", "s1")
 	x.relay("rly_u", 8443, false)
 	res := x.start("rly_u", store.RelayStageLeg)
-	udpRun(x.xc, x.ec, 4443, 300)
+	udpRun(x.xc, x.ec, 4443, udpCheckSendCount)
 	leg := result(t, res)
 	if leg.Path.Status != "" || !leg.OK {
 		t.Fatalf("leg only: %+v", leg)
 	}
 	x.live("rly_u")
 	res = x.start("rly_u", store.RelayStagePath)
-	udpRun(x.xc, x.c1, 4443, 300)
+	udpRun(x.xc, x.c1, 4443, udpCheckSendCount)
 	c := result(t, res)
 	if !c.Verified() || c.Leg != leg.Leg {
 		t.Fatalf("path after leg: %+v (leg was %+v)", c, leg.Leg)
@@ -430,7 +477,7 @@ func TestCheckRelayPathOnlyKeepsTheLegOfTheSameTarget(t *testing.T) {
 	// The exit moves: what the leg proved is about another target.
 	x.exec(`UPDATE node SET address = '203.0.113.99' WHERE id = ?`, x.exit.nodeID)
 	res = x.start("rly_u", store.RelayStagePath)
-	udpRun(x.xc, x.c1, 4443, 300)
+	udpRun(x.xc, x.c1, 4443, udpCheckSendCount)
 	if c = result(t, res); c.Leg.Status != "" || c.Verified() || c.To != "203.0.113.99:4443" {
 		t.Fatalf("after the exit moved: %+v", c)
 	}
@@ -474,6 +521,38 @@ func TestCheckRelayTCPProvesTheServerAtBothStages(t *testing.T) {
 	idle(t, 100*time.Millisecond, x.c1)
 }
 
+func TestCheckRelayMTProtoOwnFallbackAtBothStages(t *testing.T) {
+	x := newCheckEnv(t, "entry", "exit", "s1")
+	x.mtprotoRelay(true, "own")
+	pin := strings.Repeat("cd", 32)
+	x.exec(`UPDATE inbound SET cert_pin_sha256 = ? WHERE id = 'inb_mt'`, pin)
+	res := x.start("rly_mt")
+	leg := tcpRun(x.ec, "ours", 443)
+	if leg.Host != addrExit || len(leg.Targets) != 1 || leg.Targets[0].Port != 443 || leg.Targets[0].Kind != "tls" ||
+		leg.Targets[0].Sni != "tg.example.com" || leg.Targets[0].PinSha256 != pin {
+		t.Fatalf("MTProto leg probe = %+v", leg)
+	}
+	path := tcpRun(x.c1, "ours", 57893)
+	if path.Host != addrEntry || len(path.Targets) != 1 || path.Targets[0].Port != 57893 || path.Targets[0].Sni != "tg.example.com" || path.Targets[0].PinSha256 != pin {
+		t.Fatalf("MTProto path probe = %+v", path)
+	}
+	c := result(t, res)
+	if !c.Verified() || !c.OK || c.Leg.Verdict != "ours" || c.Path.Verdict != "ours" {
+		t.Fatalf("MTProto own-site check = %+v", c)
+	}
+}
+
+func TestCheckRelayMTProtoForeignFallbackIsUnverifiable(t *testing.T) {
+	x := newCheckEnv(t, "entry", "exit", "s1")
+	x.mtprotoRelay(false, "site")
+	c := result(t, x.start("rly_mt"))
+	if !c.OK || c.Verified() || c.Stage != "" || c.Leg.Status != "skipped" || c.Leg.Code != "unverifiable" ||
+		c.Path.Status != "skipped" || c.Path.Code != "unverifiable" {
+		t.Fatalf("MTProto foreign-site check = %+v", c)
+	}
+	idle(t, 100*time.Millisecond, x.ec, x.xc, x.c1)
+}
+
 func TestCheckRelayTCPPanelFallback(t *testing.T) {
 	x := newCheckEnv(t, "entry", "exit")
 	x.tcpRelay(true)
@@ -510,9 +589,9 @@ func TestCheckRelayAndPortChecksShareTheExitsGate(t *testing.T) {
 		idle(t, 200*time.Millisecond, x.xc) // the port check did not arm a second table
 		replyPortCommand(x.xc, arm.RequestId, &agentv1.CommandResult{Ok: true})
 		send := waitUDPSend(x.ec)
-		replyPortCommand(x.ec, send.RequestId, &agentv1.CommandResult{Ok: true, Params: map[string]string{"family": "4", "sent": "300"}})
+		replyPortCommand(x.ec, send.RequestId, &agentv1.CommandResult{Ok: true, Params: map[string]string{"family": "4", "sent": strconv.Itoa(udpCheckSendCount)}})
 		stop := waitUDPCount(x.xc, true)
-		replyPortStop(x.xc, stop, "4", map[uint16]uint64{4443: 300}, map[uint16]uint64{4443: 300})
+		replyPortStop(x.xc, stop, "4", map[uint16]uint64{4443: udpCheckSendCount}, map[uint16]uint64{4443: udpCheckSendCount})
 		if c := result(t, res); c.Leg.Status != "ok" {
 			t.Fatalf("leg = %+v", c.Leg)
 		}
@@ -537,17 +616,17 @@ func TestCheckRelayAndPortChecksShareTheExitsGate(t *testing.T) {
 		idle(t, 200*time.Millisecond, x.xc)
 		replyPortCommand(x.xc, arm.RequestId, &agentv1.CommandResult{Ok: true})
 		send := waitUDPSend(x.ec)
-		replyPortCommand(x.ec, send.RequestId, &agentv1.CommandResult{Ok: true, Params: map[string]string{"family": "4", "sent": "300"}})
+		replyPortCommand(x.ec, send.RequestId, &agentv1.CommandResult{Ok: true, Params: map[string]string{"family": "4", "sent": strconv.Itoa(udpCheckSendCount)}})
 		stop := waitUDPCount(x.xc, true)
 		got, packets := map[uint16]uint64{}, map[uint16]uint64{}
 		for _, p := range arm.Ports {
-			got[uint16(p)], packets[uint16(p)] = 300, 300
+			got[uint16(p)], packets[uint16(p)] = udpCheckSendCount, udpCheckSendCount
 		}
 		replyPortStop(x.xc, stop, "4", got, packets)
 		if p := <-port; p.code != "" {
 			t.Fatalf("port check = %+v", p)
 		}
-		udpRun(x.xc, x.ec, 4443, 300) // the relay's leg
+		udpRun(x.xc, x.ec, 4443, udpCheckSendCount) // the relay's leg
 		if c := result(t, res); c.Leg.Status != "ok" {
 			t.Fatalf("leg = %+v", c.Leg)
 		}
@@ -593,7 +672,7 @@ func TestSwitchingARelayOnEndToEnd(t *testing.T) {
 		r, err := acc.CheckRelay(x.ctx, connect.NewRequest(&adminv1.CheckRelayRequest{Id: "rly_u"}))
 		checkRPC <- rpc{r, err}
 	}()
-	udpRun(x.xc, x.ec, 4443, 300)
+	udpRun(x.xc, x.ec, 4443, udpCheckSendCount)
 	got := <-checkRPC
 	if got.err != nil || !got.resp.Msg.Relay.Check.Ok || got.resp.Msg.Relay.Check.Verified || got.resp.Msg.Relay.Check.Path.Code != "off" || got.resp.Msg.Relay.Enabled {
 		t.Fatalf("check of a relay that is off: %+v %v", got.resp, got.err)
@@ -625,7 +704,7 @@ func TestSwitchingARelayOnEndToEnd(t *testing.T) {
 	}
 
 	// The leg stays good for the next try; the path now passes.
-	if err = switchOn(300); err != nil {
+	if err = switchOn(udpCheckSendCount); err != nil {
 		t.Fatalf("a working path: %v", err)
 	}
 	if l := stateOf(); !l.Enabled || !l.Proven() || l.State != "active" {
@@ -634,5 +713,45 @@ func TestSwitchingARelayOnEndToEnd(t *testing.T) {
 	x.ec.quiet(200 * time.Millisecond)
 	if len(x.em.relays) != 1 {
 		t.Errorf("the entry lost the forward: %v", x.em.relays)
+	}
+}
+
+func TestUnverifiableTCPRelayCanBeSwitchedOn(t *testing.T) {
+	x := newCheckEnv(t, "entry", "exit", "s1")
+	x.mtprotoRelay(false, "site")
+	acc, err := accesssvc.New(x.st, x.v, x.f.reg, x.f, nil, accesssvc.Config{CheckRelay: x.f.CheckRelay})
+	if err != nil {
+		t.Fatal(err)
+	}
+	acc.SetRelayWaitForTest(10*time.Second, 10*time.Millisecond)
+	on := true
+	checked, err := acc.CheckRelay(x.ctx, connect.NewRequest(&adminv1.CheckRelayRequest{Id: "rly_mt"}))
+	if err != nil || !checked.Msg.Relay.Check.Ok || checked.Msg.Relay.Check.Verified ||
+		checked.Msg.Relay.Check.Leg.Status != "skipped" || checked.Msg.Relay.Check.Leg.Code != "unverifiable" {
+		t.Fatalf("check: %+v %v", checked, err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := acc.UpdateRelay(x.ctx, connect.NewRequest(&adminv1.UpdateRelayRequest{Id: "rly_mt", Enabled: &on}))
+		done <- err
+	}()
+	ds := x.ec.next(x.em)
+	if ds.Relays == nil || len(ds.Relays.Items) != 1 || ds.Relays.Items[0].Port != 57893 || ds.Relays.Items[0].ToHost != addrExit {
+		t.Fatalf("the unverifiable relay was not sent to the entry: %v", ds.Relays)
+	}
+	r := applied(ds, x.em.hash())
+	r.GetApplyResult().Relays = []*agentv1.RelayResult{{RelayId: "rly_mt", Ok: true, ToIp: addrExit}}
+	x.ec.send(0, r)
+	if err := <-done; err != nil {
+		t.Fatalf("switch on: %v", err)
+	}
+	link, err := x.st.RelayLink(x.ctx, "rly_mt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	check, ok := link.Check()
+	if !ok || !link.Enabled || link.State != "active" || !check.OK || check.Verified() || check.Stage != "" ||
+		check.Leg.Code != "unverifiable" || check.Path.Code != "unverifiable" {
+		t.Fatalf("switched-on unverifiable relay: enabled=%v state=%s check=%+v", link.Enabled, link.State, check)
 	}
 }

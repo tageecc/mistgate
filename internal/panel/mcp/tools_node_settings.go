@@ -1,0 +1,351 @@
+//go:build !js
+
+package mcp
+
+import (
+	"cmp"
+	"errors"
+	"fmt"
+	"regexp"
+	"slices"
+	"strings"
+	"unicode/utf8"
+
+	"connectrpc.com/connect"
+
+	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
+	"github.com/mistgate/mistgate/gen/mistgate/admin/v1/adminv1connect"
+	"github.com/mistgate/mistgate/internal/plugin"
+)
+
+func nodeSettingsTools() []toolDef { return append(change(nodeUpdate), change(nodeAWGBackend)...) }
+
+func statusWarningFact(w *adminv1.StatusReason) Fact {
+	code := clean(w.GetCode(), 60)
+	params := make(map[string]string, len(w.GetParams()))
+	untrusted := make([]string, 0, len(w.GetParams()))
+	for key, value := range w.GetParams() {
+		key = clean(key, 40)
+		params[key] = clean(value, 160)
+		untrusted = append(untrusted, key)
+	}
+	slices.Sort(untrusted)
+	return Fact{Key: "warning", Value: code, Code: code, Params: params, UntrustedParams: untrusted}
+}
+
+type directSubscriptionArg struct {
+	InboundID string `json:"inbound_id" jsonschema:"inbound id from the node detail"`
+	Included  bool   `json:"included" jsonschema:"whether the node's own address appears in subscriptions"`
+}
+
+// realityTargetArg is the site a node shows strangers at the REALITY server of a profile, instead of the profile's own target.
+type realityTargetArg struct {
+	InboundID string `json:"inbound_id" jsonschema:"inbound id from node_get: a VLESS server with REALITY on this node"`
+	Target    string `json:"target" jsonschema:"host:port of the site this node shows strangers instead of its profile's target: a host name, not an IP address, for example one node_neighbor_sites found with dns here; empty = back to the profile's target"`
+}
+
+type nodeUpdateArgs struct {
+	ReasonField
+	Node        string                  `json:"node" jsonschema:"node id or exact name"`
+	Name        *string                 `json:"name,omitempty" jsonschema:"node label, 2 to 24 lowercase letters, digits or hyphens"`
+	CountryCode *string                 `json:"country_code,omitempty" jsonschema:"two-letter country code, or empty to clear"`
+	Location    *string                 `json:"location,omitempty" jsonschema:"operator-facing location text, up to 100 characters"`
+	Provider    *string                 `json:"provider,omitempty" jsonschema:"operator-facing provider text, up to 100 characters"`
+	Notes       *string                 `json:"notes,omitempty" jsonschema:"operator notes, up to 500 characters"`
+	Direct      []directSubscriptionArg `json:"direct_in_subscriptions,omitempty" jsonschema:"per-inbound switch for whether the node's own address is in subscriptions"`
+	Reality     []realityTargetArg      `json:"reality_target,omitempty" jsonschema:"per-inbound site this node shows strangers at a REALITY server; the server restarts and people's apps reconnect only after they refresh the subscription"`
+	BeforeHash  string                  `json:"before_hash,omitempty" jsonschema:"-"`
+}
+
+var nodeLabelPattern = regexp.MustCompile(`^[a-z0-9-]{2,24}$`)
+
+func validateNodeText(field, value string, maxRunes int, newline bool) error {
+	if !utf8.ValidString(value) || utf8.RuneCountInString(value) > maxRunes {
+		return fmt.Errorf("%s must be at most %d characters", field, maxRunes)
+	}
+	for _, r := range value {
+		if (r < 0x20 || r == 0x7f) && !(newline && strings.ContainsRune("\n\r\t", r)) {
+			return fmt.Errorf("%s must be plain text", field)
+		}
+	}
+	if err := visible(field, value); err != nil {
+		return err
+	}
+	return rejectSecretShaped(field, value)
+}
+
+// prepareRealityTargets keeps the targets that change something, each for a VLESS REALITY server of the node. The shape of the target
+// (a host name and a port, not this node) is the panel's to judge: the plan asks it.
+func prepareRealityTargets(items []realityTargetArg, inbounds []*adminv1.Inbound) ([]realityTargetArg, error) {
+	if len(items) > maxIDs {
+		return nil, fmt.Errorf("reality_target: at most %d inbounds", maxIDs)
+	}
+	seen := map[string]bool{}
+	var changed []realityTargetArg
+	for _, item := range items {
+		if err := validID("inbound_id", item.InboundID); err != nil {
+			return nil, err
+		}
+		item.Target = strings.TrimSpace(item.Target)
+		if err := validateNodeText("target", item.Target, 300, false); err != nil {
+			return nil, err
+		}
+		if seen[item.InboundID] {
+			return nil, errors.New("reality_target names an inbound twice")
+		}
+		seen[item.InboundID] = true
+		var found *adminv1.Inbound
+		for _, inbound := range inbounds {
+			if inbound.GetId() == item.InboundID {
+				found = inbound
+				break
+			}
+		}
+		if found == nil {
+			return nil, errors.New("inbound_id is not an inbound on this node")
+		}
+		// a server whose target cannot be built now (its profile went to TLS) still has the target of the node to reset
+		if found.GetRealityTarget() == "" && found.GetRealityTargetOverride() == "" {
+			return nil, errors.New("reality_target needs a VLESS server with REALITY")
+		}
+		if found.GetRealityTargetOverride() != plugin.NormalizeRealityTarget(item.Target) {
+			changed = append(changed, item)
+		}
+	}
+	return changed, nil
+}
+
+// strangersFact is what a stranger who finds the node's port gets shown: the node's own site ("self"), or the site of the target.
+func strangersFact(key, target string) Fact {
+	if target == "self" {
+		return codedFact(key, "the node's own site", "reality_own")
+	}
+	host, _, _ := strings.Cut(target, ":")
+	return Fact{Key: key, Value: clean(host, 253), Untrusted: true}
+}
+
+func prepareNodeUpdate(a nodeUpdateArgs, node *adminv1.Node, notes string, inbounds []*adminv1.Inbound) (nodeUpdateArgs, []directSubscriptionArg, error) {
+	if a.Name != nil {
+		n := strings.ToLower(strings.TrimSpace(*a.Name))
+		if !nodeLabelPattern.MatchString(n) {
+			return a, nil, errors.New("name must match [a-z0-9-]{2,24}")
+		}
+		a.Name = &n
+	}
+	if a.CountryCode != nil {
+		cc := strings.ToUpper(strings.TrimSpace(*a.CountryCode))
+		if cc != "" && (len(cc) != 2 || cc[0] < 'A' || cc[0] > 'Z' || cc[1] < 'A' || cc[1] > 'Z') {
+			return a, nil, errors.New("country_code must be two letters or empty")
+		}
+		a.CountryCode = &cc
+	}
+	if a.Location != nil {
+		if err := validateNodeText("location", *a.Location, 100, false); err != nil {
+			return a, nil, err
+		}
+	}
+	if a.Provider != nil {
+		if err := validateNodeText("provider", *a.Provider, 100, false); err != nil {
+			return a, nil, err
+		}
+	}
+	if a.Notes != nil {
+		if err := validateNodeText("notes", *a.Notes, 500, true); err != nil {
+			return a, nil, err
+		}
+	}
+	if len(a.Direct) > maxIDs {
+		return a, nil, fmt.Errorf("direct_in_subscriptions: at most %d inbounds", maxIDs)
+	}
+	seen := map[string]bool{}
+	var changed []directSubscriptionArg
+	for _, item := range a.Direct {
+		if err := validID("inbound_id", item.InboundID); err != nil {
+			return a, nil, err
+		}
+		if seen[item.InboundID] {
+			continue
+		}
+		seen[item.InboundID] = true
+		var found *adminv1.Inbound
+		for _, inbound := range inbounds {
+			if inbound.GetId() == item.InboundID {
+				found = inbound
+				break
+			}
+		}
+		if found == nil {
+			return a, nil, errors.New("inbound_id is not an inbound on this node")
+		}
+		if found.GetDirectInSubscriptions() != item.Included {
+			changed = append(changed, item)
+		}
+	}
+	a.Direct = changed
+	var err error
+	if a.Reality, err = prepareRealityTargets(a.Reality, inbounds); err != nil {
+		return a, nil, err
+	}
+	metadataChanged := (a.Name != nil && *a.Name != node.GetName()) || (a.CountryCode != nil && *a.CountryCode != node.GetCountryCode()) ||
+		(a.Location != nil && *a.Location != node.GetLocation()) || (a.Provider != nil && *a.Provider != node.GetProvider()) || (a.Notes != nil && *a.Notes != notes)
+	if !metadataChanged && len(changed) == 0 && len(a.Reality) == 0 {
+		return a, nil, errors.New("nothing to change: node settings already look like this")
+	}
+	return a, changed, nil
+}
+
+func nodeSettingsHash(node *adminv1.Node, notes string, inbounds []*adminv1.Inbound) string {
+	var parts []string
+	for _, in := range inbounds {
+		parts = append(parts, in.GetId()+":"+fmt.Sprint(in.GetDirectInSubscriptions())+":"+in.GetRealityTargetOverride())
+	}
+	slices.Sort(parts)
+	return hashText(node.GetId() + "\x00" + node.GetName() + "\x00" + node.GetCountryCode() + "\x00" + node.GetLocation() + "\x00" + node.GetProvider() + "\x00" + notes + "\x00" + strings.Join(parts, ","))
+}
+
+var nodeUpdate = changeSpec[nodeUpdateArgs]{
+	name: "node_update", min: ProfileAdmin, danger: true,
+	procs: procs(adminv1connect.NodeServiceListNodesProcedure, adminv1connect.NodeServiceGetNodeProcedure, adminv1connect.NodeServiceUpdateNodeProcedure, adminv1connect.ProfileServiceUpdateInboundProcedure),
+	desc:  "Edit a node's label, country, location, provider or notes, set per-inbound direct-in-subscriptions switches, and set the site a node shows strangers at a REALITY server (reality_target: inbound_id and host:port, empty = the profile's own target; take the name from node_neighbor_sites, a site with dns here). The tool omits the node address and every setting that changes runtime behavior other than that target. Name, country, subscription switches and the REALITY target affect what users receive; those changes wait for owner approval. A new target restarts the server, and people's apps cannot connect through it until they refresh their subscription; the plan says what strangers see now and after.",
+	plan: func(c *call, a nodeUpdateArgs) (*planned, error) {
+		id, name, err := c.nodeRef(a.Node)
+		if err != nil {
+			return nil, err
+		}
+		r, err := c.cl.Node.GetNode(c.ctx, connect.NewRequest(&adminv1.GetNodeRequest{NodeId: id}))
+		if err != nil {
+			return nil, apiError(err)
+		}
+		node := r.Msg.GetNode()
+		if node == nil {
+			return nil, errors.New("node settings are unavailable")
+		}
+		a.Node = id
+		a, changed, err := prepareNodeUpdate(a, node, r.Msg.GetNotes(), r.Msg.GetInbounds())
+		if err != nil {
+			return nil, err
+		}
+		var warningFacts []Fact
+		for _, item := range changed {
+			value := item.Included
+			validated, err := c.cl.Profile.UpdateInbound(c.e.cfg.Auth.WithPlanning(c.ctx), connect.NewRequest(&adminv1.UpdateInboundRequest{InboundId: item.InboundID, DirectInSubscriptions: &value, ValidateOnly: true}))
+			if err != nil {
+				return nil, apiError(err)
+			}
+			for _, warning := range validated.Msg.GetWarnings() {
+				warningFacts = append(warningFacts, statusWarningFact(warning))
+			}
+		}
+		facts := []Fact{{Key: "node", Value: nm(name), Untrusted: true}}
+		if a.Name != nil && *a.Name != node.GetName() {
+			facts = append(facts, safeTextChange("name", node.GetName(), *a.Name))
+		}
+		if a.CountryCode != nil && *a.CountryCode != node.GetCountryCode() {
+			facts = append(facts, safeTextChange("country_code", node.GetCountryCode(), *a.CountryCode))
+		}
+		if a.Location != nil && *a.Location != node.GetLocation() {
+			facts = append(facts, safeTextChange("location", node.GetLocation(), *a.Location))
+		}
+		if a.Provider != nil && *a.Provider != node.GetProvider() {
+			facts = append(facts, safeTextChange("provider", node.GetProvider(), *a.Provider))
+		}
+		if a.Notes != nil && *a.Notes != r.Msg.GetNotes() {
+			changeFacts, err := approvalTextChangeFacts("notes", r.Msg.GetNotes(), *a.Notes)
+			if err != nil {
+				return nil, err
+			}
+			facts = append(facts, changeFacts...)
+		}
+		for _, item := range changed {
+			var inName, profile string
+			for _, in := range r.Msg.GetInbounds() {
+				if in.GetId() == item.InboundID {
+					inName, profile = in.GetProtocol(), in.GetProfileName()
+					break
+				}
+			}
+			df := codedFact("direct_in_subscriptions", nm(profile)+" / "+nm(inName)+" ("+clean(item.InboundID, 60)+") -> "+strconvBool(item.Included), "direct_in_subscriptions",
+				"profile", nm(profile), "protocol", nm(inName), "included", strconvBool(item.Included))
+			df.Untrusted, df.UntrustedParams = true, []string{"profile", "protocol"}
+			facts = append(facts, df)
+		}
+		// A site of the node's own at a REALITY server: the panel judges the target (a host name, not this node, an agent that takes it)
+		// and says what strangers see now and after; the server restarts, and the apps connect again after a subscription refresh.
+		for _, item := range a.Reality {
+			target := item.Target
+			validated, err := c.cl.Profile.UpdateInbound(c.e.cfg.Auth.WithPlanning(c.ctx), connect.NewRequest(&adminv1.UpdateInboundRequest{InboundId: item.InboundID, RealityTargetOverride: &target, ValidateOnly: true}))
+			if err != nil {
+				return nil, apiError(err)
+			}
+			for _, warning := range validated.Msg.GetWarnings() {
+				warningFacts = append(warningFacts, statusWarningFact(warning))
+			}
+			var now *adminv1.Inbound
+			for _, in := range r.Msg.GetInbounds() {
+				if in.GetId() == item.InboundID {
+					now = in
+					break
+				}
+			}
+			facts = append(facts, Fact{Key: "reality_server", Value: nm(now.GetProfileName()), Untrusted: true},
+				strangersFact("strangers_now", cmp.Or(now.GetRealityTarget(), now.GetRealityTargetOverride())), strangersFact("strangers_after", validated.Msg.GetInbound().GetRealityTarget()))
+		}
+		if len(a.Reality) > 0 {
+			facts = append(facts, codedFact("reality_effect", "the server restarts; people's apps connect again once they refresh the subscription, until then they cannot connect through this server", "reality_target_effect"))
+		}
+		facts = append(facts, warningFacts...)
+		// NodeService.UpdateNode also accepts runtime-changing fields at the API boundary. The MCP tool keeps its
+		// arguments to metadata, but still requires the owner grant for this exact procedure.
+		danger := []string{dangerPage}
+		if len(a.Reality) > 0 {
+			danger = append(danger, dangerFleet)
+		}
+		a.BeforeHash = nodeSettingsHash(node, r.Msg.GetNotes(), r.Msg.GetInbounds())
+		summary := "Update node metadata or subscription-facing inbound settings. The owner must approve this change."
+		return &planned{Summary: summary, Facts: facts, Danger: danger, Params: a}, nil
+	},
+	apply: func(c *call, a nodeUpdateArgs, _ Plan) (done, error) {
+		r, err := c.cl.Node.GetNode(c.ctx, connect.NewRequest(&adminv1.GetNodeRequest{NodeId: a.Node}))
+		if err != nil {
+			return done{}, apiError(err)
+		}
+		if r.Msg.GetNode() == nil || nodeSettingsHash(r.Msg.GetNode(), r.Msg.GetNotes(), r.Msg.GetInbounds()) != a.BeforeHash {
+			return done{}, failure("changed_since_plan", "node settings changed after the plan; make a new plan")
+		}
+		req := &adminv1.UpdateNodeRequest{NodeId: a.Node, Name: a.Name, CountryCode: a.CountryCode, Location: a.Location, Provider: a.Provider, Notes: a.Notes}
+		if a.Name != nil || a.CountryCode != nil || a.Location != nil || a.Provider != nil || a.Notes != nil {
+			if _, err := c.cl.Node.UpdateNode(c.ctx, connect.NewRequest(req)); err != nil {
+				return done{}, apiError(err)
+			}
+		}
+		for _, item := range a.Direct {
+			value := item.Included
+			if _, err := c.cl.Profile.UpdateInbound(c.ctx, connect.NewRequest(&adminv1.UpdateInboundRequest{InboundId: item.InboundID, DirectInSubscriptions: &value})); err != nil {
+				return done{}, inboundApplyError(err)
+			}
+		}
+		for _, item := range a.Reality {
+			target := item.Target
+			if _, err := c.cl.Profile.UpdateInbound(c.ctx, connect.NewRequest(&adminv1.UpdateInboundRequest{InboundId: item.InboundID, RealityTargetOverride: &target})); err != nil {
+				return done{}, inboundApplyError(err)
+			}
+		}
+		return doneWith("node_updated", "Node settings updated."), nil
+	},
+}
+
+// inboundApplyError: the panel refuses an inbound write with Aborted when the row changed after it was read (an edit in the
+// panel, or another plan); here that means the plan is out of date.
+func inboundApplyError(err error) error {
+	if connect.CodeOf(err) == connect.CodeAborted {
+		return failure("changed_since_plan", "a node inbound changed after the plan; make a new plan")
+	}
+	return apiError(err)
+}
+
+func strconvBool(v bool) string {
+	if v {
+		return "included"
+	}
+	return "excluded"
+}

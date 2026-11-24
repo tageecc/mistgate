@@ -86,29 +86,29 @@ type CertRow struct {
 }
 
 // LinkCertificates returns the node certificates that mTLS would still accept at now, including a
-// previous certificate inside the renewal grace period. Retired nodes have no acceptable certificates.
-func (s *Store) LinkCertificates(ctx context.Context, nodeID string, now time.Time) ([]CertRow, error) {
+// previous certificate inside the renewal grace period. Retired nodes have no acceptable certificates. sealed is the
+// node's link seal mark (node.link_sealed), read in the same query so a link accept stays one read.
+func (s *Store) LinkCertificates(ctx context.Context, nodeID string, now time.Time) (certs []CertRow, sealed bool, err error) {
 	rows, err := s.R.QueryContext(ctx, `
-		SELECT c.serial, c.node_id, c.ca_id, c.pem, c.not_before, c.not_after, c.issued_at
+		SELECT c.serial, c.node_id, c.ca_id, c.pem, c.not_before, c.not_after, c.issued_at, n.link_sealed
 		FROM node_cert c JOIN node n ON n.id = c.node_id
 		WHERE c.node_id = ? AND n.state <> 'retired' AND c.not_before <= ? AND c.not_after > ?
 		  AND (c.revoked_at IS NULL OR c.revoked_at > ?)
 		ORDER BY c.issued_at DESC`, nodeID, unix(now), unix(now), unix(now))
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer rows.Close()
-	var out []CertRow
 	for rows.Next() {
 		var c CertRow
 		var nb, na, issued int64
-		if err := rows.Scan(&c.Serial, &c.NodeID, &c.CAID, &c.PEM, &nb, &na, &issued); err != nil {
-			return nil, err
+		if err := rows.Scan(&c.Serial, &c.NodeID, &c.CAID, &c.PEM, &nb, &na, &issued, &sealed); err != nil {
+			return nil, false, err
 		}
 		c.NotBefore, c.NotAfter, c.IssuedAt = fromUnix(nb), fromUnix(na), fromUnix(issued)
-		out = append(out, c)
+		certs = append(certs, c)
 	}
-	return out, rows.Err()
+	return certs, sealed, rows.Err()
 }
 
 func insertCert(ctx context.Context, tx *sql.Tx, c CertRow) error {
@@ -191,7 +191,7 @@ func (s *Store) CertStatus(ctx context.Context, serial string, now time.Time) (C
 // non-retired node (re-enrollment). Older unused tokens of the node stop working.
 // The returned node is the current row.
 func (s *Store) CreateEnrollment(ctx context.Context, n *NodeRow, nodeID string, tokenHash []byte, createdBy string, now, expires time.Time) (NodeRow, error) {
-	stmts := make([]Stmt, 0, 5)
+	stmts := make([]Stmt, 0, 8)
 	if n != nil {
 		nodeID = n.ID
 		if n.DecoyMode == "" {
@@ -201,6 +201,7 @@ func (s *Store) CreateEnrollment(ctx context.Context, n *NodeRow, nodeID string,
 			INSERT INTO node (id, name, address, country_code, location, provider, state, created_at, decoy_mode)
 			VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
 			Args: []any{n.ID, n.Name, n.Address, n.CountryCode, n.Location, n.Provider, unix(now), n.DecoyMode}})
+		stmts = append(stmts, nodeShareStmts(n.ID, n.Share, now)...)
 	}
 	stmts = append(stmts,
 		guard(`EXISTS (SELECT 1 FROM node WHERE id = ? AND state <> 'retired')`, nodeID),
@@ -348,7 +349,7 @@ func (s *Store) Enroll(ctx context.Context, tokenHash, keyHash []byte, now time.
 			Args: []any{unix(now), snap.nodeID, unix(now)}},
 		insertCertStmt(c),
 		Stmt{Query: `UPDATE enrollment_token SET used_at = ?, csr_key_hash = ?, issued_serial = ? WHERE id = ?`, Args: []any{unix(now), keyHash, c.Serial, snap.id}},
-		Stmt{Query: `UPDATE node SET cert_serial = ? WHERE id = ?`, Args: []any{c.Serial, snap.nodeID}},
+		Stmt{Query: `UPDATE node SET cert_serial = ?, link_sealed = 0 WHERE id = ?`, Args: []any{c.Serial, snap.nodeID}}, // a new enrolment starts the link mark afresh
 	)
 	if errors.Is(err, errGuard) {
 		snap, err = readSnapshot()

@@ -15,6 +15,16 @@ service SubscriptionService {
   rpc ListClients(ListClientsRequest) returns (ListClientsResponse);
   // "Serving rules" tab: which rule and format a sample User-Agent gets.
   rpc TestUserAgent(TestUserAgentRequest) returns (TestUserAgentResponse);
+  // "Response headers" tab: the headers of the list (the editor's draft, checked like a save) one person gets with one
+  // User-Agent. INVALID_ARGUMENT for a list that a save would refuse; NOT_FOUND for an unknown person.
+  rpc PreviewResponseHeaders(PreviewResponseHeadersRequest) returns (PreviewResponseHeadersResponse);
+  // "Mihomo templates" tab: the profile one person would get from the editor's draft of a template, as the Mihomo answer builds it
+  // (nothing is written: no device, no credential), and what the owner should look at. INVALID_ARGUMENT for a text that a save
+  // would refuse; NOT_FOUND for an unknown person.
+  rpc PreviewMihomoTemplate(PreviewMihomoTemplateRequest) returns (PreviewMihomoTemplateResponse);
+  // "Routing" tab: reads what the owner pasted (link, base64 or JSON) as a save does and returns the entry it would store, with its
+  // info and the mode of a link. INVALID_ARGUMENT with the reason for a text that a save would refuse. Nothing is written.
+  rpc PreviewRoutingProfile(PreviewRoutingProfileRequest) returns (PreviewRoutingProfileResponse);
 }
 
 message SubscriptionSettings {
@@ -50,6 +60,112 @@ message SubscriptionSettings {
   HappPing happ_ping = 12;
   // With happ_ping set: Happ pings the servers each time it opens (subscription-ping-onopen-enabled: 1, else 0).
   bool happ_ping_on_open = 13;
+  // AmneziaWG servers in what the subscription link hands out (today only the Mihomo profile carries them).
+  // Absent = true: settings stored before this switch existed keep today's behaviour.
+  optional bool link_awg = 14;
+  // Include automatic server selection in Mihomo and sing-box subscription profiles; absent means on.
+  optional bool link_auto_select = 15;
+  // Days without a connection or subscription fetch before a device stops counting. 0 disables idling; otherwise 7 to 365.
+  // Absent in an update = keep the stored setting.
+  optional uint32 device_idle_after_days = 16;
+  // The owner's own response headers of a successful subscription answer (e.g. flclashx-servicename). In order: when two
+  // entries of one name both apply, the first wins. Refusals (device limit, a blocked device, no access) carry none of them.
+  repeated ResponseHeader response_headers = 17;
+  // The owner's own Mihomo YAML profiles, one for each of the groups they name; a person of a group that no template names gets the
+  // panel's own profile. The list is replaced as a whole. Checked on save (see MihomoTemplate); at most 20 templates, 64 KiB each and
+  // 256 KiB in all.
+  repeated MihomoTemplate mihomo_templates = 18;
+  // The owner's own routing profiles for the apps Happ and INCY, one for each of the groups they name; a person gets one profile at most,
+  // by their main group. The list is replaced as a whole. Checked on save (see RoutingProfile); at most 20 profiles.
+  repeated RoutingProfile routing_profiles = 19;
+}
+
+// One routing profile of the owner, for Happ and INCY: what goes direct, through the VPN and to the block list, the app's DNS and the
+// geo files. The owner pastes a link (`happ://routing/onadd/...`, `incy://...`, `://routing/add/...`), the bare base64 or the JSON; a
+// save reads it, keeps only the fields the two apps document (the others are named in info.dropped_fields and left out) and stores the
+// JSON the panel writes out of them, so what the apps get is never the pasted text. An answer to Happ carries the profile as
+// `happ://routing/<add|onadd>/<base64>`, one to INCY as `incy://...`, in the `routing` header while the link is at most 3000 bytes, else
+// on a line of the subscription body. The person's own DNS preset replaces the DNS fields of the profile; the rules stay the owner's.
+// A save is refused (INVALID_ARGUMENT, the text names the field) for a text that is no profile, a field of the wrong type, a geo-file or
+// DoH address that is not https, a profile over 32 KiB, a name used twice, a group in two profiles or two profiles for all groups.
+message RoutingProfile {
+  // What the owner pasted, or the JSON the panel stored; always the stored JSON in a response.
+  string profile = 1;
+  // false = the app adds the profile and turns it on (`onadd`); true = it adds it and the person turns it on (`add`).
+  bool only_add = 2;
+  // false = every group; true = only the people whose main group is in group_ids (none listed = nobody gets it).
+  bool only_groups = 3;
+  // Group ids, only with only_groups; at most 100. A group that is deleted later drops out the next time the settings are saved.
+  repeated string group_ids = 4;
+  // What the profile holds, in numbers. Filled by the panel in a response, ignored in a request.
+  RoutingInfo info = 5;
+}
+
+// What a stored routing profile holds, for the admin to show in words.
+message RoutingInfo {
+  string name = 1;
+  uint32 direct_sites = 2;
+  uint32 direct_ip = 3;
+  uint32 proxy_sites = 4;
+  uint32 proxy_ip = 5;
+  uint32 block_sites = 6;
+  uint32 block_ip = 7;
+  // "DoH", "DoU" or "" (the app's own), and the address: the DoH URL, else the IP.
+  string remote_dns_type = 8;
+  string remote_dns = 9;
+  string domestic_dns_type = 10;
+  string domestic_dns = 11;
+  // Entries of DnsHosts.
+  uint32 hosts = 12;
+  string geoip_address = 13;
+  string geosite_address = 14;
+  // "true", "false" or "": what the app does with traffic no rule names.
+  string global_proxy = 15;
+  string domain_strategy = 16;
+  string fake_dns = 17;
+  string last_updated = 18;
+  bool use_chunk_files = 19;
+  // Fields of the pasted text that the panel does not keep (at most 10, names only). Filled by PreviewRoutingProfile only.
+  repeated string dropped_fields = 20;
+  // The stored JSON in bytes, and the bytes of the Happ link of it without the person's DNS (the header holds at most 3000).
+  uint32 profile_bytes = 21;
+  uint32 header_bytes = 22;
+}
+
+// One Mihomo YAML profile of the owner. The panel puts the servers of the person at the start of its `proxies` and, while
+// link_auto_select is on and the template has no group of that name, adds a url-test group `Auto` over them at the end of its
+// `proxy-groups`; groups take the servers with `include-all-proxies` or `filter`. `dns` is added (resolvers of the person's preset,
+// respect-rules on) only when the template has none. Everything else is left as written, comments included. The panel never
+// fetches a URL of a template.
+//
+// A save is refused (INVALID_ARGUMENT, the text names the line) unless the text is one valid YAML document that parses in full (no
+// alias bomb, no repeated key), has a mapping at its root, `proxies` and `proxy-groups` that are lists (or absent) with named
+// entries, groups that refer only to names of the template, the core and `Auto`, and `use` that names its `proxy-providers`; a
+// group may be in one template only. Names are unique without regard to case.
+message MihomoTemplate {
+  // 1 to 60 characters; how the editor and MCP call the template.
+  string name = 1;
+  // The text, 1 byte to 64 KiB, UTF-8.
+  string yaml = 2;
+  // The groups whose people get this template (at most 100). A group that is deleted later drops out of the list the next time the
+  // settings are saved; a template without groups serves nobody.
+  repeated string group_ids = 3;
+}
+
+// One response header the owner adds to the subscription answer the apps fetch. The name is an HTTP token (RFC 9110) that is
+// none of the panel's own headers (GetSubscriptionSettingsResponse.reserved_header_names); the value has no control
+// characters; at most 20 entries, a name of at most 64 bytes, a value of at most 1000 bytes and 4096 bytes in all.
+message ResponseHeader {
+  string name = 1;
+  string value = 2;
+  // Send the value as "base64:" plus its base64, the way the panel sends the title (apps that read text headers decode it).
+  bool base64 = 3;
+  // The answer formats it goes with: SUB_FORMAT_BASE64_URIS, _MIHOMO_YAML, _XRAY_JSON or _SINGBOX_JSON. Empty = all of them.
+  repeated SubFormat formats = 4;
+  // false = every group; true = only the people of group_ids (none listed = nobody gets it).
+  bool only_groups = 5;
+  // Group ids, only with only_groups. A group that is deleted later drops out of the list the next time the settings are saved.
+  repeated string group_ids = 6;
 }
 
 // The ping-type header Happ is sent (only Happ, only when set), with ping-result: time (the delay in ms, not an icon).
@@ -162,6 +278,12 @@ message GetSubscriptionSettingsResponse {
   // People who have a live common (no device ID) place right now: the apps that report none are what STRICT turns away,
   // so the confirmation of switching to it shows this number.
   uint32 shared_link_users = 6;
+  // Live AmneziaWG credentials held by the subscription link's devices, across all users. Turning link_awg off drops
+  // each credential the next time its app fetches a Mihomo profile.
+  uint32 link_awg_keys = 7;
+  // What an own response header may not be named, from the code that sets the headers: exact names, and prefixes written with a
+  // trailing "*" ("X-Hwid-*"). Compared without regard to case. The panel refuses such a name on save; the editor shows it first.
+  repeated string reserved_header_names = 8;
 }
 
 // One server of the preview: what a server name is built from.
@@ -208,4 +330,75 @@ message TestUserAgentResponse {
   SubFormat format = 2;
   // True when the fallback treated the User-Agent as a browser.
   bool browser = 3;
+}
+
+message PreviewResponseHeadersRequest {
+  string user_id = 1;
+  string user_agent = 2;
+  // The list to preview: the editor's draft, or the saved one.
+  repeated ResponseHeader headers = 3;
+}
+
+// One header as it goes out.
+message SentHeader {
+  string name = 1;
+  // As sent: with "base64:" and the encoded text when the entry asks for base64.
+  string value = 2;
+  bool base64 = 3;
+}
+
+message PreviewResponseHeadersResponse {
+  // The answer format the User-Agent gets (SUB_FORMAT_USER_PAGE for a browser: the page, not a subscription).
+  SubFormat format = 1;
+  // The own headers that person's answer carries, in the order they are listed. Empty when the answer is not a subscription
+  // (see not_served) or no entry applies.
+  repeated SentHeader headers = 2;
+  // Why there are none by design: "page" (a browser gets the user page), "decoy" (the User-Agent is served as an unknown link),
+  // "no_access" (the person's subscription is off, expired or over its quota: the answer carries a note and no own headers).
+  // "" = the answer is a subscription.
+  string not_served = 3;
+  // The person's group, for the preview's caption.
+  string group_name = 4;
+  // The saved routing profile is in the answer: its link is the `routing` entry of headers (Happ and INCY only). The header does not
+  // fit (the link is over 3000 bytes) and the link is on a line of the body: routing_in_body, and no `routing` entry.
+  bool routing_in_body = 5;
+}
+
+message PreviewRoutingProfileRequest {
+  // A link, a base64 text or the JSON of a profile.
+  string input = 1;
+}
+
+message PreviewRoutingProfileResponse {
+  // The entry for the list: profile as stored, only_add from the link (add = true), info with dropped_fields.
+  RoutingProfile profile = 1;
+}
+
+message PreviewMihomoTemplateRequest {
+  string user_id = 1;
+  // The text of the draft, checked as a save checks it (and against the saved switch of automatic selection).
+  string yaml = 2;
+  // The groups the draft is for; none: the warning "unused". The person need not be in one of them.
+  repeated string group_ids = 3;
+}
+
+// One finding that does not stop a save (SubscriptionService words them by code). code is one of: no_server_group (no group takes the
+// servers of the person: include-all-proxies, or Auto), own_dns (the person's DNS preset is not applied to this template),
+// preset_rules_skipped (the preset has ad, split or country rules that a template does not get), own_auto (the template has its own
+// Auto, so the panel adds none), unknown_rule_target (arg: the last field of a rule that names no proxy or group), unused (no group).
+message MihomoWarning {
+  string code = 1;
+  string arg = 2;
+}
+
+message PreviewMihomoTemplateResponse {
+  // The profile: the servers of the person with their name, type, address and port only (no credential), around the template. When
+  // not_served is set, the profile the person gets instead (the panel's own).
+  string yaml = 1;
+  repeated MihomoWarning warnings = 2;
+  // The person's group, for the preview's caption.
+  string group_name = 3;
+  // Why the person does not get the template: "no_access" (their subscription is off, expired or over its quota: the answer is a note)
+  // or "no_servers" (none of their servers can be in a Mihomo profile). "" = the template.
+  string not_served = 4;
 }

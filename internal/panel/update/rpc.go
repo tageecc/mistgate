@@ -2,16 +2,23 @@ package update
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"connectrpc.com/connect"
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
+	agentv1 "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/internal/agentcap"
 	"github.com/mistgate/mistgate/internal/panel/edition"
 	"github.com/mistgate/mistgate/internal/panel/health"
 	"github.com/mistgate/mistgate/internal/panel/store"
+	"github.com/mistgate/mistgate/internal/release"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 // rpc is the admin UpdateService (update.proto). Roles are decided by auth/policy.go before a call gets here;
@@ -52,6 +59,10 @@ func unixOrZero(t interface {
 
 // rolloutMsg converts a rollout with its steps. Keys are sent whole ("updates.pause.<code>", "updates.step.err.<code>").
 func rolloutMsg(ro store.RolloutRow, steps []store.StepRow) *adminv1.Rollout {
+	return rolloutMsgWithProgress(ro, steps, nil)
+}
+
+func rolloutMsgWithProgress(ro store.RolloutRow, steps []store.StepRow, progress map[string]progressState) *adminv1.Rollout {
 	m := &adminv1.Rollout{Id: ro.ID, Status: rolloutStatusProto[ro.Status], ToVersion: ro.ToVersion, ToBuilt: ro.ToBuilt,
 		BatchSize: uint32(ro.BatchSize), CreatedUnix: ro.CreatedAt.Unix(), FinishedUnix: unixOrZero(ro.FinishedAt)}
 	if ro.Status == store.RolloutPaused && ro.PauseKey != "" {
@@ -71,6 +82,15 @@ func rolloutMsg(ro store.RolloutRow, steps []store.StepRow) *adminv1.Rollout {
 		}
 		if len(x.Params) > 0 {
 			st.Params = x.Params
+		}
+		p, ok := progress[x.NodeID]
+		if !ok && x.ProgressPhase != "" {
+			p, ok = progressState{RequestID: x.RequestID, Phase: x.ProgressPhase, Downloaded: x.ProgressDownloaded,
+				Total: x.ProgressTotal, Speed: x.ProgressSpeed, UpdatedUnix: x.ProgressUpdatedUnix, Source: x.ProgressSource}, true
+		}
+		if ok && x.State == store.StepSent && x.RequestID != "" && p.RequestID == x.RequestID {
+			st.DownloadPhase, st.DownloadedBytes, st.TotalBytes, st.BytesPerSecond = p.Phase, p.Downloaded, p.Total, p.Speed
+			st.DownloadSource = reportedDownloadSource(p.Source)
 		}
 		m.Steps = append(m.Steps, st)
 	}
@@ -92,14 +112,30 @@ func (r rpc) GetUpdates(ctx context.Context, _ *connect.Request[adminv1.GetUpdat
 	b := s.bundleFor(ctx)
 	resp := &adminv1.GetUpdatesResponse{NowUnix: s.now().Unix(), Bundle: b.view, Panel: &adminv1.PanelBuild{
 		Version: s.cfg.PanelVersion, Built: s.cfg.PanelBuilt, HasReleaseKey: s.cfg.Key != nil}}
+	channel, err := s.updateChannel(ctx)
+	if err != nil {
+		return nil, s.internal("load update channel", err)
+	}
+	resp.UpdateChannel = string(channel)
+	if runningChannel, ok := release.ChannelOf(s.cfg.PanelVersion); ok {
+		resp.RunningVersionChannel = string(runningChannel)
+	}
 	offset, err := s.scheduleTimezoneOffset(ctx)
 	if err != nil {
 		return nil, s.internal("load update timezone", err)
 	}
 	resp.ScheduleTimezoneOffsetMinutes = offset
+	var panelStatus PanelUpdateStatus
 	if s.cfg.PanelUpdater != nil {
-		resp.Panel.Update = panelUpdateProto(s.cfg.PanelUpdater.Status())
+		panelStatus = s.cfg.PanelUpdater.Status()
+		resp.Panel.Update = panelUpdateProto(panelStatus)
 	}
+	if panelStatus.Version != "" {
+		if offeredChannel, ok := release.ChannelOf(panelStatus.Version); ok {
+			resp.OfferedReleaseChannel = string(offeredChannel)
+		}
+	}
+	resp.RunningNewerThanChannelOffers = panelStatus.RunningNewer
 	if s.cfg.Key != nil {
 		resp.Panel.ReleaseKeyFingerprint = fingerprint(s.cfg.Key)
 	}
@@ -116,6 +152,18 @@ func (r rpc) GetUpdates(ctx context.Context, _ *connect.Request[adminv1.GetUpdat
 		resp.Rollout = rolloutMsg(ro, steps)
 	case err != store.ErrNotFound:
 		return nil, s.internal("load rollout", err)
+	}
+	timeout, err := s.updateDownloadTimeout(ctx)
+	if err != nil {
+		return nil, s.internal("load update download timeout", err)
+	}
+	resp.UpdateDownloadTimeoutSeconds = uint32(timeout / time.Second)
+	if !s.cfg.Edge {
+		sources, err := s.updateDownloadSources(ctx)
+		if err != nil {
+			return nil, s.internal("load update download sources", err)
+		}
+		resp.UpdateDownloadSources = sources
 	}
 	if !ro.Active() {
 		steps = nil // only an active rollout makes a node UPDATING
@@ -157,6 +205,83 @@ func (r rpc) GetUpdates(ctx context.Context, _ *connect.Request[adminv1.GetUpdat
 	return connect.NewResponse(resp), nil
 }
 
+func (r rpc) GetOsUpdates(ctx context.Context, _ *connect.Request[adminv1.GetOsUpdatesRequest]) (*connect.Response[adminv1.GetOsUpdatesResponse], error) {
+	s := r.s
+	if err := edition.Check(!s.OSUpdatesEnabled(), edition.OSUpdates); err != nil {
+		return nil, err
+	}
+	ctx, cancel := r.requestContext(ctx)
+	defer cancel()
+	nodes, err := s.st.Nodes(ctx, false)
+	if err != nil {
+		return nil, s.internal("load OS update nodes", err)
+	}
+	liveRows, err := s.fl.Live(ctx)
+	if err != nil {
+		return nil, s.internal("load OS update liveness", err)
+	}
+	live := make(map[string]store.NodeLiveRow, len(liveRows))
+	for _, row := range liveRows {
+		live[row.NodeID] = row
+	}
+	stored, err := s.st.OsStatuses(ctx)
+	if err != nil {
+		return nil, s.internal("load OS update snapshots", err)
+	}
+	host := s.PanelHostOsStatus()
+	resp := &adminv1.GetOsUpdatesResponse{NowUnix: s.now().Unix(), Nodes: []*adminv1.NodeOs{}, PanelHost: host}
+	g, err := s.osGlobalNow(ctx)
+	if err != nil {
+		return nil, s.internal("check running rollouts", err)
+	}
+	if resp.Rollout, err = s.osRolloutOrLast(ctx); err != nil {
+		return nil, s.internal("load OS rollout", err)
+	}
+	resp.ScheduleTimezoneOffsetMinutes, err = s.scheduleTimezoneOffset(ctx)
+	if err != nil {
+		return nil, s.internal("load update timezone", err)
+	}
+	reboots, _ := s.osReboots(ctx, s.now()) // a read that fails leaves the reboot limits unknown, not the page empty
+	for _, node := range nodes {
+		if node.State != "active" {
+			continue
+		}
+		row := live[node.ID]
+		var status *agentv1.OsStatus
+		if saved, ok := stored[node.ID]; ok {
+			status = &agentv1.OsStatus{}
+			if err := protojson.Unmarshal([]byte(saved.StatusJSON), status); err != nil {
+				s.log.Warn("stored OS status is invalid", "code", "os_status_decode_failed", "node", node.ID)
+				status = nil
+			}
+		}
+		var online uint32
+		if row.Connected && row.UsersJSON != "" {
+			var users map[string]int64
+			if json.Unmarshal([]byte(row.UsersJSON), &users) == nil {
+				online = uint32(len(users))
+			}
+		}
+		capable := slices.Contains(node.AgentCaps, agentcap.OSStatus)
+		facts, err := s.st.NodeFacts(ctx, node.ID)
+		if err != nil {
+			return nil, s.internal("read node facts", err)
+		}
+		inbounds, err := s.st.FleetInbounds(ctx, node.ID, true)
+		if err != nil {
+			return nil, s.internal("read node inbounds", err)
+		}
+		// Containers on one kernel share the boot id, so a match alone only means "same kernel": see onPanelServer.
+		osn := s.osNodeOf(node, row.Connected, status, host, facts.Hostname, resp.NowUnix, reboots[node.ID])
+		resp.Nodes = append(resp.Nodes, &adminv1.NodeOs{NodeId: node.ID, Name: node.Name, Connected: row.Connected,
+			Supported: osn.supported, OnlineUsers: online, OnPanelServer: osn.onPanel, State: osUpdateState(capable, row.Connected, status, resp.NowUnix), Status: status,
+			UpdateCapable: osn.updateCap, UpdateBlock: osBlockForMode(g, osn, store.OsModeSecurity),
+			UpdateBlockAll: osBlockForMode(g, osn, store.OsModeAll), RebootBlock: osBlock(g, osn, true),
+			RebootPossibleUnix: unixOrZero(osn.rebootAt), Inbounds: uint32(len(inbounds))})
+	}
+	return connect.NewResponse(resp), nil
+}
+
 // releaseNotes picks "What's new" for the two cards: the releases a node update would bring (newer than the oldest agent
 // among the nodes, up to the trusted bundle) and the ones a panel update would bring (newer than this panel, up to the
 // release it can install). The notes are informational and unsigned; without a verified release to go to, nothing is shown.
@@ -185,7 +310,8 @@ func (s *Service) releaseNotes(b *bundleState, views []nodeView, panel *adminv1.
 func releaseNoteMsgs(notes []ReleaseNote) []*adminv1.ReleaseNote {
 	out := make([]*adminv1.ReleaseNote, 0, len(notes))
 	for _, n := range notes {
-		out = append(out, &adminv1.ReleaseNote{Version: n.Version, Url: n.URL, PublishedUnix: n.PublishedUnix, En: n.En, Ru: n.Ru, Zh: n.Zh, Security: n.Security})
+		out = append(out, &adminv1.ReleaseNote{Version: n.Version, Url: n.URL, PublishedUnix: n.PublishedUnix,
+			En: n.En, Ru: n.Ru, Zh: n.Zh, Security: n.Security, Channel: string(n.Channel)})
 	}
 	return out
 }
@@ -228,7 +354,8 @@ func (r rpc) InstallPanelUpdate(ctx context.Context, req *connect.Request[adminv
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrPanelUnsupported), errors.Is(err, ErrNoPanelRelease), errors.Is(err, ErrNoPanelUpdate), errors.Is(err, ErrPanelAssetMissing),
-			errors.Is(err, ErrPanelUnsigned), errors.Is(err, ErrPanelExpired), errors.Is(err, ErrPanelNoKey), errors.Is(err, ErrPanelChanged):
+			errors.Is(err, ErrPanelUnsigned), errors.Is(err, ErrPanelExpired), errors.Is(err, ErrPanelNoKey), errors.Is(err, ErrPanelChanged),
+			errors.Is(err, ErrPanelUpdateChannelNotAllowed), errors.Is(err, ErrPanelUpdateChannelConfig):
 			return nil, connect.NewError(connect.CodeFailedPrecondition, err)
 		default:
 			return nil, connect.NewError(connect.CodeUnavailable, err)
@@ -331,10 +458,30 @@ func (r rpc) RescanBundle(ctx context.Context, _ *connect.Request[adminv1.Rescan
 	if r.s.cfg.Edge {
 		b = r.s.refreshReleaseBundle(ctx)
 	} else {
-		b = r.s.rescan()
+		b = r.s.rescanForRequest()
 	}
-	r.s.audit(ctx, "update_rescan", map[string]string{"status": b.view.Status.String()})
-	return connect.NewResponse(&adminv1.RescanBundleResponse{Bundle: b.view}), nil
+	view := b.view
+	audit := map[string]string{"status": b.view.Status.String()}
+	if !r.s.cfg.Edge {
+		// Reading the folder is not all: the bundle of a new release also has to be fetched from its source, and the owner is told
+		// honestly whether that is done, going on, or waiting for something (Bundle.params "sync", "sync_wait").
+		if outcome, wait := r.s.syncBundleOnRequest(ctx); outcome != "" {
+			if cur := r.s.current(); cur != nil {
+				b = cur // a bundle installed by the sync is the one to show
+			}
+			view = proto.Clone(b.view).(*adminv1.Bundle)
+			if view.Params == nil {
+				view.Params = map[string]string{}
+			}
+			view.Params["sync"] = outcome
+			audit["sync"] = outcome
+			if wait != "" {
+				view.Params["sync_wait"], audit["sync_wait"] = wait, wait
+			}
+		}
+	}
+	r.s.audit(ctx, "update_rescan", audit)
+	return connect.NewResponse(&adminv1.RescanBundleResponse{Bundle: view}), nil
 }
 
 func (r rpc) ScheduleNodeUpdate(ctx context.Context, req *connect.Request[adminv1.ScheduleNodeUpdateRequest]) (*connect.Response[adminv1.ScheduleNodeUpdateResponse], error) {
@@ -381,10 +528,68 @@ func (r rpc) SetUpdateTimezone(ctx context.Context, req *connect.Request[adminv1
 	return connect.NewResponse(&adminv1.SetUpdateTimezoneResponse{TimezoneOffsetMinutes: req.Msg.TimezoneOffsetMinutes}), nil
 }
 
+func (r rpc) SetUpdateChannel(ctx context.Context, req *connect.Request[adminv1.SetUpdateChannelRequest]) (*connect.Response[adminv1.SetUpdateChannelResponse], error) {
+	ctx, cancel := r.requestContext(ctx)
+	defer cancel()
+	if err := r.s.cfg.StepUp(ctx); err != nil {
+		return nil, err
+	}
+	channel, ok := release.ParseChannel(req.Msg.Channel)
+	if !ok {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("channel must be stable, testing or dev"))
+	}
+	old, err := r.s.updateChannel(ctx)
+	if err != nil {
+		return nil, r.s.internal("load update channel", err)
+	}
+	if channel != old {
+		if err := r.s.st.SetSettingIfChanged(ctx, UpdateChannelSetting, string(channel)); err != nil {
+			return nil, r.s.internal("save update channel", err)
+		}
+		r.s.audit(ctx, "update.channel", map[string]string{"old": string(old), "new": string(channel)})
+		if invalidator, ok := r.s.cfg.PanelUpdater.(interface{ Invalidate() }); ok {
+			invalidator.Invalidate()
+		}
+	}
+	return connect.NewResponse(&adminv1.SetUpdateChannelResponse{Channel: string(channel)}), nil
+}
+
+func (r rpc) SetUpdateDownloadTimeout(ctx context.Context, req *connect.Request[adminv1.SetUpdateDownloadTimeoutRequest]) (*connect.Response[adminv1.SetUpdateDownloadTimeoutResponse], error) {
+	ctx, cancel := r.requestContext(ctx)
+	defer cancel()
+	if err := r.s.cfg.StepUp(ctx); err != nil {
+		return nil, err
+	}
+	if err := r.s.setUpdateDownloadTimeout(ctx, req.Msg.TimeoutSeconds); err != nil {
+		return nil, err
+	}
+	return connect.NewResponse(&adminv1.SetUpdateDownloadTimeoutResponse{TimeoutSeconds: req.Msg.TimeoutSeconds}), nil
+}
+
+func (r rpc) SetUpdateDownloadSources(ctx context.Context, req *connect.Request[adminv1.SetUpdateDownloadSourcesRequest]) (*connect.Response[adminv1.SetUpdateDownloadSourcesResponse], error) {
+	if r.s.cfg.Edge {
+		return nil, connect.NewError(connect.CodeUnimplemented, errors.New("optional update download sources are not available in this edition"))
+	}
+	ctx, cancel := r.requestContext(ctx)
+	defer cancel()
+	if err := r.s.cfg.StepUp(ctx); err != nil {
+		return nil, err
+	}
+	sources, err := r.s.setUpdateDownloadSources(ctx, req.Msg.GetSources())
+	if err != nil {
+		return nil, err
+	}
+	return connect.NewResponse(&adminv1.SetUpdateDownloadSourcesResponse{Sources: sources}), nil
+}
+
 // Conditions is the health condition source (health.Service.AddConditionSource): while the active rollout is paused
 // because a step failed, the gate failed or the panel lost track of a step, UPDATE_FAILED is raised; resuming,
 // cancelling or a new rollout makes it go away. A pause by the owner or by a changed bundle raises nothing.
 func (s *Service) Conditions(ctx context.Context) []health.ExtCond {
+	return append(s.agentConditions(ctx), s.osConditions(ctx)...)
+}
+
+func (s *Service) agentConditions(ctx context.Context) []health.ExtCond {
 	ro, err := s.st.ActiveRollout(ctx)
 	if err != nil || ro.Status != store.RolloutPaused {
 		return nil

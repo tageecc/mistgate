@@ -37,13 +37,28 @@ service NodeService {
   // in error_code. One measurement per node at a time.
   rpc MeasureBandwidth(MeasureBandwidthRequest) returns (MeasureBandwidthResponse);
   // Checks that UDP datagrams sent to the node arrive (agents with "udpcheck/1"; design/udp-port-check.md): about 6 s per
-  // 8 ports, a few MB. Ports: the given ones (at most 7), else the node's enabled inbound ports and the free ports the
-  // picker prefers; 443 is always added. Another node sends (both editions); a VPS panel with no other usable node sends
+  // 8 ports, about 300 KiB of UDP payload at most. Ports: the given ones (at most 7), else the node's enabled UDP inbound ports;
+  // 443 is always added. Another node sends (both editions); a VPS panel with no other usable node sends
   // itself. Conclusive results are stored and shown in GetNodeResponse.port_checks.
   // The same call probes the node's TCP ports (agents with "tcpcheck/1"; design/vless.md section 7.4): port 80 only with an
   // ACME name on the node, the Hysteria2 site port and the VLESS ports. The rows are CheckPortsResponse.tcp and are stored for
   // GetNodeResponse.tcp_checks. Owner or helper; API tokens directly (like RunDoctor). Every "could not check" outcome is error_code, never an RPC error.
   rpc CheckPorts(CheckPortsRequest) returns (CheckPortsResponse);
+  // Checks from outside that an IPv6 address of the node answers (agents with "udpcheck/1"; the packets are those of CheckPorts):
+  // the UDP delivery of the node's enabled UDP servers and the TLS identity of its TCP servers, sent to the address instead of the
+  // node's main one by another node whose IPv6 works (the panel itself last; Globalping connects to one TLS port when no
+  // node can). Nothing is changed on any host and port_check / tcp_check are not touched; the answer is kept in Node.ipv6.last_check (UpdateIpv6Entry uses a passing one for ten minutes) and audited as node.ipv6_check. The address has
+  // to be one the node's doctor lists as its uplink's (params addrs and src of the ipv6 check); FAILED_PRECONDITION with a reason
+  // (no_ipv6, ipv6_broken, agent_old, not_checked, main_is_ipv6) when the node has no such address to give, INVALID_ARGUMENT for any other address. Every "could
+  // not check" outcome is error_code, never an RPC error. Owner only; MCP node_ipv6_check.
+  rpc CheckIpv6(CheckIpv6Request) returns (CheckIpv6Response);
+  // Turns the node's IPv6 entry on or off (Node.ipv6; the feature is described at NodeIpv6). ENABLE adds the server
+  // "<node> · IPv6" next to each of the node's servers in everyone's subscription, at the next refresh of their apps; it needs a
+  // check of the address (CheckIpv6) that passed less than 10 minutes ago, and runs one itself when there is none. A check
+  // that does not pass changes nothing and is answered in error_code, like CheckIpv6's. DISABLE removes the servers again
+  // and always works. Both are idempotent: asking for what already is changes nothing and is not audited. Owner only; closed to
+  // API tokens; the MCP tool node_ipv6_plan / node_ipv6_apply goes through the owner's approval. Audited as node.ipv6_entry.
+  rpc UpdateIpv6Entry(UpdateIpv6EntryRequest) returns (UpdateIpv6EntryResponse);
   // "Retire from fleet": revoke the certificate, tell a connected agent to exit, remove the node from
   // every user's access. The row stays (audit, traffic history) with status RETIRED.
   rpc RetireNode(RetireNodeRequest) returns (RetireNodeResponse);
@@ -61,6 +76,19 @@ service NodeService {
   // GetNodeConnections of every node that is not retired, in one read (the MCP tool fleet_connections). A read: every role
   // and API tokens.
   rpc GetFleetConnections(GetFleetConnectionsRequest) returns (GetFleetConnectionsResponse);
+  // Per-inbound autonomous-system counters for a bounded window. Only ASNs and counts are stored or returned; no client address.
+  rpc GetNetworks(GetNetworksRequest) returns (GetNetworksResponse);
+  // What the panel wants a node to run against what the node reports it runs, one node or every node that is not retired: the
+  // desired and applied revision and hash, whether they agree, since when they have not, the last apply and, per inbound, the
+  // panel's spec version, the applied spec hash, the node's state for it, its last error and certificate expiry. No
+  // address, certificate pin or key. A read: every role and API tokens (the MCP tool node_runtime).
+  rpc GetNodeRuntime(GetNodeRuntimeRequest) returns (GetNodeRuntimeResponse);
+  // A node's host load per hour (HostMetrics of every stats batch, rolled up by the panel, kept 90 days): means and peaks of CPU,
+  // softirq, RAM, network and sessions. A read: every role and API tokens (the MCP tool node_metrics with hours).
+  rpc GetNodeHostHistory(GetNodeHostHistoryRequest) returns (GetNodeHostHistoryResponse);
+  // The paths the UDP port check found lossy: from one node to another, with the loss and the other sender's result, and a
+  // summary per target. Node names only, never an address. A read: every role and API tokens (the MCP tool path_loss_matrix).
+  rpc GetPathLoss(GetPathLossRequest) returns (GetPathLossResponse);
 }
 
 // One row of the nodes table / one card.
@@ -128,8 +156,77 @@ message Node {
   // The connected or last-seen agent lists "user-rate-limit/1", so it applies the per-person speed limit
   // (User.speed_limit_bps). False: this node holds people to the smaller of their two limits per device instead.
   bool user_rate_limit_supported = 34;
+  // The IPv6 entry of this node: unset only for a node message that was built without the doctor's view (never in the lists).
+  NodeIpv6 ipv6 = 35;
   // Operator notes for the admin list. Not included in user pages or subscription names.
-  string notes = 35;
+  string notes = 36;
+  // The owner's short text for people, shown next to this server in the Mistgate app ("" = none). Up to 40 characters. The node's
+  // name is never shown to them.
+  string public_label = 37;
+  // The node has opened an encrypted link session at least once, so the panel no longer accepts an unencrypted one from it
+  // (re-enrolling the node clears this). False for a node that never used the link or only with an agent too old to encrypt.
+  bool link_sealed = 38;
+  // Bytes this node passed on as a relay entry since 00:00 (the same day boundary as traffic_today_bytes). Until agents count the
+  // way back it is the direction towards the exits only.
+  uint64 relay_today_bytes = 39 [jstype = JS_NUMBER];
+  // The TCP port of this node's site that the bridge of a reverse relay arrives at when the node is an entry; 0 = 443 on the
+  // node's own site (the usual case). The path of the bridge is not shown: it is the panel's, like the key of a link.
+  uint32 bridge_port = 40;
+  // Why the bridge is not on 443: "" (it is, or no reverse relay needs it), "reality_external_target" (a VLESS inbound holds 443
+  // with a foreign REALITY target, so the bridge has a port of its own) or "port_443_taken" (another server of the node holds 443).
+  string bridge_port_reason = 41;
+  // The profile whose inbound holds 443 in those two cases, for the "open the profile" button; empty otherwise.
+  string bridge_port_profile_id = 42;
+  // The entry node whose bridge the agent of this node runs its control channel through, because it cannot reach the panel
+  // directly; empty = a direct connection (Hello.link_via_node_id; live state, not stored).
+  string link_via_node_id = 43;
+  // The library site this node serves (mode "own"); empty when none (DecoySiteService).
+  string decoy_site_id = 44;
+  // Who the node is handed out to; the groups that receive it are those whose Group.disabled_node_ids lacks this node. Always set.
+  NodeShareSummary sharing = 45;
+}
+
+// How a node is handed out, for the nodes list and the node's page.
+message NodeShareSummary {
+  NodeShareMode mode = 1;
+  // Groups that receive the node now, of all groups; a group made later counts in groups_total only.
+  uint32 groups_receiving = 2;
+  uint32 groups_total = 3;
+  // When the owner last set the share (the node's creation until then). A group's own page does not move it.
+  int64 changed_unix = 4 [jstype = JS_NUMBER];
+  // NONE for more than a day on a node that is enrolled and has an enabled server: the label "nobody gets this node". Only a
+  // field, never an alert: handing a node to nobody is a state the owner may want.
+  bool idle = 5;
+}
+
+// The IPv6 entry: an extra way in for people whose network blocks this node's IPv4 address. It adds one server, "<node> · IPv6",
+// next to each of the node's servers in every subscription that has the node; it connects to an IPv6 address of the node with
+// the same names, keys and certificates as the main one, and apps without IPv6 skip it. It is not the same as "IPv6 for
+// clients" (Node.client_ipv6), which decides whether people's traffic may leave the node over IPv6. Static AmneziaWG keys
+// (.conf, vpn://) are not part of it; the Mihomo proxies of AmneziaWG are.
+message NodeIpv6 {
+  // The address the "· IPv6" servers connect to. Empty = the entry is off.
+  string entry = 1;
+  // Whether the node can take the entry now: its host has IPv6 that works and the main address is not an IPv6 one already.
+  bool entry_supported = 2;
+  // Why not, when entry_supported is false: no_ipv6 (the host has no global IPv6 address), ipv6_broken (it has one but
+  // outbound IPv6 does not work, so nothing will come in either), agent_old (IPv6 works but the agent names no address),
+  // not_checked (the doctor has not reported yet) or main_is_ipv6 (the node's address is IPv6 already). Empty when supported.
+  string unavailable_reason = 3;
+  // The stable global addresses of the node's uplink, as its doctor reports them; the entry is chosen among these.
+  repeated Ipv6Address addresses = 4;
+  // The address the node uses for its own outbound IPv6: the default choice. Empty when the agent does not say.
+  string src = 5;
+  // The latest outside check of the entry's address (while the entry is on), else the latest of any address: when, by whom
+  // (sender), and the verdict of every port. Unset when the node was never checked.
+  CheckIpv6Response last_check = 6;
+  // Fields 7 to 15 are for changing the address of the entry (prefix, rotation state, the old address and until when).
+}
+
+message Ipv6Address {
+  string address = 1;
+  // The prefix length the host holds it with (64, or 128 for a single address).
+  uint32 prefix_len = 2;
 }
 
 enum AwgPrepareState {
@@ -150,7 +247,7 @@ message AwgPrepare {
   AwgPrepareState state = 2;
   int64 since_unix = 3 [jstype = JS_NUMBER];
   // FAILED: a stable code (timeout, apt_lock, step_failed, source_moved, module_not_loaded, module_unusable,
-  // interrupted) and one short English sentence. Never package-manager output.
+  // module_build_failed, interrupted) and one short English sentence. Never package-manager output.
   string reason_code = 4;
   string reason = 5;
 }
@@ -183,6 +280,37 @@ message NodeMetrics {
   uint64 net_rx_bps = 8 [jstype = JS_NUMBER];
   uint64 net_tx_bps = 9 [jstype = JS_NUMBER];
   int64 at_unix = 10 [jstype = JS_NUMBER];
+  // The fields below come from agents that send them (agent.proto HostMetrics 11 to 20); `agent` is absent otherwise, and then
+  // they are not known rather than zero.
+  // Parts of the machine's CPU in percent of all CPUs: steal (the hypervisor gave the time to other guests; inside cpu_pct) and
+  // I/O wait (not in cpu_pct).
+  float steal_pct = 11;
+  float iowait_pct = 12;
+  uint64 swap_used_bytes = 13 [jstype = JS_NUMBER];
+  uint64 swap_total_bytes = 14 [jstype = JS_NUMBER];
+  // Connection tracking entries and the limit (0 and 0 when conntrack is not loaded). A full table drops new connections.
+  uint64 conntrack_count = 15 [jstype = JS_NUMBER];
+  uint64 conntrack_max = 16 [jstype = JS_NUMBER];
+  uint32 tcp_sockets = 17;
+  uint32 udp_sockets = 18;
+  // Main NIC link speed in Mbit/s; 0 = the driver does not say (most virtual NICs).
+  uint32 nic_speed_mbps = 19;
+  // The agent process, inside which every engine runs: what Mistgate costs the machine.
+  ProcessUsage agent = 20;
+}
+
+// What one process uses. cpu_pct is in percent of the whole machine (all CPUs).
+message ProcessUsage {
+  float cpu_pct = 1;
+  uint64 rss_bytes = 2 [jstype = JS_NUMBER];
+  // The Go runtime: all memory it mapped from the OS, the part in heap objects, and its goroutines.
+  uint64 go_total_bytes = 3 [jstype = JS_NUMBER];
+  uint64 go_heap_bytes = 4 [jstype = JS_NUMBER];
+  uint32 goroutines = 5;
+  uint32 threads = 6;
+  // Open file descriptors (sockets among them) and the soft limit (0 = not known).
+  uint32 open_fds = 7;
+  uint32 fd_limit = 8;
 }
 
 // "Host facts" block. The full pre-check result comes with SSH provisioning.
@@ -247,6 +375,49 @@ message GetNodeResponse {
   repeated PortCheck port_checks = 12;
   // Stored TCP checks of this node (the last run), by port.
   repeated TcpCheck tcp_checks = 13;
+  // Latest paired check that found source-side UDP filtering; 0 = none or a later check passed cleanly.
+  int64 udp_filtered_unix = 14 [jstype = JS_NUMBER];
+  // The TCP ports of this node that services share by the SNI of the ClientHello (an agent with "tcp-share/1"), as the agent last
+  // reported them; empty when it shares none. The panel stores the snapshot when it changes and at most every 5 minutes, so the
+  // counters are as of shared_ports_unix (0 = none).
+  repeated SharedPort shared_ports = 15;
+  int64 shared_ports_unix = 16 [jstype = JS_NUMBER];
+}
+
+// One shared TCP port: counters since the agent started (StatsBatch.shared_ports of agent.proto, which says what each one counts).
+// No client address is in it, and the unknown names are what visitors asked for, at most 5.
+message SharedPort {
+  uint32 port = 1;
+  // The inbound that gets what no route claims; empty when the port has none.
+  string default_inbound_id = 2;
+  uint64 accepted = 3;
+  // By inbound id: connections handed to the service.
+  repeated SharedRoute routes = 4;
+  // Why connections went to the default route.
+  uint64 default_no_sni = 5;
+  uint64 default_unknown_name = 6;
+  uint64 default_not_tls = 7;
+  uint64 default_bad_hello = 8;
+  uint64 default_hello_too_large = 9;
+  // ... and because the service of the name asked for is not running.
+  uint64 default_route_down = 10;
+  uint64 timeouts = 11;
+  uint64 evicted = 12;
+  uint64 refused = 13;
+  uint64 no_route = 14;
+  repeated SharedUnknownName unknown_names = 15;
+  // Why the front is not up (the bind error of the port); empty when it is.
+  string bind_error = 16;
+}
+
+message SharedRoute {
+  string inbound_id = 1;
+  uint64 delivered = 2;
+}
+
+message SharedUnknownName {
+  string name = 1;
+  uint64 count = 2;
 }
 
 message CreateEnrollmentRequest {
@@ -261,6 +432,9 @@ message CreateEnrollmentRequest {
   string provider = 6;
   // Token lifetime. 0 = 3600. Max 86400.
   uint32 ttl_seconds = 7;
+  // Only for a new node (node_id empty; INVALID_ARGUMENT with node_id): who the node is handed out to. Unset or mode
+  // UNSPECIFIED = the panel decides: the first node of the panel goes to every group, a later one to none.
+  NodeSharing sharing = 8;
 }
 
 message CreateEnrollmentResponse {
@@ -300,6 +474,8 @@ message UpdateNodeRequest {
   // "IPv6 for clients". Owner only (PERMISSION_DENIED for a helper). Requires an agent with "client-ipv6/1" when false
   // (FAILED_PRECONDITION "agent too old" otherwise); turning it back on is always allowed.
   optional bool client_ipv6 = 13;
+  // The text people see next to the server in the Mistgate app. Up to 40 characters, no control characters; "" = none.
+  optional string public_label = 14;
 }
 
 message DnsResolvers {
@@ -413,7 +589,7 @@ message MeasureBandwidthResponse {
 
 message CheckPortsRequest {
   string node_id = 1;
-  // At most 7; 443 is always added. Empty = the node's enabled inbound ports, then the free ports the picker prefers.
+  // At most 7; 443 is always added. Empty = the node's enabled UDP inbound ports.
   repeated uint32 ports = 2;
 }
 
@@ -428,6 +604,64 @@ message CheckPortsResponse {
   // sender for the TCP part (no other node lists "tcpcheck/1" and the panel does not send); the UDP part's error_code
   // does not decide it, except node_offline. A row that could not be probed has verdict "" and a reason.
   repeated TcpCheck tcp = 4;
+  // Latest paired check that found source-side UDP filtering; 0 = none or a later check passed cleanly.
+  int64 udp_filtered_unix = 5 [jstype = JS_NUMBER];
+}
+
+message CheckIpv6Request {
+  string node_id = 1;
+  // The node's IPv6 address to check; empty = the one the node uses for outbound IPv6.
+  string address = 2;
+}
+
+// The answer for one port of a check of an IPv6 address.
+message Ipv6PortVerdict {
+  // "tcp" | "udp".
+  string network = 1;
+  uint32 port = 2;
+  // tcp: ours (the connection reached this node), other (something else answered), refused, timeout, or reachable (Globalping
+  // only connected). udp: ok, lossy, broken.
+  string verdict = 3;
+}
+
+message CheckIpv6Response {
+  // The address that was checked (canonical spelling).
+  string address = 1;
+  // Every probed port answered as it should (tcp ours, udp ok). Never true for an error_code.
+  bool passed = 2;
+  // "" = the ports were probed (passed and verdicts say how it went). Otherwise: node_offline, agent_too_old, nothing_to_check (the
+  // node has no enabled server), no_ipv6_verifier (no other node has working IPv6, the panel has none, and Globalping is off or
+  // could not connect), failed.
+  string error_code = 3;
+  repeated Ipv6PortVerdict verdicts = 4;
+  // The name of the node that sent the probes, "panel", or "globalping" (it only proves that a connection opens). Empty when none did.
+  string sender = 5;
+  int64 checked_unix = 6 [jstype = JS_NUMBER];
+}
+
+enum Ipv6EntryAction {
+  IPV6_ENTRY_ACTION_UNSPECIFIED = 0;
+  IPV6_ENTRY_ACTION_ENABLE = 1;
+  IPV6_ENTRY_ACTION_DISABLE = 2;
+  // 3 to 5 are for the steps of changing the address: ROTATE, CANCEL, DROP_OLD.
+}
+
+message UpdateIpv6EntryRequest {
+  string node_id = 1;
+  Ipv6EntryAction action = 2;
+  // ENABLE: one of the node's addresses (Node.ipv6.addresses); empty = the one the node uses for outbound IPv6. Turning the
+  // entry on for another address while it is on is FAILED_PRECONDITION "ipv6_entry_on": turn it off first.
+  string address = 3;
+}
+
+message UpdateIpv6EntryResponse {
+  // The node as it is now (unchanged when error_code is set).
+  Node node = 1;
+  // "" = done (or already so). Otherwise nothing changed: CheckIpv6Response.error_code's words when the check could not run, or
+  // check_failed when it ran and a port did not answer as the node's own.
+  string error_code = 2;
+  // The check ENABLE used (a fresh one, or the one it ran); unset for DISABLE.
+  CheckIpv6Response check = 3;
 }
 
 message RetireNodeRequest {
@@ -468,6 +702,69 @@ message GetFleetConnectionsResponse {
   int64 now_unix = 2 [jstype = JS_NUMBER];
   // Every node that is not retired, by name.
   repeated NodeConnections nodes = 3;
+  // The key exchange of the ClientHellos that REALITY devices sent over the window (agents with "vless-hello-kex/1"), counted on
+  // the nodes on the current core. A device is pq when it sent only hellos with an X25519MLKEM768 share before any X25519 share
+  // (the condition a strict REALITY library demands), classic when it sent only hellos without it, mixed when it sent both
+  // (an app that switches fingerprints, or two apps on one key), unknown when none of its hellos could be read. The devices
+  // are counted once however many nodes and inbounds they used.
+  uint32 hello_kex_pq_only = 4;
+  uint32 hello_kex_classic_only = 5;
+  uint32 hello_kex_mixed = 6;
+  uint32 hello_kex_unknown_only = 7;
+  // The devices that sent at least one classic hello, most classic hellos first, at most 50.
+  repeated HelloKexDevice hello_kex_classic = 8;
+  // Nodes that serve a VLESS REALITY inbound whose agent does not list "vless-hello-kex/1": their devices are missing from the
+  // counts above.
+  repeated string hello_kex_nodes_without = 9;
+}
+
+message GetNetworksRequest {
+  // Whole UTC hour buckets, 1 to 168. 0 means 24.
+  uint32 hours = 1;
+  // Empty means every node that is not retired.
+  string node_id = 2;
+}
+
+message NetworkNodeRef {
+  string node_id = 1;
+  string node_name = 2;
+}
+
+message NetworkHourRow {
+  string node_id = 1;
+  string node_name = 2;
+  string inbound_id = 3;
+  string profile_name = 4;
+  string protocol = 5;
+  uint32 asn = 6;
+  string country = 7;
+  string name = 8;
+  string operator = 9;
+  uint64 attempts = 10 [jstype = JS_NUMBER];
+  uint64 unfinished = 11 [jstype = JS_NUMBER];
+  uint64 connects = 12 [jstype = JS_NUMBER];
+  uint64 broken = 13 [jstype = JS_NUMBER];
+  uint64 peak_people = 14 [jstype = JS_NUMBER];
+  uint64 baseline_attempts = 15 [jstype = JS_NUMBER];
+  uint64 baseline_unfinished = 16 [jstype = JS_NUMBER];
+  uint64 baseline_connects = 17 [jstype = JS_NUMBER];
+  uint64 baseline_broken = 18 [jstype = JS_NUMBER];
+  uint64 baseline_peak_people = 19 [jstype = JS_NUMBER];
+  bool fleet = 20;
+  bool cdn = 21;
+}
+
+message GetNetworksResponse {
+  int64 since_unix = 1 [jstype = JS_NUMBER];
+  int64 now_unix = 2 [jstype = JS_NUMBER];
+  uint32 hours = 3;
+  uint32 mode = 4;
+  // The build time of the trusted panel table, zero when it is absent or invalid.
+  int64 table_built_unix = 5 [jstype = JS_NUMBER];
+  repeated NetworkHourRow rows = 6;
+  repeated NetworkNodeRef nodes_without_nets = 7;
+  repeated NetworkNodeRef nodes_without_table = 8;
+  bool truncated = 9;
 }
 
 message GetNodeJournalRequest {
@@ -485,6 +782,8 @@ message GetNodeJournalRequest {
   string query = 6;
   // At most 200; 0 means 100.
   uint32 limit = 7;
+  // "" = all; else only entries whose "code" attribute is exactly this (case-insensitive), such as "engine_failed".
+  string code = 8;
 }
 
 // One kind of record of one node in one hour.
@@ -544,6 +843,19 @@ message GetNodeJournalResponse {
 //   - hellos_foreign: ClientHellos for another server name (scanners).
 //   - rtt_ms (average smoothed RTT of connections that moved data, over rtt_samples samples) and loss_permille (packets
 //     the node declared lost per thousand it sent, over pkts_sent): how fast and clean the path was.
+// Why handshakes fail, with agents that list "links/3" (agent.proto LinkCounters; unsupported names what this protocol,
+// transport or AWG backend cannot see):
+//   - hs_unfinished: the node answered a ClientHello and the handshake never finished (the answer did not reach the client,
+//     or it gave up).
+//   - tls_alerts_sent, tls_alerts_recv: handshakes the node, or the client, ended with a TLS alert; tls_cert_refused: of the
+//     client's, those that refused the node's certificate (a pin or certificate problem on our side).
+//   - reality_fallback (VLESS REALITY): connections sent to the target as not a client (scanners, probes, another name);
+//     auth_failed: of them, hellos with our name that failed REALITY authentication (a wrong key or short id).
+//   - tcp_stalls (VLESS; TrustTunnel with "trusttunnel-tcp-stalls/1", on the inbound only): connections whose data stopped being acknowledged; tcp_stalls_16k: of them, those that stalled
+//     after 8 to 32 KiB (the TSPU's freeze after the first bytes).
+//   - initiations, responses, responses_unmatched (AmneziaWG, userspace backend): handshake initiations of known keys, the
+//     node's answers, and answers the device never confirmed (lost on the way back).
+//   - VLESS with links/3 also counts hellos, hellos_foreign and connects.
 message InboundConnections {
   string inbound_id = 1;
   string profile_id = 2;
@@ -565,7 +877,8 @@ message InboundConnections {
   // The counters this protocol, or this node's agent, does not count (their zero means nothing): awg "rejects", "drops",
   // "hellos", "handshakes" and every links/2 counter; vless every counter until its agent counts them; hysteria2 on an
   // agent without "links/2" the links/2 counters (client_closes, freezes, quiet, accepted, hellos_foreign, rtt_ms,
-  // loss_permille, rtt_samples, pkts_sent).
+  // loss_permille, rtt_samples, pkts_sent); the links/3 counters an agent without "links/3" does not send, and those the
+  // protocol, its transport or the AWG backend cannot see (see above).
   repeated string unsupported = 15;
   // With by_hour: the hours of the window that have a counter, oldest first.
   repeated LinkHour hours = 16;
@@ -583,6 +896,37 @@ message InboundConnections {
   uint32 loss_permille = 25;
   uint32 rtt_samples = 26;
   uint64 pkts_sent = 27 [jstype = JS_NUMBER];
+  uint32 hs_unfinished = 28;
+  uint32 tls_alerts_sent = 29;
+  uint32 tls_alerts_recv = 30;
+  uint32 tls_cert_refused = 31;
+  uint32 reality_fallback = 32;
+  uint32 auth_failed = 33;
+  uint32 tcp_stalls = 34;
+  uint32 tcp_stalls_16k = 35;
+  uint32 initiations = 36;
+  uint32 responses = 37;
+  uint32 responses_unmatched = 38;
+  // TrustTunnel agents that list "trusttunnel-refusals/1" (agent.proto LinkCounters tunnel_*): the tunnel requests the engine
+  // refused after the credential had authenticated, by reason, counted on the inbound and never on a person or a device.
+  // tunnel_no_ipv4 and tunnel_blocked are ordinary traffic (an app that asks for an IPv6 address on a node without IPv6, one
+  // that asks for a private address); tunnel_conn_* and tunnel_timeout are a fault of the node only in numbers (a dead uplink or
+  // route makes every connect fail); tunnel_other_deadlines, tunnel_other_dial and tunnel_stream_* point at the node or at
+  // a credential that was just removed. unsupported names them for other protocols and for agents without the capability.
+  uint32 tunnel_blocked = 39;
+  uint32 tunnel_no_ipv4 = 40;
+  uint32 tunnel_conn_refused = 41;
+  uint32 tunnel_conn_unreachable = 42;
+  uint32 tunnel_conn_dns = 43;
+  uint32 tunnel_conn_other = 44;
+  uint32 tunnel_timeout = 45;
+  uint32 tunnel_other_deadlines = 46;
+  uint32 tunnel_other_authority = 47;
+  uint32 tunnel_other_icmp = 48;
+  uint32 tunnel_other_dial = 49;
+  uint32 tunnel_stream_closed = 50;
+  uint32 tunnel_stream_cred_gone = 51;
+  uint32 tunnel_stream_conn_limit = 52;
 }
 
 message ClientConnections {
@@ -651,4 +995,158 @@ enum LogLevel {
   LOG_LEVEL_INFO = 1;
   LOG_LEVEL_WARNING = 2;
   LOG_LEVEL_ERROR = 3;
+}
+
+message GetNodeRuntimeRequest {
+  // "" = every node that is not retired.
+  string node_id = 1;
+}
+
+// One inbound of the node: the panel's side and the node's last report. "Applied" means the node confirmed it in an apply
+// result; an inbound the panel no longer wants (enabled = false) that still has an applied spec hash and a running state is
+// what an orphan looks like: the panel took it out of the desired state and the node has not confirmed it stopped. Compare
+// live_state too: a node that still lists a not-enabled inbound as active runs something the panel does not want.
+message InboundRuntime {
+  string inbound_id = 1;
+  string profile_name = 2;
+  string protocol = 3;
+  // The panel's desired state: true = in the desired state sent to the node.
+  bool enabled = 4;
+  // Goes into the spec sent to the node; bumped with the profile version and overrides.
+  int64 spec_version = 5 [jstype = JS_NUMBER];
+  // The first 12 characters of the spec hash the node reported for the inbound; "" = it never reported one.
+  string applied_spec_hash = 6;
+  // The panel's stored state of it, from the node's last apply result: "active" (running), "failed", "pending" (not confirmed
+  // running yet) or "disabled" (the panel took it out of the desired state and recorded it as stopped).
+  string applied_state = 7;
+  // The node's last error for it, cut short; "" = none.
+  string last_error = 8;
+  // Certificate expiry of what the inbound serves (0 = none or not reported). The pin is never returned.
+  int64 cert_not_after_unix = 9 [jstype = JS_NUMBER];
+  // What the node's latest stats batch (every 10 s) says this inbound is doing: "active", "failed" or "pending" (starting or
+  // stopped); "" = the node did not list it (not connected, or the node does not run it).
+  string live_state = 10;
+}
+
+message NodeRuntime {
+  string node_id = 1;
+  string node_name = 2;
+  // "pending" or "active" (retired nodes are not listed).
+  string state = 3;
+  bool connected = 4;
+  uint64 desired_revision = 5 [jstype = JS_NUMBER];
+  // The first 12 characters of the hash of the desired state; "" = nothing was computed yet.
+  string desired_hash = 6;
+  uint64 applied_revision = 7 [jstype = JS_NUMBER];
+  string applied_hash = 8;
+  // The desired and applied hashes are equal, non-empty, and the node is not drifting.
+  bool in_sync = 9;
+  // The node applied a state other than the one sent, twice in a row; since when (0 = no drift).
+  bool drift = 10;
+  int64 drift_since_unix = 11 [jstype = JS_NUMBER];
+  // When the node last reported an apply result or a Hello that matched (0 = never since this feature) and how it ended:
+  // "applied", "partial" or "in_sync".
+  int64 last_apply_unix = 12 [jstype = JS_NUMBER];
+  string last_apply_status = 13;
+  uint32 last_apply_ms = 14;
+  repeated InboundRuntime inbounds = 15;
+  // Inbound ids the node's latest stats batch lists as running or starting that the panel has no inbound row for at all: a
+  // node running something the panel does not know. Empty for a node that is not connected.
+  repeated string unknown_running_inbound_ids = 16;
+}
+
+message GetNodeRuntimeResponse {
+  int64 now_unix = 1 [jstype = JS_NUMBER];
+  repeated NodeRuntime nodes = 2;
+}
+
+message GetNodeHostHistoryRequest {
+  string node_id = 1;
+  // Hours back from now, 1 to 720. 0 means 24; more is cut to 720.
+  uint32 hours = 2;
+}
+
+// One hour of host load. Means are over the hour's stats batches (one per 10 s); peaks are the highest batch.
+message HostHour {
+  int64 hour_start_unix = 1 [jstype = JS_NUMBER];
+  uint32 samples = 2;
+  float cpu_avg_pct = 3;
+  float cpu_max_pct = 4;
+  float softirq_max_pct = 5;
+  float load1_max = 6;
+  uint64 ram_used_max_bytes = 7 [jstype = JS_NUMBER];
+  uint64 ram_total_bytes = 8 [jstype = JS_NUMBER];
+  uint64 rx_avg_bps = 9 [jstype = JS_NUMBER];
+  uint64 rx_max_bps = 10 [jstype = JS_NUMBER];
+  uint64 tx_avg_bps = 11 [jstype = JS_NUMBER];
+  uint64 tx_max_bps = 12 [jstype = JS_NUMBER];
+  uint32 sessions_max = 13;
+  // Mean people online over the hour's samples.
+  float sessions_avg = 14;
+  // How many of the hour's samples carried the resource fields below (agents that send HostMetrics.agent). 0 = none did, and
+  // the fields are not known rather than zero.
+  uint32 ext_samples = 15;
+  float steal_avg_pct = 16;
+  float steal_max_pct = 17;
+  float iowait_max_pct = 18;
+  uint64 swap_used_max_bytes = 19 [jstype = JS_NUMBER];
+  // Peak connection-tracking entries and the latest limit.
+  uint64 conntrack_max = 20 [jstype = JS_NUMBER];
+  uint64 conntrack_limit = 21 [jstype = JS_NUMBER];
+  uint32 tcp_sockets_max = 22;
+  // The latest link speed of the main NIC the agent reported; 0 = not known.
+  uint32 nic_speed_mbps = 23;
+  // The agent process: mean and peak CPU in percent of the machine, peak resident memory.
+  float agent_cpu_avg_pct = 24;
+  float agent_cpu_max_pct = 25;
+  uint64 agent_rss_max_bytes = 26 [jstype = JS_NUMBER];
+}
+
+message GetNodeHostHistoryResponse {
+  string node_id = 1;
+  string node_name = 2;
+  int64 since_unix = 3 [jstype = JS_NUMBER];
+  int64 now_unix = 4 [jstype = JS_NUMBER];
+  // Oldest first; an hour without a sample is absent.
+  repeated HostHour hours = 5;
+}
+
+message GetPathLossRequest {
+  // Only paths checked in the last hours, 1 to 720. 0 means 24 (the alert's own window is 30).
+  uint32 hours = 1;
+}
+
+// One lossy path: packets of the sender did not arrive at the target while another sender's did.
+message PathLossRow {
+  string from_node_id = 1;
+  string from_name = 2;
+  string to_node_id = 3;
+  string to_name = 4;
+  // The UDP ports of the run, comma separated.
+  string ports = 5;
+  uint32 sent = 6;
+  uint32 got = 7;
+  // 100 * (sent - got) / sent.
+  float loss_pct = 8;
+  // The second sender that got packets through to the same target, and how many.
+  string other_name = 9;
+  uint32 other_got = 10;
+  // Ports the sender delivered whole while the lost ones got nothing: a filter on the way, not a lossy line. "" = none.
+  string open_ports = 11;
+  int64 checked_unix = 12 [jstype = JS_NUMBER];
+}
+
+// Per target: how many senders lose packets on the way to it. One sender: the path of that sender. Several: look at the target.
+message PathLossTarget {
+  string node_id = 1;
+  string name = 2;
+  uint32 lossy_senders = 3;
+  float worst_loss_pct = 4;
+}
+
+message GetPathLossResponse {
+  int64 since_unix = 1 [jstype = JS_NUMBER];
+  int64 now_unix = 2 [jstype = JS_NUMBER];
+  repeated PathLossRow rows = 3;
+  repeated PathLossTarget targets = 4;
 }

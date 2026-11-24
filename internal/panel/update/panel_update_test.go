@@ -1,3 +1,5 @@
+//go:build !js
+
 package update
 
 import (
@@ -18,6 +20,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -28,14 +31,6 @@ import (
 
 // The health window of a replaced panel is 45 s in production; tests that need one set it.
 func init() { panelHealthWindow = 0 }
-
-type roundTripFunc func(*http.Request) (*http.Response, error)
-
-func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
-
-func githubResponse(status int, body []byte) *http.Response {
-	return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}
-}
 
 func minimalELF(machine elf.Machine) []byte {
 	b := make([]byte, 64)
@@ -81,32 +76,42 @@ func (f *panelFixture) digest() string {
 
 // client serves the release API and its assets, counting the requests by kind.
 func (f *panelFixture) client(t *testing.T) (*http.Client, map[string]int) {
+	return panelFixturesClient(t, f)
+}
+
+func panelFixturesClient(t *testing.T, fixtures ...*panelFixture) (*http.Client, map[string]int) {
 	t.Helper()
-	served := f.served
-	if served == nil {
-		served = f.binary
-	}
-	assets := map[string][]byte{"mistgate-linux-amd64": served}
-	if !f.unsigned {
-		m := release.Manifest{Schema: release.Schema, Version: f.tag, Built: f.built, Expires: f.expires,
-			Files: []release.File{{OS: "linux", Arch: "amd64", Name: "mistgate-linux-amd64", Size: int64(len(f.binary)), SHA256: f.digest()}}}
-		body, err := m.Marshal()
-		if err != nil {
-			t.Fatal(err)
+	var releases []githubRelease
+	assets := make(map[string]map[string][]byte, len(fixtures))
+	for _, f := range fixtures {
+		served := f.served
+		if served == nil {
+			served = f.binary
 		}
-		sig := release.SignPanel(f.signer, body)
-		if f.nodeSig {
-			sig = release.Sign(f.signer, body)
+		byName := map[string][]byte{"mistgate-linux-amd64": served}
+		if !f.unsigned {
+			m := release.Manifest{Schema: release.Schema, Version: f.tag, Built: f.built, Expires: f.expires,
+				Files: []release.File{{OS: "linux", Arch: "amd64", Name: "mistgate-linux-amd64", Size: int64(len(f.binary)), SHA256: f.digest()}}}
+			body, err := m.Marshal()
+			if err != nil {
+				t.Fatal(err)
+			}
+			sig := release.SignPanel(f.signer, body)
+			if f.nodeSig {
+				sig = release.Sign(f.signer, body)
+			}
+			byName[release.PanelManifestName], byName[release.PanelSignatureName] = body, sig
 		}
-		assets[release.PanelManifestName], assets[release.PanelSignatureName] = body, sig
+		rel := githubRelease{TagName: f.tag, HTMLURL: githubReleasePageBase + f.tag, PublishedAt: time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)}
+		for name, b := range byName {
+			sum := sha256.Sum256(b)
+			rel.Assets = append(rel.Assets, githubAsset{Name: name, Size: int64(len(b)), BrowserDownloadURL: panelReleasePrefix + f.tag + "/" + name,
+				Digest: "sha256:" + hex.EncodeToString(sum[:])})
+		}
+		releases = append(releases, rel)
+		assets[f.tag] = byName
 	}
-	rel := githubRelease{TagName: f.tag, HTMLURL: githubReleasePageBase + f.tag, PublishedAt: time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)}
-	for name, b := range assets {
-		sum := sha256.Sum256(b)
-		rel.Assets = append(rel.Assets, githubAsset{Name: name, Size: int64(len(b)), BrowserDownloadURL: panelReleasePrefix + f.tag + "/" + name,
-			Digest: "sha256:" + hex.EncodeToString(sum[:])})
-	}
-	relBody, err := json.Marshal(rel)
+	relBody, err := json.Marshal(releases)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,9 +124,14 @@ func (f *panelFixture) client(t *testing.T) (*http.Client, map[string]int) {
 			counts["api"]++
 			return githubResponse(http.StatusOK, relBody), nil
 		}
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 		name := filepath.Base(r.URL.Path)
+		tag := ""
+		if len(parts) >= 2 {
+			tag = parts[len(parts)-2]
+		}
 		counts[name]++
-		if b, ok := assets[name]; ok && r.URL.Host == "github.com" {
+		if b, ok := assets[tag][name]; ok && r.URL.Host == "github.com" {
 			return githubResponse(http.StatusOK, b), nil
 		}
 		return githubResponse(http.StatusNotFound, nil), nil
@@ -162,7 +172,8 @@ func newPanelUpdater(t *testing.T, f *panelFixture, rec *recorder, mutate func(*
 	dataDir := t.TempDir()
 	cfg := PanelUpdateConfig{
 		CurrentBuilt: panelOwnBuilt, Key: panelTestPub, DataDir: dataDir, ServiceUnit: "mistgate.service",
-		Executable: filepath.Join(dataDir, "mistgate"), Enabled: true, OS: "linux", Arch: "amd64", HTTPClient: client,
+		Executable: filepath.Join(dataDir, "mistgate"), AllowedChannelFile: filepath.Join(dataDir, "missing-panel-update-channel"),
+		Enabled: true, OS: "linux", Arch: "amd64", HTTPClient: client,
 		Runner: rec.run, Now: func() time.Time { return panelTestNow }, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	if mutate != nil {
@@ -213,7 +224,7 @@ func TestPanelUpdaterOffersSignedReleaseAndSchedulesTheHelper(t *testing.T) {
 		containsArg(l[0], "--sha256") || !containsArg(l[0], "--property=TimeoutStartSec=30min") {
 		t.Fatalf("unexpected launch command: %#v", l)
 	}
-	if r := readRequest(t, dataDir); r.Version != "v1.2.0" || r.SHA256 != f.digest() {
+	if r := readRequest(t, dataDir); r.Version != "v1.2.0" || r.SHA256 != f.digest() || r.Channel != "stable" {
 		t.Fatalf("request = %+v", r)
 	}
 	if !updater.Status().Installing {
@@ -241,11 +252,110 @@ func TestPanelUpdaterRequestsFixedRootHelperForNonRootService(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dataDir, "panel-update.new")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("unprivileged panel staged a binary for the root helper: %v", err)
 	}
-	if r := readRequest(t, dataDir); r.Version != "v1.2.0" {
+	if r := readRequest(t, dataDir); r.Version != "v1.2.0" || r.Channel != "stable" {
 		t.Fatalf("request = %+v", r)
 	}
 	if !updater.Status().Installing {
 		t.Fatal("accepted helper request did not retain the installing state")
+	}
+}
+
+func TestPanelUpdaterSchedulesRestoreThroughTransientAndFixedHelpers(t *testing.T) {
+	f := newPanelFixture()
+	request := PanelRestoreRequest{StageDir: PanelRestoreStagePrefix + strings.Repeat("b", 32), Source: "upload", FileName: "backup.tar.gz.age", MadeByVersion: "v1.2.3"}
+	for _, tc := range []struct {
+		name string
+		root bool
+	}{{name: "transient", root: false}, {name: "fixed root unit", root: true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &recorder{show: func(string) string {
+				return "LoadState=loaded\nActiveState=inactive\nInactiveExitTimestampMonotonic=5\n"
+			}}
+			updater, _, dataDir := newPanelUpdater(t, f, rec, func(c *PanelUpdateConfig) { c.UseRootHelperService = tc.root })
+			if tc.root {
+				rootLayoutAt(t, dataDir)
+			}
+			if err := updater.Restore(context.Background(), request); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := takePanelRestoreRequest(dataDir); err != nil {
+				t.Fatalf("restore request = %v", err)
+			}
+			launched := rec.launched()
+			if len(launched) != 1 {
+				t.Fatalf("helper launches = %#v", launched)
+			}
+			if tc.root {
+				if strings.Join(launched[0], " ") != "systemctl start --no-block "+panelUpdateHelperService {
+					t.Fatalf("fixed restore launch = %#v", launched[0])
+				}
+			} else if launched[0][0] != "systemd-run" || !containsArg(launched[0], "--restore") || containsArg(launched[0], "--fetch-latest") {
+				t.Fatalf("transient restore launch = %#v", launched[0])
+			}
+			if !updater.Status().Installing {
+				t.Fatal("scheduled restore did not retain the helper-running state")
+			}
+		})
+	}
+}
+
+func TestPersistentOperationLockBlocksUpdaterAfterPanelRestart(t *testing.T) {
+	f := newPanelFixture()
+	restoreRequest := PanelRestoreRequest{
+		StageDir: PanelRestoreStagePrefix + strings.Repeat("c", 32), Source: "upload",
+		FileName: "backup.tar.gz.age", MadeByVersion: "v1.2.3",
+	}
+	for _, kind := range []string{"restore", "update"} {
+		t.Run(kind, func(t *testing.T) {
+			rec := &recorder{}
+			updater, counts, dataDir := newPanelUpdater(t, f, rec, nil)
+			var metadata *PanelRestoreRequest
+			if kind == "restore" {
+				metadata = &restoreRequest
+			}
+			lock, err := acquirePanelOperationLock(dataDir, kind, metadata, panelTestNow)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lock.release()
+
+			// A new updater instance represents the panel process after a restart.
+			restarted := NewGitHubPanelUpdater(updater.cfg)
+			if !restarted.Status().Installing {
+				t.Fatal("restarted updater did not see the helper operation lock")
+			}
+			if err := restarted.Install(context.Background(), "v1.2.0", f.digest()); err == nil || !strings.Contains(err.Error(), "already running") {
+				t.Fatalf("panel update during helper lock = %v", err)
+			}
+			if err := restarted.Restore(context.Background(), restoreRequest); err == nil || !strings.Contains(err.Error(), "already running") {
+				t.Fatalf("second restore during helper lock = %v", err)
+			}
+			if len(rec.launched()) != 0 || counts["api"] != 0 {
+				t.Fatalf("helper was rescheduled or release check ran: launches=%v counts=%v", rec.launched(), counts)
+			}
+		})
+	}
+}
+
+func TestStaleOperationLockIsIgnoredAndCleanedByNextHelper(t *testing.T) {
+	dataDir := t.TempDir()
+	now := panelTestNow
+	stale := PanelOperationState{ID: strings.Repeat("a", 32), Kind: "update",
+		StartedUnix: now.Add(-16 * time.Minute).Unix(), HeartbeatUnix: now.Add(-16 * time.Minute).Unix()}
+	if err := writePanelOperationState(dataDir, stale); err != nil {
+		t.Fatal(err)
+	}
+	if PanelOperationRunning(dataDir, now) {
+		t.Fatal("stale operation lock was treated as active")
+	}
+	lock, err := acquirePanelOperationLock(dataDir, "update", nil, now)
+	if err != nil {
+		t.Fatalf("next helper did not clear stale lock: %v", err)
+	}
+	defer lock.release()
+	state, active, exists, err := ReadPanelOperationState(dataDir, now)
+	if err != nil || !active || !exists || state.ID == stale.ID {
+		t.Fatalf("new helper lock = %+v active=%v exists=%v err=%v", state, active, exists, err)
 	}
 }
 
@@ -366,6 +476,50 @@ func TestPanelUpdaterOrdersByBuildTime(t *testing.T) {
 		if s := updater.Check(context.Background()); s.Available != tc.want || s.ErrorKey != "" {
 			t.Errorf("%s: %+v", name, s)
 		}
+	}
+}
+
+func TestPanelUpdaterDiscoveryChannelsAndNoDowngrade(t *testing.T) {
+	stable := newPanelFixture()
+	stable.tag, stable.built = "v1.2.0", 1_770_000_000
+	testingRelease := newPanelFixture()
+	testingRelease.tag, testingRelease.built = "v1.2.1-testing.1", 1_780_000_000
+	dev := newPanelFixture()
+	dev.tag, dev.built = "v1.2.2-dev.1", 1_790_000_000
+	client, _ := panelFixturesClient(t, stable, testingRelease, dev)
+	channel := release.ChannelStable
+	updater, _, _ := newPanelUpdater(t, stable, &recorder{}, func(c *PanelUpdateConfig) {
+		c.HTTPClient = client
+		c.CurrentBuilt = 1_760_000_000
+		c.Channel = func() release.Channel { return channel }
+	})
+
+	for _, tc := range []struct {
+		channel release.Channel
+		version string
+		notes   int
+	}{
+		{release.ChannelStable, stable.tag, 1},
+		{release.ChannelTesting, testingRelease.tag, 2},
+		{release.ChannelDev, dev.tag, 3},
+	} {
+		channel = tc.channel
+		updater.Invalidate()
+		status := updater.Check(context.Background())
+		if status.Version != tc.version || status.Channel != tc.channel || !status.Available {
+			t.Fatalf("channel %s status = %+v, want %s", tc.channel, status, tc.version)
+		}
+		if got := updater.ReleaseNotes(); len(got) != tc.notes {
+			t.Fatalf("channel %s notes count = %d, want %d: %+v", tc.channel, len(got), tc.notes, got)
+		}
+	}
+
+	channel = release.ChannelStable
+	updater.cfg.CurrentBuilt = dev.built
+	updater.Invalidate()
+	status := updater.Check(context.Background())
+	if status.Version != stable.tag || status.Available || !status.RunningNewer {
+		t.Fatalf("stable channel must not offer an older stable bundle to a newer dev build: %+v", status)
 	}
 }
 
@@ -587,13 +741,42 @@ func helperEnv(t *testing.T) (dataDir, target string) {
 func helperConfig(t *testing.T, f *panelFixture, dataDir, target string) PanelUpdateConfig {
 	client, _ := f.client(t)
 	return PanelUpdateConfig{CurrentBuilt: panelOwnBuilt, Key: panelTestPub, DataDir: dataDir, ServiceUnit: "mistgate.service", Executable: target,
-		OS: "linux", Arch: "amd64", HTTPClient: client, Now: func() time.Time { return panelTestNow }, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+		AllowedChannelFile: filepath.Join(dataDir, "missing-panel-update-channel"),
+		OS:                 "linux", Arch: "amd64", HTTPClient: client, Now: func() time.Time { return panelTestNow }, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+}
+
+func rootOwnedChannelFileForTest(t *testing.T, channel string) string {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("root-owned channel policy is Linux-only")
+	}
+	path := filepath.Join(t.TempDir(), "panel-update-channel")
+	if err := os.WriteFile(path, []byte(channel+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uid, gid, ok := panelDataOwner(info)
+	if !ok {
+		t.Skip("file ownership is not available")
+	}
+	if uid != 0 {
+		if err := os.Chown(path, 0, gid); err != nil {
+			t.Skipf("cannot create a root-owned channel policy: %v", err)
+		}
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func TestRootHelperInstallsTheConfirmedSignedRelease(t *testing.T) {
 	f := newPanelFixture()
 	dataDir, target := helperEnv(t)
-	if err := writePanelUpdateRequest(dataDir, panelUpdateRequest{Version: "v1.2.0", SHA256: f.digest()}); err != nil {
+	if err := writePanelUpdateRequest(dataDir, panelUpdateRequest{Version: "v1.2.0", SHA256: f.digest(), Channel: "stable"}); err != nil {
 		t.Fatal(err)
 	}
 	var calls [][]string
@@ -616,6 +799,155 @@ func TestRootHelperInstallsTheConfirmedSignedRelease(t *testing.T) {
 	}
 }
 
+// A panel on the Development channel confirmed a dev release: the helper looks on that release's channel, not on
+// Stable (where it saw nothing newer and refused with "already up to date"), and installs exactly the confirmed build.
+func TestRootHelperInstallsTheConfirmedReleaseOfItsChannel(t *testing.T) {
+	stable := newPanelFixture()
+	dev := newPanelFixture()
+	dev.tag, dev.built = "v1.2.1-dev.1", panelTestBuilt+100
+	dev.binary = append(minimalELF(elf.EM_X86_64), 1)
+	dataDir, target := helperEnv(t)
+	if err := writePanelUpdateRequest(dataDir, panelUpdateRequest{Version: dev.tag, SHA256: dev.digest(), Channel: "dev"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := helperConfig(t, stable, dataDir, target)
+	cfg.HTTPClient, _ = panelFixturesClient(t, stable, dev)
+	cfg.AllowedChannelFile = rootOwnedChannelFileForTest(t, "dev")
+	var calls [][]string
+	if err := installLatestPanelUpdate(context.Background(), cfg, systemctlRecorder(&calls, nil)); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(target); err != nil || !bytes.Equal(got, dev.binary) {
+		t.Fatalf("installed binary = %x, %v; want the dev build", got, err)
+	}
+	// A stable request still installs the stable release when a newer dev build exists beside it.
+	dataDir, target = helperEnv(t)
+	if err := writePanelUpdateRequest(dataDir, panelUpdateRequest{Version: stable.tag, SHA256: stable.digest(), Channel: "stable"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg = helperConfig(t, stable, dataDir, target)
+	cfg.HTTPClient, _ = panelFixturesClient(t, stable, dev)
+	cfg.AllowedChannelFile = rootOwnedChannelFileForTest(t, "stable")
+	if err := installLatestPanelUpdate(context.Background(), cfg, systemctlRecorder(&calls, nil)); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(target); err != nil || !bytes.Equal(got, stable.binary) {
+		t.Fatalf("installed binary = %x, %v; want the stable build", got, err)
+	}
+}
+
+func TestRootHelperRefusesDevRequestWhenAllowedChannelDefaultsToStable(t *testing.T) {
+	dev := newPanelFixture()
+	dev.tag, dev.built = "v1.2.1-dev.1", panelTestBuilt+100
+	dataDir, target := helperEnv(t)
+	if err := writePanelUpdateRequest(dataDir, panelUpdateRequest{Version: dev.tag, SHA256: dev.digest(), Channel: "dev"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := helperConfig(t, dev, dataDir, target)
+	cfg.AllowedChannelFile = filepath.Join(t.TempDir(), "missing-panel-update-channel")
+	var calls [][]string
+	err := installLatestPanelUpdate(context.Background(), cfg, systemctlRecorder(&calls, nil))
+	if !errors.Is(err, ErrPanelUpdateChannelNotAllowed) || !strings.Contains(err.Error(), "panel_update_channel_not_allowed") ||
+		!strings.Contains(err.Error(), "channel=dev&allowed=stable") ||
+		!strings.Contains(err.Error(), `sudo sh -c 'install -d -o root -g root -m 0755 /etc/mistgate && tmp=$(mktemp /etc/mistgate/.panel-update-channel.XXXXXX) && printf "%s\n" dev > "$tmp" && chmod 0644 "$tmp" && mv -f "$tmp" /etc/mistgate/panel-update-channel'`) {
+		t.Fatalf("channel refusal = %v", err)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("systemctl ran: %#v", calls)
+	}
+	if got, _ := os.ReadFile(target); string(got) != "previous" {
+		t.Fatalf("installed binary changed: %q", got)
+	}
+}
+
+func TestMissingRootPanelUpdateChannelDefaultsToStable(t *testing.T) {
+	channel, err := readRootAllowedPanelUpdateChannel(filepath.Join(t.TempDir(), "missing-panel-update-channel"))
+	if err != nil || channel != release.ChannelStable {
+		t.Fatalf("missing root channel policy = %q, %v; want stable", channel, err)
+	}
+}
+
+func TestPanelUpdaterRefusesAChannelTheRootPolicyDoesNotAllowBeforeScheduling(t *testing.T) {
+	f := newPanelFixture()
+	rec := &recorder{}
+	updater, counts, dataDir := newPanelUpdater(t, f, rec, func(c *PanelUpdateConfig) {
+		c.Channel = func() release.Channel { return release.ChannelDev }
+		c.AllowedChannelFile = filepath.Join(t.TempDir(), "missing-panel-update-channel")
+	})
+	err := updater.Install(context.Background(), f.tag, f.digest())
+	if !errors.Is(err, ErrPanelUpdateChannelNotAllowed) || err.Error() != "panel_update_channel_not_allowed: channel=dev&allowed=stable" {
+		t.Fatalf("panel channel refusal = %v", err)
+	}
+	if counts["api"] != 0 || len(rec.launched()) != 0 {
+		t.Fatalf("channel refusal checked GitHub or launched the helper: counts=%v launched=%v", counts, rec.launched())
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, panelUpdateRequestName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("wrote request despite channel refusal: %v", err)
+	}
+}
+
+// A panel whose selected channel the root policy does not allow shows that as a state of the card (not installable, a
+// stable key), every time and without a log line; a stable panel on a missing policy is unaffected.
+func TestPanelUpdaterShowsAChannelPolicyMismatchAsAStateNotALogLine(t *testing.T) {
+	f := newPanelFixture()
+	var logs strings.Builder
+	updater, _, _ := newPanelUpdater(t, f, &recorder{}, func(c *PanelUpdateConfig) {
+		c.Channel = func() release.Channel { return release.ChannelTesting }
+		c.AllowedChannelFile = filepath.Join(t.TempDir(), "missing-panel-update-channel")
+		c.Log = slog.New(slog.NewTextHandler(&logs, nil))
+	})
+	for i := 0; i < 3; i++ {
+		updater.Invalidate()
+		s := updater.Check(context.Background())
+		if !s.Available || s.Installable || s.ErrorKey != "channel_not_allowed" {
+			t.Fatalf("check %d status = %+v", i, s)
+		}
+	}
+	if logs.Len() != 0 {
+		t.Fatalf("a channel policy mismatch was logged: %s", logs.String())
+	}
+	if s := updater.Status(); s.Installable || s.ErrorKey != "channel_not_allowed" {
+		t.Fatalf("status = %+v", s)
+	}
+
+	stable, _, _ := newPanelUpdater(t, f, &recorder{}, nil)
+	if s := stable.Check(context.Background()); !s.Available || !s.Installable || s.ErrorKey != "" {
+		t.Fatalf("stable panel on a missing policy = %+v", s)
+	}
+}
+
+func TestRootHelperRefusesAChannelOtherThanTheAllowedOne(t *testing.T) {
+	stable := newPanelFixture()
+	dataDir, target := helperEnv(t)
+	if err := writePanelUpdateRequest(dataDir, panelUpdateRequest{Version: stable.tag, SHA256: stable.digest(), Channel: "stable"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := helperConfig(t, stable, dataDir, target)
+	cfg.AllowedChannelFile = rootOwnedChannelFileForTest(t, "dev")
+	var calls [][]string
+	if err := installLatestPanelUpdate(context.Background(), cfg, systemctlRecorder(&calls, nil)); !errors.Is(err, ErrPanelUpdateChannelNotAllowed) || len(calls) != 0 {
+		t.Fatalf("stable request with dev allowed: err=%v calls=%v", err, calls)
+	}
+}
+
+func TestRootHelperRefusesAnUnsafeChannelPolicyFile(t *testing.T) {
+	f := newPanelFixture()
+	dataDir, target := helperEnv(t)
+	if err := writePanelUpdateRequest(dataDir, panelUpdateRequest{Version: f.tag, SHA256: f.digest(), Channel: "stable"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := helperConfig(t, f, dataDir, target)
+	path := rootOwnedChannelFileForTest(t, "stable")
+	if err := os.WriteFile(path, []byte("latest\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg.AllowedChannelFile = path
+	var calls [][]string
+	if err := installLatestPanelUpdate(context.Background(), cfg, systemctlRecorder(&calls, nil)); !errors.Is(err, ErrPanelUpdateChannelConfig) || len(calls) != 0 {
+		t.Fatalf("garbage policy: err=%v calls=%v", err, calls)
+	}
+}
+
 // The helper trusts nothing the panel's service user can write except the narrowing request: it verifies the signed
 // manifest again, and anything that does not match stops it before the panel is touched.
 func TestRootHelperRefusesBeforeStoppingThePanel(t *testing.T) {
@@ -628,7 +960,7 @@ func TestRootHelperRefusesBeforeStoppingThePanel(t *testing.T) {
 	}{
 		"tampered asset":      {mutate: func(f *panelFixture) { f.served = append([]byte("x"), f.binary[1:]...) }, want: "SHA-256"},
 		"no request":          {request: &panelUpdateRequest{}, want: "no confirmed panel update request"},
-		"another release":     {request: &panelUpdateRequest{Version: "v1.1.0", SHA256: strings.Repeat("a", 64)}, want: ErrPanelChanged.Error()},
+		"another release":     {request: &panelUpdateRequest{Version: "v1.1.0", SHA256: strings.Repeat("a", 64), Channel: "stable"}, want: ErrPanelChanged.Error()},
 		"unsigned release":    {mutate: func(f *panelFixture) { f.unsigned = true }, want: ErrPanelUnsigned.Error()},
 		"foreign signature":   {mutate: func(f *panelFixture) { f.signer = other }, want: ErrPanelUnsigned.Error()},
 		"not newer":           {cfg: func(c *PanelUpdateConfig) { c.CurrentBuilt = panelTestBuilt }, want: ErrNoPanelUpdate.Error()},
@@ -640,7 +972,7 @@ func TestRootHelperRefusesBeforeStoppingThePanel(t *testing.T) {
 				tc.mutate(f)
 			}
 			dataDir, target := helperEnv(t)
-			req := panelUpdateRequest{Version: "v1.2.0", SHA256: f.digest()}
+			req := panelUpdateRequest{Version: "v1.2.0", SHA256: f.digest(), Channel: "stable"}
 			if tc.request != nil {
 				req = *tc.request
 			}
@@ -670,7 +1002,15 @@ func TestRootHelperRefusesBeforeStoppingThePanel(t *testing.T) {
 
 func TestPanelUpdateRequestIsValidated(t *testing.T) {
 	dir := t.TempDir()
-	for _, body := range []string{`{"version":"v1.2.0","sha256":"short"}`, `{"version":"latest","sha256":"` + strings.Repeat("a", 64) + `"}`, `not json`} {
+	validDigest := strings.Repeat("a", 64)
+	for _, body := range []string{
+		`{"version":"v1.2.0","sha256":"short","channel":"stable"}`,
+		`{"version":"latest","sha256":"` + validDigest + `","channel":"stable"}`,
+		`{"version":"v1.2.0","sha256":"` + validDigest + `","channel":"nightly"}`,
+		`{"version":"v1.2.0","sha256":"` + validDigest + `","channel":"stable","force":true}`,
+		`{"version":"v1.2.0","sha256":"` + validDigest + `","channel":"stable"}{"force":true}`,
+		`not json`,
+	} {
 		if err := os.WriteFile(filepath.Join(dir, panelUpdateRequestName), []byte(body), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -679,6 +1019,23 @@ func TestPanelUpdateRequestIsValidated(t *testing.T) {
 		}
 		if _, err := os.Stat(filepath.Join(dir, panelUpdateRequestName)); !errors.Is(err, os.ErrNotExist) {
 			t.Errorf("an invalid request was kept: %v", err)
+		}
+	}
+}
+
+func TestClearPanelHelperRequestsLeavesTheFixedHelperWithOneMode(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{panelUpdateRequestName, panelRestoreRequestName} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("stale"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := clearPanelHelperRequests(dir); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{panelUpdateRequestName, panelRestoreRequestName} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("stale request %s remains: %v", name, err)
 		}
 	}
 }
@@ -874,6 +1231,409 @@ func TestApplyPanelUpdateKeepsDataUntouchedIfFailedServiceCannotStop(t *testing.
 		t.Fatalf("data backup was not preserved: %v", err)
 	}
 }
+
+func TestApplyPanelRestoreSwapsDataKeepsPreviousAndWritesResult(t *testing.T) {
+	previousWindow, previousPoll := panelHealthWindow, panelHealthPoll
+	panelHealthWindow, panelHealthPoll = 0, time.Millisecond
+	t.Cleanup(func() { panelHealthWindow, panelHealthPoll = previousWindow, previousPoll })
+	dataDir, _ := helperEnv(t)
+	if err := os.WriteFile(filepath.Join(dataDir, "old.txt"), []byte("old panel data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stageName := restoreStagePrefixForTest
+	stageDir := filepath.Join(dataDir, stageName)
+	if err := os.Mkdir(stageDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stageDir, "new.txt"), []byte("restored panel data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var calls [][]string
+	request := PanelRestoreRequest{StageDir: stageName, Source: "upload", FileName: "mistgate-backup.tar.gz.age", MadeByVersion: "v1.2.3"}
+	if err := applyPanelRestore(dataDir, "mistgate.service", request, systemctlRecorder(&calls, nil)); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(filepath.Join(dataDir, "new.txt")); err != nil || string(got) != "restored panel data" {
+		t.Fatalf("restored data = %q, %v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "old.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old panel data remains active: %v", err)
+	}
+	kept, err := filepath.Glob(dataDir + ".before-restore-*")
+	if err != nil || len(kept) != 1 {
+		t.Fatalf("kept directories = %v, %v", kept, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(kept[0], "old.txt")); err != nil || string(got) != "old panel data" {
+		t.Fatalf("kept old data = %q, %v", got, err)
+	}
+	result, err := ReadPanelRestoreResult(dataDir)
+	if err != nil || result.Outcome != "restored" || result.Source != request.Source || result.FileName != request.FileName || result.MadeByVersion != request.MadeByVersion {
+		t.Fatalf("restore result = %+v, %v", result, err)
+	}
+	if len(calls) < 5 || strings.Join(calls[0], " ") != "stop mistgate.service" || strings.Join(calls[1], " ") != "start mistgate.service" {
+		t.Fatalf("systemctl calls = %#v", calls)
+	}
+}
+
+func TestApplyPanelRestoreRollsBackWhenHealthCheckFails(t *testing.T) {
+	previousWindow, previousPoll := panelHealthWindow, panelHealthPoll
+	panelHealthWindow, panelHealthPoll = 0, time.Millisecond
+	t.Cleanup(func() { panelHealthWindow, panelHealthPoll = previousWindow, previousPoll })
+	dataDir, _ := helperEnv(t)
+	if err := os.WriteFile(filepath.Join(dataDir, "old.txt"), []byte("old panel data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stageName := restoreStagePrefixForTest
+	stageDir := filepath.Join(dataDir, stageName)
+	if err := os.Mkdir(stageDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stageDir, "new.txt"), []byte("bad restored data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var calls [][]string
+	failedHealth := false
+	err := applyPanelRestore(dataDir, "mistgate.service", PanelRestoreRequest{StageDir: stageName, Source: "r2", FileName: "backup.tar.gz.age", MadeByVersion: "v1.2.3"},
+		systemctlRecorder(&calls, func(args []string) (string, error) {
+			if len(args) == 3 && args[0] == "is-active" && !failedHealth {
+				failedHealth = true
+				return "", errors.New("new panel is unhealthy")
+			}
+			return "", nil
+		}))
+	if err == nil || !strings.Contains(err.Error(), "rolled back") {
+		t.Fatalf("restore error = %v, want rollback", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(dataDir, "old.txt")); err != nil || string(got) != "old panel data" {
+		t.Fatalf("previous data was not restored: %q, %v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "new.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed restored data remains active: %v", err)
+	}
+	result, err := ReadPanelRestoreResult(dataDir)
+	if err != nil || result.Outcome != "failed" {
+		t.Fatalf("failed restore result = %+v, %v", result, err)
+	}
+	starts := 0
+	for _, call := range calls {
+		if len(call) == 2 && strings.Join(call, " ") == "start mistgate.service" {
+			starts++
+		}
+	}
+	if starts != 2 {
+		t.Fatalf("start calls = %d, want new and restored panel; calls %#v", starts, calls)
+	}
+}
+
+func TestApplyPanelRestoreRecordsPreflightFailureWithoutStoppingThePanel(t *testing.T) {
+	dataDir, _ := helperEnv(t)
+	var calls [][]string
+	err := applyPanelRestore(dataDir, "mistgate.service", PanelRestoreRequest{
+		StageDir: PanelRestoreStagePrefix + strings.Repeat("a", 32), Source: "upload", FileName: "backup.tar.gz.age", MadeByVersion: "v1.2.3",
+	}, systemctlRecorder(&calls, nil))
+	if err == nil || !strings.Contains(err.Error(), "staged restore path") {
+		t.Fatalf("missing stage error = %v", err)
+	}
+	if len(calls) != 2 || strings.Join(calls[0], " ") != "stop mistgate.service" || strings.Join(calls[1], " ") != "start mistgate.service" {
+		t.Fatalf("systemctl calls around stage verification = %#v", calls)
+	}
+	result, err := ReadPanelRestoreResult(dataDir)
+	if err != nil || result.Outcome != "failed" {
+		t.Fatalf("preflight failure result = %+v, %v", result, err)
+	}
+}
+
+func TestNormalizeRestoreOwnershipDoesNotFollowSymlinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("ownership is not available on Windows")
+	}
+	parent := t.TempDir()
+	currentPath := filepath.Join(parent, "current")
+	if err := os.Mkdir(currentPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	current, err := os.Stat(currentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uid, gid, ok := panelDataOwner(current)
+	if !ok {
+		t.Skip("file ownership is not available")
+	}
+	target := filepath.Join(parent, "outside.txt")
+	if err := os.WriteFile(target, []byte("outside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wantUID, wantGID := uid+1, gid+1
+	if err := os.Chown(target, wantUID, wantGID); err != nil {
+		t.Skipf("cannot assign a distinct target owner: %v", err)
+	}
+	stage := filepath.Join(parent, "stage")
+	if err := os.Mkdir(stage, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(stage, "outside-link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := normalizeRestoreOwnership(stage, current); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotUID, gotGID, ok := panelDataOwner(after)
+	if !ok || gotUID != wantUID || gotGID != wantGID {
+		t.Fatalf("symlink target owner = %d:%d, available %t; want untouched %d:%d", gotUID, gotGID, ok, wantUID, wantGID)
+	}
+}
+
+func TestKeptRestoreNameMatchesPanelValidationAndHelperDeletesIt(t *testing.T) {
+	dataDir, _ := helperEnv(t)
+	kept, err := newKeptRestorePath(dataDir, time.Date(2026, time.November, 6, 12, 30, 45, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := filepath.Base(kept)
+	if !validKeptDeleteName(dataDir, name) {
+		t.Fatalf("helper kept name %q does not match deletion validation", name)
+	}
+	if err := os.Mkdir(kept, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(kept, "old.db"), []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyPanelKeptDataDelete(dataDir, PanelKeptDeleteRequest{Name: name}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(kept); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("kept restore directory remains: %v", err)
+	}
+	result, err := ReadPanelKeptDeleteResult(dataDir)
+	if err != nil || result.Outcome != "deleted" || result.Name != name {
+		t.Fatalf("kept-data delete result = %+v, %v", result, err)
+	}
+}
+
+func TestUpdaterDeletesKeptDataThroughBothHelperModesAndWaitsForResult(t *testing.T) {
+	f := newPanelFixture()
+	for _, helperIsRoot := range []bool{false, true} {
+		name := "transient"
+		if helperIsRoot {
+			name = "fixed root helper"
+		}
+		t.Run(name, func(t *testing.T) {
+			rec := &recorder{}
+			var dataDir string
+			updater, _, dir := newPanelUpdater(t, f, rec, func(c *PanelUpdateConfig) {
+				dataDir = c.DataDir
+				c.UseRootHelperService = helperIsRoot
+				c.Runner = func(ctx context.Context, command string, args ...string) ([]byte, error) {
+					out, err := rec.run(ctx, command, args...)
+					if err != nil {
+						return out, err
+					}
+					started := command == "systemctl" && len(args) >= 2 && args[0] == "start" || command == "systemd-run"
+					if started {
+						request, err := takePanelKeptDeleteRequest(dataDir)
+						if err != nil {
+							return nil, err
+						}
+						if err := applyPanelKeptDataDelete(dataDir, request); err != nil {
+							return nil, err
+						}
+					}
+					return out, nil
+				}
+			})
+			if helperIsRoot {
+				rootLayoutAt(t, dir)
+			}
+			keptName := filepath.Base(dir) + ".before-restore-20261106-123045"
+			keptPath := filepath.Join(filepath.Dir(dir), keptName)
+			if err := os.Mkdir(keptPath, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(keptPath, "old.db"), []byte("old"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := updater.DeleteKeptData(context.Background(), keptName); err != nil {
+				t.Fatalf("delete kept data: %v", err)
+			}
+			if _, err := os.Lstat(keptPath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("kept data remains: %v", err)
+			}
+			if _, err := os.Lstat(filepath.Join(dir, PanelKeptDeleteResultFileName)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("panel did not consume delete result: %v", err)
+			}
+			launched := rec.launched()
+			if len(launched) != 1 {
+				t.Fatalf("helper launches = %#v", launched)
+			}
+			if helperIsRoot {
+				if strings.Join(launched[0], " ") != "systemctl start --no-block "+panelUpdateHelperService {
+					t.Fatalf("fixed helper launch = %#v", launched[0])
+				}
+			} else if launched[0][0] != "systemd-run" || !containsArg(launched[0], "--delete-kept") {
+				t.Fatalf("transient helper launch = %#v", launched[0])
+			}
+		})
+	}
+}
+
+func TestKeptDataDeleteRefusesSymlinksWithoutFollowingThem(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation is not available on Windows")
+	}
+	dataDir, _ := helperEnv(t)
+	name := filepath.Base(dataDir) + ".before-restore-20261106-123045"
+	kept := filepath.Join(filepath.Dir(dataDir), name)
+	if err := os.Mkdir(kept, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "outside.txt")
+	if err := os.WriteFile(target, []byte("untouched"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(kept, "outside-link")); err != nil {
+		t.Fatal(err)
+	}
+	err := applyPanelKeptDataDelete(dataDir, PanelKeptDeleteRequest{Name: name})
+	if err == nil || !strings.Contains(err.Error(), "contains a symlink") {
+		t.Fatalf("symlink kept directory deletion = %v", err)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "untouched" {
+		t.Fatalf("outside target changed: %q, %v", got, err)
+	}
+	if _, err := os.Lstat(kept); err != nil {
+		t.Fatalf("kept directory was removed despite its symlink: %v", err)
+	}
+}
+
+func TestRestoreJournalRecoversEveryInterruptedSwapPhase(t *testing.T) {
+	phases := []struct {
+		name         string
+		wantRestored bool
+	}{
+		{"prepared", false},
+		{"stage-moved", false},
+		{"exchange-intent", false},
+		{"swapped", false},
+		{"kept", false},
+		{"health", false},
+		{"committed", true},
+	}
+	for _, phase := range phases {
+		t.Run(phase.name, func(t *testing.T) {
+			dataDir, _ := helperEnv(t)
+			if err := os.WriteFile(filepath.Join(dataDir, "old.txt"), []byte("old"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			stageName := restoreStagePrefixForTest
+			stageDir := filepath.Join(dataDir, stageName)
+			if err := os.Mkdir(stageDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(stageDir, "new.txt"), []byte("new"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			previousHook := restoreJournalHook
+			restoreJournalHook = func(current string) error {
+				if current == phase.name {
+					return errors.New("simulated process death")
+				}
+				return nil
+			}
+			t.Cleanup(func() { restoreJournalHook = previousHook })
+			request := PanelRestoreRequest{StageDir: stageName, Source: "upload", FileName: "backup.tar.gz.age", MadeByVersion: "v1.2.3"}
+			var calls [][]string
+			err := applyPanelRestore(dataDir, "mistgate.service", request, systemctlRecorder(&calls, nil))
+			if !errors.Is(err, errRestoreJournalInterruption) {
+				t.Fatalf("apply interrupted at %s: %v", phase.name, err)
+			}
+			restoreJournalHook = nil
+			if err := recoverPanelRestoreJournal(dataDir, "mistgate.service", systemctlRecorder(&calls, nil)); err != nil {
+				t.Fatalf("recover phase %s: %v", phase.name, err)
+			}
+			wantFile := "old.txt"
+			if phase.wantRestored {
+				wantFile = "new.txt"
+			}
+			if _, err := os.Stat(filepath.Join(dataDir, wantFile)); err != nil {
+				t.Fatalf("live data after recovering %s lacks %s: %v", phase.name, wantFile, err)
+			}
+			missingFile := "new.txt"
+			if phase.wantRestored {
+				missingFile = "old.txt"
+			}
+			if _, err := os.Stat(filepath.Join(dataDir, missingFile)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("unexpected live file %s after recovery: %v", missingFile, err)
+			}
+			if _, err := os.Stat(restoreJournalPath(dataDir)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("restore journal remained after recovery: %v", err)
+			}
+		})
+	}
+}
+
+func TestRestoreJournalRollbackRecoversAnInterruptedFallback(t *testing.T) {
+	dataDir, _ := helperEnv(t)
+	if err := os.WriteFile(filepath.Join(dataDir, "old.txt"), []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stageName := restoreStagePrefixForTest
+	stageDir := filepath.Join(dataDir, stageName)
+	if err := os.Mkdir(stageDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stageDir, "new.txt"), []byte("new"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	previousExchange, previousHook := restoreRenameExchange, restoreJournalHook
+	restoreRenameExchange = func(string, string) error {
+		if runtime.GOOS == "linux" {
+			return syscall.EINVAL
+		}
+		return errors.ErrUnsupported
+	}
+	restoreJournalHook = func(phase string) error {
+		if phase == "rolling-back" {
+			return errors.New("simulated process death during rollback")
+		}
+		return nil
+	}
+	t.Cleanup(func() {
+		restoreRenameExchange, restoreJournalHook = previousExchange, previousHook
+	})
+	failedHealth := false
+	var calls [][]string
+	err := applyPanelRestore(dataDir, "mistgate.service", PanelRestoreRequest{
+		StageDir: stageName, Source: "r2", FileName: "backup.tar.gz.age", MadeByVersion: "v1.2.3",
+	}, systemctlRecorder(&calls, func(args []string) (string, error) {
+		if len(args) == 3 && args[0] == "is-active" && !failedHealth {
+			failedHealth = true
+			return "", errors.New("new panel is unhealthy")
+		}
+		return "", nil
+	}))
+	if !errors.Is(err, errRestoreJournalInterruption) {
+		t.Fatalf("restore rollback interruption = %v", err)
+	}
+	restoreRenameExchange, restoreJournalHook = previousExchange, nil
+	if err := recoverPanelRestoreJournal(dataDir, "mistgate.service", systemctlRecorder(&calls, nil)); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(filepath.Join(dataDir, "old.txt")); err != nil || string(got) != "old" {
+		t.Fatalf("previous data after fallback recovery = %q, %v", got, err)
+	}
+	result, err := ReadPanelRestoreResult(dataDir)
+	if err != nil || result.Outcome != "failed" {
+		t.Fatalf("rollback recovery result = %+v, %v", result, err)
+	}
+}
+
+const restoreStagePrefixForTest = PanelRestoreStagePrefix + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 func containsArg(args []string, want string) bool {
 	for _, arg := range args {

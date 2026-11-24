@@ -86,7 +86,7 @@ func TestWorkerInstallsNodeOverPinnedSSHAndRedactsSecrets(t *testing.T) {
 			return []byte(strings.Join([]string{
 				"distribution=ubuntu", "version=22.04", "kernel=6.8.0", "architecture=x86_64",
 				"cpu_count=4", "memory_bytes=1073741824", "disk_available_bytes=1073741824",
-				"systemd=yes", "already_enrolled=no", "existing_node_id=", "panel_reachable=yes", "",
+				"systemd=yes", "nftables=yes", "already_enrolled=no", "existing_node_id=", "panel_reachable=yes", "",
 			}, "\n")), nil
 		case strings.HasPrefix(command, "sh -s -- "):
 			data, err := io.ReadAll(channel)
@@ -324,6 +324,62 @@ func TestWorkerInstallsNodeOverPinnedSSHAndRedactsSecrets(t *testing.T) {
 		if strings.Contains(event.Code, password) || strings.Contains(event.Code, token) {
 			t.Fatalf("credential appeared in journal: %+v", event)
 		}
+	}
+}
+
+func TestFinishPanelKeyJobStoresNoPasswordAndItsFingerprint(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "panel.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	vlt, err := vault.New(make([]byte, vault.KeySize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(1_800_000_000, 0).UTC()
+	svc, err := NewService(st, vlt, Config{
+		Nodes: testNodeManager{}, Binaries: testBinarySource{}, PanelAddr: "panel.example.com:443", AgentSNI: "agent.example.com",
+		StepUp: func(context.Context) error { return nil }, Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const nodeID = "nod_panelkey"
+	if _, err := st.W.ExecContext(ctx, `INSERT INTO node (id, name, address, state, created_at) VALUES (?, 'edge-key', 'edge.example.com', 'pending', ?)`, nodeID, now.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	job := store.NodeProvisionJob{
+		ID: "prv_panelkey", NodeID: nodeID, Name: "edge-key", Address: "edge.example.com", SSHHost: "node.example.com", SSHPort: 22,
+		HostFingerprint: "SHA256:" + strings.Repeat("A", 43), Secret: []byte("sealed"), CreatedBy: "adm_test", CreatedAt: now, UpdatedAt: now,
+	}
+	if err := st.CreateNodeProvisionJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	running, claimed, err := st.ClaimNodeProvisionJob(ctx, now)
+	if err != nil || !claimed {
+		t.Fatalf("claim job = %v, %v", claimed, err)
+	}
+	key, _, err := svc.ensurePanelSSHKey(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.finishJob(ctx, running, credentials{Method: "panel_key", Username: "root"}, key.Fingerprint)
+	access, err := st.NodeServerAccess(ctx, nodeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(access.Password) != 0 || access.PanelKeyFingerprint != key.Fingerprint || access.PasswordLogin {
+		t.Fatalf("panel-key access = saved password %t, panel fingerprint %q, password login %t", len(access.Password) > 0, access.PanelKeyFingerprint, access.PasswordLogin)
+	}
+	var blobType string
+	if err := st.R.QueryRowContext(ctx, `SELECT typeof(password) FROM node_server_access WHERE node_id = ?`, nodeID).Scan(&blobType); err != nil || blobType != "blob" {
+		t.Fatalf("empty password storage type = %q, err %v; want an empty BLOB", blobType, err)
+	}
+	completed, err := st.NodeProvisionJob(ctx, job.ID)
+	if err != nil || len(completed.Secret) != 0 || completed.State != "completed" {
+		t.Fatalf("finished job = state %q, secret %d bytes, err %v", completed.State, len(completed.Secret), err)
 	}
 }
 

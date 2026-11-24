@@ -1,5 +1,6 @@
 ---
 title: Mistgate 文档
+seoTitle: "Mistgate 文档：安装、节点、协议、API"
 description: 文档包含哪些内容、在哪里查找，以及阅读顺序。
 ---
 
@@ -44,6 +45,9 @@ Mistgate 是供你管理自己的 VPN 集群的自托管面板：一个二进制
 - [Hysteria2](guide/hysteria2.md)：Hysteria2 协议配置设置、证书和混淆。
 - [VLESS REALITY](guide/vless.md)：TCP 和 XHTTP 上的 VLESS 协议配置、何时选择它而不是 Hysteria2、如何选择 REALITY 目标、端口和应用。
 - [同一节点上的 VLESS 与 Hysteria2](guide/vless-and-hysteria2.md)：分别由什么监听端口、VLESS 占用 TCP 443 时 Hysteria2 站点和 Let’s Encrypt 会发生什么，以及如何让少数用户试用 VLESS。
+- [一个 443，多个服务共用](guide/shared-port.md)：VLESS、TrustTunnel 和 MTProto 如何按名称共用同一节点的 TCP 443、哪些不能共用、陌生访问者会看到什么、DNS 记录、在管理后台和通过 MCP 的设置方法、端口卡片及其限制。
+- [MTProto（Telegram 代理）](guide/mtproto.md)：仅供 Telegram 应用使用的代理（实验性）：握手中名称的两种选择、用户的密钥和链接、中转，以及它的局限。
+- [TrustTunnel](guide/trusttunnel.md)：运行在普通 HTTPS 之上、各平台都有官方应用的 VPN（实验性）：它需要什么、各项设置、用户的 `tt://` 密钥，以及它的局限。
 - [AmneziaWG](guide/amneziawg.md)：AmneziaWG 2.0 和 3.1 协议配置、用户态或内核模块、设备和密钥。
 - [WARP](guide/warp.md)：通过 Cloudflare WARP 转发协议配置的流量。
 - [经入口节点中转](guide/relays.md)：中转何时能帮到网络封锁了节点的用户、它解决不了什么、入口能看到什么，以及如何添加。
@@ -54,11 +58,13 @@ Mistgate 是供你管理自己的 VPN 集群的自托管面板：一个二进制
 - [DNS](guide/dns.md)：用户和分组的 DNS 预设，以及节点的 DNS。
 - [BT 下载拦截](guide/torrent-protection.md)：逐节点的 BitTorrent 拦截功能、拦截内容及事件显示的信息。
 - [自有伪装站点](guide/decoy-site.md)：用自己的小型站点替换内置伪装页面，并提供让 AI 智能体生成独特站点的现成提示词。
+- [助手](guide/assistant.md)：管理后台中的云端模型，回答节点、用户和错误相关的问题并准备更改，由你来应用；提供商、数据去向、记忆和限制。
 
 ### 运维
 
 - [运行状况](operations/health.md)：客户端视角检测、节点诊断和告警。
 - [可达性](operations/reachability.md)：能否从某个国家境内访问节点：Globalping、封锁名单、TSPU 探测、每个节点的最近一周和告警。
+- [自有探测点](operations/probes.md)：国境内由你控制的路由器或服务器从它自己的网络检查节点；Keenetic、安装、更新、删除、探测点做什么以及网络服务商能看到什么。
 - [Telegram 告警](operations/telegram-alerts.md)：机器人、绑定聊天、发送内容和对象，以及面板监视器。
 - [面板监视器](operations/panel-watcher.md)：Cloudflare 每分钟检查一次面板，并通过 Telegram 报告服务中断。
 - [更新](operations/updates.md)：节点自更新、立即或定时更新节点、回滚以及更新面板。

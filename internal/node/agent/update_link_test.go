@@ -51,7 +51,7 @@ func applyLinkUpdate(ctx context.Context, a *Agent, f *updFix, token string, con
 	req := &pb.UpdateAgent{
 		RequestId: "update-link-test", Manifest: manifest, Signature: signature, DownloadToken: token,
 	}
-	return a.upd.Apply(ctx, req, updSource{a: a, token: req.GetDownloadToken()})
+	return a.upd.Apply(ctx, req, &updSource{a: a, token: req.GetDownloadToken()})
 }
 
 func TestUpdateLinkFetchFullFileAndEscapesPath(t *testing.T) {
@@ -207,9 +207,11 @@ func TestUpdateLinkFetchRetriesStalledDownload(t *testing.T) {
 			http.Error(w, "too many requests", http.StatusInternalServerError)
 		}
 	}))
-	a.linkPingTimeout = 50 * time.Millisecond
+	// The timer covers a fresh TLS handshake and the response head of the resumed request, so it must be far
+	// longer than a loaded -race runner needs for that; the stalled first request still ends within it.
+	a.updateLinkIdle = 400 * time.Millisecond
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	result, finish := applyLinkUpdate(ctx, a, f, linkDownloadToken, content)
 	if result == nil || !result.Ok || finish == nil {
@@ -300,7 +302,8 @@ func TestUpdateLinkFetchDoesNotFollowRedirect(t *testing.T) {
 		http.Redirect(w, r, "/redirect", http.StatusFound)
 	}))
 	_, err := (updSource{a: a, token: linkDownloadToken}).Fetch(context.Background(), binName, 0, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "HTTP 302") {
+	var failure *update.FetchFailure
+	if !errors.As(err, &failure) || failure.Code != "http_302" || errors.Is(err, update.ErrPermanent) {
 		t.Fatalf("Fetch error = %v, want transient HTTP 302 error", err)
 	}
 	if redirected.Load() != 0 {
@@ -315,7 +318,8 @@ func TestUpdateLinkFetchRejectsWrongContentRangeStart(t *testing.T) {
 		_, _ = io.WriteString(w, "data")
 	}))
 	_, err := (updSource{a: a, token: linkDownloadToken}).Fetch(context.Background(), binName, 5, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "starts at") {
+	var failure *update.FetchFailure
+	if !errors.As(err, &failure) || failure.Code != "size" || !errors.Is(err, update.ErrPermanent) {
 		t.Fatalf("Fetch error = %v, want wrong Content-Range start error", err)
 	}
 }
@@ -393,6 +397,57 @@ func TestUpdateLinkFetchDiscardsPrefixWhenRangeGets200(t *testing.T) {
 	}
 	if rangeHeader != "bytes=5-" || total != uint64(len(content)) || got.String() != string(content[5:]) {
 		t.Errorf("Fetch total=%d range=%q body=%q", total, rangeHeader, got.String())
+	}
+}
+
+func TestUpdateLinkSlowRange200PrefixKeepsIdleTimerAlive(t *testing.T) {
+	// What the test proves: discarding the ignored prefix alone takes longer than the idle timer (cut*pause >
+	// idle), yet it must not fire because every byte resets it. The gap between bytes is a tenth of the timer,
+	// so a scheduling stall under -race has to exceed 360 ms before it can fake a stalled download.
+	const (
+		idle  = 400 * time.Millisecond
+		pause = 40 * time.Millisecond
+		cut   = 12
+	)
+	content := bytes.Repeat([]byte("x"), 20)
+	var calls atomic.Int32
+	a, f, _ := newLinkUpdateAgent(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch calls.Add(1) {
+		case 1:
+			w.Header().Set("Content-Length", fmt.Sprint(len(content)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(content[:cut])
+		case 2:
+			if got, want := r.Header.Get("Range"), fmt.Sprintf("bytes=%d-", cut); got != want {
+				t.Errorf("range = %q, want %q", got, want)
+			}
+			w.Header().Set("Content-Length", fmt.Sprint(len(content)))
+			w.WriteHeader(http.StatusOK) // the origin ignores Range; the agent must discard the prefix
+			flusher, _ := w.(http.Flusher)
+			for i := range content {
+				if _, err := w.Write(content[i : i+1]); err != nil {
+					return
+				}
+				if flusher != nil {
+					flusher.Flush()
+				}
+				time.Sleep(pause)
+			}
+		default:
+			t.Errorf("unexpected request %d", calls.Load())
+		}
+	}), func(c *update.Config) { c.IdleTimeout = idle })
+	a.updateLinkIdle = idle
+
+	result, finish := applyLinkUpdate(context.Background(), a, f, linkDownloadToken, content)
+	if result == nil || !result.Ok || finish == nil {
+		t.Fatalf("Apply = (%v, %v), want success and finish", result, finish != nil)
+	}
+	if got, err := os.ReadFile(f.exe); err != nil || !bytes.Equal(got, content) {
+		t.Fatalf("updated executable = %d bytes, err %v", len(got), err)
+	}
+	if err := finish(); err != nil {
+		t.Fatal(err)
 	}
 }
 

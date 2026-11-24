@@ -1,51 +1,37 @@
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { EditionNotice } from "@/components/edition-notice";
 import { Button } from "@/components/ui/button";
 import { Modal } from "@/components/ui/modal";
 import { Notice } from "@/components/ui/notice";
-import { useToast } from "@/components/ui/toast";
 import type { Node as NodeMsg } from "@/gen/mistgate/admin/v1/node_pb";
 import { useT } from "@/i18n";
-import { nodes as nodesApi } from "@/lib/api";
-import { asDecoyMode, maxBulkNodes, ownBlockedBy, type DecoyMode } from "@/lib/decoy";
+import { decoySites, nodes as nodesApi } from "@/lib/api";
+import { asDecoyMode, type DecoyMode } from "@/lib/decoy";
+import { isDraft, sitesQuery } from "@/lib/decoysites";
 import { useEdition } from "@/lib/edition";
 import { errorText } from "@/lib/errors";
 import type { Plain } from "@/lib/plain";
+import { LibraryPicker } from "./decoys/picker";
 import { DecoyModeChoice } from "./node/decoy";
 
 type Node = Plain<NodeMsg>;
 
 /**
- * The bar that appears when nodes are ticked on the Nodes page: how many, and "Set decoy site" for all of them at once
- * (SetNodesDecoyMode, up to 50). Own is off while any ticked node has no uploaded site, because the panel refuses it then.
+ * "Decoy site…" of the Nodes page's bulk bar: one choice for all the selected nodes in one call (up to 50). Built-in and
+ * the panel's directory are a mode (SetNodesDecoyMode); a site of your own is one site of the library, chosen from the list
+ * under it and put on every node (AssignDecoySite), with a link to open it. Own is off while the library has no ready site
+ * and in the Cloudflare edition. Once the panel took it, `onDone` runs (the bar lists the nodes, each with its state read
+ * live) and the window closes; a refusal stays in it.
  */
-export function DecoyBulk({ nodes, onClear }: { nodes: Node[]; onClear: () => void }) {
+export function DecoyBulkDialog({ nodes, onClose, onDone }: { nodes: readonly Node[]; onClose: () => void; onDone: () => void }) {
   const t = useT();
-  const [open, setOpen] = useState(false);
-  return (
-    <div className="flex flex-wrap items-center gap-2 rounded-card border border-accent-line bg-surface px-3.5 py-2.5">
-      <span className="text-[13px] font-bold">{t.n("decoy.bulk.selected", nodes.length)}</span>
-      {nodes.length >= maxBulkNodes && <span className="text-xs text-muted">{t("decoy.bulk.limit")}</span>}
-      <span className="flex-1" />
-      <Button variant="primary" size="md" onClick={() => setOpen(true)}>
-        {t("decoy.bulk.action")}
-      </Button>
-      <Button variant="ghost" size="md" onClick={onClear}>
-        {t("decoy.bulk.clear")}
-      </Button>
-      {open && <BulkDialog nodes={nodes} onClose={() => setOpen(false)} onDone={onClear} />}
-    </div>
-  );
-}
-
-function BulkDialog({ nodes, onClose, onDone }: { nodes: Node[]; onClose: () => void; onDone: () => void }) {
-  const t = useT();
-  const toast = useToast();
   const qc = useQueryClient();
   const edge = useEdition().off("decoy_own");
-  const blocked = ownBlockedBy(nodes);
-  const ownOff = edge || blocked.length > 0;
+  const library = useQuery({ ...sitesQuery, enabled: !edge });
+  const ready = (library.data?.sites ?? []).filter((x) => !isDraft(x));
+  const noSites = !edge && library.isSuccess && ready.length === 0;
+  const ownOff = edge || noSites;
   const panelOff = nodes.some((n) => !n.decoyPanelAvailable);
 
   // start from the mode they all share, when they share one that can still be chosen
@@ -55,13 +41,19 @@ function BulkDialog({ nodes, onClose, onDone }: { nodes: Node[]; onClose: () => 
     return same && !(first === "own" && ownOff) && !(first === "panel" && panelOff) ? first : "builtin";
   });
   const [mode, setMode] = useState<DecoyMode>(start);
+  const [siteId, setSiteId] = useState("");
   const [problem, setProblem] = useState("");
 
   const apply = useMutation({
-    mutationFn: () => nodesApi.setNodesDecoyMode({ nodeIds: nodes.map((n) => n.id), mode }),
-    onSuccess: (r) => {
-      toast(t.n("decoy.bulk.done", r.nodes.length || nodes.length));
+    mutationFn: async () => {
+      const nodeIds = nodes.map((n) => n.id);
+      if (mode === "own") await decoySites.assignDecoySite({ siteId, nodeIds, panel: false });
+      else await nodesApi.setNodesDecoyMode({ nodeIds, mode });
+    },
+    onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ["nodes"] });
+      void qc.invalidateQueries({ queryKey: ["decoy-sites"] });
+      void qc.invalidateQueries({ queryKey: ["decoy-site"] });
       for (const n of nodes) void qc.invalidateQueries({ queryKey: ["node", n.id] });
       onDone();
       onClose();
@@ -80,7 +72,7 @@ function BulkDialog({ nodes, onClose, onDone }: { nodes: Node[]; onClose: () => 
           <Button variant="ghost" size="md" onClick={onClose}>
             {t("common.cancel")}
           </Button>
-          <Button variant="primary" size="md" disabled={apply.isPending || (mode === "own" && ownOff) || (mode === "panel" && panelOff)} onClick={() => apply.mutate()}>
+          <Button variant="primary" size="md" disabled={apply.isPending || (mode === "own" && (ownOff || !siteId)) || (mode === "panel" && panelOff)} onClick={() => apply.mutate()}>
             {t("decoy.apply")}
           </Button>
         </>
@@ -97,7 +89,13 @@ function BulkDialog({ nodes, onClose, onDone }: { nodes: Node[]; onClose: () => 
         panelOff={panelOff}
         panelNote={panelOff ? t("decoy.panelNone") : undefined}
         ownOff={ownOff}
-        ownNote={!edge && blocked.length > 0 ? t("decoy.bulk.ownBlocked", { names: blocked.join(", ") }) : undefined}
+        ownNote={noSites ? t("dz.bulk.noSites") : undefined}
+        ownExtra={
+          <>
+            <LibraryPicker value={siteId} onChange={setSiteId} disabled={apply.isPending} />
+            {!siteId && ready.length > 0 && <p className="text-xs text-muted">{t("dz.bulk.needSite")}</p>}
+          </>
+        }
       />
       <EditionNotice feature="decoy_own" />
       {problem && <Notice tone="danger">{problem}</Notice>}

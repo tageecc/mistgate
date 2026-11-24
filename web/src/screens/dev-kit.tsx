@@ -1,15 +1,11 @@
+import { CloudUsageKit } from "./dev-kit-cloud";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useRef, useState, type ReactNode } from "react";
 import { Role } from "@/gen/mistgate/admin/v1/auth_pb";
-import { InboundState, NodeStatus, WarpState, type Inbound } from "@/gen/mistgate/admin/v1/common_pb";
-import type { ProfileSummary } from "@/gen/mistgate/admin/v1/profile_pb";
+import { NodeStatus } from "@/gen/mistgate/admin/v1/common_pb";
 import { nodesQuery } from "@/lib/queries";
 import { meQuery } from "@/lib/session";
-import { TwinPanel, twinPlanKey, type Egress } from "@/screens/profiles/twin";
-import { WherePanel } from "@/screens/profiles/where";
 import { groupsQuery } from "@/screens/users/rpc";
-import { AccentPicker } from "@/components/accent-picker";
-import { CloudUsageKit } from "./dev-kit-cloud";
 import { Avatar, Card, Chip, Kbd, PageTitle, SectionLabel } from "@/components/ui/bits";
 import { Button } from "@/components/ui/button";
 import { IconButton } from "@/components/ui/icon-button";
@@ -34,29 +30,61 @@ import { TextsTab } from "@/screens/subscriptions/texts";
 import { LinkModal } from "@/screens/users/link-modal";
 import { NodeDemos } from "@/screens/dev-kit-node";
 import { PortsKit } from "@/screens/dev-kit-ports";
-import { VlessKit } from "@/screens/dev-kit-vless";
+import { ShareKit } from "@/screens/dev-kit-share";
 import { useT } from "@/i18n";
 import { App } from "@/gen/mistgate/admin/v1/common_pb";
 import type { Group } from "@/gen/mistgate/admin/v1/group_pb";
-import { profiles as profilesApi } from "@/lib/api";
-import { ConnectError, Code } from "@connectrpc/connect";
-import { AfterCreate, useAfterCreate } from "@/screens/profiles/after-create";
-import { DeployDialog } from "@/screens/profiles/deploy";
-import { GroupsTab, ReachLine } from "@/screens/users/groups";
+import { GroupsTab } from "@/screens/users/groups";
 import { profileListQuery, protocolsQuery } from "@/screens/users/rpc";
-import { DevicesPanel } from "@/screens/users/user-detail";
+import { DevicesPanel } from "@/screens/users/user-devices";
 import { dnsPresetsQuery } from "@/screens/subscriptions/queries";
-import type { ProtocolInfo } from "@/gen/mistgate/admin/v1/profile_pb";
 import { FleetKit } from "./dev-kit-fleet";
 import { ProfileApprovalsKit, SettingsDemos } from "./dev-kit-settings";
 import { PolishKit } from "./dev-kit-polish";
-import { DnsLinkKit } from "./dev-kit-dns";
+import { DnsAdsKit, DnsLinkKit } from "./dev-kit-dns";
 import { EdgeKit } from "./dev-kit-edge";
 import { UsersKit } from "./dev-kit-users";
-import { SubsKit } from "./dev-kit-subs";
 import { DecoyKit } from "./dev-kit-decoy";
+import { SSHKit } from "./dev-kit-ssh";
+import { OsKit, OsPageKit } from "./dev-kit-os";
+import { OsFleetKit } from "./dev-kit-os-fleet";
+import { ClientLogsKit } from "./dev-kit-clientlogs";
+import { ProbesKit } from "./dev-kit-probes";
+import { BulkKit, BulkPage } from "./dev-kit-bulk";
+import { UsersBulkKit, UsersBulkPage } from "./dev-kit-users-bulk";
 import { HealthWarpKit } from "@/screens/dev-kit-health-warp";
+import { Ipv6Kit } from "./dev-kit-ipv6";
 import { PagingKit, UpdatesKit } from "./dev-kit-redesign";
+import { ReleaseKit } from "./dev-kit-release";
+import { RestoreKit } from "./dev-kit-restore";
+import { AiKit } from "./dev-kit-ai";
+import { GraphKit } from "./dev-kit-graph";
+import { AwgRelayKit } from "./dev-kit-awg-relay";
+import { QrKit } from "./dev-kit-qr";
+import { BridgeKit } from "./dev-kit-bridge";
+import { FoundationKit } from "./dev-kit-foundation";
+import { NodePageFrame, NodePageKit } from "./dev-kit-node-page";
+import { NodeAddPage } from "./dev-kit-node-add";
+import { NodeShareKit, NodeSharePage } from "./dev-kit-node-share";
+import { OverviewKit, OverviewPage } from "./dev-kit-overview";
+import { ShellKit, ShellPage } from "./dev-kit-shell";
+import { DecoysKit, DecoysPage } from "./dev-kit-decoys";
+import { SubsPage, SubsScenesKit } from "./dev-kit-subs-page";
+import { NodesKit, NodesPage } from "./dev-kit-nodes";
+import { PnUsersKit, UsersPage } from "./dev-kit-users-page";
+import { PnProfilesKit, ProfilesPage } from "./dev-kit-profiles";
+import { PnProfileKit, ProfileScenePage } from "./dev-kit-profile";
+import { PnProfileNewKit, ProfileNewPage } from "./dev-kit-profile-new";
+import { HealthScenePage, PnHealthKit } from "./dev-kit-health";
+import { PnReachKit, ReachScenePage } from "./dev-kit-reach";
+import { SettingsKit, SettingsScenePage } from "./dev-kit-settings-page";
+import { AiScenePage, PnAiKit } from "./dev-kit-ai-page";
+import { IntegrationsScenePage, PnIntegrationsKit } from "./dev-kit-integrations-page";
+import { AssistantScenePage, PnAssistantKit } from "./dev-kit-assistant";
+import { PnUpdatesKit, UpdatesScenePage } from "./dev-kit-updates";
+import { UserKit, UserPage } from "./dev-kit-user";
+import { GroupKit, GroupScenePage } from "./dev-kit-group";
+import { WindowsKit, WindowsPage } from "./dev-kit-windows";
 
 // Development only (see router.tsx): every primitive in one place, to look at in both themes and at
 // 390 and 1280 px. Plain English on purpose: this page never ships.
@@ -87,34 +115,6 @@ function SyntaxSample() {
   );
 }
 
-// "Where it runs" on the profile page, on a private query cache so it needs no server: three states, one per verdict
-const demoGroups = [
-  { id: "grp_1", name: "family", profileIds: ["prf_1"], userCount: 5, dnsPresetId: "" },
-  { id: "grp_2", name: "friends", profileIds: ["prf_1", "prf_2"], userCount: 2, dnsPresetId: "" },
-  { id: "grp_3", name: "test", profileIds: ["prf_2"], userCount: 1, dnsPresetId: "" },
-];
-const demoNodes = [
-  { id: "nod_1", name: "de1", status: NodeStatus.ONLINE, countryCode: "DE" },
-  { id: "nod_2", name: "fi1", status: NodeStatus.ONLINE, countryCode: "FI" },
-];
-const demoProfile = (over: object) => ({ id: "prf_1", name: "Amnezia 3.1 test", protocol: "awg", nodeCount: 1, userCount: 7, version: 1, ...over }) as unknown as ProfileSummary;
-const demoInbound = (over: object) => ({ id: "inb_1", profileId: "prf_1", nodeId: "nod_1", nodeName: "de1", port: 51820, state: InboundState.ACTIVE, lastError: "", ...over }) as unknown as Inbound;
-
-function WhereDemo({ profile, inbounds, groups, role = Role.OWNER, twin }: { profile: ProfileSummary; inbounds: Inbound[]; groups: typeof demoGroups; role?: Role; twin?: boolean }) {
-  const [qc] = useState(() => {
-    const c = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity, retry: false } } });
-    c.setQueryData(groupsQuery.queryKey, groups as never);
-    c.setQueryData(nodesQuery.queryKey, { nodes: demoNodes } as never);
-    c.setQueryData(meQuery.queryKey, { admin: { role } } as never);
-    return c;
-  });
-  return (
-    <QueryClientProvider client={qc}>
-      <WherePanel profile={profile} inbounds={inbounds} twin={twin ? { egress: "direct", dirty: false } : undefined} />
-    </QueryClientProvider>
-  );
-}
-
 // Groups, the two ways and "what a person gets", the "put on nodes" window, the new-profile block and the card's devices:
 // mock data on a private cache that never asks the server (queries off by default).
 const kitProfiles = [
@@ -127,9 +127,9 @@ const kitProtocols = [
   { id: "awg", displayName: "AmneziaWG", apps: [App.AMNEZIA] },
 ];
 const kitGroups = [
-  { id: "grp_all", name: "Все", profileIds: ["p_hy", "p_warp", "p_awg"], userCount: 9, dnsPresetId: "", happNodes: 2, amneziaNodes: 0 },
-  { id: "grp_f", name: "Друзья", profileIds: ["p_hy"], userCount: 3, dnsPresetId: "", happNodes: 2, amneziaNodes: 0 },
-  { id: "grp_t", name: "тест 2", profileIds: [], userCount: 1, dnsPresetId: "", happNodes: 0, amneziaNodes: 0 },
+  { id: "grp_all", name: "Все", profileIds: ["p_hy", "p_warp", "p_awg"], userCount: 9, extraUserCount: 0, dnsPresetId: "", happNodes: 2, amneziaNodes: 0 },
+  { id: "grp_f", name: "Друзья", profileIds: ["p_hy"], userCount: 3, extraUserCount: 0, dnsPresetId: "", happNodes: 2, amneziaNodes: 0 },
+  { id: "grp_t", name: "тест 2", profileIds: [], userCount: 1, extraUserCount: 0, dnsPresetId: "", happNodes: 0, amneziaNodes: 0 },
 ] as unknown as Group[];
 const kitNodes = [
   { id: "nod_1", name: "de1", status: NodeStatus.ONLINE, countryCode: "DE", address: "de1.example.com", protocols: ["hysteria2"], awgBackend: "auto" },
@@ -151,57 +151,14 @@ function KitCache({ children }: { children: ReactNode }) {
   return <QueryClientProvider client={qc}>{children}</QueryClientProvider>;
 }
 
-/**
- * Dev only: the window's calls answered here, refusing the way the panel does: nl1 has the port taken (and names a free
- * one), fi1 sits on an IP, where Let's Encrypt needs a domain.
- */
-function fakeDeploy() {
-  (profilesApi as unknown as { createInbound: unknown }).createInbound = async (r: { profileId: string; nodeId: string; portOverride: number; tlsServerNameOverride: string }) => {
-    await new Promise((res) => setTimeout(res, 400));
-    if (r.nodeId === "nod_2" && !r.portOverride) throw new ConnectError("port_taken: port=443&profile=hy2 · WARP · 8443&free=8444", Code.AlreadyExists);
-    if (r.nodeId === "nod_3" && r.profileId === "p_hy" && !r.tlsServerNameOverride) throw new ConnectError("acme_needs_domain: address=203.0.113.10", Code.FailedPrecondition);
-    return { inbound: {} };
-  };
-}
-
-function DeployDemo() {
-  const [open, setOpen] = useState<"" | "hy2" | "awg">("");
-  const profile =
-    open === "awg" ? { id: "p_awg", name: "AWG 3.1 · QUIC", protocol: "awg" } : { id: "p_hy", name: "hy2 · 443 · Salamander", protocol: "hysteria2", tlsMode: "acme_domain", sni: "" };
-  return (
-    <KitCache>
-      <Button
-        onClick={() => {
-          fakeDeploy();
-          setOpen("hy2");
-        }}
-      >
-        Hysteria2 + Let's Encrypt
-      </Button>
-      <Button
-        onClick={() => {
-          fakeDeploy();
-          setOpen("awg");
-        }}
-      >
-        AmneziaWG, first on a node
-      </Button>
-      <DeployDialog open={open !== ""} onOpenChange={(o) => !o && setOpen("")} profile={profile} inbounds={[{ nodeId: "nod_1" }]} />
-    </KitCache>
-  );
-}
-
-function AfterDemo() {
-  const info = kitProtocols[0] as unknown as ProtocolInfo;
-  const a = useAfterCreate(info, "");
-  return <AfterCreate a={a} info={info} settings={{ port: 443, tls_mode: "acme_domain", sni: "" }} />;
-}
-
-const kitUser = { id: "usr_demo", name: "Марина", groupName: "Все", deviceLimit: 5, devicesUsed: 2, apps: { happ: true, amnezia: true } } as never;
+const kitUser = { id: "usr_demo", name: "Марина", groupName: "Все", extraGroupIds: [], extraGroupNames: [], extraGroupColors: [], deviceLimit: 5, devicesUsed: 2, apps: { happ: true, amnezia: true } } as never;
 const kitDevices = [
   // kind: 1 an app on the link with its device ID, 2 the place the apps without one share, 3 an AmneziaVPN key
   { id: "dev_l", kind: 1, platform: "ios", model: "iPhone 15", osVersion: "iOS 18.1", client: "Happ/3.4.2", fingerprint: "a1b2c3", usedBytes: 4.8e9, onlineNodeIds: ["de1"], awgProfileId: "", awgProfileName: "", awgVersion: "", protocols: ["hysteria2"], online: true, lastSeenUnix: Math.floor(Date.now() / 1000) - 60, firstSeenUnix: Math.floor(Date.now() / 1000) - 9 * 86400, lastHandshakeUnix: 0, stale: false, address: "" },
   { id: "dev_i", kind: 2, platform: "", model: "", osVersion: "", client: "Hiddify/2.5.7", fingerprint: "", usedBytes: 0, onlineNodeIds: [], awgProfileId: "", awgProfileName: "", awgVersion: "", protocols: ["hysteria2"], online: false, lastSeenUnix: Math.floor(Date.now() / 1000) - 7200, firstSeenUnix: 0, lastHandshakeUnix: 0, stale: false, address: "" },
+  // an app that connected through the Mistgate API by its own key ("By key"), and one whose link changed since ("Link changed")
+  { id: "dev_e", kind: 1, platform: "windows", model: "Office PC", osVersion: "Windows 11", client: "Mistgate/1.0", fingerprint: "c3d4e5", usedBytes: 1.2e9, onlineNodeIds: ["de1"], awgProfileId: "", awgProfileName: "", awgVersion: "", protocols: ["hysteria2"], online: true, lastSeenUnix: Math.floor(Date.now() / 1000) - 30, firstSeenUnix: Math.floor(Date.now() / 1000) - 3 * 86400, lastHandshakeUnix: 0, stale: false, address: "", enrolled: true, enrolLinkStale: false },
+  { id: "dev_r", kind: 1, platform: "macos", model: "MacBook Air", osVersion: "macOS 15", client: "Mistgate/1.0", fingerprint: "f6a7b8", usedBytes: 3e8, onlineNodeIds: [], awgProfileId: "", awgProfileName: "", awgVersion: "", protocols: ["hysteria2"], online: false, lastSeenUnix: Math.floor(Date.now() / 1000) - 3600, firstSeenUnix: Math.floor(Date.now() / 1000) - 5 * 86400, lastHandshakeUnix: 0, stale: false, address: "", enrolled: true, enrolLinkStale: true },
   {
     id: "dev_k",
     kind: 3,
@@ -224,23 +181,6 @@ const kitDevices = [
     address: "10.66.4.3",
   },
 ] as never;
-
-// "The same server with and without WARP": the action and its dialog, the plan filled in the cache (the server's dry run)
-function TwinDemo({ profile, egress, plan }: { profile: ProfileSummary; egress: Egress; plan: object }) {
-  const [qc] = useState(() => {
-    const c = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity, retry: false } } });
-    c.setQueryData(groupsQuery.queryKey, demoGroups as never);
-    c.setQueryData(nodesQuery.queryKey, { nodes: demoNodes.map((n, i) => ({ ...n, warp: { state: i === 0 ? WarpState.UP : WarpState.NOT_CONFIGURED } })) } as never);
-    c.setQueryData(meQuery.queryKey, { admin: { role: Role.OWNER } } as never);
-    c.setQueryData(twinPlanKey(profile.id, egress === "warp" ? "direct" : "warp", profile.version), plan as never);
-    return c;
-  });
-  return (
-    <QueryClientProvider client={qc}>
-      <TwinPanel profile={profile} egress={egress} dirty={false} />
-    </QueryClientProvider>
-  );
-}
 
 // Subscriptions -> "Names & texts": the servers of the busiest group as GetSubscriptionSettings sends them (two in one
 // country, to show the number), and an announcement longer than Happ shows (the counter and the cut)
@@ -286,10 +226,34 @@ export default function DevKit() {
   const turnstile = useRef<TurnstileHandle>(null);
   const [replay, setReplay] = useState(0);
   const [linkDemo, setLinkDemo] = useState<"pw" | "plain" | "awg" | "nothing" | null>(null);
-  // ?only=dns|edge|node|health|users|subs|approvals|fleet: one kit alone, for its screenshots
-  const only = { cloud: CloudUsageKit, dns: DnsLinkKit, edge: EdgeKit, node: NodeDemos, health: HealthWarpKit, users: UsersKit, subs: SubsKit, approvals: ProfileApprovalsKit, fleet: FleetKit }[
-    new URLSearchParams(location.search).get("only") ?? ""
-  ];
+  // ?only=profile-delete|dns|ads|edge|node|health|users|subs|approvals|ipv6|ports|share|ssh|os|os-fleet|os-page|client-logs|bulk|bulk-users|graph|awg-relay|qr|probes|trusttunnel|bridge|foundation|shell|overview|nodes|windows|nodepage|node-share|pn-group|decoys|pn-profiles|pn-health|pn-reach|pn-settings|pn-updates|pn-ai|pn-assistant|pn-integrations: one kit alone, for its screenshots;
+  // ?only=bulk-page and bulk-users-page are whole pages (the Nodes screen, the People tab, in the shell's frame), drawn without the kit's column
+  const which = new URLSearchParams(location.search).get("only") ?? "";
+  if (which === "shell-page") return <ShellPage />;
+  if (which === "overview-page") return <OverviewPage />;
+  if (which === "nodes-page") return <NodesPage />;
+  if (which === "users-page") return <UsersPage />;
+  if (which === "profiles-page") return <ProfilesPage />;
+  if (which === "profile-page") return <ProfileScenePage />;
+  if (which === "profile-new-page") return <ProfileNewPage />;
+  if (which === "health-page") return <HealthScenePage />;
+  if (which === "reach-page") return <ReachScenePage />;
+  if (which === "settings-page") return <SettingsScenePage />;
+  if (which === "pn-updates-page") return <UpdatesScenePage />;
+  if (which === "pn-ai-page") return <AiScenePage />;
+  if (which === "pn-integrations-page") return <IntegrationsScenePage />;
+  if (which === "pn-assistant-page") return <AssistantScenePage />;
+  if (which === "user-page") return <UserPage />;
+  if (which === "group-page") return <GroupScenePage />;
+  if (which === "decoys-page") return <DecoysPage />;
+  if (which === "subs-page") return <SubsPage />;
+  if (which === "windows-page") return <WindowsPage />;
+  if (which === "nodepage-frame") return <NodePageFrame />;
+  if (which === "node-share-page") return <NodeSharePage />;
+  if (which === "node-add-page") return <NodeAddPage />;
+  if (which === "bulk-page") return <BulkPage />;
+  if (which === "bulk-users-page") return <UsersBulkPage />;
+  const only = { dns: DnsLinkKit, ads: DnsAdsKit, edge: EdgeKit, node: NodeDemos, health: HealthWarpKit, users: UsersKit, approvals: ProfileApprovalsKit, fleet: FleetKit, ipv6: Ipv6Kit, ports: PortsKit, share: ShareKit, ssh: SSHKit, os: OsKit, "os-fleet": OsFleetKit, "os-page": OsPageKit, "client-logs": ClientLogsKit, bulk: BulkKit, "bulk-users": UsersBulkKit, release: ReleaseKit, restore: RestoreKit, ai: AiKit, graph: GraphKit, "awg-relay": AwgRelayKit, qr: QrKit, probes: ProbesKit, bridge: BridgeKit, foundation: FoundationKit, shell: ShellKit, overview: OverviewKit, nodes: NodesKit, windows: WindowsKit, nodepage: NodePageKit, "node-share": NodeShareKit, "pn-users": PnUsersKit, "pn-user": UserKit, "pn-group": GroupKit, decoys: DecoysKit, "pn-profiles": PnProfilesKit, "pn-profile": PnProfileKit, "pn-profile-new": PnProfileNewKit, "pn-health": PnHealthKit, "pn-reach": PnReachKit, subs: SubsScenesKit, "subs-scenes": SubsScenesKit, "pn-settings": SettingsKit, "pn-updates": PnUpdatesKit, "pn-ai": PnAiKit, "pn-assistant": PnAssistantKit, "pn-integrations": PnIntegrationsKit, cloud: CloudUsageKit }[which];
   if (only) {
     const Kit = only;
     return (
@@ -320,7 +284,7 @@ export default function DevKit() {
         <Button variant="secondary" size="xs">XS 22</Button>
         <Button variant="primary" disabled>Disabled</Button>
         <IconButton aria-label="Back">‹</IconButton>
-        <IconButton variant="close" aria-label="Close">×</IconButton>
+        <IconButton variant="compact" aria-label="Close">×</IconButton>
         <Stepper decrementLabel="Less" incrementLabel="More" onDecrement={() => setN(n - 10)} onIncrement={() => setN(n + 10)}>
           {n} GB
         </Stepper>
@@ -391,10 +355,6 @@ export default function DevKit() {
           </SectionLabel>
         ))}
         <SyntaxSample />
-      </Block>
-
-      <Block title="Accent">
-        <AccentPicker />
       </Block>
 
       <Block title="Toast, modal, brand">
@@ -468,44 +428,14 @@ export default function DevKit() {
       />
 
       <section className="flex flex-col gap-3">
-        <SectionLabel>Where it runs (profile page): works / on no node / in no group / read-only</SectionLabel>
-        <WhereDemo profile={demoProfile({ protocol: "hysteria2" })} inbounds={[demoInbound({}), demoInbound({ id: "inb_2", nodeId: "nod_2", nodeName: "fi1", state: InboundState.FAILED, lastError: "bind: address already in use" })]} groups={demoGroups} twin />
-        <WhereDemo profile={demoProfile({ userCount: 0 })} inbounds={[]} groups={demoGroups.slice(2)} />
-        <WhereDemo profile={demoProfile({ userCount: 0, protocol: "hysteria2" })} inbounds={[demoInbound({})]} groups={demoGroups.slice(2)} />
-        <WhereDemo profile={demoProfile({})} inbounds={[demoInbound({})]} groups={demoGroups} role={Role.READONLY} />
-      </section>
-
-      <section className="flex flex-col gap-3">
-        <SectionLabel>Same server with and without WARP (profile page): direct profile / WARP profile (AmneziaWG)</SectionLabel>
-        <TwinDemo profile={demoProfile({ protocol: "hysteria2", name: "files" })} egress="direct" plan={{ name: "files · WARP", egress: "warp", port: 8443, nodeIds: ["nod_1", "nod_2"], groupIds: ["grp_1", "grp_2"], hopDropped: true }} />
-        <TwinDemo profile={demoProfile({ name: "Amnezia 3.1 test · WARP" })} egress="warp" plan={{ name: "Amnezia 3.1 test", egress: "direct", port: 31877, nodeIds: ["nod_1"], groupIds: ["grp_1"], hopDropped: false }} />
-      </section>
-
-      <section className="flex flex-col gap-3">
-        <SectionLabel>Groups tab (users screen) and what a person of a group gets (create-user form)</SectionLabel>
+        <SectionLabel>Groups tab (users screen)</SectionLabel>
         <KitCache>
           <GroupsTab creating={false} onCreatingChange={() => {}} />
-          <Card className="flex flex-col divide-y divide-line px-4">
-            {kitGroups.map((g) => (
-              <ReachLine key={g.id} group={g} />
-            ))}
-          </Card>
-        </KitCache>
-      </section>
-
-      <Block title="Put on nodes (profile page): results per node; nl1 has the port taken, fi1 is an IP (Let's Encrypt needs a domain); the AWG backend of a node's first AWG profile">
-        <DeployDemo />
-      </Block>
-
-      <section className="flex flex-col gap-3">
-        <SectionLabel>New profile: right after it is created (a group with Hysteria2 is left alone, one without gets it)</SectionLabel>
-        <KitCache>
-          <AfterDemo />
         </KitCache>
       </section>
 
       <section className="flex flex-col gap-3">
-        <SectionLabel>User card: devices in the two ways</SectionLabel>
+        <SectionLabel>User card: devices in the two ways (Office PC: "By key"; MacBook Air: "Link changed")</SectionLabel>
         <KitCache>
           <DevicesPanel user={kitUser} devices={kitDevices} profiles={[{ id: "p_awg", name: "AWG 3.1 · QUIC", protocol: "awg" } as never]} actions={{ refresh: async () => {}, revoke: async () => {} } as never} onEditGroup={() => {}} />
         </KitCache>
@@ -513,7 +443,6 @@ export default function DevKit() {
 
       <NodeDemos />
       <PortsKit />
-      <VlessKit />
 
       <HealthWarpKit />
       <PagingKit />
@@ -532,7 +461,6 @@ export default function DevKit() {
       <EdgeKit />
       <DecoyKit />
       <UsersKit />
-      <SubsKit />
 
       <LinkModal
         target={

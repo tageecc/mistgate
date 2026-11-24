@@ -7,6 +7,7 @@ import type { MessageKey } from "@/i18n/en";
 import { relays as relaysApi } from "./api";
 import { plain, type Plain } from "./plain";
 import { pollMs } from "./queries";
+import { blockedOf, bridgeCarries, bridgeFailed, bridgeReason, modeOf, reachReason } from "./relay-bridge";
 
 // Relays (relay.proto): a port of an entry node that passes a server of another node (the exit) on, unchanged. Owner only.
 // The node page shows them twice: on the entry, the list with its checks and switches (screens/node/relays.tsx); on the
@@ -18,6 +19,9 @@ export type Candidate = Plain<RelayCandidate>;
 export type Stage = Plain<RelayStage>;
 export type CountryHint = Plain<RelayCountryHint>;
 export type ReachHint = Plain<RelayReachHint>;
+
+/** The label of a path through an entry: "via RU", or "via a relay" for an entry with no country. */
+export const viaLabel = (t: T, cc: string) => (cc ? t("relay.via", { cc }) : t("relay.viaAny"));
 
 /** The relays with this node at either end, oldest first. Under ["relays"], so a change refreshes every node page. */
 export const relaysQuery = (nodeId: string) =>
@@ -44,9 +48,10 @@ export const monitorStreak = 2;
 /** The row's state: what the agent, the last check and the panel's rounds through it say. "checking" is the page's own, while a call runs. */
 export type RelayState = "on" | "off" | "failed" | "applying" | "checking";
 
-export function relayState(r: Pick<RelayMsg, "enabled" | "state" | "check" | "monitor">): Exclude<RelayState, "checking"> {
+export function relayState(r: Pick<RelayMsg, "enabled" | "state" | "check" | "monitor"> & { mode?: string; activeMode?: string; reverseBlocked?: string; network?: string }): Exclude<RelayState, "checking"> {
   if (r.enabled && r.state === InboundState.FAILED) return "failed"; // the entry could not install the forward
-  if (r.check && !r.check.ok) return "failed"; // the last check failed: switched off by it, or found broken while on
+  if (bridgeFailed(r)) return "failed"; // it stands in the bridge and the exit does not hold it
+  if (r.check && !r.check.ok && !bridgeCarries(r)) return "failed"; // the last check failed: switched off by it, or found broken while on (a leg the bridge stands in for is no failure)
   // the panel's rounds through it failed twice running: what opens the relay_down alert (relay_round.go failStreakMin)
   if (r.enabled && r.monitor && !r.monitor.ok && r.monitor.failStreak >= monitorStreak) return "failed";
   if (r.enabled) return r.state === InboundState.ACTIVE ? "on" : "applying";
@@ -64,15 +69,23 @@ export const statePill: Record<RelayState, { kind: StatusKind; word: MessageKey 
 /** Why "Turn on" is not offered yet, or "" when it is: the panel's gate (a passing leg check under 15 min), said before the click. */
 export type Gate = "" | "agent_old" | "exit_down" | "unchecked" | "failed" | "stale";
 
-export function enableGate(r: Pick<RelayMsg, "agentSupported" | "exitLive" | "check" | "network">, nowS: number): Gate {
+export function enableGate(r: Pick<RelayMsg, "agentSupported" | "exitLive" | "check" | "network"> & { mode?: string; reverseBlocked?: string }, nowS: number): Gate {
   if (!r.agentSupported) return "agent_old";
   if (!r.exitLive) return "exit_down";
+  const mode = modeOf(r);
+  const reach = r.check?.reverseReach;
+  const bridgeOk = blockedOf(r) === "" && reach?.status === "ok" && nowS - reach.atUnix <= checkTtlS;
+  // the bridge only (relay_check.go reverseRelayGate): the exit reached the entry's bridge a moment ago, the leg does not matter
+  if (mode === "reverse") return bridgeOk ? "" : !reach?.status ? "unchecked" : reach.status === "fail" || reach.status === "skipped" ? "failed" : "stale";
   const leg = r.check?.leg;
-  if (!leg?.status) return "unchecked";
-  if (leg.status !== "ok") return "failed";
-  if (nowS - leg.atUnix > checkTtlS || r.check!.network !== r.network) return "stale";
-  return "";
+  const direct: Gate = !leg?.status ? "unchecked" : leg.status !== "ok" && !unverifiable(leg) ? "failed" : nowS - leg.atUnix > checkTtlS || r.check!.network !== r.network ? "stale" : "";
+  // auto: the direct leg passed, or it failed and the bridge passes
+  return mode === "auto" && direct !== "" && bridgeOk && leg?.status === "fail" ? "" : direct;
 }
+
+/** A stage the panel had no way to probe (a server with no name of its own to check, like MTProto fronting another site):
+ * not a failure, the relay may be on, it is just not proven (relay_check.go). */
+export const unverifiable = (s?: Pick<Stage, "status" | "code">) => s?.status === "skipped" && s.code === "unverifiable";
 
 /** The names a reason sentence fills in. */
 export type RelayNames = { entry: string; exit: string; exitPort: number; port: number; network: string };
@@ -102,13 +115,23 @@ export function stageReason(t: T, stage: "leg" | "path", s: Pick<Stage, "code" |
   return t(`relay.why.${stage}`, vars);
 }
 
-/** The first failed stage of the relay's last check in words, or "" when none failed. */
-export function checkReason(t: T, r: Pick<RelayMsg, "check" | "viaNodeName" | "exitNodeName" | "exitPort" | "port" | "network">): string {
+/**
+ * The first failed stage of the relay's last check in words, or "" when none failed. A bridge stage ("reverse_reach", "bridge")
+ * speaks of the bridge; a failed leg of a relay that may use a bridge says when the bridge does not help either.
+ */
+export function checkReason(t: T, r: Pick<RelayMsg, "check" | "viaNodeName" | "exitNodeName" | "exitPort" | "port" | "network"> & { enabled?: boolean; mode?: string; activeMode?: string }): string {
   const c = r.check;
+  const n = { entry: r.viaNodeName, exit: r.exitNodeName };
+  if (c?.bridge && (c.stage === "bridge" || bridgeFailed(r))) return bridgeReason(t, c.bridge, n);
   if (!c || c.ok) return "";
+  if (c.stage === "reverse_reach") return c.reverseReach ? reachReason(t, c.reverseReach, n) : "";
   const stage = c.stage === "path" ? "path" : "leg";
   const s = c[stage];
-  return s ? stageReason(t, stage, s, namesOf(r)) : "";
+  const why = s ? stageReason(t, stage, s, namesOf(r)) : "";
+  const reach = c.reverseReach;
+  // the bridge was tried because the leg failed, and it failed too
+  if (why && stage === "leg" && reach?.status === "fail" && modeOf(r) !== "dnat") return t("relay.why.both", { reason: why, bridge: reachReason(t, reach, n) });
+  return why;
 }
 
 /** What the entry's agent reported when it could not install the forward ("forward_drop", "resolve: …", "refused: …"). */
@@ -162,27 +185,4 @@ export function seenHint(t: T, entry: string, exit?: CountryHint, entryHint?: Co
   const both = dark.filter((x) => entryHint.dark.includes(x));
   if (both.length > 0) return { tone: "bad", text: t("relay.hint.seen.no", { entry, networks: both.join(", ") }) };
   return { tone: "ok", text: t("relay.hint.seen.yes", { entry, networks: dark.join(", ") }) };
-}
-
-export type CandidateNode = { nodeId: string; nodeName: string; servers: Candidate[]; suggested: boolean };
-
-/**
- * The candidates by exit node, in the panel's order (the ones that can be relayed first, the cut exits among them first):
- * the suggested nodes (cut, with a server that can be relayed), then the others.
- */
-export function groupCandidates(list: Candidate[]): { suggested: CandidateNode[]; others: CandidateNode[] } {
-  const byNode = new Map<string, CandidateNode>();
-  for (const c of list) {
-    const g = byNode.get(c.nodeId) ?? { nodeId: c.nodeId, nodeName: c.nodeName, servers: [], suggested: false };
-    g.servers.push(c);
-    byNode.set(c.nodeId, g);
-  }
-  const all = [...byNode.values()];
-  // what can be picked first in each node: then the ones relayed already, then the ones that cannot be
-  const rank = (c: Candidate) => (c.unsupported ? 2 : c.relayId ? 1 : 0);
-  for (const g of all) {
-    g.servers.sort((a, b) => rank(a) - rank(b));
-    g.suggested = g.servers.some((c) => !c.unsupported && isCut(c.country));
-  }
-  return { suggested: all.filter((g) => g.suggested), others: all.filter((g) => !g.suggested) };
 }

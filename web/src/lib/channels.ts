@@ -1,0 +1,19 @@
+// Release channels (design/adr/0011-release-channels.md): a panel follows one channel and sees it and every more stable one.
+// The channel of a release is its tag: vX.Y.Z is stable, vX.Y.Z-testing.N testing, vX.Y.Z-dev.N dev.
+
+export type Channel = "stable" | "testing" | "dev";
+
+export const channels: readonly Channel[] = ["stable", "testing", "dev"];
+
+/** The server's string as a channel; anything else (an unstamped build, an empty field) reads as stable. */
+export const asChannel = (s: string | undefined): Channel => (s === "testing" || s === "dev" ? s : "stable");
+
+/** How early a channel is: stable 0, testing 1, dev 2. A panel on a channel sees the releases of every lower rank too. */
+export const channelRank: Record<Channel, number> = { stable: 0, testing: 1, dev: 2 };
+
+/**
+ * The command that makes `channel` the one the root update helper may install from (the file the installer creates and the
+ * helper trusts: /etc/mistgate/panel-update-channel, root:root 0644, replaced by rename). Same text as the update docs.
+ */
+export const panelChannelCommand = (channel: Channel) =>
+  `sudo sh -c 'install -d -o root -g root -m 0755 /etc/mistgate && tmp=$(mktemp /etc/mistgate/.panel-update-channel.XXXXXX) && printf "%s\\n" ${channel} > "$tmp" && chmod 0644 "$tmp" && mv -f "$tmp" /etc/mistgate/panel-update-channel'`;

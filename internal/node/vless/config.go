@@ -37,14 +37,25 @@ func buildCoreConfig(spec plugin.InboundSpec, cfg settings, creds *credentialInd
 		if cfg.reality.dialAddr != "" {
 			dest, network = cfg.reality.dialAddr, cfg.reality.dialNet
 		}
-		stream.SecurityType = serial.GetMessageType(&reality.Config{})
-		stream.SecuritySettings = []*serial.TypedMessage{serial.ToTypedMessage(&reality.Config{
+		rc := &reality.Config{
 			Dest: dest, Type: network, ServerNames: append([]string(nil), cfg.reality.serverNames...),
 			PrivateKey: append([]byte(nil), cfg.reality.privateKey...), ShortIds: cloneByteSlices(cfg.reality.shortIDs),
-		})}
+		}
+		if cfg.reality.self {
+			// The node's own site learns the visitor's address from a PROXY v2 header (startSite reads it). A foreign
+			// target gets none: it would not understand it.
+			rc.Xver = 2
+		}
+		stream.SecurityType = serial.GetMessageType(&reality.Config{})
+		stream.SecuritySettings = []*serial.TypedMessage{serial.ToTypedMessage(rc)}
 	}
+	shared := tracker != nil && tracker.shared != nil
 	if tracker != nil {
 		stream.Tcpmasks = []*serial.TypedMessage{serial.ToTypedMessage(newTCPConnMaskConfig(tracker.key.inboundID, tracker.key.generation))}
+	}
+	if shared {
+		// Xray reverses the list: the shared mask takes the listener first, then the tracker wraps what it accepts.
+		stream.Tcpmasks = append(stream.Tcpmasks, serial.ToTypedMessage(newSharedMaskConfig(tracker.key.inboundID, tracker.key.generation)))
 	}
 	switch cfg.transport {
 	case "xhttp":
@@ -64,13 +75,12 @@ func buildCoreConfig(spec plugin.InboundSpec, cfg settings, creds *credentialInd
 		}}
 	}
 
-	receiver := &proxyman.ReceiverConfig{
-		StreamSettings: stream,
-		SniffingSettings: &proxyman.SniffingConfig{
-			Enabled: true, RouteOnly: true, DestinationOverride: []string{"http", "tls", "quic"},
-		},
-	}
-	if cfg.security == "tls" {
+	// No sniffing. The node has no routing rules, so a sniffed name would go nowhere, while xray-core's dispatcher sniffer()
+	// holds the first bytes of a flow for up to 200 ms while it looks for one (a UDP datagram under 20 bytes waits the whole
+	// time). Destinations come from the app (an IP is kept, a name is resolved by the node's DNS) and the torrent guard
+	// works on the egress socket, not on the sniffer.
+	receiver := &proxyman.ReceiverConfig{StreamSettings: stream}
+	if cfg.security == "tls" || shared { // Xray listens on the private socket; the shared mask swaps it for the route
 		receiver.Listen = net.NewIPOrDomain(net.DomainAddress(unixAddr))
 	} else {
 		receiver.PortList = &net.PortList{Range: []*net.PortRange{net.SinglePortRange(net.Port(spec.Listen.Port))}}
@@ -89,7 +99,7 @@ func buildCoreConfig(spec plugin.InboundSpec, cfg settings, creds *credentialInd
 		Inbound: []*core.InboundHandlerConfig{{
 			Tag:              spec.ID,
 			ReceiverSettings: serial.ToTypedMessage(receiver),
-			ProxySettings:    serial.ToTypedMessage(&vlessin.Config{Clients: clients, Decryption: "none"}),
+			ProxySettings:    serial.ToTypedMessage(&vlessin.Config{Users: clients, Decryption: "none"}),
 		}},
 	}
 }

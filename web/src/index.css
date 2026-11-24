@@ -1,13 +1,16 @@
 @import "tailwindcss";
 @import "./fonts/fonts.css";
 @import "./assets/mark-motion.css";
+@import "./screens/shell.css";
 
 /*
- * Design tokens. This is the ONE place colours, radii, type and
- * motion live. Dark is the default theme, light is `data-theme="light"` on <html> (src/lib/theme.ts).
- * The accent is user-selectable (src/lib/accent.ts sets --accent inline on <html>); everything tinted is
- * derived from it with color-mix(in oklch). No shadows, except the dock/toast/modal ones noted below.
- * Components use the Tailwind names mapped in @theme below, never raw colours.
+ * Design tokens. This is the ONE place colours, radii, type and motion live. Dark is the default theme, light is
+ * `data-theme="light"` on <html> (src/lib/theme.ts). The accent is user-selectable (src/lib/accent.ts sets --accent inline
+ * on <html>, mint unless chosen otherwise); what is tinted by it derives from it below. Section tones and status colours are
+ * explicit pairs (a colour and the background it sits on), one set per theme, so contrast is fixed by hand, not by a mix
+ * ratio. Components use the Tailwind names mapped in @theme below, never raw colours.
+ * The calm look (hairline borders, three roles of text, no gradients, weights 400/500) follows the redesign of the panel;
+ * the ideas come from the "unslop" pass by Damir Sokolovsky (CC BY 4.0).
  */
 :root {
   color-scheme: dark;
@@ -19,39 +22,68 @@
   --accent-sand: #dcc68c;
   --accent-rose: #e6a6b0;
   --accent-sage: #b0cc90;
-  --accent: #b8acf2;
+  --accent: #7dd3a0;
 
   --bg: #0c0c0e;
   --surface: #141417;
   --surface-2: #1d1d22;
-  --border: #25252b;
   --text: #f3f3f5;
   --muted: #8b8b94;
+  /* the three roles of text: --text, --sec (a step quieter), --muted (labels, hints) */
+  --sec: color-mix(in srgb, var(--text) 66%, var(--bg));
+  /* the hairline: text at 9 %, see-through, so it sits right on any surface; --border-solid is the same on a surface */
+  --border: color-mix(in srgb, var(--text) 9%, transparent);
+  --border-solid: color-mix(in srgb, var(--text) 9%, var(--surface));
+  --border-hover: color-mix(in srgb, var(--text) 18%, transparent);
+  /* the quiet fill: a secondary button, a tag, a hovered row */
+  --step: color-mix(in srgb, var(--text) 5%, var(--surface));
+  --step-hover: color-mix(in srgb, var(--text) 9%, var(--surface));
   --faint: #4a4a52;
-  --them: #d4d4dc;
   --them: #d4d4dc; /* second series on charts */
   --dock: rgb(24 24 28 / 0.78);
   --ink-on-accent: #0c0c0e; /* text on the accent: always this, in both themes */
 
+  /* the accent in its three jobs: the fill (--accent), a line or a mark (a tab's line, a switch, a tick), and text; the
+     light theme takes the last two darker, as the design does for its mint (#2bb673 and #0b7a4b) */
+  --accent-mark: var(--accent);
+  --accent-text: var(--accent);
+  --accent-soft: color-mix(in srgb, var(--accent-mark) 12%, var(--surface));
+  --accent-line: color-mix(in srgb, var(--accent-mark) 36%, var(--surface));
+  --accent-hover: color-mix(in srgb, var(--accent) 88%, #fff);
+  --focus-ring: color-mix(in srgb, var(--accent-mark) 16%, transparent);
+  /* "works" is always mint, whatever the accent */
+  --ok: var(--accent-mint);
+
+  /* tones: a foreground and the background it sits on. Section identity (the sidebar's pastels) and protocol tags. */
+  --tone-lavender: #b8acf2;
+  --tone-lavender-bg: #2d2b38;
+  --tone-sky: #8ec8ea;
+  --tone-sky-bg: #263037;
+  --tone-sand: #dcc68c;
+  --tone-sand-bg: #332f25;
+  --tone-rose: #e6a6b0;
+  --tone-rose-bg: #362a2c;
+  --tone-sage: #b0cc90;
+  --tone-sage-bg: #2b3126; /* not drawn on the boards in the dark theme: the sage at ~16 % on the surface, as its neighbours are */
+  --tone-mint: #7dd3a0;
+  --tone-mint-bg: #243229;
+  --tone-blip: #89a5b5;
+
   /* status */
   --warning: #febc2e;
-  --warning-soft: rgb(254 188 46 / 0.12);
-  --warning-line: rgb(254 188 46 / 0.35);
+  --warning-soft: #33290f;
+  --warning-line: color-mix(in srgb, var(--warning) 35%, transparent);
+  --warning-text: var(--warning);
   --danger: #ff5a5f;
   --danger-soft: rgb(255 90 95 / 0.14);
+  --danger-text: var(--danger);
 
-  /* theme-dependent mix ratios */
+  /* legacy mix ratios: the screens that are not redesigned yet still tint through them (accent presets mixed in oklch);
+     the redesigned parts read the pairs above. Removed with the last of those screens. */
   --_soft-pct: 14%;
   --_line-pct: 50%;
   --_text-pct: 100%;
-  --_chroma: 1; /* the darkened light-theme tones lose colour, so section tones get it back (index.css .id-chip) */
-
-  /* derived accent tokens */
-  --accent-soft: color-mix(in oklch, var(--accent) var(--_soft-pct), var(--bg));
-  --accent-line: color-mix(in oklch, var(--accent) var(--_line-pct), var(--border));
-  --accent-text: color-mix(in oklch, var(--accent) var(--_text-pct), #000);
-  --warning-text: color-mix(in oklch, var(--warning) var(--_text-pct), #000);
-  --danger-text: color-mix(in oklch, var(--danger) var(--_text-pct), #000);
+  --_chroma: 1;
 
   /* the logo has three fills: white, light, dark; the last two are tinted by the accent */
   --logo-w: #fff;
@@ -59,61 +91,129 @@
   --logo-d: oklch(from var(--accent) calc(l * 0.56) calc(c * 2.1) h);
 
   /* charts: the accent line and how strong the fill under each line is (first line = accent, the rest = --them) */
-  --chart-line: var(--accent);
+  --chart-line: var(--accent-mark);
   --chart-fill-a: 0.3;
   --chart-fill-b: 0.2;
 
-  /* the only shadows in the product; off in the light theme */
-  --shadow-dock: 0 12px 30px -12px rgb(0 0 0 / 0.5);
-  --shadow-toast: 0 14px 30px -10px rgb(0 0 0 / 0.5);
+  /* shadows: only on what floats (a menu, a toast, a window, the dock), in both themes */
+  --shadow-dock: 0 16px 40px rgb(0 0 0 / 0.55);
+  --shadow-pop: 0 16px 40px rgb(0 0 0 / 0.5);
+  --shadow-toast: 0 12px 32px rgb(0 0 0 / 0.4);
+  --shadow-dlg: 0 32px 80px rgb(0 0 0 / 0.55);
+  /* the plain window (Modal) has none on the dark theme; the assistant's pop-ups (a menu over its input) are the same black on both */
+  --shadow-win: none;
+  --shadow-as-pop: 0 16px 40px rgb(0 0 0 / 0.5);
+  --scrim: color-mix(in srgb, #000 62%, transparent);
+
+  --e: cubic-bezier(0.22, 1, 0.36, 1);
+  /* the board's springs as curves (a pop with an overshoot, a settle, a soft fade) and how long each takes */
+  --sp-pop: linear(0, 0.108, 0.363, 0.671, 0.955, 1.161, 1.279, 1.306, 1.265, 1.182, 1.09, 1.005, 0.943, 0.911, 0.906, 0.921, 0.947, 0.977, 1.002, 1.019, 1.028, 1.028, 1.023, 1.015, 1.006, 0.999, 0.994, 0.991, 0.991, 0.993, 0.996, 0.998, 1.001, 1.002, 1.003, 1.003, 1);
+  --sp-pop-t: 0.77s;
+  --sp-settle: linear(0, 0.035, 0.117, 0.229, 0.357, 0.484, 0.604, 0.715, 0.808, 0.884, 0.947, 0.992, 1.025, 1.046, 1.058, 1.063, 1.063, 1.059, 1.052, 1.044, 1.036, 1.028, 1.021, 1.015, 1.009, 1.005, 1.002, 0.999, 0.998, 0.997, 0.996, 0.996, 0.996, 0.997, 0.997, 0.997, 1);
+  --sp-settle-t: 0.58s;
+  --sp-fade: linear(0, 0.024, 0.079, 0.159, 0.246, 0.343, 0.435, 0.522, 0.607, 0.681, 0.748, 0.804, 0.854, 0.893, 0.925, 0.952, 0.972, 0.988, 1, 1.008, 1.014, 1.017, 1.019, 1.019, 1.018, 1.017, 1.016, 1.014, 1.012, 1.011, 1.009, 1.007, 1.006, 1.005, 1.004, 1.003, 1);
+  --sp-fade-t: 0.39s;
+
+  /* the width of the menu column: 264 open, 72 folded, 0 on a phone. The shell sets it (lib/menu.ts); the floating things
+     (the toast, the bulk bar) keep clear of it. */
+  --menu-w: 0px;
 }
 :root[data-theme="light"] {
   color-scheme: light;
   --bg: #f8f8f6;
   --surface: #ffffff;
   --surface-2: #efefec;
-  --border: #e3e3df;
   --text: #16161a;
   --muted: #6b6b73;
+  --border: color-mix(in srgb, var(--text) 11%, transparent);
+  --border-solid: color-mix(in srgb, var(--text) 11%, var(--surface));
+  --step: color-mix(in srgb, var(--text) 4%, var(--surface));
   --faint: #c4c4c8;
   --them: #a4a4ac;
-  --them: #a4a4ac;
   --dock: rgb(255 255 255 / 0.82);
-  --chart-line: color-mix(in oklch, var(--accent) 65%, #3a2f7a);
-  --chart-fill-a: 0.16;
-  --chart-fill-b: 0;
+
+  --accent-mark: oklch(from var(--accent) calc(l * 0.86) calc(c * 1.36) h);
+  --accent-text: oklch(from var(--accent) calc(l * 0.64) calc(c * 1.04) h);
+  --accent-hover: color-mix(in srgb, var(--accent) 92%, #000);
+  --ok: oklch(from var(--accent-mint) calc(l * 0.86) calc(c * 1.36) h);
+
+  --tone-lavender: #5a48a8;
+  --tone-lavender-bg: #eae8fc;
+  --tone-sky: #1d6d95;
+  --tone-sky-bg: #e0f0fa;
+  --tone-sand: #7a6212;
+  --tone-sand-bg: #f5efdf;
+  --tone-rose: #8a3e4c;
+  --tone-rose-bg: #f9e6e8;
+  --tone-sage: #4d6b22;
+  --tone-sage-bg: #e8f1e0;
+  --tone-mint: #0b7a4b;
+  --tone-mint-bg: #dcf3e4;
+  --tone-blip: #7691a0;
+
+  --warning: #b07400;
+  --warning-soft: #fbefd0;
+  --danger: #c9353b;
+  --danger-soft: #fde6e5;
+  /* the design's amber and red as text on their own wash are 3.4 and 4.4 : 1; these two are the same hues a step deeper
+     (4.7 and 4.9 : 1), for text only; dots, bars and glyphs keep the designed colours */
+  --warning-text: #946000;
+  --danger-text: #bb2f35;
+
   --_soft-pct: 24%;
   --_line-pct: 65%;
   --_text-pct: 50%;
   --_chroma: 1.9;
-  --shadow-dock: none;
-  --shadow-toast: none;
+
+  --shadow-dock: 0 12px 32px rgb(22 22 26 / 0.16);
+  --shadow-pop: 0 16px 40px rgb(22 22 26 / 0.14);
+  --shadow-toast: 0 12px 32px rgb(22 22 26 / 0.18);
+  /* the board's windows, the assistant and its pop-ups keep the dark theme's black shadow on the light one too (pn.css: .an, .sr, .cfm .55; .as-mp .5);
+     only its plain menus and popovers (.pop, .mm) and toasts are soft */
+  --shadow-dlg: 0 32px 80px rgb(0 0 0 / 0.55);
+  --shadow-win: var(--shadow-dlg);
+  --shadow-as-pop: 0 16px 40px rgb(0 0 0 / 0.5);
+  --scrim: color-mix(in srgb, #1a1a1e 38%, transparent);
+  --chart-fill-a: 0.16;
+  --chart-fill-b: 0;
 }
 
 @theme {
-  /* the single breakpoint is ~720px: tables -> cards, sidebar -> dock, modal -> sheet */
+  /* a phone is below ~720px: tables -> cards, sidebar -> dock, modal -> sheet */
   --breakpoint-md: 45rem;
   /* the node grid goes from 3 to 5 columns here (5 need ~1000px of content width) */
   --breakpoint-wide: 68.75rem;
+  /* the redesigned shell (menu folds to a rail below `rail`, content widths step at `mid` and `full`); lg: and xl: stay the stock ones */
+  --breakpoint-rail: 62.5rem;
+  --breakpoint-mid: 75rem;
+  --breakpoint-full: 85rem;
 
-  /* one height for every control of the top bar (search, fleet pill, GitHub, language, theme): h-bar, size-bar */
-  --spacing-bar: 2.25rem;
-
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
   --ease-out-soft: cubic-bezier(0.2, 0.8, 0.2, 1);
   --ease-spring: cubic-bezier(0.3, 1.5, 0.5, 1);
   --ease-spring-strong: cubic-bezier(0.3, 1.6, 0.5, 1);
+
+  /* the new weights are two: 400 for text, 500 for headings, buttons and accents (600 is rare). The old classes are bent to
+     them here, so no class changes at the call sites; the last stage of the redesign renames them and takes this out. */
+  --font-weight-semibold: 500;
+  --font-weight-bold: 500;
+  --font-weight-extrabold: 600;
 }
 
 @theme inline {
   --color-canvas: var(--bg);
   --color-surface: var(--surface);
   --color-surface-2: var(--surface-2);
+  --color-step: var(--step);
   --color-line: var(--border);
   --color-fg: var(--text);
+  --color-sec: var(--sec);
   --color-muted: var(--muted);
   --color-faint: var(--faint);
   --color-them: var(--them);
   --color-accent: var(--accent);
+  --color-accent-mark: var(--accent-mark);
+  --color-accent-hover: var(--accent-hover);
   --color-on-accent: var(--ink-on-accent);
   --color-accent-soft: var(--accent-soft);
   --color-accent-line: var(--accent-line);
@@ -125,23 +225,38 @@
   --color-danger: var(--danger);
   --color-danger-soft: var(--danger-soft);
   --color-danger-text: var(--danger-text);
-  --color-ok: var(--accent-mint);
+  --color-ok: var(--ok);
+  --color-ok-soft: var(--tone-mint-bg);
+  --color-ok-text: var(--tone-mint);
   --color-busy: var(--accent-sky);
   --color-dock: var(--dock);
+  --color-tone-lavender: var(--tone-lavender);
+  --color-tone-lavender-bg: var(--tone-lavender-bg);
+  --color-tone-sky: var(--tone-sky);
+  --color-tone-sky-bg: var(--tone-sky-bg);
+  --color-tone-sand: var(--tone-sand);
+  --color-tone-sand-bg: var(--tone-sand-bg);
+  --color-tone-rose: var(--tone-rose);
+  --color-tone-rose-bg: var(--tone-rose-bg);
+  --color-tone-sage: var(--tone-sage);
+  --color-tone-sage-bg: var(--tone-sage-bg);
+  --color-tone-mint: var(--tone-mint);
+  --color-tone-mint-bg: var(--tone-mint-bg);
+  --color-tone-blip: var(--tone-blip);
 
-  /* radii: fields/44px buttons 14 . 36px buttons/chips 11 . cards 16 . large cards 18 . dock 20 . sheet 22 */
-  --radius-chip: 11px;
-  --radius-ctl: 11px;
-  --radius-field: 14px;
+  /* radii: buttons and fields 10 . small buttons and rows 8 . tags 6 . cards 16 . windows and sheets 20 . menus 14 */
+  --radius-chip: 6px;
+  --radius-ctl: 8px;
+  --radius-field: 10px;
+  --radius-pop: 14px;
   --radius-card: 16px;
-  --radius-card-lg: 18px;
+  --radius-card-lg: 16px;
   --radius-dock: 20px;
-  --radius-sheet: 22px;
+  --radius-sheet: 20px;
 
   /* The ideographs are in no web font: after the Latin faces come the system CJK ones (nothing is downloaded). */
-  --font-sans: "Onest", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", "Source Han Sans SC", sans-serif;
-  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", "Source Han Sans SC", monospace;
-
+  --font-sans: "Onest", "Vazirmatn", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", "Source Han Sans SC", sans-serif;
+  --font-mono: "JetBrains Mono", "Vazirmatn", ui-monospace, SFMono-Regular, Menlo, Consolas, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", "Source Han Sans SC", monospace;
 }
 
 @layer base {
@@ -155,14 +270,15 @@
     color: var(--text);
     font-family: var(--font-sans);
     font-size: 14px;
-    line-height: 1.45;
+    line-height: 20px;
+    text-wrap: pretty;
     -webkit-font-smoothing: antialiased;
     transition:
       background-color 0.5s,
       color 0.5s;
   }
   :focus-visible {
-    outline: 2px solid var(--accent);
+    outline: 2px solid var(--accent-mark);
     outline-offset: 2px;
   }
   button {
@@ -172,70 +288,104 @@
     cursor: default;
   }
   ::placeholder {
-    color: inherit;
-    opacity: 0.4;
+    color: var(--muted);
+    opacity: 1;
   }
 }
 
-/* Status tones: one --c per state; pills, dots and glyphs derive everything from it.
+/* Status tones: three roles per state. --c is the fill (a dot, a bar, the glyph's disc), --c-fg the text and --c-bg the
+   background a pill or a banner sits on; the pairs are explicit per theme (see the tokens above).
    Status is always colour + glyph + word, never colour alone. */
 .tone-ok {
-  --c: var(--accent-mint);
+  --c: var(--ok);
+  --c-ink: var(--ink-on-accent);
+  --c-fg: var(--tone-mint);
+  --c-bg: var(--tone-mint-bg);
 }
 .tone-warn {
   --c: var(--warning);
+  --c-ink: var(--ink-on-accent);
+  --c-fg: var(--warning-text);
+  --c-bg: var(--warning-soft);
 }
 .tone-bad {
   --c: var(--danger);
+  --c-ink: var(--ink-on-accent);
+  --c-fg: var(--danger-text);
+  --c-bg: var(--danger-soft);
 }
 .tone-off {
   --c: var(--muted);
+  --c-ink: var(--ink-on-accent);
+  --c-fg: var(--muted);
+  --c-bg: var(--step);
 }
 .tone-busy {
-  --c: var(--accent-sky);
+  --c: var(--tone-sky);
+  --c-ink: var(--ink-on-accent);
+  --c-fg: var(--tone-sky);
+  --c-bg: var(--tone-sky-bg);
 }
 .tone-blip {
-  /* grey-blue, never red: a hoster blip is not an outage */
-  --c: color-mix(in oklch, var(--accent-sky) 40%, var(--muted));
+  /* grey-blue, never red: a hoster blip is not an outage; its text is the blue pulled toward the text colour to stay legible */
+  --c: var(--tone-blip);
+  --c-ink: var(--ink-on-accent);
+  --c-fg: color-mix(in srgb, var(--tone-blip) 55%, var(--text));
+  --c-bg: color-mix(in srgb, var(--tone-blip) 16%, var(--surface));
 }
-/* status-coloured text that stays readable on the light theme (like the pill's text) */
+/* the glyph's mark sits on --c: dark ink, white only on the light theme's deeper red */
+:root[data-theme="light"] .tone-bad {
+  --c-ink: #fff;
+}
+/* status-coloured text (like the pill's text) */
 .tone-text {
-  color: color-mix(in oklch, var(--c) var(--_text-pct), #000);
+  color: var(--c-fg);
 }
-/* a status-tinted panel (node state banner): the pill's background and border without its text colour */
+/* a status-tinted panel (node state banner): the pill's background and a line of the status colour, without its text colour */
 .tint {
-  background: color-mix(in oklch, var(--c) var(--_soft-pct), var(--bg));
-  border: 1px solid color-mix(in oklch, var(--c) 40%, var(--border));
+  background: var(--c-bg);
+  border: 1px solid color-mix(in srgb, var(--c) 32%, transparent);
 }
 /* the tint drawn dashed: a state on record that nobody saw live (a node in a block list) */
 .tint-dashed {
   border-style: dashed;
 }
 .pill {
-  background: color-mix(in oklch, var(--c) var(--_soft-pct), var(--bg));
-  border: 1px solid color-mix(in oklch, var(--c) 40%, var(--border));
-  color: color-mix(in oklch, var(--c) var(--_text-pct), #000);
+  background: var(--c-bg);
+  color: var(--c-fg);
 }
 
-/* Section identity tones (the sidebar's pastels): data-tone sets --t; the chip and .id-fg derive from it, darkened on
-   the light theme like the status tones. Names a section, never a state. */
+/* Section identity tones (the sidebar's pastels): data-tone sets --t (the raw pastel, for a swatch or a bar) and the pair
+   --t-fg / --t-bg (a chip and its text, explicit per theme). Names a section, never a state. */
 [data-tone="lavender"] {
   --t: var(--accent-lavender);
+  --t-fg: var(--tone-lavender);
+  --t-bg: var(--tone-lavender-bg);
 }
 [data-tone="sky"] {
   --t: var(--accent-sky);
+  --t-fg: var(--tone-sky);
+  --t-bg: var(--tone-sky-bg);
 }
 [data-tone="sand"] {
   --t: var(--accent-sand);
+  --t-fg: var(--tone-sand);
+  --t-bg: var(--tone-sand-bg);
 }
 [data-tone="sage"] {
   --t: var(--accent-sage);
+  --t-fg: var(--tone-sage);
+  --t-bg: var(--tone-sage-bg);
 }
 [data-tone="mint"] {
   --t: var(--accent-mint);
+  --t-fg: var(--tone-mint);
+  --t-bg: var(--tone-mint-bg);
 }
 [data-tone="rose"] {
   --t: var(--accent-rose);
+  --t-fg: var(--tone-rose);
+  --t-bg: var(--tone-rose-bg);
 }
 .id-chip {
   display: inline-flex;
@@ -247,22 +397,28 @@
 .id-chip,
 .tone-chip {
   border-radius: 7px;
-  background: color-mix(in oklch, var(--t) calc(var(--_soft-pct) + 4%), var(--surface));
-  color: oklch(from color-mix(in oklch, var(--t) var(--_text-pct), #000) l calc(c * var(--_chroma)) h);
+  background: var(--t-bg);
+  color: var(--t-fg);
 }
 .id-fg {
-  color: oklch(from color-mix(in oklch, var(--t) var(--_text-pct), #000) l calc(c * var(--_chroma)) h);
+  color: var(--t-fg);
 }
 
 /* Motion: screens fade + rise in, cards lift on hover, buttons press. Reduced motion is honoured below. */
-@keyframes mg-ui-in {
+/* a floating thing (a menu, a toast) rises 8px as it appears */
+@keyframes mg-up {
   from {
     opacity: 0;
-    transform: translateY(10px) scale(0.985);
+    transform: translateY(8px);
   }
   to {
     opacity: 1;
     transform: none;
+  }
+}
+@keyframes mg-skp {
+  50% {
+    opacity: 0.45;
   }
 }
 @keyframes mg-ui-pop {
@@ -292,19 +448,46 @@
     transform: rotate(360deg);
   }
 }
-.screen-enter {
-  animation: mg-ui-in 0.45s var(--ease-out-soft) both;
-}
-/* the line of a node's ways in draws itself from people down to the node, once */
-@keyframes mg-ways-draw {
+/* a bar of unknown length: a short stretch slides along its track (the OS update of a node), mirrored in right-to-left */
+@keyframes mg-ui-slide {
   from {
-    transform: scaleY(0);
+    transform: translateX(calc(-100% * var(--x-dir)));
+  }
+  to {
+    transform: translateX(calc(300% * var(--x-dir)));
   }
 }
-.ways-draw {
-  transform-origin: top;
-  animation: mg-ways-draw 0.3s var(--ease-out-soft) both;
+/* a page opening: the whole screen settles in at once, short and quiet, from the first frame (no blank flash, no tile
+   popping in after another) */
+@keyframes mg-page-in {
+  from {
+    opacity: 0.35;
+    transform: translateY(3px);
+  }
 }
+.screen-enter {
+  animation: mg-page-in 0.2s var(--ease-out-soft) both;
+}
+/* "Loading…" only when the wait is long enough to notice: a fast load never flashes it */
+@keyframes mg-show {
+  from {
+    opacity: 0;
+  }
+}
+.pending-delay {
+  animation: mg-show 0.16s ease-out 0.22s both;
+}
+/* a thing that has just been created (components/fx/fresh.tsx): its row takes the accent's wash and it fades away, as the board's
+   dr-fresh does (18% of the accent, 2.4 s). Only the start is named, so the row ends as it is. */
+@keyframes mg-fresh {
+  from {
+    background-color: color-mix(in srgb, var(--accent-mark) 18%, transparent);
+  }
+}
+[data-mg-fresh] {
+  animation: mg-fresh 2.4s var(--e) backwards;
+}
+/* the line of a node's ways in draws itself from people down to the node, once */
 .pop-in {
   animation: mg-ui-pop 0.4s both;
 }
@@ -318,12 +501,72 @@
   border-color: var(--accent-line);
 }
 
+/* The Nodes page's bulk bar (screens/nodes-bulk.tsx) floats where the dock is: on a phone it takes the dock's place, on a
+   desktop the toasts move up above it. */
+@media (width < 45rem) {
+  body:has([data-bulk-bar]) [data-dock] {
+    visibility: hidden;
+  }
+}
+@media (width >= 45rem) {
+  body:has([data-bulk-bar]) [data-toast-viewport] {
+    bottom: 92px;
+  }
+}
+
 /* horizontally scrollable strips (settings sub-nav) without a visible scrollbar */
 .no-scrollbar {
   scrollbar-width: none;
 }
 .no-scrollbar::-webkit-scrollbar {
   display: none;
+}
+
+/* a quiet scroll area (ScrollFade): a thin scrollbar that shows on hover or focus, and a soft fade at an edge only while
+   there is more beyond it */
+@property --fade-top {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+@property --fade-bottom {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+.scroll-soft {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+  mask-image: linear-gradient(to bottom, transparent 0, #000 var(--fade-top), #000 calc(100% - var(--fade-bottom)), transparent 100%);
+  transition:
+    --fade-top 0.18s ease,
+    --fade-bottom 0.18s ease,
+    scrollbar-color 0.2s ease;
+}
+.scroll-soft[data-top="1"] {
+  --fade-top: 22px;
+}
+.scroll-soft[data-bottom="1"] {
+  --fade-bottom: 28px;
+}
+.scroll-soft:hover,
+.scroll-soft:focus-visible {
+  scrollbar-color: color-mix(in oklch, var(--muted) 45%, transparent) transparent;
+}
+.scroll-soft:focus-visible {
+  outline: none;
+}
+.scroll-soft::-webkit-scrollbar {
+  width: 6px;
+}
+.scroll-soft::-webkit-scrollbar-thumb {
+  border-radius: 99px;
+  background: transparent;
+}
+.scroll-soft:hover::-webkit-scrollbar-thumb {
+  background: color-mix(in oklch, var(--muted) 45%, transparent);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -334,6 +577,139 @@
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
+  }
+}
+
+/* JSON colouring of a tool call's input: keys, strings, numbers, words; readable in both themes */
+:root {
+  --json-key: var(--accent-sky);
+  --json-str: var(--accent-mint);
+  --json-num: var(--accent-sand);
+  --json-lit: var(--accent-rose);
+}
+:root[data-theme="light"] {
+  --json-key: color-mix(in oklch, var(--accent-sky) 45%, #000);
+  --json-str: color-mix(in oklch, var(--accent-mint) 45%, #000);
+  --json-num: color-mix(in oklch, var(--accent-sand) 40%, #000);
+  --json-lit: color-mix(in oklch, var(--accent-rose) 45%, #000);
+}
+
+/* The assistant's open button (components/assistant/chat.tsx): the cat on the accent. Its right eye blinks, then winks with an
+   arc; with the pointer over the button it winks at once. Reduced motion stops all of it (the rule above). */
+.cat {
+  --cf: var(--ink-on-accent);
+  --ce: var(--accent);
+}
+.cat-h {
+  fill: var(--cf);
+}
+.cat-l,
+.cat-r {
+  fill: var(--ce);
+  transform-box: fill-box;
+  transform-origin: 50% 60%;
+}
+.cat-w {
+  fill: none;
+  stroke: var(--ce);
+  stroke-width: 2;
+  stroke-linecap: round;
+  opacity: 0;
+  animation: cat-arc 5.5s ease-in-out infinite;
+}
+.cat-r {
+  animation: cat-eye 5.5s ease-in-out infinite;
+}
+.cat-l {
+  animation: cat-blink 5.5s ease-in-out infinite;
+}
+@keyframes cat-eye {
+  0%,
+  84%,
+  100% {
+    transform: none;
+    opacity: 1;
+  }
+  87%,
+  95% {
+    transform: scaleY(0.05);
+    opacity: 0;
+  }
+}
+@keyframes cat-arc {
+  0%,
+  85%,
+  98%,
+  100% {
+    opacity: 0;
+  }
+  87%,
+  95% {
+    opacity: 1;
+  }
+}
+@keyframes cat-blink {
+  0%,
+  40%,
+  44%,
+  100% {
+    transform: none;
+  }
+  42% {
+    transform: scaleY(0.1);
+  }
+}
+.cat-fab:hover .cat-r {
+  animation: none;
+  transform: scaleY(0.05);
+  opacity: 0;
+}
+.cat-fab:hover .cat-w {
+  animation: none;
+  opacity: 1;
+}
+.cat-fab .cat {
+  transition: transform 0.25s var(--ease-spring);
+}
+.cat-fab:hover .cat {
+  transform: rotate(-6deg) scale(1.06);
+}
+@keyframes mg-ring {
+  from {
+    opacity: 0.55;
+    transform: scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: scale(1.5);
+  }
+}
+.chat-fab-ring {
+  animation: mg-ring 1.6s ease-out infinite;
+}
+
+/* a new message or tool row: fades in with a 4px rise */
+
+/* The assistant chat's typing dots: three dots that rise in turn; still and half-lit with reduced motion. */
+
+/* A word of an answer as it streams in (useSmoothText in components/assistant/markdown.tsx): from clear and a little soft to
+   sharp. Only the words that just arrived are animating at any moment. */
+@keyframes mg-word-in {
+  from {
+    opacity: 0;
+    filter: blur(3px);
+  }
+  to {
+    opacity: 1;
+    filter: none;
+  }
+}
+.chat-word {
+  animation: mg-word-in 0.4s var(--e) both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .chat-word {
+    animation: none;
   }
 }
 
@@ -352,4 +728,68 @@
 }
 :lang(zh) [class*="tracking-[-"] {
   letter-spacing: 0;
+}
+
+/*
+ * Persian (<html lang="fa" dir="rtl">), set in Vazirmatn (fonts.css). Arabic script is cursive and tall: lines get the
+ * same extra air as Chinese, and no tracking at all (spacing letters apart breaks the joins).
+ */
+:lang(fa) body {
+  line-height: 1.6;
+}
+:lang(fa) .leading-snug {
+  line-height: 1.55;
+}
+:lang(fa) .leading-tight {
+  line-height: 1.4;
+}
+:lang(fa) [class*="tracking-"] {
+  letter-spacing: 0;
+}
+
+/*
+ * Right to left. The layout mirrors through logical utilities (ms-/ps-/inset-s-/text-start/border-s); what does not
+ * simply mirror is said here once, not at every call site:
+ * - the two horizontal glyphs (Icon "back" and "chevronRight") point the other way, unless a quarter turn makes them a
+ *   vertical fold (a disclosure that turns on open flips its turn with rtl:group-open:-rotate-90);
+ * - a mono value (an IP, a port, a key, a version, a path) takes its direction from its own first letter, so
+ *   "/dev/net/tun" or "203.0.113.7:443" reads left to right inside Persian, and a mono "5 روز" stays Persian;
+ * - code blocks are left to right whole.
+ */
+/* the sign of a sideways move, for motion measured in JS (the sliding thumb of components/ui/segmented.tsx) */
+:root,
+[dir="ltr"] {
+  --x-dir: 1;
+}
+[dir="rtl"] {
+  --x-dir: -1;
+}
+[dir="rtl"] svg[data-flip]:not([class~="rotate-90"], [class~="-rotate-90"]) {
+  scale: -1 1;
+}
+.font-mono:dir(rtl) {
+  unicode-bidi: plaintext;
+}
+[dir="rtl"] pre {
+  direction: ltr;
+  text-align: left;
+}
+
+/* a screen's list rows on their first data: a fade with a 4px rise (components/fx/page.tsx) */
+
+/* the switch's thumb stretches to 20px while it is pressed, and a checked one keeps its far edge where it is (pn.css .fz-sw:active i;
+   the board's rule grows it past the track by 2px, which looks like a slip) */
+[role="switch"]:active:not([data-disabled]) > span {
+  width: 1.25rem;
+}
+[role="switch"][data-checked]:active:not([data-disabled]) > span {
+  translate: 0.75rem 0;
+}
+[dir="rtl"] [role="switch"][data-checked]:active:not([data-disabled]) > span {
+  translate: -0.75rem 0;
+}
+
+/* The white card of a QR code (components/qr-code.tsx): a hairline in the light theme, as the board's .t-light .u-qr has. */
+:root[data-theme="light"] .qr-card {
+  box-shadow: 0 0 0 1px var(--border);
 }

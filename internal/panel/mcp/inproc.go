@@ -1,3 +1,5 @@
+//go:build !js
+
 package mcp
 
 import (
@@ -11,6 +13,10 @@ import (
 	"connectrpc.com/connect"
 
 	"github.com/mistgate/mistgate/gen/mistgate/admin/v1/adminv1connect"
+	"github.com/mistgate/mistgate/gen/mistgate/decoysite/v1/decoysitev1connect"
+	"github.com/mistgate/mistgate/gen/mistgate/ops/v1/opsv1connect"
+	"github.com/mistgate/mistgate/gen/mistgate/probe/v1/probev1connect"
+	"github.com/mistgate/mistgate/gen/mistgate/tasks/v1/tasksv1connect"
 )
 
 // forwardedHeaders are the request headers of the agent's MCP call that an in-process API call carries: the credential
@@ -56,7 +62,16 @@ type clients struct {
 	Provisioning adminv1connect.ProvisioningServiceClient
 	Warp         adminv1connect.WarpServiceClient
 	ClientProbe  adminv1connect.ClientProbeServiceClient
+	ClientAPI    adminv1connect.ClientApiServiceClient
+	ClientCompat adminv1connect.ClientCompatServiceClient
 	Relay        adminv1connect.RelayServiceClient
+	DNS          adminv1connect.DnsServiceClient
+	Reachability adminv1connect.CountryReachabilityServiceClient
+	Backup       adminv1connect.BackupServiceClient
+	Probe        probev1connect.ProbeServiceClient
+	Ops          opsv1connect.OpsServiceClient
+	Tasks        tasksv1connect.TasksServiceClient
+	DecoySite    decoysitev1connect.DecoySiteServiceClient
 }
 
 func newClients(h http.Handler, header http.Header, remote string) *clients {
@@ -75,7 +90,16 @@ func newClients(h http.Handler, header http.Header, remote string) *clients {
 		Provisioning: adminv1connect.NewProvisioningServiceClient(hc, base),
 		Warp:         adminv1connect.NewWarpServiceClient(hc, base),
 		ClientProbe:  adminv1connect.NewClientProbeServiceClient(hc, base),
+		ClientAPI:    adminv1connect.NewClientApiServiceClient(hc, base),
+		ClientCompat: adminv1connect.NewClientCompatServiceClient(hc, base),
 		Relay:        adminv1connect.NewRelayServiceClient(hc, base),
+		DNS:          adminv1connect.NewDnsServiceClient(hc, base),
+		Reachability: adminv1connect.NewCountryReachabilityServiceClient(hc, base),
+		Backup:       adminv1connect.NewBackupServiceClient(hc, base),
+		Probe:        probev1connect.NewProbeServiceClient(hc, base),
+		Ops:          opsv1connect.NewOpsServiceClient(hc, base),
+		Tasks:        tasksv1connect.NewTasksServiceClient(hc, base),
+		DecoySite:    decoysitev1connect.NewDecoySiteServiceClient(hc, base),
 	}
 }
 
@@ -97,6 +121,14 @@ func apiError(err error) error {
 		case connect.CodePermissionDenied:
 			return failure("not_allowed", "not allowed for this token: "+clean(ce.Message(), maxError))
 		case connect.CodeResourceExhausted:
+			code, params := panelCode(ce.Message())
+			if code == "token_user_change_limit" {
+				msg := "The token's hourly user-change limit was reached. Make a new plan; it will wait for the owner to approve it."
+				if strings.Contains(ce.Message(), "reason=over_hourly_limit") {
+					msg = "This call changes more people than the token's hourly limit allows in one call. Make a new plan; it will wait for the owner to approve it."
+				}
+				return &outcomeError{msg: msg, out: Outcome{Code: code, Params: params}}
+			}
 			return failure("rate_limited", "rate limit: slow down")
 		}
 		code, params := panelCode(ce.Message())

@@ -58,6 +58,7 @@ type clientConfig struct {
 	hpk    string
 	server string // server public key
 	masked bool
+	noIPv6 bool // the exit gives the client no IPv6: no format carries the tunnel's IPv6 address (RenderInput.NoIPv6Egress)
 }
 
 func (c clientConfig) v31() bool { return c.s.Version == Version31 }
@@ -124,6 +125,7 @@ func buildClient(in protocols.RenderInput) (clientConfig, bool) {
 		}
 	}
 	c.ip4, c.ip6 = ps.IP4, ps.IP6
+	c.noIPv6 = in.NoIPv6Egress
 
 	var pub struct {
 		PublicKey string `json:"public_key"`
@@ -151,7 +153,7 @@ func buildClient(in protocols.RenderInput) (clientConfig, bool) {
 // Render implements protocols.Protocol.
 func (*Protocol) Render(in protocols.RenderInput) (plugin.Fragment, bool) {
 	switch in.Format {
-	case plugin.FormatAWGConf, plugin.FormatAmneziaVPN, plugin.FormatMihomo:
+	case plugin.FormatAWGConf, plugin.FormatAmneziaVPN, plugin.FormatMihomo, plugin.FormatMistgate:
 	default:
 		return plugin.Skipped(plugin.NoteAWG) // Happ and the URI list cannot carry AWG, nor can Xray or sing-box
 	}
@@ -160,6 +162,9 @@ func (*Protocol) Render(in protocols.RenderInput) (plugin.Fragment, bool) {
 	}
 	c, ok := buildClient(in)
 	if !ok {
+		return plugin.Fragment{}, false
+	}
+	if in.Format == plugin.FormatMistgate && !protocols.HasCapability(in.Capabilities, "awg", c.s.Version) {
 		return plugin.Fragment{}, false
 	}
 	var data []byte
@@ -177,16 +182,31 @@ func (*Protocol) Render(in protocols.RenderInput) (plugin.Fragment, bool) {
 		if data, err = c.mihomo(); err != nil {
 			return plugin.Fragment{}, false
 		}
+	case plugin.FormatMistgate:
+		var err error
+		if data, err = c.mistgate(); err != nil {
+			return plugin.Fragment{}, false
+		}
 	}
 	return plugin.Fragment{Format: in.Format, Name: c.name, Data: data}, true
 }
 
 func (c clientConfig) endpoint() string { return net.JoinHostPort(c.host, strconv.Itoa(c.port)) }
 
+// addr6 is the tunnel's IPv6 address the client is given: none when the exit gives it no IPv6. Without a source address
+// the device refuses IPv6 at once and the app uses IPv4, where an address with nowhere to go makes it wait for a timeout.
+// AllowedIPs keep ::/0 either way: the device's real IPv6 must not leave around the tunnel.
+func (c clientConfig) addr6() string {
+	if c.noIPv6 {
+		return ""
+	}
+	return c.ip6
+}
+
 func (c clientConfig) address() string {
 	a := c.ip4 + "/32"
-	if c.ip6 != "" {
-		a += ", " + c.ip6 + "/128"
+	if c.addr6() != "" {
+		a += ", " + c.addr6() + "/128"
 	}
 	return a
 }
@@ -426,8 +446,8 @@ func (c clientConfig) mihomo() ([]byte, error) {
 	p := newMap()
 	p.set("name", quoted(c.name)).str("type", "wireguard").set("server", quoted(c.host)).set("port", intNode(c.port))
 	p.set("ip", quoted(c.ip4+"/32"))
-	if c.ip6 != "" {
-		p.set("ipv6", quoted(c.ip6+"/128"))
+	if c.addr6() != "" {
+		p.set("ipv6", quoted(c.addr6()+"/128"))
 	}
 	p.set("private-key", quoted(c.priv)).set("public-key", quoted(c.server)).set("pre-shared-key", quoted(c.psk))
 	p.set("allowed-ips", allowed).set("udp", boolNode(true)).set("mtu", intNode(c.s.MTU))

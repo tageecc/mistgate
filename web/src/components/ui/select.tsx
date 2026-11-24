@@ -1,34 +1,35 @@
 import { Select as BaseSelect } from "@base-ui/react/select";
+import type { ReactNode } from "react";
 import { cx } from "@/lib/cx";
+import { Icon } from "./icons";
 
-/** `hint` is a second, muted line under the label in the list; a `disabled` option is greyed out and cannot be picked. */
-export type SelectOption = { value: string; label: string; hint?: string; disabled?: boolean };
+/**
+ * `hint` is a second, muted line under the label in the list; a `disabled` option is greyed out and cannot be picked; `icon`
+ * (a small mark, decorative) stands before the label in the list and in the closed field.
+ */
+export type SelectOption = { value: string; label: string; hint?: string; disabled?: boolean; icon?: ReactNode };
 
 type Props = {
   value: string;
   onValueChange: (value: string) => void;
   options: readonly SelectOption[];
   "aria-label": string;
-  /** 36px filter box for toolbars (Nodes list); the default is the 44px field. */
+  /** 32px filter box for toolbars (Nodes list); the default is the 40px field. */
   compact?: boolean;
   className?: string;
 };
 
 /** The look of a dropdown list, shared with the language menu (components/prefs.tsx). */
 export const selectPopupClass =
-  "min-w-(--anchor-width) origin-(--transform-origin) rounded-card border border-line bg-surface p-1.5 shadow-(--shadow-toast) outline-none transition-[scale,opacity] duration-150 data-ending-style:scale-[0.98] data-ending-style:opacity-0 data-starting-style:scale-[0.98] data-starting-style:opacity-0";
+  "min-w-(--anchor-width) origin-(--transform-origin) rounded-pop border border-line bg-surface p-1.5 shadow-(--shadow-pop) outline-none transition-[scale,opacity] duration-150 data-ending-style:scale-[0.98] data-ending-style:opacity-0 data-starting-style:scale-[0.98] data-starting-style:opacity-0";
 export const selectItemClass =
-  "flex min-h-10 cursor-pointer items-center gap-2 rounded-ctl px-2.5 py-1.5 text-[13px] font-semibold text-fg outline-none select-none data-highlighted:bg-surface-2";
-/** The tick of the chosen row. */
+  "flex min-h-9 cursor-pointer items-center gap-2.5 rounded-ctl px-2.5 py-1 text-sm text-fg outline-none select-none data-highlighted:bg-step data-selected:font-medium";
+/** The tick of the chosen row (16px, as the board's). */
 export function SelectCheck() {
-  return (
-    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M2.5 6.5l2.5 2.5 4.5-5.5" />
-    </svg>
-  );
+  return <Icon name="check" size={16} />;
 }
 
-/** Dropdown styled like a 44px text field; the list pops over in a card. */
+/** Dropdown styled like a 40px text field; the list pops over in a menu. */
 export function Select({ value, onValueChange, options, compact, className, ...rest }: Props) {
   return (
     <BaseSelect.Root
@@ -38,18 +39,23 @@ export function Select({ value, onValueChange, options, compact, className, ...r
     >
       <BaseSelect.Trigger
         className={cx(
-          "flex w-full items-center justify-between gap-3 border border-line bg-surface text-left font-medium text-fg outline-none transition-colors duration-200 focus-visible:border-accent data-popup-open:border-accent-line",
-          compact ? "h-9 rounded-ctl px-3 text-xs" : "h-11 rounded-field px-3.5 text-sm",
+          "group flex w-full items-center justify-between gap-3 border border-line bg-canvas text-start text-fg outline-none transition-[border-color,box-shadow] duration-150 ease-out hover:border-(--border-hover) focus-visible:border-accent-line focus-visible:shadow-[0_0_0_3px_var(--focus-ring)] data-popup-open:border-accent-line data-disabled:opacity-45",
+          compact ? "h-8 rounded-ctl px-3 text-[13px]" : "h-10 rounded-field px-3 text-sm",
           className,
         )}
         {...rest}
       >
         {/* one line always: a long label is cut with an ellipsis, never wrapped out of the box */}
-        <BaseSelect.Value className="min-w-0 truncate" />
-        <BaseSelect.Icon className="flex-none text-muted">
-          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M3 4.5l3 3 3-3" />
-          </svg>
+        <span className="flex min-w-0 items-center gap-2">
+          {options.find((o) => o.value === value)?.icon && (
+            <span aria-hidden className="flex flex-none text-fg">
+              {options.find((o) => o.value === value)!.icon}
+            </span>
+          )}
+          <BaseSelect.Value className="min-w-0 truncate" />
+        </span>
+        <BaseSelect.Icon className="flex-none text-muted transition-transform duration-200 ease-(--e) group-data-popup-open:rotate-180">
+          <Icon name="chevronDown" size={16} />
         </BaseSelect.Icon>
       </BaseSelect.Trigger>
       <BaseSelect.Portal>
@@ -64,6 +70,11 @@ export function Select({ value, onValueChange, options, compact, className, ...r
                   disabled={o.disabled}
                   className={cx(selectItemClass, "data-disabled:cursor-default data-disabled:opacity-45")}
                 >
+                  {o.icon && (
+                    <span aria-hidden className="flex flex-none text-fg">
+                      {o.icon}
+                    </span>
+                  )}
                   <span className="flex min-w-0 flex-1 flex-col">
                     <BaseSelect.ItemText>{o.label}</BaseSelect.ItemText>
                     {o.hint && <span className="truncate text-[11px] leading-snug font-medium text-muted">{o.hint}</span>}

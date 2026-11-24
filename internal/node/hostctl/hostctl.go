@@ -38,7 +38,8 @@ type Host interface {
 	// Cleanup removes everything the agent installed (nft tables with hops, SSH guard, UDP delivery checks and torrent queue, tagged UFW inbound rules
 	// and the UFW rules the SSH install tagged with ProvisionUFWTag, sysctl and journald drop-ins,
 	// the owner-approved tagged forwarding exceptions,
-	// and the resolver fix of the doctor: resolved drop-in, resolv.conf restored from its backup; the tunnel table
+	// and the resolver fix of the doctor: resolved drop-in, resolv.conf restored from its backup; the IPv6 addresses of
+	// ipv6-owned.json (never an address the host had); the tunnel table
 	// "mistgate_awg", the relay table "mistgate_relay" and every link named mgawg* or mgwarp). The WARP routing rules and routes are the WARP
 	// manager's (warp.Cleanup).
 	// Live sysctl values are not reverted (the previous values are not recorded).
@@ -117,6 +118,17 @@ type Metrics struct {
 	NetRxBps   uint64
 	NetTxBps   uint64
 	UptimeS    uint64
+
+	// Parts of the machine's CPU: steal (given by the hypervisor to other guests; inside CPUPct) and I/O wait (not in
+	// CPUPct).
+	StealPct, IOWaitPct float64
+	SwapUsed, SwapTotal uint64
+	// Connection tracking entries and limit (0, 0 = conntrack not loaded).
+	ConntrackCount, ConntrackMax uint64
+	// Sockets in use, IPv4 and IPv6 together.
+	TCPSockets, UDPSockets uint32
+	// Link speed of the main NIC in Mbit/s; 0 = the driver does not say (most virtual NICs).
+	NICSpeedMbps uint32
 }
 
 // Hop is one port-hopping range: packets to Network/From-To are redirected to the inbound's real Port.

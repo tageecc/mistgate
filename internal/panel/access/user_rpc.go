@@ -1,6 +1,7 @@
 package access
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"slices"
@@ -10,6 +11,7 @@ import (
 	"connectrpc.com/connect"
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
+	"github.com/mistgate/mistgate/gen/mistgate/admin/v1/adminv1connect"
 	"github.com/mistgate/mistgate/internal/panel/auth"
 	"github.com/mistgate/mistgate/internal/panel/dns"
 	"github.com/mistgate/mistgate/internal/panel/pagepass"
@@ -75,9 +77,14 @@ func (s *Service) userProtos(ctx context.Context, users []store.AccessUser) ([]*
 		ids[i] = u.ID
 	}
 	a := s.st.Access()
-	devs, err := a.DeviceCounts(ctx, ids)
+	now := s.now()
+	devs, err := a.DeviceCounts(ctx, ids, now)
 	if err != nil {
 		return nil, s.internal("device counts", err)
+	}
+	telegramKeys, err := a.TelegramKeyUsers(ctx, ids)
+	if err != nil {
+		return nil, s.internal("telegram keys", err)
 	}
 	viaProtos, err := a.UsersProtocolsSince(ctx, ids, s.now().Add(-viaWindow))
 	if err != nil {
@@ -114,7 +121,7 @@ func (s *Service) userProtos(ctx context.Context, users []store.AccessUser) ([]*
 		var via []adminv1.App
 		for _, pid := range viaProtos[u.ID] {
 			if p, ok := s.reg.Get(pid); ok {
-				_, _, apps := clientApps(p)
+				_, _, _, _, apps := clientApps(p)
 				for _, app := range apps {
 					if !slices.Contains(via, app) {
 						via = append(via, app)
@@ -128,19 +135,24 @@ func (s *Service) userProtos(ctx context.Context, users []store.AccessUser) ([]*
 		if !NextReset(u.QuotaReset, u.PeriodStart).IsZero() {
 			next = NextReset(u.QuotaReset, u.PeriodStart).Unix()
 		}
+		deviceCounts := devs[u.ID]
 		out[i] = &adminv1.User{
 			Id: u.ID, Name: u.Name, SubscriptionName: u.SubscriptionName, GroupId: u.GroupID, GroupName: u.GroupName, Status: statusProto[u.Status],
-			Apps: &adminv1.AppToggles{Happ: u.AppHapp, Amnezia: u.AppAmnezia}, Via: via,
-			DevicesUsed: uint32(devs[u.ID]), DeviceLimit: uint32(u.DeviceLimit),
+			Apps: &adminv1.AppToggles{Happ: u.AppHapp, Amnezia: u.AppAmnezia, Telegram: u.AppTelegram, Mistgate: new(!u.AppMistgateOff), TrustTunnel: new(u.AppTrustTunnel)}, Via: via,
+			DevicesUsed: uint32(deviceCounts.Used), DevicesIdle: uint32(deviceCounts.Idle), DeviceLimit: uint32(u.DeviceLimit),
 			UsedBytes: u.UsedBytes, QuotaBytes: u.QuotaBytes, QuotaReset: resetToProto[u.QuotaReset], NextResetUnix: next,
 			ExpiresUnix: unixOrZero(u.ExpiresAt), LastSeenUnix: unixOrZero(u.LastSeenAt), Online: isOnline,
 			SpeedLimitBps: u.SpeedLimitBps, DeviceSpeedLimitBps: u.DeviceSpeedLimitBps, Nodes: &adminv1.NodeSelection{All: u.AllNodes, NodeIds: u.NodeIDs},
-			CreatedUnix: u.CreatedAt.Unix(), DnsPresetId: u.DNSPresetID,
+			CreatedUnix: u.CreatedAt.Unix(), DnsPresetId: u.DNSPresetID, PageOpen: u.PageOpen,
 		}
 		effID, effName, src := dnsLookup.Resolve(u.DNSPresetID, u.GroupDNSPresetID)
 		out[i].EffectiveDnsPresetId, out[i].EffectiveDnsPresetName, out[i].DnsSource = effID, effName, dns.Source(src).Proto()
 		out[i].GroupColor = groups[u.GroupID].Color
-		out[i].AccessHapp, out[i].AccessAmnezia = s.accessOf(u, groups[u.GroupID], full)
+		for _, g := range sortedExtraGroups(u, groups) {
+			out[i].ExtraGroupIds, out[i].ExtraGroupNames, out[i].ExtraGroupColors = append(out[i].ExtraGroupIds, g.ID), append(out[i].ExtraGroupNames, g.Name), append(out[i].ExtraGroupColors, g.Color)
+		}
+		out[i].AccessHapp, out[i].AccessAmnezia, out[i].AccessTelegram, _ = s.accessOf(u, store.GroupsOf(u, groups), full)
+		_, out[i].TelegramIssued = telegramKeys[u.ID]
 		if isOnline {
 			out[i].CurrentNodeId, out[i].CurrentNodeName = cur, nodeName[cur]
 		}
@@ -180,32 +192,66 @@ func (s *Service) subscriptionURL(token string) (string, error) {
 // missingProtocols are the protocols the apps allow, a device gets one credential for, and that are not in have. A per-device
 // protocol (AWG) is not among them: its credentials are issued on request, bound to one profile (AddAWGDevice, and
 // lazily for the device of a Mihomo subscription).
-func (s *Service) missingProtocols(happ, amnezia bool, have map[string]bool) []protocols.Protocol {
+func (s *Service) missingProtocols(happ, amnezia, telegram bool, have map[string]bool) []protocols.Protocol {
 	var out []protocols.Protocol
 	for _, p := range s.reg.List() {
-		if !have[p.ID()] && !protocols.IsPerDevice(p) && protocols.AllowedForApps(p, appsOf(happ, amnezia)...) {
+		// A per-device protocol (AWG) is issued on request, and Telegram/TrustTunnel keys belong to the person: none go to a link device.
+		if !have[p.ID()] && !protocols.IsPerDevice(p) && !isTelegram(p) && !isTrustTunnel(p) && protocols.AllowedForApps(p, appsOf(happ, amnezia, telegram, false)...) {
 			out = append(out, p)
 		}
 	}
 	return out
 }
 
+// newCred issues the credential of p for a device and seals its secret under the credential's id. The caller puts the owner on it
+// (a key of the person is made before its device is stored).
+func (s *Service) newCred(p protocols.Protocol, userID, deviceID string) (store.AccessCred, error) {
+	iss, err := p.IssueCredential(protocols.IssueInput{UserID: userID, DeviceID: deviceID})
+	if err != nil {
+		return store.AccessCred{}, err
+	}
+	id := store.NewID("crd_")
+	return store.AccessCred{ID: id, Protocol: p.ID(), SecretEnc: s.vault.Seal([]byte(iss.Secret), id), DataJSON: string(iss.NodeData)}, nil
+}
+
+// deviceCred is newCred for a device that exists.
+func (s *Service) deviceCred(p protocols.Protocol, userID, deviceID string, now time.Time) (store.AccessCred, error) {
+	cred, err := s.newCred(p, userID, deviceID)
+	cred.DeviceID, cred.UserID, cred.CreatedAt = deviceID, userID, now
+	return cred, err
+}
+
 // newCreds issues a credential for every protocol missingProtocols names.
-func (s *Service) newCreds(userID, deviceID string, happ, amnezia bool, have map[string]bool) ([]store.AccessCred, error) {
+func (s *Service) newCreds(userID, deviceID string, happ, amnezia, telegram bool, have map[string]bool) ([]store.AccessCred, error) {
 	var out []store.AccessCred
 	now := s.now()
-	for _, p := range s.missingProtocols(happ, amnezia, have) {
-		iss, err := p.IssueCredential(protocols.IssueInput{UserID: userID, DeviceID: deviceID})
+	for _, p := range s.missingProtocols(happ, amnezia, telegram, have) {
+		cred, err := s.deviceCred(p, userID, deviceID, now)
 		if err != nil {
 			return nil, err
 		}
-		id := store.NewID("crd_")
-		out = append(out, store.AccessCred{
-			ID: id, DeviceID: deviceID, UserID: userID, Protocol: p.ID(),
-			SecretEnc: s.vault.Seal([]byte(iss.Secret), id), DataJSON: string(iss.NodeData), CreatedAt: now,
-		})
+		out = append(out, cred)
 	}
 	return out, nil
+}
+
+// newEnrolledClientCreds adds the capability-gated Mistgate-only protocol credential to the link-app credentials. This method
+// is called only for a device already authenticated by its client API key; a basic subscription fetch never reaches it.
+func (s *Service) newEnrolledClientCreds(userID, deviceID string, happ, amnezia, telegram bool, have map[string]bool,
+	caps []string, mistgateEnabled bool) ([]store.AccessCred, error) {
+	out, err := s.newCreds(userID, deviceID, happ, amnezia, telegram, have)
+	if err != nil || !mistgateEnabled || !protocols.HasCapability(caps, "trusttunnel", "1") || have["trusttunnel"] {
+		return out, err
+	}
+	if !s.mistgateConsumes("trusttunnel") {
+		return out, nil
+	}
+	p, _ := s.reg.Get("trusttunnel")
+	cred, err := s.deviceCred(p, userID, deviceID, s.now())
+	if err != nil {
+		return nil, err
+	}
+	return append(out, cred), nil
 }
 
 func (s *Service) CreateUser(ctx context.Context, req *connect.Request[adminv1.CreateUserRequest]) (*connect.Response[adminv1.CreateUserResponse], error) {
@@ -231,12 +277,13 @@ func (s *Service) CreateUser(ctx context.Context, req *connect.Request[adminv1.C
 	if m.TermDays > 36500 {
 		return nil, invalid("term is too long")
 	}
-	happ, amnezia := true, true
+	happ, amnezia, telegram, mistgateOff, trustTunnel := true, true, false, false, false
 	if m.Apps != nil {
-		happ, amnezia = m.Apps.Happ, m.Apps.Amnezia
+		happ, amnezia, telegram, mistgateOff = m.Apps.Happ, m.Apps.Amnezia, m.Apps.Telegram, m.Apps.Mistgate != nil && !*m.Apps.Mistgate
+		trustTunnel = m.Apps.TrustTunnel != nil && *m.Apps.TrustTunnel
 	}
 	if !happ && !amnezia {
-		return nil, invalid("at least one app must be on")
+		return nil, invalid("at least one of Happ and Amnezia must be on")
 	}
 	all, nodeIDs, err := s.resolveNodes(ctx, m.Nodes)
 	if err != nil {
@@ -258,13 +305,32 @@ func (s *Service) CreateUser(ctx context.Context, req *connect.Request[adminv1.C
 	id := store.NewID("usr_")
 	u := store.AccessUser{
 		ID: id, Name: name, GroupID: m.GroupId, Status: ComputeStatus(false, expires, m.QuotaBytes, 0, now),
-		AppHapp: happ, AppAmnezia: amnezia, AllNodes: all, NodeIDs: nodeIDs,
+		AppHapp: happ, AppAmnezia: amnezia, AppTelegram: telegram, AppTrustTunnel: trustTunnel, AppMistgateOff: mistgateOff, AllNodes: all, NodeIDs: nodeIDs,
 		QuotaBytes: m.QuotaBytes, QuotaReset: reset, PeriodStart: PeriodStart(reset, now), ExpiresAt: expires,
 		DeviceLimit: limit, SpeedLimitBps: m.SpeedLimitBps, DeviceSpeedLimitBps: m.DeviceSpeedLimitBps, DNSPresetID: m.DnsPresetId,
 		SubTokenHash: hash, SubTokenEnc: s.vault.Seal([]byte(token), id), CreatedAt: now,
 	}
-	// No device yet: the first app that fetches the subscription makes its own, with its own credentials.
-	switch err := s.st.Access().CreateUser(ctx, u, store.AccessDevice{}, nil); {
+	// No link device yet: the first app that fetches the subscription makes its own, with its own credentials. The Telegram and
+	// TrustTunnel keys are the person's own and are made with them when their switches are on.
+	var keys []store.AccessKeyDevice
+	if telegram {
+		var dev store.AccessDevice
+		var creds []store.AccessCred
+		if dev, creds, err = s.telegramKeyForNewUser(id, now); err != nil {
+			return nil, err
+		}
+		keys = append(keys, store.AccessKeyDevice{Device: dev, Creds: creds})
+	}
+	if trustTunnel && u.Status == StatusActive {
+		key, keyErr := s.trustTunnelKeyForNewUser(id, now)
+		if keyErr != nil {
+			return nil, keyErr
+		}
+		keys = append(keys, key)
+	}
+	// Creating a person is not counted against a token's hourly limit of user changes: the limit is for what takes
+	// access away or rewrites a person, and a billing script creates, extends and enables people all day.
+	switch err := s.st.Access().CreateUserWithKeys(ctx, u, keys...); {
 	case errors.Is(err, store.ErrAccessExists):
 		return nil, coded(connect.CodeAlreadyExists, "name_taken")
 	case errors.Is(err, store.ErrNotFound):
@@ -272,6 +338,7 @@ func (s *Service) CreateUser(ctx context.Context, req *connect.Request[adminv1.C
 	case err != nil:
 		return nil, s.internal("create user", err)
 	}
+	s.tokens.add([32]byte(hash))
 	s.notify.StateChanged()
 	s.audit(ctx, actor(ctx), "user_create", map[string]any{"user": id, "name": name})
 	created, err := s.loadUsers(ctx, id)
@@ -284,7 +351,7 @@ func (s *Service) CreateUser(ctx context.Context, req *connect.Request[adminv1.C
 	if auth.PrincipalFrom(ctx).Token {
 		return connect.NewResponse(resp), nil
 	}
-	if resp.PagePassword, err = s.pagePassword(ctx, token); err != nil {
+	if resp.PagePassword, err = s.pagePassword(ctx, token, 0, false); err != nil {
 		return nil, err
 	}
 	resp.SubscriptionUrl = url
@@ -328,6 +395,8 @@ func (s *Service) ListUsers(ctx context.Context, req *connect.Request[adminv1.Li
 		q.Filter = "over_quota"
 	case adminv1.UserFilter_USER_FILTER_OVER_DEVICE_LIMIT:
 		q.Filter = "over_device_limit"
+	case adminv1.UserFilter_USER_FILTER_TELEGRAM:
+		q.Filter = "telegram"
 	default:
 		return nil, invalid("unknown filter")
 	}
@@ -355,7 +424,7 @@ func (s *Service) ListUsers(ctx context.Context, req *connect.Request[adminv1.Li
 	}
 	resp := &adminv1.ListUsersResponse{Counts: &adminv1.UserCounts{
 		All: uint32(counts.All), Online: uint32(counts.Online), Expiring: uint32(counts.Expiring), OverQuota: uint32(counts.OverQuota),
-		OverDeviceLimit: uint32(counts.OverDeviceLimit),
+		OverDeviceLimit: uint32(counts.OverDeviceLimit), Telegram: uint32(counts.Telegram),
 	}}
 	setListUserCountField(resp.Counts, "devices_used", 5, uint32(counts.DevicesUsed))
 	setListUserCountField(resp.Counts, "devices_online", 6, uint32(counts.DevicesOnline))
@@ -383,7 +452,7 @@ func (s *Service) GetUser(ctx context.Context, req *connect.Request[adminv1.GetU
 	resp := &adminv1.GetUserResponse{User: protos[0]}
 	now := s.now()
 
-	devs, err := a.Devices(ctx, u.ID)
+	devs, err := a.Devices(ctx, u.ID, now)
 	if err != nil {
 		return nil, s.internal("devices", err)
 	}
@@ -395,23 +464,35 @@ func (s *Service) GetUser(ctx context.Context, req *connect.Request[adminv1.GetU
 	for _, d := range awgDevs {
 		awgByID[d.ID] = d
 	}
+	lastOnline, err := a.DeviceLastOnline(ctx, u.ID)
+	if err != nil {
+		return nil, s.internal("devices last online", err)
+	}
 	onlineDevices := s.online.OnlineDevices()
 	for _, d := range devs {
 		if ad, ok := awgByID[d.ID]; ok {
 			dev := s.deviceProto(ad)
 			dev.UsedBytes = d.UsedBytes
+			dev.Idle, dev.IdleSinceUnix = d.Idle, unixOrZero(d.IdleSinceAt)
+			dev.LastOnlineUnix = unixOrZero(lastOnline[d.ID])
 			resp.Devices = append(resp.Devices, dev)
 			continue
 		}
 		kind := adminv1.DeviceKind_DEVICE_KIND_LINK
-		if d.Implicit {
+		switch {
+		case d.Kind == store.DeviceKindKey && slices.Contains(d.Protocols, store.TrustTunnelProtocol):
+			kind = adminv1.DeviceKind_DEVICE_KIND_KEY
+		case d.Kind == store.DeviceKindKey: // not an AmneziaVPN or TrustTunnel key (those are above): the Telegram key
+			kind = adminv1.DeviceKind_DEVICE_KIND_TELEGRAM_KEY
+		case d.Implicit:
 			kind = adminv1.DeviceKind_DEVICE_KIND_LINK_SHARED
 		}
 		nodes := onlineDevices[d.ID]
 		resp.Devices = append(resp.Devices, &adminv1.Device{
 			Id: d.ID, Platform: d.Platform, Model: d.Model, FirstSeenUnix: unixOrZero(d.FirstSeenAt), LastSeenUnix: unixOrZero(d.LastSeenAt),
 			Online: len(nodes) > 0, Protocols: d.Protocols, Kind: kind, OsVersion: d.OSVersion, Client: d.Client, UsedBytes: d.UsedBytes,
-			OnlineNodeIds: nodes, Fingerprint: d.Fingerprint,
+			OnlineNodeIds: nodes, Fingerprint: d.Fingerprint, Idle: d.Idle, IdleSinceUnix: unixOrZero(d.IdleSinceAt), LastOnlineUnix: unixOrZero(lastOnline[d.ID]),
+			Enrolled: len(d.KeyHash) > 0, EnrolLinkStale: len(d.KeyHash) > 0 && !bytes.Equal(d.EnrolTokenHash, u.SubTokenHash),
 		})
 	}
 
@@ -432,20 +513,16 @@ func (s *Service) GetUser(ctx context.Context, req *connect.Request[adminv1.GetU
 		resp.NodeTraffic = append(resp.NodeTraffic, &adminv1.NodeTraffic{NodeId: t.NodeID, NodeName: t.NodeName, Protocol: t.Protocol, Bytes: t.Bytes})
 	}
 
-	g, err := a.Group(ctx, u.GroupID)
+	gs, err := a.UserGroups(ctx, u)
 	if err != nil {
 		return nil, s.internal("group", err)
-	}
-	inGroup := map[string]bool{}
-	for _, id := range g.ProfileIDs {
-		inGroup[id] = true
 	}
 	profs, err := a.Profiles(ctx)
 	if err != nil {
 		return nil, s.internal("profiles", err)
 	}
 	for _, p := range profs {
-		if inGroup[p.ID] {
+		if gs.Holds(p.ID) {
 			ref := &adminv1.ProfileRef{Id: p.ID, Name: p.Name, Protocol: p.Protocol}
 			if proto, ok := s.reg.Get(p.Protocol); ok {
 				if merged, err := s.mergedSettings(p); err == nil { // the formats are a hint: a profile that will not open still shows
@@ -476,7 +553,7 @@ func (s *Service) GetUser(ctx context.Context, req *connect.Request[adminv1.GetU
 			if !slices.Contains(na.NodeProtocols, f.Profile.Protocol) {
 				na.NodeProtocols = append(na.NodeProtocols, f.Profile.Protocol)
 			}
-			if inGroup[f.Profile.ID] && s.allowed(f.Profile.Protocol, u.AppHapp, u.AppAmnezia) && !slices.Contains(na.Protocols, f.Profile.Protocol) {
+			if gs.Gives(f.Profile.ID, n.ID) && (s.allowed(f.Profile.Protocol, u.AppHapp, u.AppAmnezia, u.AppTelegram, u.AppTrustTunnel) || !u.AppMistgateOff && s.mistgateConsumes(f.Profile.Protocol)) && !slices.Contains(na.Protocols, f.Profile.Protocol) {
 				na.Protocols = append(na.Protocols, f.Profile.Protocol)
 			}
 		}
@@ -505,6 +582,18 @@ func (s *Service) GetUser(ctx context.Context, req *connect.Request[adminv1.GetU
 		}
 	}
 	return connect.NewResponse(resp), nil
+}
+
+// takeBackKey revokes a key that UpdateUser made just before its write was refused. The stored switch is read again first: a
+// concurrent update may have switched the app on in the meantime and now holds the same key.
+func (s *Service) takeBackKey(ctx context.Context, by, userID string, made bool, appOn func(store.AccessUser) bool, revoke func(context.Context, string, string) error) {
+	if !made {
+		return
+	}
+	if current, err := s.st.Access().User(ctx, userID); err == nil && appOn(current) {
+		return
+	}
+	_ = revoke(ctx, by, userID)
 }
 
 func (s *Service) UpdateUser(ctx context.Context, req *connect.Request[adminv1.UpdateUserRequest]) (*connect.Response[adminv1.UpdateUserResponse], error) {
@@ -536,6 +625,10 @@ func (s *Service) UpdateUser(ctx context.Context, req *connect.Request[adminv1.U
 		}
 		u.GroupID = *m.GroupId
 	}
+	change, nextExtra, err := groupChangeOf(old, u.GroupID, m.AddGroupIds, m.RemoveGroupIds)
+	if err != nil {
+		return nil, err
+	}
 	if m.QuotaBytes != nil {
 		u.QuotaBytes = *m.QuotaBytes
 	}
@@ -560,9 +653,15 @@ func (s *Service) UpdateUser(ctx context.Context, req *connect.Request[adminv1.U
 		u.DeviceLimit = int(*m.DeviceLimit)
 	}
 	if m.Apps != nil {
-		u.AppHapp, u.AppAmnezia = m.Apps.Happ, m.Apps.Amnezia
+		u.AppHapp, u.AppAmnezia, u.AppTelegram = m.Apps.Happ, m.Apps.Amnezia, m.Apps.Telegram
+		if m.Apps.TrustTunnel != nil { // absent: the switch stays as it was (an older client does not know it)
+			u.AppTrustTunnel = *m.Apps.TrustTunnel
+		}
+		if m.Apps.Mistgate != nil { // absent: the switch stays as it was (an older client does not know it)
+			u.AppMistgateOff = !*m.Apps.Mistgate
+		}
 		if !u.AppHapp && !u.AppAmnezia {
-			return nil, invalid("at least one app must be on")
+			return nil, invalid("at least one of Happ and Amnezia must be on")
 		}
 	}
 	if m.Nodes != nil {
@@ -583,10 +682,16 @@ func (s *Service) UpdateUser(ctx context.Context, req *connect.Request[adminv1.U
 		}
 		u.DNSPresetID = *m.DnsPresetId // DNS is client-side (the subscription): no state push for the nodes
 	}
+	pageAction, err := pagePasswordAction(m.PagePasswordAction, old)
+	if err != nil {
+		return nil, err
+	}
 	u.Status = ComputeStatus(u.Disabled, u.ExpiresAt, u.QuotaBytes, u.UsedBytes, now)
+	u.ExtraGroupIDs = nextExtra
+	groupsChanged := u.GroupID != old.GroupID || !slices.Equal(old.ExtraGroupIDs, nextExtra)
 	var impact *adminv1.AccessImpact
-	if u.GroupID != old.GroupID {
-		if impact, err = s.groupChangeImpact(ctx, old, u.GroupID); err != nil {
+	if groupsChanged || len(change.Add)+len(change.Remove) > 0 { // an unknown group is NOT_FOUND on a dry run too
+		if impact, err = s.userGroupsImpact(ctx, old, u); err != nil {
 			return nil, err
 		}
 	}
@@ -597,21 +702,84 @@ func (s *Service) UpdateUser(ctx context.Context, req *connect.Request[adminv1.U
 		}
 		return connect.NewResponse(&adminv1.UpdateUserResponse{User: users[0], Impact: impact}), nil
 	}
-	switch err := a.UpdateUser(ctx, u, setNodes); {
+	asked := 0
+	if userUpdateChanges(old, u) || groupsChanged || pageAction != "" {
+		asked = 1
+	}
+	reservation, err := s.reserveTokenUserChanges(ctx, adminv1connect.UserServiceUpdateUserProcedure, asked)
+	if err != nil {
+		return nil, err
+	}
+	defer reservation.finish()
+	// The keys of the apps this update switches on are made before it writes (a person with the app on and no key has no link), and
+	// taken back when the write is refused or a later key is.
+	var telegramKeyMade, trustTunnelKeyMade bool
+	takeBackKeys := func() {
+		s.takeBackKey(ctx, actor(ctx), u.ID, telegramKeyMade, func(p store.AccessUser) bool { return p.AppTelegram }, s.revokeTelegramKey)
+		s.takeBackKey(ctx, actor(ctx), u.ID, trustTunnelKeyMade, func(p store.AccessUser) bool { return p.AppTrustTunnel }, s.revokeTrustTunnelKey)
+	}
+	if u.AppTelegram && !old.AppTelegram {
+		if telegramKeyMade, err = s.issueTelegramKey(ctx, actor(ctx), u); err != nil {
+			return nil, err
+		}
+	}
+	if u.AppTrustTunnel && u.Status == StatusActive && (!old.AppTrustTunnel || old.Status != StatusActive) {
+		if trustTunnelKeyMade, err = s.issueTrustTunnelKey(ctx, actor(ctx), u); err != nil {
+			takeBackKeys()
+			return nil, err
+		}
+	}
+	// A request that asks for nothing but the page password does not rewrite the row from the values read above (a change made in
+	// between would be lost): the password is one statement of its own, below.
+	if changedUserFields(m) != "page_password" {
+		err = a.UpdateUser(ctx, u, old, setNodes, change)
+	}
+	switch {
+	case errors.Is(err, store.ErrAccessVersion): // the person changed after the read above (switched off, extended, edited): nothing is written over it
+		takeBackKeys()
+		return nil, coded(connect.CodeAborted, "stale_user")
 	case errors.Is(err, store.ErrAccessExists):
+		takeBackKeys()
 		return nil, coded(connect.CodeAlreadyExists, "name_taken")
 	case errors.Is(err, store.ErrNotFound):
+		takeBackKeys()
 		return nil, notFound("user, group or node")
 	case err != nil:
+		takeBackKeys()
 		return nil, s.internal("update user", err)
 	}
-	// No credentials are issued here: a device gets the ones its apps allow when it fetches the subscription.
-	if u.Status != old.Status || u.GroupID != old.GroupID || u.AppHapp != old.AppHapp || u.AppAmnezia != old.AppAmnezia ||
+	if pageAction != "" {
+		if _, err := a.SetPagePassword(ctx, u.ID, pageAction); errors.Is(err, store.ErrNotFound) {
+			return nil, notFound("user")
+		} else if err != nil {
+			return nil, s.internal("set page password", err)
+		}
+	}
+	reservation.markTouched(asked)
+	if !u.AppTelegram && old.AppTelegram {
+		if err := s.revokeTelegramKey(ctx, actor(ctx), u.ID); err != nil {
+			return nil, err
+		}
+	}
+	if !u.AppTrustTunnel && old.AppTrustTunnel {
+		if err := s.revokeTrustTunnelKey(ctx, actor(ctx), u.ID); err != nil {
+			return nil, err
+		}
+	}
+	// No other credentials are issued here: a device gets the ones its apps allow when it fetches the subscription.
+	if u.Status != old.Status || groupsChanged || u.AppHapp != old.AppHapp || u.AppAmnezia != old.AppAmnezia || u.AppTelegram != old.AppTelegram || u.AppTrustTunnel != old.AppTrustTunnel || u.AppMistgateOff != old.AppMistgateOff ||
 		u.AllNodes != old.AllNodes || !slices.Equal(u.NodeIDs, old.NodeIDs) || u.SpeedLimitBps != old.SpeedLimitBps ||
 		u.DeviceSpeedLimitBps != old.DeviceSpeedLimitBps || !u.ExpiresAt.Equal(old.ExpiresAt) {
 		s.notify.StateChanged()
 	}
-	s.audit(ctx, actor(ctx), "user_update", map[string]any{"user": u.ID, "name": u.Name, "fields": changedUserFields(m)})
+	fields := map[string]any{"user": u.ID, "name": u.Name, "fields": changedUserFields(m)}
+	if added, removed := idsDiff(old.ExtraGroupIDs, nextExtra); len(added)+len(removed) > 0 { // what the person's extra groups really did
+		fields["groups_added"], fields["groups_removed"] = strings.Join(added, ","), strings.Join(removed, ",")
+	}
+	if pageAction != "" { // the word of what was done; the password is computed and never written anywhere
+		fields["page_password"] = map[string]string{store.PagePassChange: "changed", store.PagePassRemove: "removed", store.PagePassRestore: "restored"}[pageAction]
+	}
+	s.audit(ctx, actor(ctx), "user_update", fields)
 	users, err := s.loadUsers(ctx, u.ID)
 	if err != nil {
 		return nil, err
@@ -619,24 +787,137 @@ func (s *Service) UpdateUser(ctx context.Context, req *connect.Request[adminv1.U
 	return connect.NewResponse(&adminv1.UpdateUserResponse{User: users[0], Impact: impact}), nil
 }
 
-// groupChangeImpact is what moving the user to another group does to their profiles and AmneziaVPN keys.
-func (s *Service) groupChangeImpact(ctx context.Context, u store.AccessUser, to string) (*adminv1.AccessImpact, error) {
+// maxUserGroups is how many groups one person may be in, the main one counted. A check at the edge of what the API takes, not a
+// setting: a person's subscription and desired state read every one of their groups.
+const maxUserGroups = 16
+
+// groupChangeOf validates the group part of an update and works out the person's next extra groups. main is the main group
+// after the request (the request's group_id, or the stored one). The extra groups are the stored ones, plus add, minus remove,
+// without main: the old main group stays only when add names it. Errors are INVALID_ARGUMENT group_in_both, main_group and
+// too_many_groups. The returned change is what the store applies as deltas (ids sorted, without repeats).
+func groupChangeOf(old store.AccessUser, main string, add, remove []string) (store.AccessGroupChange, []string, error) {
+	add, remove = slices.Compact(slices.Sorted(slices.Values(add))), slices.Compact(slices.Sorted(slices.Values(remove)))
+	if len(add) > 0 && add[0] == "" || len(remove) > 0 && remove[0] == "" {
+		return store.AccessGroupChange{}, nil, invalid("group id is empty")
+	}
+	if len(add)+len(remove) > 2*maxUserGroups {
+		return store.AccessGroupChange{}, nil, coded(connect.CodeInvalidArgument, "too_many_groups")
+	}
+	for _, id := range add {
+		if slices.Contains(remove, id) {
+			return store.AccessGroupChange{}, nil, coded(connect.CodeInvalidArgument, "group_in_both", "group", id)
+		}
+	}
+	if slices.Contains(remove, main) {
+		return store.AccessGroupChange{}, nil, coded(connect.CodeInvalidArgument, "main_group", "group", main)
+	}
+	next := slices.Clone(old.ExtraGroupIDs)
+	next = append(next, add...)
+	next = slices.DeleteFunc(next, func(id string) bool { return id == main || slices.Contains(remove, id) })
+	slices.Sort(next)
+	next = slices.Compact(next)
+	if 1+len(next) > maxUserGroups {
+		return store.AccessGroupChange{}, nil, coded(connect.CodeInvalidArgument, "too_many_groups")
+	}
+	return store.AccessGroupChange{Add: add, Remove: remove}, next, nil
+}
+
+// idsDiff is the ids that are in next and not in old (added) and the other way round (removed).
+func idsDiff(old, next []string) (added, removed []string) {
+	for _, id := range next {
+		if !slices.Contains(old, id) {
+			added = append(added, id)
+		}
+	}
+	for _, id := range old {
+		if !slices.Contains(next, id) {
+			removed = append(removed, id)
+		}
+	}
+	return added, removed
+}
+
+// sortedExtraGroups are the person's extra groups that exist (by the map of all groups), ordered by name.
+func sortedExtraGroups(u store.AccessUser, byID map[string]store.AccessGroup) []store.AccessGroup {
+	var out []store.AccessGroup
+	for _, id := range u.ExtraGroupIDs {
+		if g, ok := byID[id]; ok {
+			out = append(out, g)
+		}
+	}
+	slices.SortFunc(out, func(a, b store.AccessGroup) int {
+		if c := strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name)); c != 0 {
+			return c
+		}
+		return strings.Compare(a.ID, b.ID)
+	})
+	return out
+}
+
+// userGroupsImpact is what a person's change of groups (the main group and the extra ones, as in `to`: GroupID and ExtraGroupIDs)
+// does to their profiles, AmneziaVPN keys and nodes: all their groups before against all after. Profiles by the union of what
+// the groups hold (for one group each side this is the plain profile impact); nodes by pairs (profile, node) on live inbounds
+// within the person's own node choice (to.AllNodes, to.NodeIDs), so a group with the same profiles but another set of nodes
+// shows as a change. NOT_FOUND "group" for an id that does not exist. Nil when nothing changes.
+func (s *Service) userGroupsImpact(ctx context.Context, from, to store.AccessUser) (*adminv1.AccessImpact, error) {
 	a := s.st.Access()
-	from, err := a.Group(ctx, u.GroupID)
+	all, err := a.Groups(ctx)
 	if err != nil {
 		return nil, s.internal("group", err)
 	}
-	next, err := a.Group(ctx, to)
-	if errors.Is(err, store.ErrNotFound) {
-		return nil, notFound("group")
-	} else if err != nil {
-		return nil, s.internal("group", err)
+	byID := make(map[string]store.AccessGroup, len(all))
+	for _, g := range all {
+		byID[g.ID] = g
 	}
-	awg, err := a.AWGDevicesPerProfile(ctx, "", u.ID)
+	for _, id := range append([]string{to.GroupID}, to.ExtraGroupIDs...) {
+		if _, ok := byID[id]; !ok {
+			return nil, notFound("group")
+		}
+	}
+	before, after := store.GroupsOf(from, byID), store.GroupsOf(to, byID)
+	awg, err := a.AWGDevicesPerProfile(ctx, "", from.ID)
 	if err != nil {
 		return nil, s.internal("awg devices", err)
 	}
-	return s.impactOf(ctx, from.ProfileIDs, next.ProfileIDs, 1, awg)
+	imp, err := s.impactOf(ctx, before.ProfileIDs(), after.ProfileIDs(), 1, awg)
+	if err != nil {
+		return nil, err
+	}
+	full, err := a.InboundsFull(ctx, "")
+	if err != nil {
+		return nil, s.internal("inbounds", err)
+	}
+	gets := func(gs store.AccessGroups) map[string]bool {
+		out := map[string]bool{}
+		for _, f := range full {
+			if liveInbound(f) && gs.Gives(f.Profile.ID, f.Node.ID) && (to.AllNodes || slices.Contains(to.NodeIDs, f.Node.ID)) {
+				out[f.Node.ID] = true
+			}
+		}
+		return out
+	}
+	was, will := gets(before), gets(after)
+	var gained, lost []string
+	for id := range will {
+		if !was[id] {
+			gained = append(gained, id)
+		}
+	}
+	for id := range was {
+		if !will[id] {
+			lost = append(lost, id)
+		}
+	}
+	if len(gained)+len(lost) == 0 {
+		return imp, nil
+	}
+	if imp == nil {
+		imp = &adminv1.AccessImpact{Users: 1}
+	}
+	slices.Sort(gained)
+	slices.Sort(lost)
+	imp.GainedNodeIds, imp.LostNodeIds = gained, lost
+	return imp, nil
 }
 
 func checkIDs(ids []string) error {
@@ -653,9 +934,29 @@ func (s *Service) SetUsersEnabled(ctx context.Context, req *connect.Request[admi
 	if err := checkIDs(req.Msg.UserIds); err != nil {
 		return nil, err
 	}
+	usersBefore, err := s.st.Access().UsersByIDs(ctx, req.Msg.UserIds)
+	if err != nil {
+		return nil, s.internal("load users to update", err)
+	}
+	// Only disabling counts against a token's hourly limit, and only the people it really disables: enabling gives
+	// access back, and repeating a call changes nobody.
+	asked := 0
+	if !req.Msg.Enabled {
+		for _, u := range usersBefore {
+			if !u.Disabled {
+				asked++
+			}
+		}
+	}
+	reservation, err := s.reserveTokenUserChanges(ctx, adminv1connect.UserServiceSetUsersEnabledProcedure, asked)
+	if err != nil {
+		return nil, err
+	}
+	defer reservation.finish()
 	if err := s.st.Access().SetUsersDisabled(ctx, req.Msg.UserIds, !req.Msg.Enabled); err != nil {
 		return nil, s.internal("set disabled", err)
 	}
+	reservation.markTouched(asked)
 	if err := s.Recompute(ctx, req.Msg.UserIds); err != nil {
 		return nil, s.internal("recompute", err)
 	}
@@ -684,11 +985,14 @@ func (s *Service) ExtendUsers(ctx context.Context, req *connect.Request[adminv1.
 		return nil, s.internal("load users", err)
 	}
 	now := s.now()
+	// Extending is not counted against a token's hourly limit of user changes: it only gives people more time.
 	for _, u := range us {
 		if u.ExpiresAt.IsZero() {
 			continue
 		}
-		if err := a.SetUserExpiry(ctx, u.ID, maxTime(now, u.ExpiresAt).AddDate(0, 0, int(m.Days))); err != nil {
+		if err := extendUser(ctx, a, u, now, int(m.Days)); errors.Is(err, store.ErrAccessVersion) {
+			return nil, coded(connect.CodeAborted, "stale_user")
+		} else if err != nil {
 			return nil, s.internal("extend", err)
 		}
 	}
@@ -705,9 +1009,29 @@ func (s *Service) ExtendUsers(ctx context.Context, req *connect.Request[adminv1.
 	return connect.NewResponse(&adminv1.ExtendUsersResponse{Users: users}), nil
 }
 
+// extendUser moves u's term end days further. A term end that changed since u was read (an edit, another extension) is read
+// again and the new end worked out from it: two extensions at once both count, and an edit is not written over. A person who
+// is gone or has no term end is left alone; store.ErrAccessVersion when the term end keeps changing.
+func extendUser(ctx context.Context, a store.Access, u store.AccessUser, now time.Time, days int) error {
+	for range 5 {
+		if u.ExpiresAt.IsZero() {
+			return nil
+		}
+		err := a.SetUserExpiry(ctx, u.ID, u.ExpiresAt, maxTime(now, u.ExpiresAt).AddDate(0, 0, days))
+		if !errors.Is(err, store.ErrAccessVersion) {
+			return err
+		}
+		if u, err = a.User(ctx, u.ID); errors.Is(err, store.ErrNotFound) {
+			return nil
+		} else if err != nil {
+			return err
+		}
+	}
+	return store.ErrAccessVersion
+}
+
 // ResetUserTraffic zeroes used_bytes of the current period. The period start (so the next reset) and the traffic
-// history stay; the status is recomputed, which lifts LIMITED, and the nodes hear about it through Recompute-style
-// notification when a status changed.
+// history stay; the status is recomputed from current data, which lifts LIMITED, and the nodes are notified after a reset.
 func (s *Service) ResetUserTraffic(ctx context.Context, req *connect.Request[adminv1.ResetUserTrafficRequest]) (*connect.Response[adminv1.ResetUserTrafficResponse], error) {
 	m := req.Msg
 	if err := checkIDs(m.UserIds); err != nil {
@@ -722,19 +1046,38 @@ func (s *Service) ResetUserTraffic(ctx context.Context, req *connect.Request[adm
 		return nil, notFound("user")
 	}
 	now := s.now()
-	changed := false
+	asked := 0
+	for _, u := range us {
+		status := ComputeStatus(u.Disabled, u.ExpiresAt, u.QuotaBytes, 0, now)
+		if u.UsedBytes > 0 || status != u.Status {
+			asked++
+		}
+	}
+	reservation, err := s.reserveTokenUserChanges(ctx, adminv1connect.UserServiceResetUserTrafficProcedure, asked)
+	if err != nil {
+		return nil, err
+	}
+	defer reservation.finish()
+	reset := false
 	ids := make([]string, 0, len(us))
 	for _, u := range us {
 		status := ComputeStatus(u.Disabled, u.ExpiresAt, u.QuotaBytes, 0, now)
-		if err := a.ResetUserTraffic(ctx, u.ID, status); err != nil {
-			return nil, s.internal("reset traffic", err)
+		if u.UsedBytes > 0 || status != u.Status {
+			if err := a.ResetUserTraffic(ctx, u.ID, status); err != nil {
+				return nil, s.internal("reset traffic", err)
+			}
+			reservation.markTouched(1)
+			reset = true
 		}
-		changed = changed || status != u.Status
 		ids = append(ids, u.ID)
 		s.audit(ctx, actor(ctx), "user_reset_traffic", map[string]any{"user": u.ID, "was_bytes": u.UsedBytes})
 	}
-	if changed {
+	changed, refreshed, err := s.recompute(ctx, ids)
+	if reset || changed > 0 || refreshed && err != nil {
 		s.notify.StateChanged()
+	}
+	if err != nil {
+		return nil, s.internal("recompute", err)
 	}
 	users, err := s.loadUsers(ctx, ids...)
 	if err != nil {
@@ -767,15 +1110,53 @@ func changedUserFields(m *adminv1.UpdateUserRequest) string {
 		set  bool
 		name string
 	}{
-		{m.Name != nil, "name"}, {m.GroupId != nil, "group"}, {m.QuotaBytes != nil, "quota"}, {m.QuotaReset != nil, "quota_reset"},
-		{m.ExpiresUnix != nil, "expires"}, {m.DeviceLimit != nil, "device_limit"}, {m.Apps != nil, "apps"}, {m.Nodes != nil, "nodes"},
+		{m.Name != nil, "name"}, {m.GroupId != nil, "group"}, {len(m.AddGroupIds)+len(m.RemoveGroupIds) > 0, "groups"}, {m.QuotaBytes != nil, "quota"}, {m.QuotaReset != nil, "quota_reset"},
+		{m.ExpiresUnix != nil, "expires"}, {m.DeviceLimit != nil, "device_limit"}, {m.Apps != nil, "apps"}, {m.Apps != nil && m.Apps.Mistgate != nil, "app_mistgate"},
+		{m.Apps != nil && m.Apps.TrustTunnel != nil, "app_trusttunnel"}, {m.Nodes != nil, "nodes"},
 		{m.SpeedLimitBps != nil, "speed_limit"}, {m.DeviceSpeedLimitBps != nil, "device_speed_limit"}, {m.DnsPresetId != nil, "dns"}, {m.SubscriptionName != nil, "subscription_name"},
+		{m.PagePasswordAction != adminv1.PagePasswordAction_PAGE_PASSWORD_ACTION_UNSPECIFIED, "page_password"},
 	} {
 		if x.set {
 			f = append(f, x.name)
 		}
 	}
 	return strings.Join(f, ",")
+}
+
+// pagePasswordAction is the store's word for what a request does to the page password of a person ("" for nothing: no action asked,
+// or one that changes nothing, like removing a password that is removed). Changing a removed password is refused: there is none to
+// change, and "restore" is what brings one back.
+func pagePasswordAction(a adminv1.PagePasswordAction, old store.AccessUser) (string, error) {
+	switch a {
+	case adminv1.PagePasswordAction_PAGE_PASSWORD_ACTION_UNSPECIFIED:
+		return "", nil
+	case adminv1.PagePasswordAction_PAGE_PASSWORD_ACTION_CHANGE:
+		if old.PageOpen {
+			return "", coded(connect.CodeFailedPrecondition, "page_password_removed")
+		}
+		return store.PagePassChange, nil
+	case adminv1.PagePasswordAction_PAGE_PASSWORD_ACTION_REMOVE:
+		if old.PageOpen {
+			return "", nil
+		}
+		return store.PagePassRemove, nil
+	case adminv1.PagePasswordAction_PAGE_PASSWORD_ACTION_RESTORE:
+		if !old.PageOpen {
+			return "", nil
+		}
+		return store.PagePassRestore, nil
+	}
+	return "", invalid("unknown page password action")
+}
+
+// userUpdateChanges reports whether the normalized update differs from a stored, admin-editable user field.
+func userUpdateChanges(old, next store.AccessUser) bool {
+	return old.Name != next.Name || old.SubscriptionName != next.SubscriptionName || old.GroupID != next.GroupID ||
+		old.Disabled != next.Disabled || old.Status != next.Status || old.AppHapp != next.AppHapp ||
+		old.AppAmnezia != next.AppAmnezia || old.AppTelegram != next.AppTelegram || old.AppTrustTunnel != next.AppTrustTunnel || old.AppMistgateOff != next.AppMistgateOff || old.AllNodes != next.AllNodes ||
+		!slices.Equal(old.NodeIDs, next.NodeIDs) || old.QuotaBytes != next.QuotaBytes || old.QuotaReset != next.QuotaReset ||
+		!old.PeriodStart.Equal(next.PeriodStart) || !old.ExpiresAt.Equal(next.ExpiresAt) || old.DeviceLimit != next.DeviceLimit ||
+		old.SpeedLimitBps != next.SpeedLimitBps || old.DeviceSpeedLimitBps != next.DeviceSpeedLimitBps || old.DNSPresetID != next.DNSPresetID
 }
 
 func maxTime(a, b time.Time) time.Time {
@@ -789,8 +1170,12 @@ func maxTime(a, b time.Time) time.Time {
 // "device_blocked" instead of servers) until UnblockDevice; the shared device and a key have no HWID to block
 // (FailedPrecondition cannot_block). Both write the audit entry device_revoke.
 func (s *Service) RevokeDevice(ctx context.Context, req *connect.Request[adminv1.RevokeDeviceRequest]) (*connect.Response[adminv1.RevokeDeviceResponse], error) {
+	reservation, err := s.reserveTokenUserChanges(ctx, adminv1connect.UserServiceRevokeDeviceProcedure, 1)
+	if err != nil {
+		return nil, err
+	}
+	defer reservation.finish()
 	var userID string
-	var err error
 	if req.Msg.Block {
 		userID, err = s.st.Access().BlockDevice(ctx, req.Msg.DeviceId, s.now())
 	} else {
@@ -804,6 +1189,7 @@ func (s *Service) RevokeDevice(ctx context.Context, req *connect.Request[adminv1
 	case err != nil:
 		return nil, s.internal("revoke device", err)
 	}
+	reservation.markTouched(1)
 	s.notify.StateChanged()
 	s.audit(ctx, actor(ctx), "device_revoke", map[string]any{"user": userID, "device": req.Msg.DeviceId, "block": req.Msg.Block})
 	users, err := s.loadUsers(ctx, userID)
@@ -831,6 +1217,12 @@ func (s *Service) UnblockDevice(ctx context.Context, req *connect.Request[adminv
 }
 
 func (s *Service) DeleteUsers(ctx context.Context, req *connect.Request[adminv1.DeleteUsersRequest]) (*connect.Response[adminv1.DeleteUsersResponse], error) {
+	if s.cfg.StepUp == nil {
+		return nil, connect.NewError(connect.CodePermissionDenied, errors.New("step-up required"))
+	}
+	if err := s.cfg.StepUp(ctx); err != nil {
+		return nil, err
+	}
 	if err := checkIDs(req.Msg.UserIds); err != nil {
 		return nil, err
 	}
@@ -862,12 +1254,16 @@ func (s *Service) GetSubscriptionLink(ctx context.Context, req *connect.Request[
 		return nil, s.internal("get user", err)
 	}
 	var token string
+	gen, open := u.PagePassGen, u.PageOpen
 	if req.Msg.Rotate {
 		tok, hash := newToken()
 		if err := a.SetSubToken(ctx, u.ID, hash, s.vault.Seal([]byte(tok), u.ID)); err != nil {
 			return nil, s.internal("rotate token", err)
 		}
-		token = tok
+		s.tokens.remove([32]byte(u.SubTokenHash))
+		s.tokens.add([32]byte(hash))
+		s.audit(ctx, actor(ctx), "user_link_rotate", map[string]any{"user": u.ID, "name": u.Name})
+		token, gen = tok, 0 // SetSubToken starts the password's number again; page_open stays as the owner left it
 	} else {
 		pt, err := s.vault.Open(u.SubTokenEnc, u.ID)
 		if err != nil {
@@ -879,22 +1275,22 @@ func (s *Service) GetSubscriptionLink(ctx context.Context, req *connect.Request[
 	if err != nil {
 		return nil, err
 	}
-	pw, err := s.pagePassword(ctx, token)
+	pw, err := s.pagePassword(ctx, token, gen, open)
 	if err != nil {
 		return nil, err
 	}
 	return connect.NewResponse(&adminv1.GetSubscriptionLinkResponse{Url: url, PagePassword: pw}), nil
 }
 
-// pagePassword is the password of the page of a token, "" when the instance does not ask for one. It is computed
-// (package pagepass), so a rotated link has a new one.
-func (s *Service) pagePassword(ctx context.Context, token string) (string, error) {
+// pagePassword is the password of the page of a token in a generation, "" when the instance does not ask for one or the person's
+// password was removed (open). It is computed (package pagepass), so a new link or a change of the password is a new one.
+func (s *Service) pagePassword(ctx context.Context, token string, gen int, open bool) (string, error) {
 	set, err := subsettings.Load(ctx, s.st)
 	if err != nil {
 		return "", s.internal("load subscription settings", err)
 	}
-	if !subsettings.PagePassword(set) {
+	if !subsettings.PagePassword(set) || open {
 		return "", nil
 	}
-	return pagepass.Password(s.vault.Derive(pagepass.KeyLabel), token), nil
+	return pagepass.Password(s.vault.Derive(pagepass.KeyLabel), token, gen), nil
 }

@@ -6,20 +6,25 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { Role } from "@/gen/mistgate/admin/v1/auth_pb";
 import { ApprovalState, TokenChannel, TokenProfile } from "@/gen/mistgate/admin/v1/integrations_pb";
+import { AiScreen } from "@/screens/ai";
 import { IntegrationsScreen } from "./index";
 
 const listApiTokens = vi.fn();
 const createApiToken = vi.fn();
 const revokeApiToken = vi.fn();
+const setApiTokenBulk = vi.fn();
 const listApprovals = vi.fn();
 const approve = vi.fn();
 const reject = vi.fn();
 let role = Role.OWNER;
+let accessList: { nodeId: string; panelKeyFingerprint: string }[] = [];
+const panelPublicKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGq7cYk4m1x mistgate-panel";
 vi.mock("@/lib/api", () => ({
   apiTokens: {
     listApiTokens: (...a: unknown[]) => listApiTokens(...a),
     createApiToken: (...a: unknown[]) => createApiToken(...a),
     revokeApiToken: (...a: unknown[]) => revokeApiToken(...a),
+    setApiTokenBulk: (...a: unknown[]) => setApiTokenBulk(...a),
   },
   approvals: {
     listApprovals: (...a: unknown[]) => listApprovals(...a),
@@ -29,6 +34,11 @@ vi.mock("@/lib/api", () => ({
   // the Telegram card has its own tests (telegram.test.tsx); here it only has to render
   telegram: { getTelegram: () => Promise.resolve({ status: { bot: { configured: false, username: "", error: "" }, links: [], adminUrlKnown: false } }) },
   updates: {},
+  // a node_install approval: whether the panel key logs in to some node (the default login), and the key itself
+  provisioning: {
+    listNodeServerAccess: async () => ({ access: accessList }),
+    getPanelSSHKey: async () => ({ publicKey: panelPublicKey, fingerprint: "SHA256:pAnElKeYfInGeRpRiNt0123456789abcdefghijkl" }),
+  },
   auth: { me: () => Promise.resolve({ admin: { id: "adm_1", role } }) },
   isUnauthenticated: () => false,
   webauthnSupported: () => false,
@@ -54,13 +64,14 @@ let root: Root | null = null;
 let host: HTMLDivElement | null = null;
 beforeEach(() => {
   role = Role.OWNER;
-  search = {};
+  search = { tab: "mcp" };
+  accessList = [];
 });
 afterEach(() => {
   act(() => root?.unmount());
   host?.remove();
   root = host = null;
-  for (const m of [listApiTokens, createApiToken, revokeApiToken, listApprovals, approve, reject, navigate]) m.mockReset();
+  for (const m of [listApiTokens, createApiToken, revokeApiToken, setApiTokenBulk, listApprovals, approve, reject, navigate]) m.mockReset();
 });
 
 const NOW = Math.floor(Date.now() / 1000);
@@ -77,6 +88,7 @@ const token = (over: Record<string, unknown> = {}) => ({
   createdByName: "Owner",
   rateLimitPerMin: 120,
   hint: "ab12",
+  allowBulkUserChanges: false,
   ...over,
 });
 const approval = (over: Record<string, unknown> = {}) => ({
@@ -105,7 +117,8 @@ const approval = (over: Record<string, unknown> = {}) => ({
 const tokens = (list: unknown[]) => ({ tokens: list, nowUnix: NOW });
 const inbox = (list: unknown[], awaiting = list.filter((a) => (a as { state: number }).state === ApprovalState.AWAITING).length) => ({ approvals: list, awaiting, nowUnix: NOW });
 
-async function mount(t: unknown, a: unknown = inbox([])) {
+// Tokens, MCP and the approvals live on AI (ADR 0014): its MCP and approvals tabs; Integrations keeps Telegram.
+async function mount(t: unknown, a: unknown = inbox([]), screen: "ai" | "integrations" = "ai") {
   listApiTokens.mockResolvedValue(t);
   listApprovals.mockResolvedValue(a);
   host = document.createElement("div");
@@ -115,7 +128,7 @@ async function mount(t: unknown, a: unknown = inbox([])) {
   await act(async () =>
     root!.render(
       <QueryClientProvider client={qc}>
-        <IntegrationsScreen />
+        {screen === "ai" ? <AiScreen /> : <IntegrationsScreen />}
       </QueryClientProvider>,
     ),
   );
@@ -135,6 +148,7 @@ function type(input: Element | null, value: string) {
     input?.dispatchEvent(new Event("input", { bubbles: true }));
   });
 }
+const buttonsOf = (label: string) => document.querySelector(`button[aria-label='${label}']`);
 const radio = (label: string) => [...document.querySelectorAll("[role=radio]")].find((r) => r.textContent?.includes(label));
 
 describe("the Integrations screen: tokens", () => {
@@ -166,16 +180,17 @@ describe("the Integrations screen: tokens", () => {
   it("creates a token, shows its secret once and forgets it when the dialog is closed", async () => {
     createApiToken.mockResolvedValue({ token: token({ id: "tok_9", name: "grafana" }), secret: "tk1_exampleexampleexampleexampleexampleexample1" });
     await mount(tokens([]));
-    expect(text()).toContain("No tokens yet");
+    expect(text()).toContain("No tokens");
     await click(button("New token"));
     expect(radio("Read only")?.getAttribute("aria-checked")).toBe("true"); // the safest access is preselected
-    await type(document.querySelector("input[placeholder^='e.g.']"), "  grafana ");
+    await type(document.querySelector("input[placeholder='claude-ops']"), "  grafana ");
     await click(radio("Operator"));
     await click([...document.querySelectorAll("[role=radio]")].find((r) => r.textContent === "180 days"));
     await click(button("Create token"));
     await settle();
-    expect(createApiToken).toHaveBeenCalledWith({ name: "grafana", profile: TokenProfile.OPERATOR, ttlDays: 180, rateLimitPerMin: 120 });
-    expect(dialog()!.textContent).toContain("Copy the token now");
+    // the hourly limit of user changes stays on unless the owner switches it off for this token
+    expect(createApiToken).toHaveBeenCalledWith({ name: "grafana", profile: TokenProfile.OPERATOR, ttlDays: 180, rateLimitPerMin: 120, allowBulkUserChanges: false });
+    expect(dialog()!.textContent).toContain("Token created");
     expect(document.querySelector("[data-testid=token-secret]")?.textContent).toBe("tk1_exampleexampleexampleexampleexampleexample1");
 
     // Esc does not lose it; only the button closes it
@@ -195,7 +210,7 @@ describe("the Integrations screen: tokens", () => {
     expect(labels.filter((l) => /^(never|no expiry|forever|unlimited)/i.test(l ?? ""))).toEqual([]);
     await click(button("Create token"));
     expect(text()).toContain("Give the token a name");
-    await type(document.querySelector("input[placeholder^='e.g.']"), "x");
+    await type(document.querySelector("input[placeholder='claude-ops']"), "x");
     await type(document.querySelector("input[inputmode=numeric]"), "601");
     await click(button("Create token"));
     expect(text()).toContain("Enter a whole number from 1 to 600");
@@ -206,12 +221,13 @@ describe("the Integrations screen: tokens", () => {
     createApiToken.mockRejectedValue(new ConnectError("name taken", Code.AlreadyExists));
     await mount(tokens([token()]));
     await click(button("New token"));
-    await type(document.querySelector("input[placeholder^='e.g.']"), "claude-ops");
+    await type(document.querySelector("input[placeholder='claude-ops']"), "claude-ops");
     await click(button("Create token"));
     await settle();
     expect(createApiToken).toHaveBeenCalledTimes(1);
-    expect(dialog()).toBeNull();
-    expect(button("Create token")).toBeDefined();
+    // the create window stays open: nothing the owner typed is lost
+    expect(dialog()).not.toBeNull();
+    expect(inDialog("Create token")).toBeDefined();
   });
 
   it("asks before revoking, then revokes that token", async () => {
@@ -226,26 +242,63 @@ describe("the Integrations screen: tokens", () => {
     expect(dialog()).toBeNull();
   });
 
-  it("says only the owner manages integrations, and asks the panel for nothing", async () => {
+  it("shows each token's limit of user changes and lets the owner lift it and put it back", async () => {
+    setApiTokenBulk.mockResolvedValue({});
+    await mount(tokens([token(), token({ id: "tok_2", name: "billing", allowBulkUserChanges: true }), token({ id: "tok_3", name: "grafana", profile: TokenProfile.READONLY })]));
+    expect(text()).toContain("up to 10 user changes an hour");
+    expect(text()).toContain("bulk user changes allowed");
+    expect(buttonsOf("User change limit of token billing")?.textContent).toContain("Restore the limit"); // the exempt token offers to put it back
+    // a read-only token changes nobody: no limit line and no control
+    expect(document.querySelector("button[aria-label='User change limit of token grafana']")).toBeNull();
+
+    await click(document.querySelector("button[aria-label='User change limit of token claude-ops']"));
+    expect(dialog()!.textContent).toContain("at most 10 people in an hour");
+    expect(dialog()!.textContent).toContain("Every person in every call counts");
+    expect(dialog()!.textContent).toContain("Without a limit"); // what lifting the limit risks, before the button
+    expect(setApiTokenBulk).not.toHaveBeenCalled();
+    await click(inDialog("Allow bulk changes"));
+    await settle();
+    expect(setApiTokenBulk).toHaveBeenCalledWith({ id: "tok_1", allow: true });
+    expect(dialog()).toBeNull();
+
+    // putting the limit back is one press, no window
+    await click(document.querySelector("button[aria-label='User change limit of token billing']"));
+    await settle();
+    expect(setApiTokenBulk).toHaveBeenLastCalledWith({ id: "tok_2", allow: false });
+  });
+
+  it("offers the exemption in the create form only to a token that can change users", async () => {
+    createApiToken.mockResolvedValue({ token: token({ id: "tok_9", name: "billing" }), secret: "tk1_exampleexampleexampleexampleexampleexample1" });
+    await mount(tokens([]));
+    await click(button("New token"));
+    expect(document.querySelector("[role=switch][aria-label='Bulk user changes without approval']")).toBeNull(); // read only is preselected
+    await type(document.querySelector("input[placeholder='claude-ops']"), "billing");
+    await click(radio("Operator"));
+    await click(document.querySelector("[role=switch][aria-label='Bulk user changes without approval']"));
+    await click(button("Create token"));
+    await settle();
+    expect(createApiToken).toHaveBeenCalledWith({ name: "billing", profile: TokenProfile.OPERATOR, ttlDays: 90, rateLimitPerMin: 120, allowBulkUserChanges: true });
+  });
+
+  it("says only the owner manages tokens and MCP, and asks the panel for nothing", async () => {
     role = Role.HELPER;
     await mount(tokens([token()]));
-    expect(text()).toContain("Only the owner manages integrations");
+    expect(text()).toContain("Only the owner sets up the assistant, MCP and the tokens.");
     expect(button("New token")).toBeUndefined();
     expect(listApiTokens).not.toHaveBeenCalled();
     expect(listApprovals).not.toHaveBeenCalled();
   });
 
-  it("offers Telegram alerts (the card has its own tests) and no webhooks", async () => {
-    await mount(tokens([]));
-    expect(text()).toContain("Telegram alerts");
-    expect(text()).not.toMatch(/webhook/i);
+  it("offers Telegram alerts (the card has its own tests)", async () => {
+    await mount(tokens([]), inbox([]), "integrations");
+    expect(text()).toContain("Telegram notifications");
   });
 
   it("opens the create form for the palette's “New API token” and takes ?new=token out of the address", async () => {
-    search = { new: "token" };
+    search = { tab: "mcp", new: "token" };
     await mount(tokens([token()]));
     expect(button("Create token")).toBeDefined();
-    expect(navigate).toHaveBeenCalledWith(expect.objectContaining({ to: "/integrations", search: {}, replace: true }));
+    expect(navigate).toHaveBeenCalledWith(expect.objectContaining({ to: "/ai", search: { tab: "mcp" }, replace: true }));
   });
 });
 
@@ -266,31 +319,54 @@ describe("the Integrations screen: MCP", () => {
 });
 
 describe("the Integrations screen: approvals", () => {
+  beforeEach(() => {
+    search = { tab: "approvals" };
+  });
   it("shows what the agent wants in the panel's words, quotes what came from data, and counts down", async () => {
     await mount(tokens([token()]), inbox([approval()]));
     expect(text()).toContain("1 change is waiting for your decision");
     expect(text()).toContain("Waiting for you");
-    expect(text()).toContain("Fix a node");
+    expect(text()).toContain("Fix de1"); // the title carries the node's name, as the assistant's card does
     expect(text()).toContain("by token claude-ops");
     expect(text()).toContain("Admin");
     expect(text()).toContain("Drops connections");
     expect(text()).toMatch(/Drops connections\s*yes/);
     expect(text()).toContain("It changes what runs on your nodes.");
-    expect(text()).toMatch(/\d:\d\d left/);
+    expect(text()).toMatch(/left\s*\d:\d\d/);
     // the node name and the agent's reason are quoted, not mixed into the panel's wording
     expect(text()).toContain("“de1”");
     expect(text()).toContain("“the engine looks stuck”");
     expect(text()).toContain("Written by the agent");
   });
 
+  it("titles a plan with the names its facts carry, as the assistant's card does; one without names keeps the tool's title", async () => {
+    await mount(
+      tokens([]),
+      inbox([
+        approval({
+          id: "pln_relay",
+          tool: "relay",
+          facts: [
+            { key: "action", value: "enable", untrusted: false },
+            { key: "entry", value: "msk1", untrusted: true },
+            { key: "exit", value: "fi1", untrusted: true },
+          ],
+        }),
+        approval({ id: "pln_2", tool: "rollout_start", facts: [] }),
+      ]),
+    );
+    expect([...document.querySelectorAll(".ai-ap h3")].map((h) => h.textContent)).toEqual(["Turn on the relay of fi1 through msk1", "Update nodes now"]);
+    expect(document.querySelector("button[aria-label='Approve: Turn on the relay of fi1 through msk1']")).not.toBeNull();
+  });
+
   it("approves and rejects by id", async () => {
     approve.mockResolvedValue({});
     reject.mockResolvedValue({});
     await mount(tokens([]), inbox([approval(), approval({ id: "pln_2", tool: "rollout_start" })]));
-    await click(document.querySelector("button[aria-label='Approve: Fix a node']"));
+    await click(document.querySelector("button[aria-label='Approve: Fix de1']"));
     await settle();
     expect(approve).toHaveBeenCalledWith({ id: "pln_1" });
-    await click(document.querySelector("button[aria-label='Reject: Update a node now']"));
+    await click(document.querySelector("button[aria-label='Reject: Update nodes now']"));
     await settle();
     expect(reject).toHaveBeenCalledWith({ id: "pln_2" });
   });
@@ -312,7 +388,7 @@ describe("the Integrations screen: approvals", () => {
         }),
       ]),
     );
-    const approveButton = () => document.querySelector("button[aria-label='Approve: Install a node over SSH']") as HTMLButtonElement;
+    const approveButton = () => document.querySelector("button[aria-label='Approve: Install the node edge-1 over SSH']") as HTMLButtonElement;
     expect(document.querySelector("[data-testid=host-key]")?.textContent).toBe(fp);
     // a fingerprint has no spaces: on a 390 px screen it must break anywhere, in the facts and in the box
     const factValue = [...document.querySelectorAll("dd")].find((dd) => dd.textContent === fp);
@@ -320,6 +396,8 @@ describe("the Integrations screen: approvals", () => {
     expect(document.querySelector("[data-testid=host-key]")?.className).toContain("wrap-anywhere");
     expect(text()).toContain("Host key fingerprint · ssh-ed25519");
     expect(approveButton().hasAttribute("data-disabled")).toBe(true);
+    // a password install approved here adds the panel key too: the owner reads it before approving
+    expect(text()).toContain("The panel also adds its own key to the server");
 
     await type(document.querySelector("input[type=password]"), "root-secret");
     expect(approveButton().hasAttribute("data-disabled")).toBe(true); // the key is not confirmed yet
@@ -329,6 +407,52 @@ describe("the Integrations screen: approvals", () => {
     await settle();
     expect(approve).toHaveBeenCalledWith({ id: "pln_1", sshPassword: "root-secret", confirmedFingerprint: fp });
     expect(document.querySelector<HTMLInputElement>("input[type=password]")?.value ?? "").toBe("");
+    // a plan without the panel key fact (made before the panel key) offers no choice: the panel would refuse the key
+    expect(document.querySelector("article [role=radio]")).toBeNull();
+  });
+
+  describe("the panel key on a node install", () => {
+    const fp = "SHA256:" + "B".repeat(43);
+    const install = approval({
+      tool: "node_install",
+      facts: [
+        { key: "node", value: "nl1", untrusted: true },
+        { key: "username", value: "root", untrusted: true },
+        { key: "host_key", value: fp, untrusted: false },
+        { key: "host_key_algorithm", value: "ssh-ed25519", untrusted: false },
+        { key: "panel_ssh_key", value: panelPublicKey, untrusted: false },
+      ],
+    });
+    const approveButton = () => document.querySelector("button[aria-label='Approve: Install the node nl1 over SSH']") as HTMLButtonElement;
+    const loginRadio = (label: string) => [...document.querySelectorAll<HTMLElement>("article [role=radio]")].find((r) => r.textContent === label);
+
+    it("lets the owner pick the panel key, then approves with no password", async () => {
+      approve.mockResolvedValue({});
+      await mount(tokens([]), inbox([install]));
+      expect(loginRadio("Password")?.getAttribute("aria-checked")).toBe("true"); // no node logs in by key yet
+      // the key is shown under the choice, not once more among the facts
+      expect([...document.querySelectorAll("dd")].some((dd) => dd.textContent?.includes("mistgate-panel"))).toBe(false);
+
+      await click(loginRadio("Panel key"));
+      await settle();
+      expect(document.querySelector("article input[type=password]")).toBeNull();
+      expect(document.querySelector("[data-testid=panel-key]")?.textContent).toBe(panelPublicKey);
+      expect(text()).toContain("Confirm the host key to approve.");
+      expect(approveButton().hasAttribute("data-disabled")).toBe(true);
+      await act(async () => void document.querySelector<HTMLInputElement>("article input[type=checkbox]")!.click());
+      expect(approveButton().hasAttribute("data-disabled")).toBe(false);
+      await click(approveButton());
+      await settle();
+      expect(approve).toHaveBeenCalledWith({ id: "pln_1", usePanelKey: true, confirmedFingerprint: fp });
+    });
+
+    it("starts on the panel key once it logs in to some node", async () => {
+      accessList = [{ nodeId: "nod_9", panelKeyFingerprint: "SHA256:pAnElKeYfInGeRpRiNt0123456789abcdefghijkl" }];
+      await mount(tokens([]), inbox([install]));
+      await settle();
+      expect(loginRadio("Panel key")?.getAttribute("aria-checked")).toBe("true");
+      expect(document.querySelector("article input[type=password]")).toBeNull();
+    });
   });
 
   it("shows the WARP terms link and explains the owner-approved device replacement", async () => {
@@ -357,9 +481,10 @@ describe("the Integrations screen: approvals", () => {
 
   it("refuses to approve what has run out of time", async () => {
     await mount(tokens([]), inbox([approval({ expiresUnix: NOW - 1 })]));
-    expect(text()).toContain("expired");
-    expect((document.querySelector("button[aria-label='Approve: Fix a node']") as HTMLButtonElement).hasAttribute("data-disabled")).toBe(true);
-    expect((document.querySelector("button[aria-label='Reject: Fix a node']") as HTMLButtonElement).hasAttribute("data-disabled")).toBe(true);
+    // the board's answer: the card goes, and the tab says the request lapsed
+    expect(text()).toContain("Request expired");
+    expect(document.querySelector("button[aria-label='Approve: Fix a node']")).toBeNull();
+    expect(document.querySelector("button[aria-label='Reject: Fix a node']")).toBeNull();
   });
 
   it("keeps decided changes in a history below, and no queue when nothing waits", async () => {
@@ -371,14 +496,15 @@ describe("the Integrations screen: approvals", () => {
         approval({ id: "pln_5", tool: "rollout_cancel", state: ApprovalState.REJECTED }),
       ]),
     );
-    expect(text()).not.toContain("Waiting for you");
+    // the tab is named "Waiting for you"; the queue under that title is not there
+    expect(text().split("Waiting for you").length - 1).toBe(1);
     expect(text()).toContain("Recent decisions");
     expect(text()).toContain("Done");
     expect(text()).toContain("Fix applied.");
     expect(text()).toContain("Error");
     expect(text()).toContain("node is offline");
     expect(text()).toContain("Rejected");
-    expect(text()).toContain("API tokens"); // the rest of the screen is still there
+    expect(text()).toContain("MCP and tokens"); // the other tabs are still there
     expect(document.querySelector("nav[aria-label='Recent decisions']")).toBeNull(); // a short history has no pager
   });
 
@@ -392,7 +518,7 @@ describe("the Integrations screen: approvals", () => {
   });
 
   it("opens the history on the page of the URL", async () => {
-    search = { page: 3 as never };
+    search = { tab: "approvals", page: 3 as never };
     const done = (n: number) => approval({ id: `pln_${n}`, tool: "node_fix", state: ApprovalState.APPLIED, decidedUnix: NOW - n, appliedUnix: NOW - n, result: `done ${n}` });
     await mount(tokens([]), inbox(Array.from({ length: 25 }, (_, i) => done(i + 1))));
     expect(text()).toContain("Showing 21–25 of 25");
@@ -401,7 +527,7 @@ describe("the Integrations screen: approvals", () => {
 
   it("words a relay plan: the tool, every fact it writes, and keeps names and networks on plates", async () => {
     await mount(tokens([]), inbox([approval({ tool: "relay", facts: relayFacts.create })]));
-    expect(text()).toContain("Change a relay");
+    expect(text()).toContain("Change the relay of de1 through msk1");
     const rows = [...document.querySelectorAll("dl > div")].map((d) => [d.querySelector("dt")?.textContent, d.querySelector("dd")?.textContent]);
     expect(rows.map(([k]) => k)).toEqual([
       "Entry node",
@@ -434,7 +560,9 @@ describe("the Integrations screen: approvals", () => {
             { key: "quota", value: "93.1 GiB, reset month", untrusted: false, code: "quota", params: { bytes: "100000000000", reset: "month" } },
             { key: "term", value: "never expires", untrusted: false, code: "never" },
             { key: "effect", value: "the used traffic of the current period becomes 0", untrusted: false, code: "traffic_reset" },
+            { key: "user_change_limit", value: "this token has used 9 of 10 user changes in its fixed one-hour window", untrusted: false, code: "user_change_limit", params: { used: "9", limit: "10" } },
           ],
+          danger: ["user_change_limit"],
         }),
         approval({ id: "pln_6", tool: "user_disable", state: ApprovalState.APPLIED, result: "3 users disabled.", outcomeCode: "users_disabled", outcomeParams: { n: "3" } }),
         approval({ id: "pln_7", tool: "rollout_start", state: ApprovalState.FAILED, error: "failed_precondition: no trusted bundle", outcomeCode: "no_trusted_bundle", outcomeParams: {} }),
@@ -447,6 +575,10 @@ describe("the Integrations screen: approvals", () => {
     expect(text()).toContain("100 GB, resets on the 1st");
     expect(text()).toContain("no end date");
     expect(text()).toContain("users stopped by the quota can connect again");
+    // the token's hourly limit: a label and a sentence in the admin's words, and why the plan waits
+    expect(text()).toMatch(/Token's hourly limit\s*9 of 10 user changes used in this hour/);
+    expect(text()).toContain("With this change the token would pass its hourly limit of user changes (10)");
+    expect(text()).not.toContain("fixed one-hour window");
     expect(text()).toContain("3 users disabled");
     expect(text()).not.toContain("3 users disabled.");
     expect(text()).toContain("Error: no trusted update bundle");
@@ -488,7 +620,8 @@ describe("the Integrations screen: approvals", () => {
         approval({ id: "pln_3", tool: "subscription_app_remove", state: ApprovalState.APPLIED, result: "App removed from the subscription page.", outcomeCode: "subscription_app_removed" }),
       ]),
     );
-    expect(text()).toContain("Add or change an app on the user page");
+    expect(text()).toContain("Add or change the app “My Client” on the user page");
+    expect(text()).toContain("Add or change the app “Happ” on the user page");
     expect(text()).toContain("Every user sees it on their subscription page.");
     expect(text()).toMatch(/Platform\s*macOS/);
     expect(text()).toContain("A new app card on every user’s page.");

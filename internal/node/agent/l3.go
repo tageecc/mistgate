@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"net/netip"
@@ -9,50 +10,18 @@ import (
 	"time"
 
 	pb "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/internal/agentcap"
 	"github.com/mistgate/mistgate/internal/node/awg"
 	"github.com/mistgate/mistgate/internal/node/doctor"
 	"github.com/mistgate/mistgate/internal/node/hostctl"
-	"github.com/mistgate/mistgate/internal/node/unit"
-	"github.com/mistgate/mistgate/internal/node/update"
 	"github.com/mistgate/mistgate/internal/node/warp"
 	"github.com/mistgate/mistgate/internal/plugin"
 )
 
 // The L3 side of the agent (agent.proto "AWG AND WARP"): the node-level WARP manager,
-// the firewall of the tunnel interfaces, the AWG health, and the capability strings. Everything here runs on the
+// the firewall of the tunnel interfaces, the AWG health, and the capability list. Everything here runs on the
 // worker goroutine like the rest of the reconcile, except the health readers, which are safe from any goroutine.
-
-// Capabilities this build can list in Hello.capabilities besides "doctor/1" and the update ones.
 const (
-	capAWG   = "awg/1"
-	capVLESS = "vless/1"
-	// capVLESSTLS: the VLESS engine terminates TLS through its certificate source before Xray receives a connection.
-	capVLESSTLS = "vless-tls/1"
-	// capVLESSSelf: the VLESS engine serves the node's own site behind REALITY (reality.target "self", design/vless.md
-	// section 7.5). An agent of v0.1.33/v0.1.34 has vless/1 and rejects that target.
-	capVLESSSelf    = "vless-self/1"
-	capWarp         = "warp/1"
-	capTorrentGuard = "torrentguard/1"
-	capUDPCheck     = "udpcheck/1"
-	capTCPCheck     = "tcpcheck/1"
-	capDecoy        = "decoy/1"
-	// capClientIPv6: the agent follows NodeSettings.client_ipv6_disabled (the tunnel firewall and the direct egress).
-	capClientIPv6 = "client-ipv6/1"
-	capWSLink     = "ws-link/1"
-	capLinkCounts = "links/1"
-	// capLinks2: the Hysteria2 connection endings, RTT and packet counters of StatsBatch.links (agent.proto LinkCounters from
-	// client_closes on). Listed with links/1, which a panel checks for the counters at all.
-	capLinks2 = "links/2"
-	// capJournal sends the node's deduplicated WARN+ records in StatsBatch.journal.
-	capJournal = "journal/1"
-	// capUserRateLimit: the engines that shape traffic per credential also share a bucket per person
-	// (Credential.user_rate_limit_bps, agent.proto "SPEED LIMITS").
-	capUserRateLimit = "user-rate-limit/1"
-	// capUnit3 says the node runs from a systemd unit of generation 3: /dev/net/tun is reachable (the userspace AWG
-	// and WARP backends need it) and ExecStopPost cleans the tunnel interfaces. A node without it keeps working with
-	// the kernel backends and shows the hint "unit_outdated" on the awg_backend doctor check.
-	capUnit3 = "unit/3"
-
 	egressWarp = "warp"
 	// errWarpNotConfigured is InboundResult.error of an inbound whose egress is WARP on a node without a WARP
 	// configuration: it is not started, there is never a silent direct exit (agent.proto "AWG AND WARP").
@@ -81,6 +50,8 @@ type WarpManager interface {
 	Run(ctx context.Context)
 	// Cleanup removes everything the manager installed on the host.
 	Cleanup(ctx context.Context) error
+	// Reach fetches the sites through the tunnel and says which show a block page (agent.proto "WARP REACH").
+	Reach(ctx context.Context, domains []string) (warp.ReachReport, error)
 }
 
 // SettingsAware is implemented by an engine whose configuration comes from NodeSettings (awg: the backend). The worker
@@ -139,54 +110,92 @@ func (a *Agent) reconnectWarp(ctx context.Context) *pb.CommandResult {
 
 // capabilities is the Hello.capabilities list of this build.
 func (a *Agent) capabilities() []string {
-	caps := []string{capDoctor, capBandwidth, capClientIPv6, capWSLink, capTCPCheck, capDecoy, capLinkCounts, capLinks2, capJournal}
-	if _, ok := a.engines[awg.Protocol]; ok {
-		caps = append(caps, capAWG)
-	}
-	if _, ok := a.engines["vless"]; ok {
-		caps = append(caps, capVLESS)
-		if a.cfg.Certs != nil { // the site needs the certificate source
-			caps = append(caps, capVLESSSelf, capVLESSTLS)
+	caps := []string{agentcap.Doctor, agentcap.Bandwidth, agentcap.ClientIPv6, agentcap.WSLink, agentcap.TCPCheck, agentcap.Decoy, agentcap.Links, agentcap.Links2, agentcap.Links3, agentcap.Journal, agentcap.Probe, agentcap.SNIScan, agentcap.Speed, agentcap.SpeedChannel, agentcap.Debug}
+	if a.canOSUpdate() {
+		caps = append(caps, agentcap.OSStatus)
+		if a.cfg.OSUpdate != nil {
+			caps = append(caps, agentcap.OSUpdate)
 		}
 	}
+	if !a.linkOnly() {
+		caps = append(caps, agentcap.Nets)
+	}
+	if kernelDebugSupported() {
+		caps = append(caps, agentcap.Debug2)
+	}
+	if _, ok := a.engines[awg.Protocol]; ok {
+		caps = append(caps, agentcap.AWG, agentcap.AWGFallback)
+	}
+	if _, ok := a.engines["vless"]; ok {
+		caps = append(caps, agentcap.VLESS, agentcap.VLESSUnknownKeys, agentcap.VLESSHelloKex, agentcap.VLESSTarget)
+		if a.cfg.Certs != nil { // the site needs the certificate source
+			caps = append(caps, agentcap.VLESSSelf, agentcap.VLESSTLS)
+		}
+	}
+	if _, ok := a.engines["trusttunnel"]; ok {
+		caps = append(caps, agentcap.TrustTunnel, agentcap.TrustTunnelH3, agentcap.TrustTunnelRefusals, agentcap.TrustTunnelTCPStalls)
+	}
+	if a.sharesTCP() {
+		caps = append(caps, agentcap.TCPShare)
+	}
 	if a.appliesUserRateLimit() {
-		caps = append(caps, capUserRateLimit)
+		caps = append(caps, agentcap.UserRateLimit)
 	}
 	if a.cfg.Warp != nil {
-		caps = append(caps, capWarp)
+		caps = append(caps, agentcap.Warp, agentcap.WarpReach)
 	}
 	if rh, ok := a.host.(hostctl.RelayHost); ok && rh.RelaySupported() {
-		caps = append(caps, plugin.CapRelayForward)
+		caps = append(caps, agentcap.RelayForward)
+	}
+	if a.bridgeEntry != nil {
+		caps = append(caps, agentcap.RelayReverse)
 	}
 	if hostctl.TorrentGuardSupported() {
-		caps = append(caps, capTorrentGuard)
+		caps = append(caps, agentcap.TorrentGuard)
 	}
 	if _, ok := a.host.(hostctl.UDPCounter); ok {
-		caps = append(caps, capUDPCheck)
+		caps = append(caps, agentcap.UDPCheck)
 	}
 	if a.country.canProbe() {
-		caps = append(caps, capCountryProbe)
+		caps = append(caps, agentcap.CountryProbe)
+	}
+	if a.ownedIPv6Host() != nil {
+		caps = append(caps, agentcap.IPv6Addr)
 	}
 	if a.cfg.UnitGen >= 3 {
-		caps = append(caps, capUnit3)
+		caps = append(caps, agentcap.Unit3)
 	}
 	if a.cfg.UnitRefreshLauncher != nil {
-		caps = append(caps, unit.CapabilityRefresh)
+		caps = append(caps, agentcap.UnitRefresh)
 	}
 	if a.cfg.AwgPrepare != nil && a.engines[awg.Protocol] != nil {
-		caps = append(caps, capAwgPrepare)
+		caps = append(caps, agentcap.AWGPrepare)
 	}
 	updateCaps := a.upd.Capabilities()
 	if a.linkOnly() {
-		if slices.Contains(updateCaps, update.CapUpdate) {
-			caps = append(caps, capUpdateLink)
-			if slices.Contains(updateCaps, update.CapGuard) {
-				caps = append(caps, update.CapGuard)
+		if slices.Contains(updateCaps, agentcap.Update) {
+			caps = append(caps, agentcap.UpdateLink)
+			if slices.Contains(updateCaps, agentcap.UpdateTimeout) {
+				caps = append(caps, agentcap.UpdateTimeout)
+			}
+			if slices.Contains(updateCaps, agentcap.UpdateGuard) {
+				caps = append(caps, agentcap.UpdateGuard)
 			}
 		}
 		return caps
 	}
 	return append(caps, updateCaps...)
+}
+
+// sharesTCP: the four engines that hold a TCP port or give up its site (VLESS, TrustTunnel, MTProto and Hysteria2) are all
+// built in, so a port the panel puts two of them on is one this agent can share.
+func (a *Agent) sharesTCP() bool {
+	for _, p := range []string{"vless", "trusttunnel", "mtproto", "hysteria2"} {
+		if _, ok := a.engines[p]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // appliesUserRateLimit: some engine shares a bucket per person and none that shapes per credential cannot (an engine that
@@ -228,7 +237,7 @@ func (a *Agent) syncWarp(ctx context.Context, next *model) {
 	if a.cfg.Warp == nil {
 		if next.warp != nil && !a.warpNoted {
 			a.warpNoted = true
-			a.log.Warn("the panel sent a WARP configuration, this build has no WARP manager")
+			a.log.Warn("the panel sent a WARP configuration, this build has no WARP manager", "code", "warp_manager_unavailable")
 		}
 		return
 	}
@@ -238,7 +247,7 @@ func (a *Agent) syncWarp(ctx context.Context, next *model) {
 		a.warpErr = ""
 	case a.warpErr != shortMsg(err):
 		a.warpErr = shortMsg(err)
-		a.log.Error("warp configuration not applied", "err", err)
+		a.log.Error("warp configuration not applied", "code", "warp_apply_failed", "err", err)
 		a.event(pb.Severity_SEVERITY_ERROR, "warp_needs_attention", "", map[string]string{"reason": "apply_failed", "error": a.warpErr})
 	}
 }
@@ -265,6 +274,54 @@ func tunnelOf(spec plugin.InboundSpec) (hostctl.Tunnel, error) {
 		out.Subnet6, out.Addr6 = t.AddrV6.Masked(), t.AddrV6.Addr()
 	}
 	return out, hostctl.ValidateTunnel(out)
+}
+
+// tunnelPublishedPorts returns the enabled inbound listeners that a tunnel client may reach on the host's other
+// addresses. TCP 443 is added by hostctl; SSH and the node's own AWG UDP ports stay behind the terminal drop.
+func tunnelPublishedPorts(next *model, sshPorts []uint16) []hostctl.PublishedPort {
+	ssh := map[uint16]bool{22: true} // the host falls back to 22 if sshd detection has no answer
+	for _, port := range sshPorts {
+		if port != 0 {
+			ssh[port] = true
+		}
+	}
+	awgUDP := map[uint16]bool{}
+	for _, id := range next.ids() {
+		spec := next.inbounds[id].spec
+		if spec.Enabled && spec.Protocol == awg.Protocol && spec.Listen.Network == "udp" && spec.Listen.Port != 0 {
+			awgUDP[spec.Listen.Port] = true
+		}
+	}
+	seen := map[hostctl.PublishedPort]bool{}
+	for _, id := range next.ids() {
+		spec := next.inbounds[id].spec
+		listen := spec.Listen
+		if !spec.Enabled || listen.Port == 0 || (listen.Network != "tcp" && listen.Network != "udp") {
+			continue
+		}
+		if listen.Network == "tcp" && ssh[listen.Port] || listen.Network == "udp" && awgUDP[listen.Port] {
+			continue
+		}
+		seen[hostctl.PublishedPort{Network: listen.Network, Port: uint32(listen.Port)}] = true
+		for _, side := range plugin.SideListens(spec) { // TrustTunnel's HTTP/3 socket, when h3 is on
+			if side.Port != 0 && (side.Network == "tcp" || side.Network == "udp") &&
+				!(side.Network == "tcp" && ssh[side.Port]) && !(side.Network == "udp" && awgUDP[side.Port]) {
+				seen[hostctl.PublishedPort{Network: side.Network, Port: uint32(side.Port)}] = true
+			}
+		}
+		// the HTTPS site of Hysteria2 (TCP 443 is also kept unconditionally by hostctl)
+		if port := plugin.Hy2SitePort(spec); port != 0 && !ssh[port] {
+			seen[hostctl.PublishedPort{Network: "tcp", Port: uint32(port)}] = true
+		}
+	}
+	ports := make([]hostctl.PublishedPort, 0, len(seen))
+	for port := range seen {
+		ports = append(ports, port)
+	}
+	slices.SortFunc(ports, func(a, b hostctl.PublishedPort) int {
+		return cmp.Or(strings.Compare(a.Network, b.Network), cmp.Compare(a.Port, b.Port))
+	})
+	return ports
 }
 
 // syncTunnels installs the firewall of the tunnel interfaces and the WARP routes of their client subnets. It runs
@@ -314,7 +371,7 @@ func (a *Agent) syncTunnels(ctx context.Context, next *model) {
 	if a.cfg.Warp != nil && (len(warpSubnets) > 0 || a.warpRouted) {
 		if err := a.cfg.Warp.SetRoutedSubnets(ctx, warpSubnets); err != nil {
 			msg := "warp routing: " + shortMsg(err)
-			a.log.Error("warp routing of the client subnets failed", "err", err)
+			a.log.Error("warp routing of the client subnets failed", "code", "warp_client_routes_failed", "err", err)
 			for id := range warpOf {
 				a.blocked[id] = msg
 			}
@@ -337,9 +394,11 @@ func (a *Agent) syncTunnels(ctx context.Context, next *model) {
 		a.syncTorrentGuard(ctx, next, nil, true)
 		return
 	}
-	if err := th.SetTunnels(ctx, ts); err != nil {
+	if err := th.SetTunnels(ctx, ts, tunnelPublishedPorts(next, a.host.SSHPorts())); err != nil {
 		msg := "tunnel firewall: " + shortMsg(err)
-		a.log.Error("tunnel firewall not installed", "err", err)
+		if a.nftNote(err) != nil { // a missing nft is said once (nft.go), not at every sweep
+			a.log.Error("tunnel firewall not installed", "code", "tunnel_firewall_failed", "err", err)
+		}
 		for _, t := range ts {
 			for _, id := range next.ids() {
 				if hostctl.TunnelIface(next.inbounds[id].spec.Listen.Port) == t.Iface && !next.inbounds[id].spec.Tunnel.IsZero() {
@@ -360,7 +419,7 @@ func (a *Agent) syncTunnels(ctx context.Context, next *model) {
 			previous := a.tunV6
 			a.tunV6 = mode
 			if mode != "" {
-				a.log.Warn("the kernel refused nft reject: IPv6 from the tunnels is not rejected", "fallback", mode)
+				a.log.Warn("the kernel refused nft reject: IPv6 from the tunnels is not rejected", "code", "tunnel_v6_reject_unsupported", "fallback", mode)
 				a.event(pb.Severity_SEVERITY_WARNING, "tunnel_v6_fallback", "", map[string]string{"mode": mode})
 			} else if previous != "" && tunnelRejectRequested(ts) {
 				a.event(pb.Severity_SEVERITY_INFO, "tunnel_v6_recovered", "", nil)
@@ -386,7 +445,7 @@ func tunnelRejectRequested(ts []hostctl.Tunnel) bool {
 func (a *Agent) blockedFail(ctx context.Context, spec plugin.InboundSpec, why string) error {
 	if e := a.engines[spec.Protocol]; e != nil {
 		if err := e.Remove(ctx, spec.ID); err != nil {
-			a.log.Warn("remove blocked inbound", "inbound", spec.ID, "err", err)
+			a.log.Warn("remove blocked inbound", "code", "blocked_inbound_remove_failed", "inbound", spec.ID, "err", err)
 		}
 	}
 	return errors.New(why)
@@ -443,6 +502,25 @@ func (a *Agent) l3Health(ctx context.Context, b *pb.StatsBatch, off time.Duratio
 			b.Warp = warpHealthToPB(h, off)
 		}
 	}
+}
+
+// AwgPeers counts the AmneziaWG devices of the enabled awg inbounds: the userspace fallback's memory ceiling asks for it
+// when it builds the engine (awg.Options.Peers).
+func (a *Agent) AwgPeers() int {
+	m := a.snapshotModel()
+	n := 0
+	for _, id := range m.ids() {
+		if in := m.inbounds[id]; in.spec.Protocol == awg.Protocol && in.spec.Enabled {
+			n += len(in.creds)
+		}
+	}
+	return n
+}
+
+// AwgModuleReprober is what the awg engine offers the doctor fix awg_module_repair (cmd/mistgate-node's wrapper does):
+// when the engine runs on the userspace fallback and the kernel backend is usable now, drop the engine and say so.
+type AwgModuleReprober interface {
+	ReprobeKernel(ctx context.Context) (moved bool, err error)
 }
 
 // backendStatuser is what an awg engine offers the doctor (awg.Engine and the lazy wrapper of cmd/mistgate-node do).

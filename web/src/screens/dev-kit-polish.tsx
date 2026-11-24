@@ -1,32 +1,27 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useState, type ReactNode } from "react";
-import { createPortal } from "react-dom";
 import { AddNodeProvider } from "@/components/add-node";
-import { DangerZone, SectionLabel } from "@/components/ui/bits";
-import { Button } from "@/components/ui/button";
+import { SectionLabel } from "@/components/ui/bits";
 import { Pending, QueryError } from "@/components/ui/query-error";
 import { Role } from "@/gen/mistgate/admin/v1/auth_pb";
 import { App } from "@/gen/mistgate/admin/v1/common_pb";
 import { UserStatus } from "@/gen/mistgate/admin/v1/user_pb";
 import { ApprovalState, TokenChannel, TokenProfile } from "@/gen/mistgate/admin/v1/integrations_pb";
 import { BundleStatus, NodeUpdateState } from "@/gen/mistgate/admin/v1/update_pb";
-import { useT } from "@/i18n";
 import { approvalsQuery, tokensQuery } from "@/lib/integrations";
 import { meQuery } from "@/lib/session";
 import { IntegrationsScreen } from "@/screens/integrations";
-import { TokensCard } from "@/screens/integrations/tokens";
 import { NodesScreen } from "@/screens/nodes";
 import { AuditPage } from "@/screens/settings-pages/audit";
 import { passkeysQuery, SecurityPage } from "@/screens/settings-pages/security";
 import { SessionsPage } from "@/screens/settings-pages/sessions";
+import { SxRoot } from "@/screens/settings-pages/sx-bits";
 import { StaleToastView } from "@/components/stale-toast";
-import { UpdateToast } from "@/components/update-toast";
+import { UpdateCard } from "@/components/update-card";
 import { updatesQuery } from "@/lib/updates";
 import { UpdatesScreen } from "@/screens/updates";
-import { GroupForm } from "@/screens/users/groups";
 import { UsersScreen } from "@/screens/users/list";
 import { groupsQuery } from "@/screens/users/rpc";
-import { SettingRow } from "@/screens/users/ui";
 
 // Development only (the /dev-kit page): the shared states (loading, errors, empty lists) as every screen shows them, on private query caches.
 // A query that is not filled goes to a panel that is not there, so it fails: that is the load-error state.
@@ -108,44 +103,19 @@ const approvals = {
   ],
 };
 
-/** The user card's and the profile's danger zones, with their own rows and buttons (the screens need a route to render whole). */
-function DangerZones() {
-  const t = useT();
-  return (
-    <div className="grid items-start gap-3.5 md:grid-cols-2">
-      <DangerZone title={t("users.danger")}>
-        <SettingRow label={t("users.resetTrafficT")} hint={t("users.resetTrafficHint")}>
-          <Button variant="secondary">{t("users.resetTraffic")}</Button>
-        </SettingRow>
-        <SettingRow label={t("users.deleteT")} hint={t("users.deleteHint")}>
-          <Button variant="danger">{t("users.delete")}</Button>
-        </SettingRow>
-      </DangerZone>
-      <DangerZone title={t("profiles.danger")}>
-        <div className="flex items-center gap-3">
-          <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-            <span className="text-[13px] font-bold">{t("profiles.delete")}</span>
-            <span className="text-[11px] leading-snug text-muted">{t("profiles.deleteHint")}</span>
-          </div>
-          <Button variant="danger">{t("users.delete")}</Button>
-        </div>
-      </DangerZone>
-    </div>
-  );
-}
-
 // The people list on mock rows: who is online, what each used (link, keys, both, nothing), four groups with their chips.
 const listGroups = [
-  { id: "grp_7kq2m4xw3vbf", name: "SIMG", profileIds: [], userCount: 3, dnsPresetId: "", happNodes: 2, amneziaNodes: 1, color: "lavender" },
-  { id: "grp_c3ndr5e2p6ha", name: "family", profileIds: [], userCount: 2, dnsPresetId: "", happNodes: 2, amneziaNodes: 0, color: "sand" },
-  { id: "grp_x9tf4gjn2k7f", name: "friends", profileIds: [], userCount: 2, dnsPresetId: "", happNodes: 2, amneziaNodes: 1, color: "sage" },
-  { id: "grp_q5w8zr6y3m2e", name: "my", profileIds: [], userCount: 1, dnsPresetId: "", happNodes: 2, amneziaNodes: 1, color: "rose" },
+  { id: "grp_7kq2m4xw3vbf", name: "SIMG", profileIds: [], userCount: 3, extraUserCount: 0, dnsPresetId: "", happNodes: 2, amneziaNodes: 1, color: "lavender" },
+  { id: "grp_c3ndr5e2p6ha", name: "family", profileIds: [], userCount: 2, extraUserCount: 0, dnsPresetId: "", happNodes: 2, amneziaNodes: 0, color: "sand" },
+  { id: "grp_x9tf4gjn2k7f", name: "friends", profileIds: [], userCount: 2, extraUserCount: 0, dnsPresetId: "", happNodes: 2, amneziaNodes: 1, color: "sage" },
+  { id: "grp_q5w8zr6y3m2e", name: "my", profileIds: [], userCount: 1, extraUserCount: 0, dnsPresetId: "", happNodes: 2, amneziaNodes: 1, color: "rose" },
 ];
 const listUser = (id: string, name: string, group: number, over: object) => ({
   id: `usr_${id}`,
   name,
   groupId: listGroups[group]!.id,
   groupName: listGroups[group]!.name,
+  extraGroupIds: [], extraGroupNames: [], extraGroupColors: [],
   groupColor: listGroups[group]!.color,
   status: UserStatus.ACTIVE,
   devicesUsed: 2,
@@ -186,37 +156,25 @@ export function PolishKit() {
       >
         <UsersScreen />
       </Shot>
-      <Shot id="users-group-color" title="Group editor: the colour swatches (a radio group of 44px targets)" seed={[[groupsQuery.queryKey, listGroups]]}>
-        <div className="max-w-md rounded-card-lg border border-line bg-surface px-4">
-          <GroupForm group={listGroups[1] as never} first={false} dns={false} profiles={[]} onCancel={() => {}} onCreated={() => {}} />
-        </div>
-      </Shot>
       <Shot id="polish-int" title="Integrations: one card header, history in sand, “Новый токен”" seed={[owner, [tokensQuery.queryKey, tokens], [approvalsQuery.queryKey, approvals]]}>
         <IntegrationsScreen />
       </Shot>
-      <Shot id="polish-int-empty" title="Tokens: none yet, one action" seed={[[tokensQuery.queryKey, { nowUnix: now, tokens: [] }]]}>
-        <TokensCard />
-      </Shot>
-      <Shot id="polish-int-error" title="Tokens: the load failed (compact, inside the card)">
-        <TokensCard />
-      </Shot>
-      <Shot id="polish-danger" title="Danger zone: the user and the profile (the node's is in “Node settings” above)">
-        <DangerZones />
-      </Shot>
       <Shot id="polish-settings-errors" title="Security (the Cloudflare card keeps its place), Sessions and Audit: the load failed" seed={[owner, [passkeysQuery.queryKey, { passkeys: [{ id: "pk1", name: "iPhone", createdAtUnix: now - 86400 * 40, lastUsedAtUnix: now - 3600, backedUp: true }] }]]}>
-        <SecurityPage />
-        <SessionsPage />
-        <AuditPage />
+        <SxRoot>
+          <SecurityPage />
+          <SessionsPage />
+          <AuditPage />
+        </SxRoot>
       </Shot>
       <Shot id="polish-pages-errors" title="Nodes and Updates: the load failed (a screen of its own)">
         <NodesScreen />
         <UpdatesScreen />
       </Shot>
-      {/* fixed in the corner of the window, so it only appears when asked for: /dev-kit?update-toast (its collapsed and closed states live in localStorage) */}
+      {/* the card at the foot of the menu: /dev-kit?update-toast, or =nodes for the nodes behind the bundle (the shell scene shows it in place) */}
       {new URLSearchParams(location.search).has("update-toast") && (
         <Shot
           id="polish-update-toast"
-          title="Update notice: a newer panel release, or with =nodes the nodes behind the bundle (fixed in the corner)"
+          title="Update card of the menu: a newer panel release, or with =nodes the nodes behind the bundle"
           seed={[
             owner,
             [
@@ -230,11 +188,12 @@ export function PolishKit() {
             ],
           ]}
         >
-          {/* the kit page centres its column with a transform, which would turn "fixed" into "inside the column" */}
-          {createPortal(<UpdateToast />, document.body)}
+          <div className="w-[264px]">
+            <UpdateCard />
+          </div>
         </Shot>
       )}
-      <Shot id="polish-stale-toast" title="Stale tab: the panel was updated under an open admin (in the corner of every page like the update notice, here in place; the profile form swaps Save for Reload)">
+      <Shot id="polish-stale-toast" title="Stale tab: the panel was updated under an open admin (in the corner of every page, here in place; the profile form swaps Save for Reload)">
         <div className="flex justify-end">
           <StaleToastView version="0.1.36" />
         </div>

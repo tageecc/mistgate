@@ -36,6 +36,24 @@ const (
 	// UpdateServiceGetUpdatesProcedure is the fully-qualified name of the UpdateService's GetUpdates
 	// RPC.
 	UpdateServiceGetUpdatesProcedure = "/mistgate.admin.v1.UpdateService/GetUpdates"
+	// UpdateServiceGetOsUpdatesProcedure is the fully-qualified name of the UpdateService's
+	// GetOsUpdates RPC.
+	UpdateServiceGetOsUpdatesProcedure = "/mistgate.admin.v1.UpdateService/GetOsUpdates"
+	// UpdateServiceStartOsRolloutProcedure is the fully-qualified name of the UpdateService's
+	// StartOsRollout RPC.
+	UpdateServiceStartOsRolloutProcedure = "/mistgate.admin.v1.UpdateService/StartOsRollout"
+	// UpdateServiceCancelOsRolloutProcedure is the fully-qualified name of the UpdateService's
+	// CancelOsRollout RPC.
+	UpdateServiceCancelOsRolloutProcedure = "/mistgate.admin.v1.UpdateService/CancelOsRollout"
+	// UpdateServicePauseOsRolloutProcedure is the fully-qualified name of the UpdateService's
+	// PauseOsRollout RPC.
+	UpdateServicePauseOsRolloutProcedure = "/mistgate.admin.v1.UpdateService/PauseOsRollout"
+	// UpdateServiceResumeOsRolloutProcedure is the fully-qualified name of the UpdateService's
+	// ResumeOsRollout RPC.
+	UpdateServiceResumeOsRolloutProcedure = "/mistgate.admin.v1.UpdateService/ResumeOsRollout"
+	// UpdateServiceRefreshOsUpdatesProcedure is the fully-qualified name of the UpdateService's
+	// RefreshOsUpdates RPC.
+	UpdateServiceRefreshOsUpdatesProcedure = "/mistgate.admin.v1.UpdateService/RefreshOsUpdates"
 	// UpdateServiceCheckPanelUpdateProcedure is the fully-qualified name of the UpdateService's
 	// CheckPanelUpdate RPC.
 	UpdateServiceCheckPanelUpdateProcedure = "/mistgate.admin.v1.UpdateService/CheckPanelUpdate"
@@ -69,6 +87,15 @@ const (
 	// UpdateServiceSetUpdateTimezoneProcedure is the fully-qualified name of the UpdateService's
 	// SetUpdateTimezone RPC.
 	UpdateServiceSetUpdateTimezoneProcedure = "/mistgate.admin.v1.UpdateService/SetUpdateTimezone"
+	// UpdateServiceSetUpdateChannelProcedure is the fully-qualified name of the UpdateService's
+	// SetUpdateChannel RPC.
+	UpdateServiceSetUpdateChannelProcedure = "/mistgate.admin.v1.UpdateService/SetUpdateChannel"
+	// UpdateServiceSetUpdateDownloadTimeoutProcedure is the fully-qualified name of the UpdateService's
+	// SetUpdateDownloadTimeout RPC.
+	UpdateServiceSetUpdateDownloadTimeoutProcedure = "/mistgate.admin.v1.UpdateService/SetUpdateDownloadTimeout"
+	// UpdateServiceSetUpdateDownloadSourcesProcedure is the fully-qualified name of the UpdateService's
+	// SetUpdateDownloadSources RPC.
+	UpdateServiceSetUpdateDownloadSourcesProcedure = "/mistgate.admin.v1.UpdateService/SetUpdateDownloadSources"
 )
 
 // UpdateServiceClient is a client for the mistgate.admin.v1.UpdateService service.
@@ -76,6 +103,22 @@ type UpdateServiceClient interface {
 	// The whole page in one call: this panel, the bundle, every node and the active or last rollout. Never
 	// contacts a node and never rescans the bundle directory (RescanBundle does).
 	GetUpdates(context.Context, *connect.Request[v1.GetUpdatesRequest]) (*connect.Response[v1.GetUpdatesResponse], error)
+	// Stored snapshots only: does not contact nodes, run apt, or refresh package lists.
+	GetOsUpdates(context.Context, *connect.Request[v1.GetOsUpdatesRequest]) (*connect.Response[v1.GetOsUpdatesResponse], error)
+	// Start an OS update of 1..20 nodes (agent.proto "OS UPDATES"). The canary runs first, then batches wait for the
+	// previous batch's health gate. Owner-only with a fresh step-up. Only one rollout of any kind is active at a time.
+	// Audited.
+	StartOsRollout(context.Context, *connect.Request[v1.StartOsRolloutRequest]) (*connect.Response[v1.StartOsRolloutResponse], error)
+	// Stop a running, queued, paused, or failed OS rollout. A job already running on a node is never interrupted and is still
+	// checked; nothing new starts. Owner-only with a fresh step-up.
+	CancelOsRollout(context.Context, *connect.Request[v1.CancelOsRolloutRequest]) (*connect.Response[v1.CancelOsRolloutResponse], error)
+	// Pause future OS jobs. A job already running on a node is never interrupted and is still checked.
+	PauseOsRollout(context.Context, *connect.Request[v1.PauseOsRolloutRequest]) (*connect.Response[v1.PauseOsRolloutResponse], error)
+	// Resume an OS rollout. A failed step is retried once by default; skip_failed marks it skipped and moves on.
+	ResumeOsRollout(context.Context, *connect.Request[v1.ResumeOsRolloutRequest]) (*connect.Response[v1.ResumeOsRolloutResponse], error)
+	// Refresh the package lists of nodes (apt-get update only; nothing is installed or rebooted). At most 3 nodes at a time
+	// and once per node per 30 minutes; the answer says which were started. Owner-only, no step-up.
+	RefreshOsUpdates(context.Context, *connect.Request[v1.RefreshOsUpdatesRequest]) (*connect.Response[v1.RefreshOsUpdatesResponse], error)
 	// Force a fresh lookup of the latest stable GitHub release. The background checker also polls periodically.
 	CheckPanelUpdate(context.Context, *connect.Request[v1.CheckPanelUpdateRequest]) (*connect.Response[v1.CheckPanelUpdateResponse], error)
 	// Install the latest signed panel release through the root helper (a transient systemd unit or the fixed
@@ -105,6 +148,12 @@ type UpdateServiceClient interface {
 	CancelNodeUpdateSchedule(context.Context, *connect.Request[v1.CancelNodeUpdateScheduleRequest]) (*connect.Response[v1.CancelNodeUpdateScheduleResponse], error)
 	// Change the fixed UTC offset used to enter new scheduled updates. Existing schedules keep their original offset.
 	SetUpdateTimezone(context.Context, *connect.Request[v1.SetUpdateTimezoneRequest]) (*connect.Response[v1.SetUpdateTimezoneResponse], error)
+	// Change the release channel this panel follows. Owner-only with a fresh step-up; never available to API tokens.
+	SetUpdateChannel(context.Context, *connect.Request[v1.SetUpdateChannelRequest]) (*connect.Response[v1.SetUpdateChannelResponse], error)
+	// Change the maximum time an agent may spend downloading one update binary. Owner-only with a fresh step-up.
+	SetUpdateDownloadTimeout(context.Context, *connect.Request[v1.SetUpdateDownloadTimeoutRequest]) (*connect.Response[v1.SetUpdateDownloadTimeoutResponse], error)
+	// Select optional node-update download sources. The panel always remains first. Owner-only with a fresh step-up.
+	SetUpdateDownloadSources(context.Context, *connect.Request[v1.SetUpdateDownloadSourcesRequest]) (*connect.Response[v1.SetUpdateDownloadSourcesResponse], error)
 }
 
 // NewUpdateServiceClient constructs a client for the mistgate.admin.v1.UpdateService service. By
@@ -122,6 +171,42 @@ func NewUpdateServiceClient(httpClient connect.HTTPClient, baseURL string, opts 
 			httpClient,
 			baseURL+UpdateServiceGetUpdatesProcedure,
 			connect.WithSchema(updateServiceMethods.ByName("GetUpdates")),
+			connect.WithClientOptions(opts...),
+		),
+		getOsUpdates: connect.NewClient[v1.GetOsUpdatesRequest, v1.GetOsUpdatesResponse](
+			httpClient,
+			baseURL+UpdateServiceGetOsUpdatesProcedure,
+			connect.WithSchema(updateServiceMethods.ByName("GetOsUpdates")),
+			connect.WithClientOptions(opts...),
+		),
+		startOsRollout: connect.NewClient[v1.StartOsRolloutRequest, v1.StartOsRolloutResponse](
+			httpClient,
+			baseURL+UpdateServiceStartOsRolloutProcedure,
+			connect.WithSchema(updateServiceMethods.ByName("StartOsRollout")),
+			connect.WithClientOptions(opts...),
+		),
+		cancelOsRollout: connect.NewClient[v1.CancelOsRolloutRequest, v1.CancelOsRolloutResponse](
+			httpClient,
+			baseURL+UpdateServiceCancelOsRolloutProcedure,
+			connect.WithSchema(updateServiceMethods.ByName("CancelOsRollout")),
+			connect.WithClientOptions(opts...),
+		),
+		pauseOsRollout: connect.NewClient[v1.PauseOsRolloutRequest, v1.PauseOsRolloutResponse](
+			httpClient,
+			baseURL+UpdateServicePauseOsRolloutProcedure,
+			connect.WithSchema(updateServiceMethods.ByName("PauseOsRollout")),
+			connect.WithClientOptions(opts...),
+		),
+		resumeOsRollout: connect.NewClient[v1.ResumeOsRolloutRequest, v1.ResumeOsRolloutResponse](
+			httpClient,
+			baseURL+UpdateServiceResumeOsRolloutProcedure,
+			connect.WithSchema(updateServiceMethods.ByName("ResumeOsRollout")),
+			connect.WithClientOptions(opts...),
+		),
+		refreshOsUpdates: connect.NewClient[v1.RefreshOsUpdatesRequest, v1.RefreshOsUpdatesResponse](
+			httpClient,
+			baseURL+UpdateServiceRefreshOsUpdatesProcedure,
+			connect.WithSchema(updateServiceMethods.ByName("RefreshOsUpdates")),
 			connect.WithClientOptions(opts...),
 		),
 		checkPanelUpdate: connect.NewClient[v1.CheckPanelUpdateRequest, v1.CheckPanelUpdateResponse](
@@ -190,12 +275,36 @@ func NewUpdateServiceClient(httpClient connect.HTTPClient, baseURL string, opts 
 			connect.WithSchema(updateServiceMethods.ByName("SetUpdateTimezone")),
 			connect.WithClientOptions(opts...),
 		),
+		setUpdateChannel: connect.NewClient[v1.SetUpdateChannelRequest, v1.SetUpdateChannelResponse](
+			httpClient,
+			baseURL+UpdateServiceSetUpdateChannelProcedure,
+			connect.WithSchema(updateServiceMethods.ByName("SetUpdateChannel")),
+			connect.WithClientOptions(opts...),
+		),
+		setUpdateDownloadTimeout: connect.NewClient[v1.SetUpdateDownloadTimeoutRequest, v1.SetUpdateDownloadTimeoutResponse](
+			httpClient,
+			baseURL+UpdateServiceSetUpdateDownloadTimeoutProcedure,
+			connect.WithSchema(updateServiceMethods.ByName("SetUpdateDownloadTimeout")),
+			connect.WithClientOptions(opts...),
+		),
+		setUpdateDownloadSources: connect.NewClient[v1.SetUpdateDownloadSourcesRequest, v1.SetUpdateDownloadSourcesResponse](
+			httpClient,
+			baseURL+UpdateServiceSetUpdateDownloadSourcesProcedure,
+			connect.WithSchema(updateServiceMethods.ByName("SetUpdateDownloadSources")),
+			connect.WithClientOptions(opts...),
+		),
 	}
 }
 
 // updateServiceClient implements UpdateServiceClient.
 type updateServiceClient struct {
 	getUpdates               *connect.Client[v1.GetUpdatesRequest, v1.GetUpdatesResponse]
+	getOsUpdates             *connect.Client[v1.GetOsUpdatesRequest, v1.GetOsUpdatesResponse]
+	startOsRollout           *connect.Client[v1.StartOsRolloutRequest, v1.StartOsRolloutResponse]
+	cancelOsRollout          *connect.Client[v1.CancelOsRolloutRequest, v1.CancelOsRolloutResponse]
+	pauseOsRollout           *connect.Client[v1.PauseOsRolloutRequest, v1.PauseOsRolloutResponse]
+	resumeOsRollout          *connect.Client[v1.ResumeOsRolloutRequest, v1.ResumeOsRolloutResponse]
+	refreshOsUpdates         *connect.Client[v1.RefreshOsUpdatesRequest, v1.RefreshOsUpdatesResponse]
 	checkPanelUpdate         *connect.Client[v1.CheckPanelUpdateRequest, v1.CheckPanelUpdateResponse]
 	installPanelUpdate       *connect.Client[v1.InstallPanelUpdateRequest, v1.InstallPanelUpdateResponse]
 	startRollout             *connect.Client[v1.StartRolloutRequest, v1.StartRolloutResponse]
@@ -207,11 +316,44 @@ type updateServiceClient struct {
 	scheduleNodeUpdate       *connect.Client[v1.ScheduleNodeUpdateRequest, v1.ScheduleNodeUpdateResponse]
 	cancelNodeUpdateSchedule *connect.Client[v1.CancelNodeUpdateScheduleRequest, v1.CancelNodeUpdateScheduleResponse]
 	setUpdateTimezone        *connect.Client[v1.SetUpdateTimezoneRequest, v1.SetUpdateTimezoneResponse]
+	setUpdateChannel         *connect.Client[v1.SetUpdateChannelRequest, v1.SetUpdateChannelResponse]
+	setUpdateDownloadTimeout *connect.Client[v1.SetUpdateDownloadTimeoutRequest, v1.SetUpdateDownloadTimeoutResponse]
+	setUpdateDownloadSources *connect.Client[v1.SetUpdateDownloadSourcesRequest, v1.SetUpdateDownloadSourcesResponse]
 }
 
 // GetUpdates calls mistgate.admin.v1.UpdateService.GetUpdates.
 func (c *updateServiceClient) GetUpdates(ctx context.Context, req *connect.Request[v1.GetUpdatesRequest]) (*connect.Response[v1.GetUpdatesResponse], error) {
 	return c.getUpdates.CallUnary(ctx, req)
+}
+
+// GetOsUpdates calls mistgate.admin.v1.UpdateService.GetOsUpdates.
+func (c *updateServiceClient) GetOsUpdates(ctx context.Context, req *connect.Request[v1.GetOsUpdatesRequest]) (*connect.Response[v1.GetOsUpdatesResponse], error) {
+	return c.getOsUpdates.CallUnary(ctx, req)
+}
+
+// StartOsRollout calls mistgate.admin.v1.UpdateService.StartOsRollout.
+func (c *updateServiceClient) StartOsRollout(ctx context.Context, req *connect.Request[v1.StartOsRolloutRequest]) (*connect.Response[v1.StartOsRolloutResponse], error) {
+	return c.startOsRollout.CallUnary(ctx, req)
+}
+
+// CancelOsRollout calls mistgate.admin.v1.UpdateService.CancelOsRollout.
+func (c *updateServiceClient) CancelOsRollout(ctx context.Context, req *connect.Request[v1.CancelOsRolloutRequest]) (*connect.Response[v1.CancelOsRolloutResponse], error) {
+	return c.cancelOsRollout.CallUnary(ctx, req)
+}
+
+// PauseOsRollout calls mistgate.admin.v1.UpdateService.PauseOsRollout.
+func (c *updateServiceClient) PauseOsRollout(ctx context.Context, req *connect.Request[v1.PauseOsRolloutRequest]) (*connect.Response[v1.PauseOsRolloutResponse], error) {
+	return c.pauseOsRollout.CallUnary(ctx, req)
+}
+
+// ResumeOsRollout calls mistgate.admin.v1.UpdateService.ResumeOsRollout.
+func (c *updateServiceClient) ResumeOsRollout(ctx context.Context, req *connect.Request[v1.ResumeOsRolloutRequest]) (*connect.Response[v1.ResumeOsRolloutResponse], error) {
+	return c.resumeOsRollout.CallUnary(ctx, req)
+}
+
+// RefreshOsUpdates calls mistgate.admin.v1.UpdateService.RefreshOsUpdates.
+func (c *updateServiceClient) RefreshOsUpdates(ctx context.Context, req *connect.Request[v1.RefreshOsUpdatesRequest]) (*connect.Response[v1.RefreshOsUpdatesResponse], error) {
+	return c.refreshOsUpdates.CallUnary(ctx, req)
 }
 
 // CheckPanelUpdate calls mistgate.admin.v1.UpdateService.CheckPanelUpdate.
@@ -269,11 +411,42 @@ func (c *updateServiceClient) SetUpdateTimezone(ctx context.Context, req *connec
 	return c.setUpdateTimezone.CallUnary(ctx, req)
 }
 
+// SetUpdateChannel calls mistgate.admin.v1.UpdateService.SetUpdateChannel.
+func (c *updateServiceClient) SetUpdateChannel(ctx context.Context, req *connect.Request[v1.SetUpdateChannelRequest]) (*connect.Response[v1.SetUpdateChannelResponse], error) {
+	return c.setUpdateChannel.CallUnary(ctx, req)
+}
+
+// SetUpdateDownloadTimeout calls mistgate.admin.v1.UpdateService.SetUpdateDownloadTimeout.
+func (c *updateServiceClient) SetUpdateDownloadTimeout(ctx context.Context, req *connect.Request[v1.SetUpdateDownloadTimeoutRequest]) (*connect.Response[v1.SetUpdateDownloadTimeoutResponse], error) {
+	return c.setUpdateDownloadTimeout.CallUnary(ctx, req)
+}
+
+// SetUpdateDownloadSources calls mistgate.admin.v1.UpdateService.SetUpdateDownloadSources.
+func (c *updateServiceClient) SetUpdateDownloadSources(ctx context.Context, req *connect.Request[v1.SetUpdateDownloadSourcesRequest]) (*connect.Response[v1.SetUpdateDownloadSourcesResponse], error) {
+	return c.setUpdateDownloadSources.CallUnary(ctx, req)
+}
+
 // UpdateServiceHandler is an implementation of the mistgate.admin.v1.UpdateService service.
 type UpdateServiceHandler interface {
 	// The whole page in one call: this panel, the bundle, every node and the active or last rollout. Never
 	// contacts a node and never rescans the bundle directory (RescanBundle does).
 	GetUpdates(context.Context, *connect.Request[v1.GetUpdatesRequest]) (*connect.Response[v1.GetUpdatesResponse], error)
+	// Stored snapshots only: does not contact nodes, run apt, or refresh package lists.
+	GetOsUpdates(context.Context, *connect.Request[v1.GetOsUpdatesRequest]) (*connect.Response[v1.GetOsUpdatesResponse], error)
+	// Start an OS update of 1..20 nodes (agent.proto "OS UPDATES"). The canary runs first, then batches wait for the
+	// previous batch's health gate. Owner-only with a fresh step-up. Only one rollout of any kind is active at a time.
+	// Audited.
+	StartOsRollout(context.Context, *connect.Request[v1.StartOsRolloutRequest]) (*connect.Response[v1.StartOsRolloutResponse], error)
+	// Stop a running, queued, paused, or failed OS rollout. A job already running on a node is never interrupted and is still
+	// checked; nothing new starts. Owner-only with a fresh step-up.
+	CancelOsRollout(context.Context, *connect.Request[v1.CancelOsRolloutRequest]) (*connect.Response[v1.CancelOsRolloutResponse], error)
+	// Pause future OS jobs. A job already running on a node is never interrupted and is still checked.
+	PauseOsRollout(context.Context, *connect.Request[v1.PauseOsRolloutRequest]) (*connect.Response[v1.PauseOsRolloutResponse], error)
+	// Resume an OS rollout. A failed step is retried once by default; skip_failed marks it skipped and moves on.
+	ResumeOsRollout(context.Context, *connect.Request[v1.ResumeOsRolloutRequest]) (*connect.Response[v1.ResumeOsRolloutResponse], error)
+	// Refresh the package lists of nodes (apt-get update only; nothing is installed or rebooted). At most 3 nodes at a time
+	// and once per node per 30 minutes; the answer says which were started. Owner-only, no step-up.
+	RefreshOsUpdates(context.Context, *connect.Request[v1.RefreshOsUpdatesRequest]) (*connect.Response[v1.RefreshOsUpdatesResponse], error)
 	// Force a fresh lookup of the latest stable GitHub release. The background checker also polls periodically.
 	CheckPanelUpdate(context.Context, *connect.Request[v1.CheckPanelUpdateRequest]) (*connect.Response[v1.CheckPanelUpdateResponse], error)
 	// Install the latest signed panel release through the root helper (a transient systemd unit or the fixed
@@ -303,6 +476,12 @@ type UpdateServiceHandler interface {
 	CancelNodeUpdateSchedule(context.Context, *connect.Request[v1.CancelNodeUpdateScheduleRequest]) (*connect.Response[v1.CancelNodeUpdateScheduleResponse], error)
 	// Change the fixed UTC offset used to enter new scheduled updates. Existing schedules keep their original offset.
 	SetUpdateTimezone(context.Context, *connect.Request[v1.SetUpdateTimezoneRequest]) (*connect.Response[v1.SetUpdateTimezoneResponse], error)
+	// Change the release channel this panel follows. Owner-only with a fresh step-up; never available to API tokens.
+	SetUpdateChannel(context.Context, *connect.Request[v1.SetUpdateChannelRequest]) (*connect.Response[v1.SetUpdateChannelResponse], error)
+	// Change the maximum time an agent may spend downloading one update binary. Owner-only with a fresh step-up.
+	SetUpdateDownloadTimeout(context.Context, *connect.Request[v1.SetUpdateDownloadTimeoutRequest]) (*connect.Response[v1.SetUpdateDownloadTimeoutResponse], error)
+	// Select optional node-update download sources. The panel always remains first. Owner-only with a fresh step-up.
+	SetUpdateDownloadSources(context.Context, *connect.Request[v1.SetUpdateDownloadSourcesRequest]) (*connect.Response[v1.SetUpdateDownloadSourcesResponse], error)
 }
 
 // NewUpdateServiceHandler builds an HTTP handler from the service implementation. It returns the
@@ -316,6 +495,42 @@ func NewUpdateServiceHandler(svc UpdateServiceHandler, opts ...connect.HandlerOp
 		UpdateServiceGetUpdatesProcedure,
 		svc.GetUpdates,
 		connect.WithSchema(updateServiceMethods.ByName("GetUpdates")),
+		connect.WithHandlerOptions(opts...),
+	)
+	updateServiceGetOsUpdatesHandler := connect.NewUnaryHandler(
+		UpdateServiceGetOsUpdatesProcedure,
+		svc.GetOsUpdates,
+		connect.WithSchema(updateServiceMethods.ByName("GetOsUpdates")),
+		connect.WithHandlerOptions(opts...),
+	)
+	updateServiceStartOsRolloutHandler := connect.NewUnaryHandler(
+		UpdateServiceStartOsRolloutProcedure,
+		svc.StartOsRollout,
+		connect.WithSchema(updateServiceMethods.ByName("StartOsRollout")),
+		connect.WithHandlerOptions(opts...),
+	)
+	updateServiceCancelOsRolloutHandler := connect.NewUnaryHandler(
+		UpdateServiceCancelOsRolloutProcedure,
+		svc.CancelOsRollout,
+		connect.WithSchema(updateServiceMethods.ByName("CancelOsRollout")),
+		connect.WithHandlerOptions(opts...),
+	)
+	updateServicePauseOsRolloutHandler := connect.NewUnaryHandler(
+		UpdateServicePauseOsRolloutProcedure,
+		svc.PauseOsRollout,
+		connect.WithSchema(updateServiceMethods.ByName("PauseOsRollout")),
+		connect.WithHandlerOptions(opts...),
+	)
+	updateServiceResumeOsRolloutHandler := connect.NewUnaryHandler(
+		UpdateServiceResumeOsRolloutProcedure,
+		svc.ResumeOsRollout,
+		connect.WithSchema(updateServiceMethods.ByName("ResumeOsRollout")),
+		connect.WithHandlerOptions(opts...),
+	)
+	updateServiceRefreshOsUpdatesHandler := connect.NewUnaryHandler(
+		UpdateServiceRefreshOsUpdatesProcedure,
+		svc.RefreshOsUpdates,
+		connect.WithSchema(updateServiceMethods.ByName("RefreshOsUpdates")),
 		connect.WithHandlerOptions(opts...),
 	)
 	updateServiceCheckPanelUpdateHandler := connect.NewUnaryHandler(
@@ -384,10 +599,40 @@ func NewUpdateServiceHandler(svc UpdateServiceHandler, opts ...connect.HandlerOp
 		connect.WithSchema(updateServiceMethods.ByName("SetUpdateTimezone")),
 		connect.WithHandlerOptions(opts...),
 	)
+	updateServiceSetUpdateChannelHandler := connect.NewUnaryHandler(
+		UpdateServiceSetUpdateChannelProcedure,
+		svc.SetUpdateChannel,
+		connect.WithSchema(updateServiceMethods.ByName("SetUpdateChannel")),
+		connect.WithHandlerOptions(opts...),
+	)
+	updateServiceSetUpdateDownloadTimeoutHandler := connect.NewUnaryHandler(
+		UpdateServiceSetUpdateDownloadTimeoutProcedure,
+		svc.SetUpdateDownloadTimeout,
+		connect.WithSchema(updateServiceMethods.ByName("SetUpdateDownloadTimeout")),
+		connect.WithHandlerOptions(opts...),
+	)
+	updateServiceSetUpdateDownloadSourcesHandler := connect.NewUnaryHandler(
+		UpdateServiceSetUpdateDownloadSourcesProcedure,
+		svc.SetUpdateDownloadSources,
+		connect.WithSchema(updateServiceMethods.ByName("SetUpdateDownloadSources")),
+		connect.WithHandlerOptions(opts...),
+	)
 	return "/mistgate.admin.v1.UpdateService/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case UpdateServiceGetUpdatesProcedure:
 			updateServiceGetUpdatesHandler.ServeHTTP(w, r)
+		case UpdateServiceGetOsUpdatesProcedure:
+			updateServiceGetOsUpdatesHandler.ServeHTTP(w, r)
+		case UpdateServiceStartOsRolloutProcedure:
+			updateServiceStartOsRolloutHandler.ServeHTTP(w, r)
+		case UpdateServiceCancelOsRolloutProcedure:
+			updateServiceCancelOsRolloutHandler.ServeHTTP(w, r)
+		case UpdateServicePauseOsRolloutProcedure:
+			updateServicePauseOsRolloutHandler.ServeHTTP(w, r)
+		case UpdateServiceResumeOsRolloutProcedure:
+			updateServiceResumeOsRolloutHandler.ServeHTTP(w, r)
+		case UpdateServiceRefreshOsUpdatesProcedure:
+			updateServiceRefreshOsUpdatesHandler.ServeHTTP(w, r)
 		case UpdateServiceCheckPanelUpdateProcedure:
 			updateServiceCheckPanelUpdateHandler.ServeHTTP(w, r)
 		case UpdateServiceInstallPanelUpdateProcedure:
@@ -410,6 +655,12 @@ func NewUpdateServiceHandler(svc UpdateServiceHandler, opts ...connect.HandlerOp
 			updateServiceCancelNodeUpdateScheduleHandler.ServeHTTP(w, r)
 		case UpdateServiceSetUpdateTimezoneProcedure:
 			updateServiceSetUpdateTimezoneHandler.ServeHTTP(w, r)
+		case UpdateServiceSetUpdateChannelProcedure:
+			updateServiceSetUpdateChannelHandler.ServeHTTP(w, r)
+		case UpdateServiceSetUpdateDownloadTimeoutProcedure:
+			updateServiceSetUpdateDownloadTimeoutHandler.ServeHTTP(w, r)
+		case UpdateServiceSetUpdateDownloadSourcesProcedure:
+			updateServiceSetUpdateDownloadSourcesHandler.ServeHTTP(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -421,6 +672,30 @@ type UnimplementedUpdateServiceHandler struct{}
 
 func (UnimplementedUpdateServiceHandler) GetUpdates(context.Context, *connect.Request[v1.GetUpdatesRequest]) (*connect.Response[v1.GetUpdatesResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("mistgate.admin.v1.UpdateService.GetUpdates is not implemented"))
+}
+
+func (UnimplementedUpdateServiceHandler) GetOsUpdates(context.Context, *connect.Request[v1.GetOsUpdatesRequest]) (*connect.Response[v1.GetOsUpdatesResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("mistgate.admin.v1.UpdateService.GetOsUpdates is not implemented"))
+}
+
+func (UnimplementedUpdateServiceHandler) StartOsRollout(context.Context, *connect.Request[v1.StartOsRolloutRequest]) (*connect.Response[v1.StartOsRolloutResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("mistgate.admin.v1.UpdateService.StartOsRollout is not implemented"))
+}
+
+func (UnimplementedUpdateServiceHandler) CancelOsRollout(context.Context, *connect.Request[v1.CancelOsRolloutRequest]) (*connect.Response[v1.CancelOsRolloutResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("mistgate.admin.v1.UpdateService.CancelOsRollout is not implemented"))
+}
+
+func (UnimplementedUpdateServiceHandler) PauseOsRollout(context.Context, *connect.Request[v1.PauseOsRolloutRequest]) (*connect.Response[v1.PauseOsRolloutResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("mistgate.admin.v1.UpdateService.PauseOsRollout is not implemented"))
+}
+
+func (UnimplementedUpdateServiceHandler) ResumeOsRollout(context.Context, *connect.Request[v1.ResumeOsRolloutRequest]) (*connect.Response[v1.ResumeOsRolloutResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("mistgate.admin.v1.UpdateService.ResumeOsRollout is not implemented"))
+}
+
+func (UnimplementedUpdateServiceHandler) RefreshOsUpdates(context.Context, *connect.Request[v1.RefreshOsUpdatesRequest]) (*connect.Response[v1.RefreshOsUpdatesResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("mistgate.admin.v1.UpdateService.RefreshOsUpdates is not implemented"))
 }
 
 func (UnimplementedUpdateServiceHandler) CheckPanelUpdate(context.Context, *connect.Request[v1.CheckPanelUpdateRequest]) (*connect.Response[v1.CheckPanelUpdateResponse], error) {
@@ -465,4 +740,16 @@ func (UnimplementedUpdateServiceHandler) CancelNodeUpdateSchedule(context.Contex
 
 func (UnimplementedUpdateServiceHandler) SetUpdateTimezone(context.Context, *connect.Request[v1.SetUpdateTimezoneRequest]) (*connect.Response[v1.SetUpdateTimezoneResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("mistgate.admin.v1.UpdateService.SetUpdateTimezone is not implemented"))
+}
+
+func (UnimplementedUpdateServiceHandler) SetUpdateChannel(context.Context, *connect.Request[v1.SetUpdateChannelRequest]) (*connect.Response[v1.SetUpdateChannelResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("mistgate.admin.v1.UpdateService.SetUpdateChannel is not implemented"))
+}
+
+func (UnimplementedUpdateServiceHandler) SetUpdateDownloadTimeout(context.Context, *connect.Request[v1.SetUpdateDownloadTimeoutRequest]) (*connect.Response[v1.SetUpdateDownloadTimeoutResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("mistgate.admin.v1.UpdateService.SetUpdateDownloadTimeout is not implemented"))
+}
+
+func (UnimplementedUpdateServiceHandler) SetUpdateDownloadSources(context.Context, *connect.Request[v1.SetUpdateDownloadSourcesRequest]) (*connect.Response[v1.SetUpdateDownloadSourcesResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("mistgate.admin.v1.UpdateService.SetUpdateDownloadSources is not implemented"))
 }

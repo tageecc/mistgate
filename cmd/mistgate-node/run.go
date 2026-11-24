@@ -35,7 +35,9 @@ func cmdRun(args []string) int {
 		return 2
 	}
 	*stateDir = absStateDir
-	var lv slog.Level
+	// A LevelVar, so a debug capture (agent.proto "DEBUG CAPTURE") can raise the level for a while and put it back; a
+	// restart starts from the flag again.
+	lv := new(slog.LevelVar)
 	if err := lv.UnmarshalText([]byte(*level)); err != nil {
 		fmt.Fprintln(os.Stderr, "run: bad --log-level:", err)
 		return 2
@@ -47,7 +49,7 @@ func cmdRun(args []string) int {
 	}
 	log := slog.New(h)
 
-	a, err := newAgent(*stateDir, *linkURL, log)
+	a, err := newAgent(*stateDir, *linkURL, log, lv)
 	if errors.Is(err, agent.ErrNotEnrolled) {
 		log.Error(err.Error())
 		return exitNotEnrolled
@@ -104,19 +106,25 @@ func newAwgPrepare(stateDir string) *awgprep.Controller {
 		return nil
 	}
 	status := filepath.Join(stateDir, "awg-prepare.json")
+	env := func(ctx context.Context) awgprep.Env {
+		e := awgprep.ReadEnv(ctx)
+		e.NodePath, e.StateDir = exe, stateDir
+		return e
+	}
 	return awgprep.New(awgprep.Config{
-		StatusPath: status, Env: awgprep.ReadEnv, Ready: awgprep.ModuleReady, Launch: awgprep.SystemdRun(exe, status),
+		StatusPath: status, Env: env, Ready: awgprep.ModuleReady, Launch: awgprep.SystemdRun(exe, status),
 	})
 }
 
 // newAgent wires the agent to the real host and the engines of this build (see wire.go).
-func newAgent(stateDir, linkURL string, log *slog.Logger) (*agent.Agent, error) {
+func newAgent(stateDir, linkURL string, log *slog.Logger, level *slog.LevelVar) (*agent.Agent, error) {
 	hooks := &agentHooks{}
 	cfg, engines, err := wire(stateDir, log, hooks)
 	if err != nil {
 		return nil, err
 	}
 	cfg.Log = log
+	cfg.Level = level
 	cfg.LinkURL = linkURL
 	cfg.Built = buildinfo.BuiltUnix()
 	cfg.Updater = newUpdater(stateDir, log)
@@ -125,11 +133,21 @@ func newAgent(stateDir, linkURL string, log *slog.Logger) (*agent.Agent, error) 
 	cfg.UnitUnderSystemd, cfg.UnitSkipReason = refresh.underSystemd, refresh.reason
 	cfg.UnitRefreshBusy, cfg.UnitRefreshReserve, cfg.UnitRefreshLauncher = refresh.busy, refresh.reserve, refresh.launch
 	cfg.AwgPrepare = newAwgPrepare(stateDir)
+	cfg.AwgKmod = newAwgKmod(stateDir)
+	if cfg.AwgKmod != nil {
+		if exe, err := os.Executable(); err == nil {
+			cfg.AwgKmodRepair = awgprep.KmodSystemdRun(exe, cfg.AwgKmod.StatusPath, awgprep.KmodRepair)
+		}
+	}
+	cfg.SecurityUpdatesLauncher = newSecurityUpdatesLauncher(stateDir)
+	cfg.NftInstallLauncher = newNftInstallLauncher(stateDir)
+	cfg.OSUpdate = newOSUpdate(stateDir, cfg.Updater)
 	a, err := agent.New(cfg, engines, hostctl.New(log))
 	if err != nil {
 		return nil, err
 	}
 	// The engines and the WARP manager were built before the agent existed; from here on they can ask it.
 	hooks.dns, hooks.awgMode, hooks.warpEmit, hooks.noClientV6 = a.DNS, a.AwgBackend, a.WarpEvent, a.ClientIPv6Disabled
+	hooks.awgPeers = a.AwgPeers
 	return a, nil
 }

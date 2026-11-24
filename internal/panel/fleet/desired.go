@@ -9,65 +9,50 @@ import (
 	"fmt"
 	"slices"
 	"sort"
-	"strings"
 	"time"
 
 	agentv1 "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/internal/agentcap"
 	"github.com/mistgate/mistgate/internal/panel/protocols"
 	"github.com/mistgate/mistgate/internal/panel/store"
 	"github.com/mistgate/mistgate/internal/plugin"
 	"github.com/mistgate/mistgate/internal/statehash"
 )
 
-// Hello.capabilities strings of the L3 additions (agent.proto "AWG AND WARP"). The panel puts an awg inbound or a
-// WarpSpec into the desired state of a stream ONLY when the stream listed the string.
-const (
-	capAWG   = "awg/1"
-	capVLESS = "vless/1"
-	// capVLESSSelf: an agent that can serve the node's own site behind REALITY (target "self"). An older vless/1 agent
-	// rejects that target, and self is the default of a new VLESS profile.
-	capVLESSSelf = "vless-self/1"
-	capVLESSTLS  = "vless-tls/1"
-	capWarp      = "warp/1"
-	// capUserRateLimit: the agent shares one bucket per person (Credential.user_rate_limit_bps, agent.proto "SPEED LIMITS").
-	capUserRateLimit = "user-rate-limit/1"
-)
-
 // protocolAWG is the plugin id of AmneziaWG. An inbound that has a Tunnel is an L3 inbound whatever the protocol.
 const protocolAWG = "awg"
+
+// protocolMTProto is the plugin id of the Telegram proxy.
+const protocolMTProto = "mtproto"
 
 // requiredCap is the node capability required before the panel can send this inbound to the agent.
 func requiredCap(s plugin.InboundSpec) string {
 	if s.Protocol == protocolAWG || !s.Tunnel.IsZero() {
-		return capAWG
+		return agentcap.AWG
+	}
+	if s.Protocol == protocolMTProto {
+		return agentcap.MTProto
+	}
+	if s.Protocol == "trusttunnel" {
+		if plugin.TrustTunnelH3(s) {
+			return agentcap.TrustTunnelH3
+		}
+		return agentcap.TrustTunnel
 	}
 	if s.Protocol == "vless" {
-		if vlessTLS(s) {
-			return capVLESSTLS
+		v, _ := plugin.VLESSOf(s)
+		if v.TLS() {
+			return agentcap.VLESSTLS
 		}
-		if vlessTargetSelf(s) {
-			return capVLESSSelf
+		if v.TargetSelf() {
+			return agentcap.VLESSSelf
 		}
-		return capVLESS
+		if s.TLS.ServerName != "" {
+			return agentcap.VLESSTarget // REALITY with another site: only a target set on the node has a name in its TLS block
+		}
+		return agentcap.VLESS
 	}
 	return ""
-}
-
-func vlessTLS(s plugin.InboundSpec) bool {
-	var settings struct {
-		Security string `json:"security"`
-	}
-	return json.Unmarshal(s.Settings, &settings) == nil && settings.Security == "tls"
-}
-
-// vlessTargetSelf: the REALITY target of a VLESS inbound is the node's own site (wire value "self").
-func vlessTargetSelf(s plugin.InboundSpec) bool {
-	var settings struct {
-		Reality struct {
-			Target string `json:"target"`
-		} `json:"reality"`
-	}
-	return json.Unmarshal(s.Settings, &settings) == nil && strings.TrimSpace(settings.Reality.Target) == "self"
 }
 
 // inboundState is one inbound as the node must hold it.
@@ -85,9 +70,16 @@ type nodeState struct {
 	// relays are the ports the node forwards to servers on other nodes, sorted by id; only for an agent that lists
 	// "relay-forward/1", and only switched-on relays whose server is usable (relayForwards).
 	relays []plugin.RelayForward
-	hash   string // statehash.StateRelays of the whole
+	// bridgeServe and bridgeDials are the bridge of the reverse relays (agent.proto "REVERSE RELAY"), only for an agent that lists
+	// "relay-reverse/1": the entry's serve setting (nil = none) and the entries an exit calls (sorted by entry id).
+	bridgeServe *plugin.BridgeServe
+	bridgeDials []plugin.BridgeDial
+	hash        string // statehash.StateBridge of the whole
 	// withheld are the inbounds the agent cannot take (an awg inbound for an agent without "awg/1"); the node page says why.
 	withheld []string
+	// withheldShare is the part of withheld that is held back only because the agent cannot share a TCP port between services (the
+	// rest lack a protocol): the node page tells the admin to update the agent to put them beside the default service.
+	withheldShare []string
 }
 
 // sentDigest is what the panel last sent on a node's stream, as much as the next delta needs.
@@ -98,6 +90,8 @@ type sentDigest struct {
 	Warp     string                 `json:"w,omitempty"`  // hash of the WarpSpec, "" = none
 	WarpOff  bool                   `json:"wo,omitempty"` // a WarpSpec with Enabled=false (RestartWarp's pause)
 	Relays   string                 `json:"rl,omitempty"` // relaysHash of the forwards, "" = none
+	Serve    string                 `json:"bs,omitempty"` // serveHash of the bridge's serve setting, "" = none
+	Dials    string                 `json:"bd,omitempty"` // dialsHash of the entries the node calls, "" = none
 }
 
 type sentInbound struct {
@@ -116,8 +110,9 @@ func (s *nodeState) ids() []string {
 
 // buildState computes the desired state of a node for an agent with these capabilities. A retired node has none. The
 // inbounds and their credentials come from Config.Desired (the access module owns the effective-access rule); the WarpSpec
-// from the WARP module. An awg inbound goes only to an agent that lists "awg/1" and the WarpSpec only to one that lists
-// "warp/1": an old agent would reject the unknown protocol, and the whole state with it.
+// from the WARP module. An awg inbound goes only to an agent that lists "awg/1", an mtproto inbound only to one with the
+// MTProto engine and the WarpSpec only to one that lists "warp/1": an old agent would reject the unknown protocol, and the
+// whole state with it.
 func (f *Fleet) buildState(ctx context.Context, n store.NodeRow, caps []string) (*nodeState, error) {
 	st := &nodeState{in: map[string]*inboundState{}}
 	if n.State != "retired" {
@@ -131,7 +126,7 @@ func (f *Fleet) buildState(ctx context.Context, n store.NodeRow, caps []string) 
 				continue
 			}
 			creds := append([]plugin.UserCred(nil), x.Creds...)
-			if !slices.Contains(caps, capUserRateLimit) {
+			if !slices.Contains(caps, agentcap.UserRateLimit) {
 				for i := range creds {
 					creds[i].RateLimitBps, creds[i].UserRateLimitBps = foldRateLimits(creds[i].RateLimitBps, creds[i].UserRateLimitBps), 0
 				}
@@ -139,20 +134,56 @@ func (f *Fleet) buildState(ctx context.Context, n store.NodeRow, caps []string) 
 			sort.Slice(creds, func(i, j int) bool { return creds[i].CredID < creds[j].CredID })
 			st.in[x.Spec.ID] = &inboundState{spec: x.Spec, specHash: statehash.Spec(x.Spec), creds: creds}
 		}
+		if !slices.Contains(caps, agentcap.TCPShare) {
+			for _, id := range unsharedLosers(st) {
+				delete(st.in, id)
+				st.withheld = append(st.withheld, id)
+				st.withheldShare = append(st.withheldShare, id)
+			}
+		}
 		sort.Strings(st.withheld)
-		if w := f.warpModule(); w != nil && slices.Contains(caps, capWarp) {
+		sort.Strings(st.withheldShare)
+		if w := f.warpModule(); w != nil && slices.Contains(caps, agentcap.Warp) {
 			if st.warp, err = w.Spec(ctx, n.ID); err != nil {
 				return nil, err
 			}
 		}
-		if slices.Contains(caps, plugin.CapRelayForward) {
-			if st.relays, err = f.relayForwards(ctx, n); err != nil {
+		if slices.Contains(caps, agentcap.RelayForward) {
+			if st.relays, err = f.relayForwards(ctx, n, caps); err != nil {
 				return nil, err
 			}
 		}
+		if st.bridgeServe, st.bridgeDials, err = f.bridgeDesired(ctx, n, caps); err != nil {
+			return nil, err
+		}
 	}
-	st.hash = statehash.StateRelays(st.list(), st.warp, st.relays)
+	st.hash = statehash.StateBridge(st.list(), st.warp, st.relays, st.bridgeServe, st.bridgeDials)
 	return st, nil
+}
+
+// unsharedLosers are the inbounds of the ports that services share by SNI (plugin.TCPSharePlan) that an agent which cannot share
+// must not be sent: all but the default route, which then listens alone, as the lowest id did before ports were shared. A port
+// without a default route is not shared by any agent: the old rule holds there.
+func unsharedLosers(st *nodeState) []string {
+	specs := make([]plugin.InboundSpec, 0, len(st.in))
+	for _, id := range st.ids() {
+		specs = append(specs, st.in[id].spec)
+	}
+	var out []string
+	for _, p := range plugin.TCPSharePlan(specs) {
+		if !p.Front() {
+			continue
+		}
+		for _, r := range p.Routes {
+			if r.ID != p.Default {
+				out = append(out, r.ID)
+			}
+		}
+		for id := range p.Shadowed {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 // foldRateLimits is the limit an agent without "user-rate-limit/1" gets: it cannot share a bucket between devices, so it
@@ -280,6 +311,7 @@ func sentDigestFor(s *nodeState, revision uint64) *sentDigest {
 	digest := &sentDigest{
 		Revision: revision, Hash: s.hash, In: make(map[string]sentInbound, len(s.in)),
 		Warp: warpHash(s.warp), WarpOff: s.warp != nil && !s.warp.Enabled, Relays: relaysHash(s.relays),
+		Serve: serveHash(s.bridgeServe), Dials: dialsHash(s.bridgeDials),
 	}
 	for id, inbound := range s.in {
 		sent := sentInbound{Spec: inbound.specHash}
@@ -342,6 +374,7 @@ func (f *Fleet) buildSpec(n store.NodeRow, row store.FleetInboundRow) (plugin.In
 		Node:                  protocols.NodeView{ID: n.ID, Name: n.Name, Address: n.Address, CountryCode: n.CountryCode},
 		PortOverride:          row.PortOverride,
 		TLSServerNameOverride: row.TLSNameOverride,
+		RealityTargetOverride: row.RealityTargetOverride,
 		SpecVersion:           row.SpecVersion,
 		Enabled:               true,
 		InboundID:             row.ID,
@@ -422,7 +455,8 @@ func relaysProto(rs []plugin.RelayForward) *agentv1.RelayForwards {
 func relayProtoAlways(rs []plugin.RelayForward) *agentv1.RelayForwards {
 	out := &agentv1.RelayForwards{Items: make([]*agentv1.RelayForward, 0, len(rs))}
 	for _, r := range rs {
-		out.Items = append(out.Items, &agentv1.RelayForward{RelayId: r.ID, Network: r.Network, Port: uint32(r.Port), ToHost: r.ToHost, ToPort: uint32(r.ToPort)})
+		out.Items = append(out.Items, &agentv1.RelayForward{RelayId: r.ID, Network: r.Network, Port: uint32(r.Port), ToHost: r.ToHost, ToPort: uint32(r.ToPort),
+			Mode: r.Mode, ExitNodeId: r.ExitNodeID})
 	}
 	return out
 }

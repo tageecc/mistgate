@@ -11,6 +11,7 @@ import (
 	"connectrpc.com/connect"
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
 	agentv1 "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/internal/agentcap"
 	"github.com/mistgate/mistgate/internal/panel/store"
 	"github.com/mistgate/mistgate/internal/release"
 )
@@ -48,7 +49,7 @@ func edgeTick(e *env) {
 
 func edgeNode(e *env, name string, inbounds int) string {
 	e.t.Helper()
-	return e.addNode(name, nodeOpts{caps: []string{"doctor/1", capLinkUpdate, capGuard}, built: oldBuilt, inbounds: inbounds})
+	return e.addNode(name, nodeOpts{caps: []string{"doctor/1", agentcap.UpdateLink, agentcap.UpdateGuard}, built: oldBuilt, inbounds: inbounds})
 }
 
 func startEdgeRollout(e *env, batch int, nodeIDs ...string) store.RolloutRow {
@@ -80,7 +81,7 @@ func recordEdgeAnswer(t *testing.T, e *env, nodeID, requestID string, result *ag
 
 func edgeUpgrade(e *env, nodeID string) {
 	e.t.Helper()
-	e.hello(nodeID, "v1.2.3-node", newBuilt, []string{"doctor/1", capLinkUpdate, capGuard}, "")
+	e.hello(nodeID, "v1.2.3-node", newBuilt, []string{"doctor/1", agentcap.UpdateLink, agentcap.UpdateGuard, "update-timeout/1"}, "")
 }
 
 func TestEdgeTickCanaryThenBatchOfTwo(t *testing.T) {
@@ -110,6 +111,26 @@ func TestEdgeTickCanaryThenBatchOfTwo(t *testing.T) {
 	frames = e.fl.updateFrames()
 	if len(frames) != 3 || frames[1].nodeID != ids[1] || frames[2].nodeID != ids[2] {
 		t.Fatalf("frames after canary passed = %+v, want the next batch of two", frames)
+	}
+}
+
+func TestEdgeUpdateTimeoutExtendsCommandDeadline(t *testing.T) {
+	e, _ := newEdgeFixture(t, edgeReleaseTag, fakeReleaseOptions{})
+	id := edgeNode(e, "slow", 0)
+	e.hello(id, "v1.2.3-node", oldBuilt, []string{"doctor/1", agentcap.UpdateLink, agentcap.UpdateGuard, "update-timeout/1"}, "")
+	startEdgeRollout(e, 1, id)
+	edgeTick(e)
+	frame := updateFrameFor(t, e.fl, id)
+	wantWait := e.s.downloadTimeoutOrDefault(e.ctx) + time.Minute
+	if got := frame.deadline; !got.Equal(e.clk.Now().Add(wantWait + e.s.cfg.ReconnectWait)) {
+		t.Fatalf("deadline = %s, want %s", got, e.clk.Now().Add(wantWait+e.s.cfg.ReconnectWait))
+	}
+	// The edge worker must keep the step alive for the same extended wait; the
+	// old fixed AnswerWait would have failed it on the next tick.
+	e.clk.Advance(e.s.cfg.AnswerWait + e.s.cfg.ReconnectWait + time.Second)
+	edgeTick(e)
+	if got := e.step(id).State; got != store.StepSent {
+		t.Fatalf("step after old deadline = %v, want sent", got)
 	}
 }
 
@@ -212,7 +233,7 @@ func TestEdgeTickRollbackUsesRecordedAnswerOrOldBuild(t *testing.T) {
 			if tc.answer {
 				recordEdgeAnswer(t, e, id, step.RequestID, okResult())
 			} else {
-				e.hello(id, "0.1.0-old", oldBuilt, []string{"doctor/1", capLinkUpdate, capGuard}, "")
+				e.hello(id, "0.1.0-old", oldBuilt, []string{"doctor/1", agentcap.UpdateLink, agentcap.UpdateGuard}, "")
 				e.clk.Advance(edgeRollbackTimeout)
 			}
 			edgeTick(e)

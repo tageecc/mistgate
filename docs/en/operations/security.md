@@ -12,7 +12,7 @@ The admin knows three roles. Every request is checked against the role per proce
 | Role | May |
 |---|---|
 | Owner | Everything: nodes (add, install over SSH, retire, logs, saved SSH access), profiles and where they run, DNS presets and which of them a node offers to people, doctor fixes, node and panel updates, WARP, backups, API tokens and approvals, the audit log, security and brand settings. |
-| Helper | Day-to-day work: users (create, change, enable and disable, extend, reset traffic, delete, devices, the subscription link), groups, subscription settings, resetting the DNS a person picked on their page, node settings (except **IPv6 exit**, which is the owner's) and restarting profiles on a node, muting alerts, Check now, running the doctor, accepting doctor warnings. |
+| Helper | Day-to-day work: users (create, change, enable and disable, extend, reset traffic, delete, devices, the subscription link), groups, subscription settings, resetting the DNS a person picked on their page, node settings (except the address and **IPv6 exit**, which are the owner's) and restarting profiles on a node, muting alerts, Check now, running the doctor, accepting doctor warnings. |
 | Read-only | Reads: the overview, nodes, profiles (secrets masked), groups, DNS presets, subscription settings, users, events, alerts, checks, doctor reports, the Updates page. And their own account: passkeys, password, sessions. |
 
 > **Note:** Today the panel has one admin, the owner created at setup: adding a helper or a read-only admin is not possible yet. The roles already matter for [API tokens](../reference/api.md), whose profiles act as these roles.
@@ -51,13 +51,15 @@ A stolen session cookie must not be enough to plant a passkey, remove the owner'
 - changing, revealing or forgetting a node's saved SSH password;
 - registering, importing or deleting a WARP account;
 - saving the backup settings, testing the backup storage, creating a backup now;
-- creating or revoking an API token, approving an agent's change.
+- creating or revoking an API token, approving an agent's change;
+- deleting users.
 
 Signing in counts as a proof, so "sign in, then add a passkey" asks nothing more. Otherwise the admin shows **Confirm it is you**: use the passkey or type an authenticator code. A code for step-up must be newer than the one used to sign in (wait for the next 30-second step). Five wrong proofs lock step-up for 15 minutes. An API token never passes step-up; see [API](../reference/api.md).
 
 ## Sessions
 
-- The session cookie is `__Host-sid`: HTTPS only, not readable by scripts, sent only to the panel itself (SameSite=Strict).
+- The separate plain HTTP listener uses `sid` without Secure; it keeps HttpOnly, SameSite=Strict and Path=/.
+- The HTTPS session cookie is `__Host-sid`: not readable by scripts, sent only to the panel itself (SameSite=Strict).
 - A session ends after 12 hours without activity, and after 30 days at most.
 - **Settings → Sessions** lists the admin's own sessions with the address and browser. **End** ends one (ending another than the current one needs step-up); **End all others** ends the rest (needs step-up).
 - Changing the password, re-binding the app and `mistgate auth reset-login` end other sessions too.
@@ -108,6 +110,15 @@ Everything on the public listener that is not the admin, a subscription or the a
 
 **Settings → Domains** shows the owner the admin address and the base of the subscription links. Both carry a secret part: do not publish them. Behind a reverse proxy, list it with `serve --trusted-proxy` so the panel sees the real client addresses (rate limits, sessions and the audit log depend on them). See [Configuration](../reference/configuration.md) for every flag.
 
+## How nodes reach the panel
+
+A node on a VPS connects over mutual TLS: it trusts only the panel's own CA, whose fingerprint is in the install command, and the panel trusts only the certificates it issued. A node on the link (the edge edition, or `--link-url`) talks over ordinary public TLS instead, which any certificate authority the server trusts can vouch for. Two things keep out a party in the middle that holds such a certificate:
+
+- The enrolment token is not sent. Tokens start with `mg2_`; the agent derives a key from the token and signs its certificate request with it, and the panel checks the signature. Whoever is in the middle learns nothing that would enrol a key of their own.
+- Once both ends have proven their keys, every message of the session is encrypted and authenticated with keys that only the node and the panel can derive. A changed, replayed or reordered message ends the session.
+
+Both need a current agent and a current panel. An older agent with a current panel, or the reverse, works as before without them. One limit remains: a party in the middle can still present itself to a current panel as an older agent and open a plain session in the node's name. It can then read the node's settings, but it cannot change what the node runs.
+
 ## Saved SSH access
 
 A node installed over SSH keeps its SSH login in the panel: the address, the port, the login, the password and the pinned host key. The password is encrypted with the master key. Only the owner sees it, under **SSH access** on the node's **Server** tab. How to use it: "Saved SSH access" in [Install a node over SSH](../getting-started/ssh-install.md).
@@ -132,7 +143,7 @@ Everything the panel knows is in its data directory, `/var/lib/mistgate` by defa
 
 The node agent does not send VPN client IP addresses in session reports, and the panel does not store them in its live session view.
 
-The stored secrets include profile secrets and device keys, the authenticator secrets, the Turnstile secret key, WARP keys, saved SSH passwords and the R2 secret access key of the backups. The users' page passwords are not stored: they are derived from the master key. A new master key therefore changes every page password and makes every stored secret unreadable. Losing the data directory means enrolling every node again (the nodes trust the panel's CA) and giving users new links.
+The stored secrets include profile secrets and device keys, the authenticator secrets, the Turnstile secret key, WARP keys, saved SSH passwords and the R2 secret access key of the backups. The users' page passwords are not stored: they are derived from the master key, the person's link and a small number kept per person (the generation of the password), and the database holds only that number and a flag that the password was removed. A new master key therefore changes every page password and makes every stored secret unreadable. Losing the data directory means enrolling every node again (the nodes trust the panel's CA) and giving users new links.
 
 > **Danger:** A lost `master.key` cannot be replaced by a new one: put it back from a backup. `mistgate serve` and `mistgate setup` refuse to make a new key next to an existing database.
 

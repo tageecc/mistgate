@@ -1,0 +1,612 @@
+syntax = "proto3";
+
+package mistgate.ops.v1;
+
+// The panel's own diagnostics and data lifecycle: its log ring and level, retention of what it stores, an export, and the
+// metrics endpoint's switch. A separate package from mistgate.admin.v1 on purpose: the Cloudflare edition's admin Worker links
+// every admin message, and none of this runs there (the VPS edition mounts the service; the edition without it answers
+// UNIMPLEMENTED "not available on this edition"). The logs, retention, export and metrics procedures are owner-only (admin-profile
+// tokens read panel logs and plan changes through MCP); GetPanelResources and GetFleetLoad are reads of numbers and node names
+// that every signed-in admin and every token may call; the debug capture's rules are with its procedures below. A procedure
+// missing from the role policy is owner-only.
+service OpsService {
+  // The log level now in force, the one the panel started with, and the size of the ring.
+  rpc GetLogSettings(GetLogSettingsRequest) returns (GetLogSettingsResponse);
+  // Changes the level until the next restart; the panel goes back to its configured default (--log-level or MISTGATE_LOG_LEVEL).
+  rpc SetLogLevel(SetLogLevelRequest) returns (SetLogLevelResponse);
+  // The panel's recent log records, newest first, with their text scrubbed (addresses, secret names, key-shaped values) and only
+  // the attribute keys of an allow-list. A read: every record is cleaned on the way out.
+  rpc GetPanelLogs(GetPanelLogsRequest) returns (GetPanelLogsResponse);
+  // How long each pruned table keeps its rows: the owner's values and the defaults.
+  rpc GetRetention(GetRetentionRequest) returns (GetRetentionResponse);
+  // Changes some of them. A value outside its limits is INVALID_ARGUMENT; a field left out stays as it is.
+  rpc SetRetention(SetRetentionRequest) returns (SetRetentionResponse);
+  // Streams newline-delimited JSON of the timeline events, the audit log, the node journal and the panel's logs of a window.
+  // Every row is scrubbed like panel_logs. The stream is a download: the admin UI saves it as a file.
+  rpc ExportData(ExportDataRequest) returns (stream ExportDataResponse);
+  // Whether /metrics is on and whether it has a token. The token itself is never returned here.
+  rpc GetMetricsSettings(GetMetricsSettingsRequest) returns (GetMetricsSettingsResponse);
+  // Turns /metrics on or off and, with rotate_token, makes a new token; the token is in this response once and only its hash is
+  // stored. Turning it on without a token makes one.
+  rpc SetMetricsSettings(SetMetricsSettingsRequest) returns (SetMetricsSettingsResponse);
+  // DEBUG CAPTURE of one node (agent capability "debug/1"). Starts it: the node raises its log level for the chosen sources for up
+  // to 15 minutes, keeps the records in a bounded buffer and ships them, scrubbed, when the time is up. An agent without the
+  // capability is FAILED_PRECONDITION "agent too old"; a node that is offline is FAILED_PRECONDITION "node is offline". Admin
+  // profile tokens start one only through an approved plan (node_debug_capture_plan / _apply); it is audit-logged.
+  rpc StartDebugCapture(StartDebugCaptureRequest) returns (StartDebugCaptureResponse);
+  // Ends a running capture now: the node ships what it holds. A capture that is already over is returned as it is.
+  rpc StopDebugCapture(StopDebugCaptureRequest) returns (StopDebugCaptureResponse);
+  // The captures the panel still holds for a node (24 hours), newest first.
+  rpc ListDebugCaptures(ListDebugCapturesRequest) returns (ListDebugCapturesResponse);
+  // The records of one capture, oldest first, with filters. Every record passes the panel's scrubbers again on the way out.
+  rpc GetDebugCapture(GetDebugCaptureRequest) returns (GetDebugCaptureResponse);
+  // What the panel itself costs: its process (CPU, memory, Go runtime, threads, descriptors), the machine it runs on, its
+  // database and the admin API's load over the last minutes. Numbers only: no address, path or name of a person.
+  rpc GetPanelResources(GetPanelResourcesRequest) returns (GetPanelResourcesResponse);
+  // How loaded each node was over a window of its hourly host load (GetNodeHostHistory's rows), what it runs out of first,
+  // how many more people it can take and what to do about it, with a fleet summary. It never contacts a node.
+  rpc GetFleetLoad(GetFleetLoadRequest) returns (GetFleetLoadResponse);
+  // The per-inbound ASN setting and facts about the panel's currently loaded trusted table and node support.
+  rpc GetNetworkSettings(GetNetworkSettingsRequest) returns (GetNetworkSettingsResponse);
+  // Changes the mode. Turning networks off removes the stored hourly and per-person rows.
+  rpc SetNetworkSettings(SetNetworkSettingsRequest) returns (SetNetworkSettingsResponse);
+  // LOGS FOR SUPPORT: the owner asks one device of the Mistgate app (a device with a key) for its logs. The person sees the request in
+  // the app at its next sync and sends the logs or refuses. At most one request is open per device; it runs out after 72 hours.
+  // NOT_FOUND: no such device with a key. FAILED_PRECONDITION: the device has an open request. Owner-only, closed to tokens, audit-logged.
+  // The panel keeps the logs (and the request) 7 days; GetClientDebug, ExportClientDebug and DeleteClientDebug read, download and delete them.
+  rpc RequestClientDebug(RequestClientDebugRequest) returns (RequestClientDebugResponse);
+  // Withdraws an open request. NOT_FOUND: no such request. FAILED_PRECONDITION: it is not open (answered, refused, withdrawn or run out).
+  rpc CancelClientDebug(CancelClientDebugRequest) returns (CancelClientDebugResponse);
+  // The requests and the bundles people sent on their own, newest first, at most 100: of one person, or of everyone.
+  rpc ListClientDebug(ListClientDebugRequest) returns (ListClientDebugResponse);
+  // The records of one received bundle, oldest first, with filters (GetDebugCapture's shape). The text is what the panel stored when
+  // the bundle came, passed once more through the panel's current secret names; the attributes are the contract's keys. The first read
+  // of a bundle is audit-logged. NOT_FOUND: no such id. FAILED_PRECONDITION: the request holds no logs. Owner-only, closed to tokens.
+  rpc GetClientDebug(GetClientDebugRequest) returns (GetClientDebugResponse);
+  // A bundle as NDJSON (one record per line: seq, ts, lvl, src, msg, kv), the same records GetClientDebug returns. Needs a fresh
+  // sign-in (step-up); every download is audit-logged. Owner-only, closed to tokens.
+  rpc ExportClientDebug(ExportClientDebugRequest) returns (stream ExportClientDebugResponse);
+  // Deletes a request that is closed, or a bundle, with its records. FAILED_PRECONDITION: the request is still open (cancel it).
+  // Audit-logged. Owner-only, closed to tokens.
+  rpc DeleteClientDebug(DeleteClientDebugRequest) returns (DeleteClientDebugResponse);
+}
+
+message GetLogSettingsRequest {}
+
+message GetLogSettingsResponse {
+  // "debug", "info", "warn" or "error".
+  string level = 1;
+  // The level the panel starts with.
+  string default_level = 2;
+  // "text" or "json": the format of the process's own output (the ring is the same either way).
+  string format = 3;
+  // Records held now and the most the ring keeps.
+  uint32 buffered = 4;
+  uint32 capacity = 5;
+}
+
+message SetLogLevelRequest {
+  // "debug", "info", "warn" or "error".
+  string level = 1;
+}
+
+message SetLogLevelResponse {
+  string level = 1;
+}
+
+message GetPanelLogsRequest {
+  // The lowest level: "debug", "info", "warn" or "error". "" means "info".
+  string min_level = 1;
+  // The window, unix seconds; 0 = open on that side.
+  int64 since_unix = 2 [jstype = JS_NUMBER];
+  int64 until_unix = 3 [jstype = JS_NUMBER];
+  // Case-insensitive substring of the message or of an attribute value; at most 100 characters.
+  string query = 4;
+  // The part of the panel that logged ("health", "fleet", "http" ...); "" = all.
+  string component = 5;
+  // An exact error code ("prune_failed" ...); "" = all.
+  string code = 6;
+  // A request id as the admin UI shows it ("abc12345"); "" = all.
+  string request_id = 7;
+  // At most 500; 0 means 100.
+  uint32 limit = 8;
+  // The next_cursor of the previous page ("" = from the newest).
+  int64 before_seq = 9 [jstype = JS_NUMBER];
+}
+
+message PanelLogEntry {
+  int64 seq = 1 [jstype = JS_NUMBER];
+  int64 time_unix_ms = 2 [jstype = JS_NUMBER];
+  // "debug", "info", "warn" or "error".
+  string level = 3;
+  string component = 4;
+  string message = 5;
+  string code = 6;
+  string request_id = 7;
+  // Only the allow-listed keys, values scrubbed.
+  map<string, string> attrs = 8;
+}
+
+message GetPanelLogsResponse {
+  repeated PanelLogEntry entries = 1;
+  // Pass as before_seq for the next page; 0 when there is none.
+  int64 next_cursor = 2 [jstype = JS_NUMBER];
+  // The level in force and the ring, so an empty answer can be read ("the level hides debug").
+  string level = 3;
+  uint32 buffered = 4;
+  uint32 capacity = 5;
+}
+
+// One retention setting.
+message RetentionItem {
+  // journal_days, events_info_days, events_warn_days, audit_days, alerts_days, check_samples_hours, check_daily_days,
+  // host_history_days, traffic_bucket_days, node_traffic_hour_days.
+  string key = 1;
+  uint32 value = 2;
+  uint32 default_value = 3;
+  uint32 min = 4;
+  uint32 max = 5;
+  // "days" or "hours".
+  string unit = 6;
+}
+
+message GetRetentionRequest {}
+
+message GetRetentionResponse {
+  repeated RetentionItem items = 1;
+}
+
+message SetRetentionRequest {
+  // key -> value, only the fields to change.
+  map<string, uint32> values = 1;
+}
+
+message SetRetentionResponse {
+  repeated RetentionItem items = 1;
+}
+
+message ExportDataRequest {
+  // The window, unix seconds, at most 31 days; 0 and 0 mean the last 24 hours.
+  int64 since_unix = 1 [jstype = JS_NUMBER];
+  int64 until_unix = 2 [jstype = JS_NUMBER];
+  // Which sources: "events", "audit", "journal", "logs". Empty = all four.
+  repeated string sources = 3;
+}
+
+message ExportDataResponse {
+  // A piece of the NDJSON, always ending at a line boundary.
+  bytes data = 1;
+}
+
+message GetMetricsSettingsRequest {}
+
+message GetMetricsSettingsResponse {
+  bool enabled = 1;
+  bool has_token = 2;
+}
+
+message SetMetricsSettingsRequest {
+  optional bool enabled = 1;
+  bool rotate_token = 2;
+}
+
+message SetMetricsSettingsResponse {
+  bool enabled = 1;
+  bool has_token = 2;
+  // Set only when a token was made by this call. It is not stored and cannot be read again.
+  string token = 3;
+}
+
+// One capture as the panel holds it.
+message DebugCaptureInfo {
+  string capture_id = 1;
+  string node_id = 2;
+  string node_name = 3;
+  // "running" (the node is capturing), "done" (shipped) or "expired" (the time passed and no report came).
+  string state = 4;
+  // "debug" or "info".
+  string level = 5;
+  repeated string sources = 6;
+  uint32 duration_s = 7;
+  int64 started_unix = 8 [jstype = JS_NUMBER];
+  // When the capture ends on the node.
+  int64 ends_unix = 9 [jstype = JS_NUMBER];
+  // The admin that asked (an id or a token's name).
+  string actor = 10;
+  // Records stored, and records the node or the panel did not keep because a limit was reached.
+  uint32 records = 11;
+  uint32 dropped = 12;
+  // "expired", "stopped" or "shutdown" once done; "" while running.
+  string end_reason = 13;
+}
+
+message StartDebugCaptureRequest {
+  string node_id = 1;
+  // "debug" or "info"; "" means "debug".
+  string level = 2;
+  // Log sources ("agent", "hysteria2", "xray", "awg" ...); empty = all. At most 8, each of 1 to 32 letters, digits, "-" or "_".
+  repeated string sources = 3;
+  // 1 to 900 seconds; 0 means 300.
+  uint32 duration_s = 4;
+}
+
+message StartDebugCaptureResponse {
+  DebugCaptureInfo capture = 1;
+}
+
+message StopDebugCaptureRequest {
+  string capture_id = 1;
+}
+
+message StopDebugCaptureResponse {
+  DebugCaptureInfo capture = 1;
+}
+
+message ListDebugCapturesRequest {
+  // "" = every node.
+  string node_id = 1;
+}
+
+message ListDebugCapturesResponse {
+  repeated DebugCaptureInfo captures = 1;
+}
+
+message GetDebugCaptureRequest {
+  // One of the two: a capture, or a node (its newest capture).
+  string capture_id = 1;
+  string node_id = 2;
+  // The lowest level: "debug" or "info"; "" = everything.
+  string min_level = 3;
+  // One log source; "" = all.
+  string source = 4;
+  // Case-insensitive substring of the cleaned message or an attribute value; at most 100 characters.
+  string query = 5;
+  // At most 500; 0 means 100.
+  uint32 limit = 6;
+  // The next_cursor of the previous page (0 = from the first record).
+  int64 after_seq = 7 [jstype = JS_NUMBER];
+}
+
+message DebugRecord {
+  int64 seq = 1 [jstype = JS_NUMBER];
+  int64 time_unix_ms = 2 [jstype = JS_NUMBER];
+  // "debug", "info", "warn" or "error".
+  string level = 3;
+  string source = 4;
+  string message = 5;
+  // Only the allow-listed keys, values scrubbed.
+  map<string, string> attrs = 6;
+}
+
+message GetDebugCaptureResponse {
+  DebugCaptureInfo capture = 1;
+  repeated DebugRecord records = 2;
+  // Pass as after_seq for the next page; 0 when there is none.
+  int64 next_cursor = 3 [jstype = JS_NUMBER];
+  // The sources that appear in the capture, to fill a filter.
+  repeated string sources = 4;
+}
+
+message GetPanelResourcesRequest {}
+
+// The panel's own process.
+message PanelProcess {
+  // CPU time since the previous read, in percent of the whole machine (all CPUs): 25 on four CPUs is one CPU fully used.
+  float cpu_pct = 1;
+  uint64 rss_bytes = 2 [jstype = JS_NUMBER];
+  // The Go runtime: all memory it mapped from the OS, the part in heap objects, and its goroutines.
+  uint64 go_total_bytes = 3 [jstype = JS_NUMBER];
+  uint64 go_heap_bytes = 4 [jstype = JS_NUMBER];
+  uint32 goroutines = 5;
+  uint32 threads = 6;
+  // Open file descriptors (sockets among them) and the soft limit (0 = not known).
+  uint32 open_fds = 7;
+  uint32 fd_limit = 8;
+  uint64 uptime_s = 9 [jstype = JS_NUMBER];
+}
+
+// The machine the panel runs on. Zeros where it cannot be read (not a Linux host).
+message PanelHost {
+  uint32 cpus = 1;
+  // Since the previous read, in percent of all CPUs: busy (everything but idle and I/O wait; steal included), the part the
+  // hypervisor gave to other guests, and the idle time spent waiting for the disk.
+  float cpu_busy_pct = 2;
+  float steal_pct = 3;
+  float iowait_pct = 4;
+  float load1 = 5;
+  uint64 ram_used_bytes = 6 [jstype = JS_NUMBER];
+  uint64 ram_total_bytes = 7 [jstype = JS_NUMBER];
+  uint64 swap_used_bytes = 8 [jstype = JS_NUMBER];
+  uint64 swap_total_bytes = 9 [jstype = JS_NUMBER];
+  // The file system that holds the panel's data directory.
+  uint64 disk_used_bytes = 10 [jstype = JS_NUMBER];
+  uint64 disk_total_bytes = 11 [jstype = JS_NUMBER];
+}
+
+// The panel's SQLite database. It is read at most once a minute.
+message PanelDatabase {
+  // The main file and its write-ahead log.
+  uint64 file_bytes = 1 [jstype = JS_NUMBER];
+  uint64 wal_bytes = 2 [jstype = JS_NUMBER];
+  // Pages in the file, the free ones among them (space a VACUUM would give back), and the page size in bytes.
+  uint64 page_count = 3 [jstype = JS_NUMBER];
+  uint64 freelist_count = 4 [jstype = JS_NUMBER];
+  uint32 page_size = 5;
+  int64 measured_unix = 6 [jstype = JS_NUMBER];
+}
+
+// The admin API's calls (the admin UI and API tokens over /api; not /mcp or /metrics) over the last window_s seconds.
+message PanelRpcLoad {
+  uint32 window_s = 1;
+  uint64 requests = 2 [jstype = JS_NUMBER];
+  // Calls that ended in a server error (HTTP 5xx), and in a refusal or a bad request (4xx).
+  uint64 server_errors = 3 [jstype = JS_NUMBER];
+  uint64 client_errors = 4 [jstype = JS_NUMBER];
+  // The 95th percentile of the time to answer a unary call, in milliseconds (streams are left out); 0 without calls.
+  float p95_ms = 5;
+}
+
+message GetPanelResourcesResponse {
+  int64 now_unix = 1 [jstype = JS_NUMBER];
+  PanelProcess process = 2;
+  PanelHost host = 3;
+  PanelDatabase database = 4;
+  // Agents connected now, and the nodes that are not retired.
+  uint32 agents_connected = 5;
+  uint32 nodes = 6;
+  PanelRpcLoad rpc = 7;
+}
+
+message GetFleetLoadRequest {
+  // The window in hours, 1 to 720; 0 means 168 (a week holds the busy hour of every weekday).
+  uint32 hours = 1;
+}
+
+// What to do about a node's load. The admin UI and the assistant word it from code and params.
+message LoadRecommendation {
+  // update_agent (the agent predates the resource fields: steal, swap, conntrack and its own cost are not known),
+  // steal_high (steal_pct: the provider oversells the host; move the node), conntrack_near_limit (fill_pct, limit),
+  // cpu_busy (cpu_pct, peak_pct, target, target_headroom: move people to the node with the most headroom; only with at least
+  // 3 people online in the busy hour), cpu_busy_add_node (cpu_pct, peak_pct: no other node has room), cpu_busy_few_people
+  // (cpu_pct, people: busy with hardly anyone online, so the load is not people's), bandwidth_limit_low (link_mbps: the number set, seen_mbps: what the node carried; check the number in the node's settings,
+  // and bandwidth_busy is not given), bandwidth_busy (peak_pct: the typical
+  // hourly peak, hour_pct: the busiest hour's mean, link_mbps, and target, target_headroom when another node has room), ram_high (ram_pct), swap_in_use (swap_mb), disk_filling (disk_pct),
+  // agent_memory_growing (growth_pct_day, rss_mb, days: the agent's daily peak memory climbs faster than its people).
+  string code = 1;
+  // "info", "warn" or "crit".
+  string severity = 2;
+  // Plain decimal numbers and node names.
+  map<string, string> params = 3;
+}
+
+// One node's load over the window. An optional field that is unset is not known: no hour carried it (an agent that predates
+// the resource fields), or there is nothing to measure.
+message NodeLoad {
+  string node_id = 1;
+  string node_name = 2;
+  bool connected = 3;
+  uint32 cpus = 4;
+  // "ok", "busy", "overloaded", or "unknown": no hour of host load in the window, or a node whose history is under a day (the
+  // install is not a pattern; then hours_with_data is above 0 and only a full disk is advised).
+  string status = 5;
+  // What runs out first once it is at least halfway to its limit: cpu, steal, bandwidth, ram, conntrack or disk; "" otherwise.
+  string bottleneck = 6;
+  // Hours of the window with samples, and those whose samples carried the resource fields.
+  uint32 hours_with_data = 7;
+  uint32 ext_hours = 8;
+  // The busy hour: the hour with the highest CPU mean, that mean, and the mean people online in it.
+  int64 busy_hour_unix = 9 [jstype = JS_NUMBER];
+  float busy_hour_cpu_pct = 10;
+  float people_busy_hour = 11;
+  uint32 people_peak = 12;
+  // The 95th percentile of the hourly CPU peaks.
+  float cpu_peak_p95_pct = 13;
+  // The 95th percentile of the hourly steal means.
+  optional float steal_p95_pct = 14;
+  // The highest hourly peak of connection-tracking entries against the limit.
+  optional float conntrack_peak_pct = 15;
+  optional float ram_peak_pct = 16;
+  optional uint64 swap_used_max_bytes = 17 [jstype = JS_NUMBER];
+  // The latest sample's root file system.
+  optional float disk_used_pct = 18;
+  // The highest hourly peaks of the main NIC, bits per second.
+  uint64 rx_peak_bps = 19 [jstype = JS_NUMBER];
+  uint64 tx_peak_bps = 20 [jstype = JS_NUMBER];
+  // The capacity the traffic is set against: the owner's ("configured", Node.bandwidth_mbps) or the link speed the agent
+  // reported ("nic"); 0 and "" = not known.
+  uint32 capacity_mbps = 21;
+  string capacity_source = 22;
+  // The highest hourly peak of the busier direction against that capacity: shown, not judged (a single burst, a download or a
+  // measurement, fills any link; hours of the panel's own speed measurements are left out).
+  optional float bandwidth_peak_pct = 23;
+  // The agent process: mean and peak CPU in percent of the machine, peak memory, and how fast its daily peak memory grows
+  // (percent per day, from three days on).
+  optional float agent_cpu_avg_pct = 24;
+  optional float agent_cpu_max_pct = 25;
+  optional uint64 agent_rss_max_bytes = 26 [jstype = JS_NUMBER];
+  optional float agent_rss_growth_pct_per_day = 27;
+  // "ok" when the per-person costs could be read from the hours (a least-squares fit of the hourly CPU mean on the hourly
+  // mean people online); otherwise why not: "few_hours" (under 24 hours with samples), "flat" (people online changed by
+  // fewer than 4), "no_trend" (the CPU does not rise with the people, or they explain under a fifth of its changes).
+  string fit = 28;
+  optional float cpu_pct_per_hundred_people = 29;
+  optional float mbps_per_person = 30;
+  // People the node could add before its busy-hour CPU mean reaches 80% (and, with a known link and per-person traffic, its
+  // busier direction 90% of the link), held to 5 times the people the node has had online at once (at least 10 of them): a
+  // fit is not followed far beyond the data it was drawn from. 0 when it is overloaded already.
+  optional uint32 headroom_people = 31;
+  // Most severe first.
+  repeated LoadRecommendation recommendations = 32;
+  // The 75th percentile of the hourly CPU peaks: the peak most hours stay under. The status and the advice read it, not the
+  // 95th: a few spikes of a server's own upkeep do not make a node busy, and peaks alone never make it overloaded.
+  float cpu_peak_typical_pct = 33;
+  // The link, read like the CPU: the 75th percentile of the hourly peaks of the busier direction against the capacity (what the
+  // status and the advice read, with the busy hour's mean below), and the highest hourly mean of the busier direction. Unset
+  // with bandwidth_peak_pct when the capacity is not known.
+  optional float bandwidth_typical_pct = 34;
+  optional float bandwidth_busy_hour_pct = 35;
+  // Set (Mbit/s) when the owner's capacity (capacity_source "configured") is below what the node was seen to carry: a stored
+  // speed test or an hourly peak went faster. The number set is then wrong, the shares above are against it, and the link is
+  // judged busy at most; 0 = not the case.
+  uint32 link_seen_mbps = 36;
+}
+
+message LoadNodeRef {
+  string node_id = 1;
+  string node_name = 2;
+  string status = 3;
+  float busy_hour_cpu_pct = 4;
+  optional uint32 headroom_people = 5;
+}
+
+message FleetLoadSummary {
+  uint32 ok = 1;
+  uint32 busy = 2;
+  uint32 overloaded = 3;
+  uint32 unknown = 4;
+  // The headroom of the nodes whose headroom is known, added up, and how many nodes those are.
+  uint32 headroom_people = 5;
+  uint32 headroom_nodes = 6;
+  // Up to three nodes closest to a limit, most loaded first; up to three that are not busy, most headroom first.
+  repeated LoadNodeRef most_loaded = 7;
+  repeated LoadNodeRef most_free = 8;
+}
+
+message GetFleetLoadResponse {
+  int64 now_unix = 1 [jstype = JS_NUMBER];
+  uint32 hours = 2;
+  // Every node that is not retired, most pressing first.
+  repeated NodeLoad nodes = 3;
+  FleetLoadSummary summary = 4;
+}
+
+message GetNetworkSettingsRequest {}
+
+message GetNetworkSettingsResponse {
+  // 0 off, 1 operators, 2 operators and per-person recent networks.
+  uint32 mode = 1;
+  // The trusted table's build time and range/operator counts; zero when absent or invalid.
+  int64 table_built_unix = 2 [jstype = JS_NUMBER];
+  uint32 ipv4_ranges = 3;
+  uint32 ipv6_ranges = 4;
+  uint32 asns = 5;
+  uint32 nodes_with_nets = 6;
+  uint32 nodes_with_matching_table = 7;
+}
+
+message SetNetworkSettingsRequest {
+  // 0 off, 1 operators, 2 operators and per-person recent networks.
+  uint32 mode = 1;
+}
+
+message SetNetworkSettingsResponse {
+  GetNetworkSettingsResponse settings = 1;
+}
+
+// A request for the logs of a device of the Mistgate app, or a bundle of logs that came. Names are the panel's today (empty when the
+// person or the device is gone); none of them is a word the app wrote.
+message ClientDebugInfo {
+  string id = 1;
+  string user_id = 2;
+  string user_name = 3;
+  string device_id = 4;
+  // What the device reported about itself ("windows", "iPhone 15").
+  string device_platform = 5;
+  string device_model = 6;
+  // "open" (waiting for the person), "received" (the logs are here), "declined" (the person refused), "cancelled" (the owner
+  // withdrew it) or "expired" (72 hours passed).
+  string state = 7;
+  // "info" or "debug": what the owner asked the app to record while the request is open.
+  string level = 8;
+  // The owner's note, which the person sees in the app; plain text.
+  string note = 9;
+  // The person sent these logs on their own, without a request.
+  bool unasked = 10;
+  // The admin who asked (a name or an id); empty for logs sent unasked.
+  string actor = 11;
+  int64 requested_unix = 12 [jstype = JS_NUMBER];
+  // When an open request runs out.
+  int64 expires_unix = 13 [jstype = JS_NUMBER];
+  // When the request stopped being open, or the logs came; 0 while open.
+  int64 closed_unix = 14 [jstype = JS_NUMBER];
+  // Of a received bundle: records kept, their size, the attributes the panel did not keep, the times of the first and the last
+  // record (unix milliseconds), and the app's name and version.
+  uint32 records = 15;
+  uint32 bytes = 16;
+  uint32 dropped_attrs = 17;
+  int64 first_unix_ms = 18 [jstype = JS_NUMBER];
+  int64 last_unix_ms = 19 [jstype = JS_NUMBER];
+  string app = 20;
+  // When the owner first read the logs; 0 = not yet.
+  int64 read_unix = 21 [jstype = JS_NUMBER];
+}
+
+message RequestClientDebugRequest {
+  string device_id = 1;
+  // At most 200 characters; control and invisible formatting characters are removed. Optional.
+  string note = 2;
+  // "info" or "debug"; "" means "info".
+  string level = 3;
+}
+
+message RequestClientDebugResponse {
+  ClientDebugInfo request = 1;
+}
+
+message CancelClientDebugRequest {
+  string id = 1;
+}
+
+message CancelClientDebugResponse {
+  ClientDebugInfo request = 1;
+}
+
+message ListClientDebugRequest {
+  // "" = every person.
+  string user_id = 1;
+}
+
+message ListClientDebugResponse {
+  repeated ClientDebugInfo items = 1;
+}
+
+message GetClientDebugRequest {
+  string id = 1;
+  // The lowest level: "debug", "info", "warn" or "error"; "" = everything.
+  string min_level = 2;
+  // One log source; "" = all.
+  string source = 3;
+  // Case-insensitive substring of the message or an attribute value; at most 100 characters.
+  string query = 4;
+  // The window of the records' own times, unix milliseconds; 0 = open on that side.
+  int64 from_ms = 5 [jstype = JS_NUMBER];
+  int64 to_ms = 6 [jstype = JS_NUMBER];
+  // At most 500; 0 means 100.
+  uint32 limit = 7;
+  // The next_cursor of the previous page (0 = from the first record).
+  int64 after_seq = 8 [jstype = JS_NUMBER];
+}
+
+message GetClientDebugResponse {
+  ClientDebugInfo bundle = 1;
+  repeated DebugRecord records = 2;
+  // Pass as after_seq for the next page; 0 when there is none.
+  int64 next_cursor = 3 [jstype = JS_NUMBER];
+  // The sources that appear in the bundle, to fill a filter.
+  repeated string sources = 4;
+}
+
+message ExportClientDebugRequest {
+  string id = 1;
+}
+
+message ExportClientDebugResponse {
+  // A piece of the NDJSON, always ending at a line boundary.
+  bytes data = 1;
+}
+
+message DeleteClientDebugRequest {
+  string id = 1;
+}
+
+message DeleteClientDebugResponse {}

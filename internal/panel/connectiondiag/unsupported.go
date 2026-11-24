@@ -4,40 +4,157 @@ package connectiondiag
 import (
 	"slices"
 	"strings"
+
+	"github.com/mistgate/mistgate/internal/agentcap"
+	"github.com/mistgate/mistgate/internal/plugin"
 )
 
-const Links2Capability = "links/2"
+// TunnelRefusalFields are those counters, in the order of plugin.TunnelRefusal. Only TrustTunnel has them: for another protocol
+// they are zero and left out of the views, and unsupported does not name them.
+var TunnelRefusalFields = []string{"tunnel_blocked", "tunnel_no_ipv4", "tunnel_conn_refused", "tunnel_conn_unreachable", "tunnel_conn_dns",
+	"tunnel_conn_other", "tunnel_timeout", "tunnel_other_deadlines", "tunnel_other_authority", "tunnel_other_icmp", "tunnel_other_dial",
+	"tunnel_stream_closed", "tunnel_stream_cred_gone", "tunnel_stream_conn_limit"}
 
 var (
 	link2Fields = []string{"client_closes", "freezes", "quiet", "accepted", "hellos_foreign", "rtt_ms", "loss_permille", "rtt_samples", "pkts_sent"}
-	unsupported = map[string][]string{
+	// Link3Fields are the counters of agents that list links/3 (agent.proto LinkCounters from hs_unfinished on).
+	Link3Fields = []string{"hs_unfinished", "tls_alerts_sent", "tls_alerts_recv", "tls_cert_refused", "reality_fallback", "auth_failed",
+		"tcp_stalls", "tcp_stalls_16k", "initiations", "responses", "responses_unmatched"}
+	// KeyLink3Fields are the links/3 counters a key's row can carry (a device row of GetUserConnection).
+	KeyLink3Fields = []string{"tcp_stalls", "tcp_stalls_16k", "initiations", "responses", "responses_unmatched"}
+	unsupported    = map[string][]string{
 		"awg": append([]string{"rejects", "drops", "hellos", "handshakes"}, link2Fields...),
-		// VLESS sessions currently supply online_s; every other connection field is unsupported.
+		// The TrustTunnel engine counts connects and unknown_keys, and with trusttunnel/1 auth_failed (a known username refused,
+		// for a wrong password or an ended term); every other counter is not reported, and its zero means nothing.
+		"trusttunnel": append([]string{"rejects", "drops", "stalls", "hellos", "handshakes", "keys_stalled", "keys_tried"}, link2Fields...),
+		// VLESS sessions supply online_s; vless-unknown-keys/1 agents additionally report unknown_keys per inbound, and links/3
+		// agents hellos, hellos_foreign and connects (see vlessSupported).
 		"vless": {"connects", "rejects", "drops", "stalls", "unknown_keys", "hellos", "handshakes", "keys_stalled", "keys_tried",
 			"client_closes", "freezes", "quiet", "accepted", "hellos_foreign", "rtt_ms", "loss_permille", "rtt_samples", "pkts_sent"},
 	}
 	hysteria2WithoutLinks2 = []string{"client_closes", "freezes", "quiet", "accepted", "hellos_foreign", "rtt_ms", "loss_permille", "rtt_samples", "pkts_sent"}
 )
 
+// Variant is what decides, beyond the protocol and the agent, which counters an inbound can have: the AmneziaWG backend the
+// node last reported ("" = no report yet), and the VLESS security ("reality" or "tls"), transport ("tcp", "xhttp", "ws") and
+// whether it is reached through a CDN. "" means not known, and a counter that depends on it is then not known either.
+type Variant struct {
+	AwgBackend          string
+	Security, Transport string
+	CDN                 bool
+}
+
+// VLESSVariant reads the variant from a VLESS profile's settings_json (no secret is in it); anything unreadable is "".
+func VLESSVariant(settingsJSON string) Variant {
+	v, ok := plugin.VLESSOf(plugin.InboundSpec{Protocol: "vless", Settings: []byte(settingsJSON)})
+	if !ok {
+		return Variant{}
+	}
+	return Variant{Security: v.Security, Transport: v.Transport, CDN: v.CDNHost != ""}
+}
+
 // UnsupportedCounters returns protocol-level counters this protocol does not report. A fresh slice keeps callers from mutating
-// shared values. Hysteria2 is treated as an older agent unless its capability is supplied to UnsupportedCountersForNode.
+// shared values. Hysteria2 and VLESS are treated as older agents unless their capability is supplied to UnsupportedCountersForNode.
 func UnsupportedCounters(protocol string) []string { return UnsupportedCountersForNode(protocol, nil) }
 
-// UnsupportedCountersForNode also accounts for node-agent capabilities. links/2 is the Hysteria2-only close and path-quality
-// contract; the other protocols do not support these fields even if the agent lists the capability.
+// UnsupportedCountersForNode is UnsupportedCountersFor without a variant: what depends on the backend or the VLESS transport is
+// not known.
 func UnsupportedCountersForNode(protocol string, agentCaps []string) []string {
+	return UnsupportedCountersFor(protocol, agentCaps, Variant{})
+}
+
+// UnsupportedCountersFor also accounts for node-agent capabilities and the inbound's variant. links/2 is the Hysteria2-only close
+// and path-quality contract, vless-unknown-keys/1 enables the VLESS unknown-user-ID counter, and links/3 the handshake-failure
+// reasons each engine can see (agent.proto LinkCounters).
+func UnsupportedCountersFor(protocol string, agentCaps []string, v Variant) []string {
 	protocol = strings.ToLower(protocol)
-	if protocol == "hysteria2" {
-		if slices.Contains(agentCaps, Links2Capability) {
+	links3 := slices.Contains(agentCaps, agentcap.Links3)
+	var out []string
+	switch protocol {
+	case "hysteria2":
+		if !slices.Contains(agentCaps, agentcap.Links2) {
+			out = append(out, hysteria2WithoutLinks2...)
+		}
+	default:
+		values, ok := unsupported[protocol]
+		if !ok {
 			return []string{}
 		}
-		return append([]string(nil), hysteria2WithoutLinks2...)
+		out = append(out, values...)
+		if protocol == "vless" && slices.Contains(agentCaps, agentcap.VLESSUnknownKeys) {
+			out = slices.DeleteFunc(out, func(f string) bool { return f == "unknown_keys" })
+		}
 	}
-	values, ok := unsupported[protocol]
-	if !ok {
+	for _, f := range Link3Fields {
+		supported := links3 && link3Supported(protocol, f, v)
+		// TrustTunnel's inbound-only auth_failed counter is part of its protocol capability contract, not the
+		// generic links/3 bundle. Its node capability gates both the inbound and this counter.
+		if protocol == "trusttunnel" && f == "auth_failed" && slices.Contains(agentCaps, agentcap.TrustTunnel) {
+			supported = true
+		}
+		// The TCP stalls of TrustTunnel have a capability of their own: an agent with links/3 but without it counts none.
+		if protocol == "trusttunnel" && (f == "tcp_stalls" || f == "tcp_stalls_16k") {
+			supported = slices.Contains(agentCaps, agentcap.TrustTunnelTCPStalls)
+		}
+		if !supported {
+			out = append(out, f)
+		}
+	}
+	if protocol == "trusttunnel" && !slices.Contains(agentCaps, agentcap.TrustTunnelRefusals) {
+		out = append(out, TunnelRefusalFields...)
+	}
+	if protocol == "vless" && links3 {
+		out = slices.DeleteFunc(out, func(f string) bool {
+			return f == "hellos" || f == "hellos_foreign" || f == "connects" && v.Security == "reality" && v.Transport == "tcp"
+		})
+	}
+	if out == nil {
 		return []string{}
 	}
-	return append([]string(nil), values...)
+	return out
+}
+
+// UnsupportedKeyCounters is the part of UnsupportedCountersFor that a key's row (GetUserConnection) can carry.
+func UnsupportedKeyCounters(protocol string, agentCaps []string, v Variant) []string {
+	all := UnsupportedCountersFor(protocol, agentCaps, v)
+	out := []string{}
+	for _, f := range KeyLink3Fields {
+		if slices.Contains(all, f) || !keyLink3(protocol, f, v) {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// link3Supported says which engine counts which links/3 counter on the inbound (its keys' rows included).
+func link3Supported(protocol, field string, v Variant) bool {
+	switch protocol {
+	case "hysteria2":
+		return field == "hs_unfinished" || field == "tls_alerts_sent" || field == "tls_alerts_recv" || field == "tls_cert_refused"
+	case "awg":
+		return v.AwgBackend == "userspace" && (field == "initiations" || field == "responses" || field == "responses_unmatched")
+	case "vless":
+		switch field {
+		case "hs_unfinished":
+			return v.Security == "reality" || v.Security == "tls"
+		case "reality_fallback", "auth_failed":
+			return v.Security == "reality"
+		case "tls_alerts_sent", "tls_alerts_recv", "tls_cert_refused":
+			return v.Security == "tls"
+		case "tcp_stalls", "tcp_stalls_16k":
+			return v.Security == "reality" && v.Transport == "tcp" || v.Security == "tls" && !v.CDN
+		}
+	}
+	return false
+}
+
+// keyLink3 says whether the counter is put on the key (VLESS behind its TLS front and TrustTunnel count the stall on the inbound row).
+func keyLink3(protocol, field string, v Variant) bool {
+	switch field {
+	case "tcp_stalls", "tcp_stalls_16k":
+		return protocol == "vless" && v.Security == "reality" && v.Transport == "tcp"
+	}
+	return protocol == "awg"
 }
 
 // SupportsHysteria2Links2 reports whether this protocol/node pair can produce the close and path-quality fields.
@@ -47,5 +164,5 @@ func SupportsHysteria2Links2(protocol string, supportsLinks2 bool) bool {
 
 // UnsupportedDescription is the common note used by MCP descriptions and tests.
 func UnsupportedDescription() string {
-	return "unsupported names counters the current protocol or agent does not report; their zero values mean nothing (AWG: rejects, drops, hellos, handshakes and all links/2 fields; VLESS: every connection counter except online_s; Hysteria2 without links/2: client_closes, freezes, quiet, accepted, hellos_foreign, rtt_ms, loss_permille, rtt_samples and pkts_sent)."
+	return "unsupported names counters the current protocol, its transport, the AWG backend or the agent does not report; their zero values mean nothing (AWG: rejects, drops, hellos, handshakes and all links/2 fields; VLESS: unknown_keys is supported with vless-unknown-keys/1, hellos, hellos_foreign and over REALITY TCP connects with links/3, and every other connection counter except online_s is unsupported; TrustTunnel: only connects and the inbound-only unknown_keys, and with trusttunnel/1 the inbound-only auth_failed, and with trusttunnel-refusals/1 the inbound-only tunnel_* refusal reasons, and with trusttunnel-tcp-stalls/1 the inbound-only tcp_stalls and tcp_stalls_16k, are reported; Hysteria2 without links/2: client_closes, freezes, quiet, accepted, hellos_foreign, rtt_ms, loss_permille, rtt_samples and pkts_sent; links/3 reasons only where the engine sees them: Hysteria2 hs_unfinished and the tls_* alerts, VLESS REALITY reality_fallback, auth_failed and hs_unfinished, VLESS tls hs_unfinished and the tls_* alerts, VLESS tcp_stalls over REALITY TCP or a direct TLS front, TrustTunnel tcp_stalls over HTTP/2, AWG initiations, responses and responses_unmatched on the userspace backend only (the kernel backend cannot tell them apart))."
 }

@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { localeOf, useLang, useT, type Lang, type T } from "@/i18n";
+import { dirOf, intlLocaleOf, useLang, useT, type Lang, type T } from "@/i18n";
 
 /** Scales a byte count to the largest unit that keeps the number below `base` (1000 for traffic, 1024 for RAM and disk). */
 export function scaleBytes(n: number, base: 1000 | 1024 = 1000): { value: number; unit: 0 | 1 | 2 | 3 | 4 } {
@@ -19,7 +19,7 @@ function numberFormat(lang: Lang, digits: number, fixed: boolean) {
   const key = `${lang}/${digits}/${fixed}`;
   let f = numberFormats.get(key);
   if (!f) {
-    f = new Intl.NumberFormat(localeOf(lang), { maximumFractionDigits: digits, minimumFractionDigits: fixed ? digits : 0 });
+    f = new Intl.NumberFormat(intlLocaleOf(lang), { maximumFractionDigits: digits, minimumFractionDigits: fixed ? digits : 0 });
     numberFormats.set(key, f);
   }
   return f;
@@ -27,16 +27,23 @@ function numberFormat(lang: Lang, digits: number, fixed: boolean) {
 
 /** Local time of day, 24 hours: "14:06". */
 function clockOf(unix: number, lang: Lang) {
-  return new Date(unix * 1000).toLocaleTimeString(localeOf(lang), { hour: "2-digit", minute: "2-digit", hour12: false });
+  return new Date(unix * 1000).toLocaleTimeString(intlLocaleOf(lang), { hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
 const sameDay = (a: Date, b: Date) =>
   a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
 
+/** Whether two moments fall in the same year of the locale's calendar (the Persian year begins at Nowruz). */
+export const sameYear = (a: Date, b: Date, locale: string) => {
+  const year = new Intl.DateTimeFormat(locale, { year: "numeric" });
+  return year.format(a) === year.format(b);
+};
+
 /** "28 сент.": the year only when it is not this one ("28 сент. 2025 г."). */
 export function dayOf(unix: number, lang: Lang, now = new Date()) {
   const d = new Date(unix * 1000);
-  return d.toLocaleDateString(localeOf(lang), { day: "numeric", month: "short", ...(d.getFullYear() === now.getFullYear() ? {} : { year: "numeric" }) });
+  const locale = intlLocaleOf(lang);
+  return d.toLocaleDateString(locale, { day: "numeric", month: "short", ...(sameYear(d, now, locale) ? {} : { year: "numeric" }) });
 }
 
 /** "28 сент., 18:15", the year as in dayOf. */
@@ -49,7 +56,29 @@ export function stampOf(unix: number, lang: Lang, now = new Date()) {
   return sameDay(new Date(unix * 1000), now) ? clockOf(unix, lang) : dateTimeOf(unix, lang, now);
 }
 
-/** The short "5 мин назад / 3 ч назад / 2 дн назад" of every list; "только что" under a minute. */
+/**
+ * stampOf in a fixed UTC offset instead of the browser's time zone: "14:06" for today there, "27 сент., 03:00" for another
+ * day. For times the panel schedules in its own time zone (scheduled tasks), so "daily at 07:30" and "next run 07:30" agree
+ * whatever zone the browser is in.
+ */
+export function stampAtOffsetOf(unix: number, offsetMinutes: number, lang: Lang, now = new Date()) {
+  const shifted = new Date((unix + offsetMinutes * 60) * 1000);
+  const today = new Date(now.getTime() + offsetMinutes * 60_000);
+  const locale = intlLocaleOf(lang);
+  const clock = shifted.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "UTC" });
+  if (shifted.getUTCFullYear() === today.getUTCFullYear() && shifted.getUTCMonth() === today.getUTCMonth() && shifted.getUTCDate() === today.getUTCDate()) {
+    return clock;
+  }
+  const day = shifted.toLocaleDateString(locale, {
+    day: "numeric",
+    month: "short",
+    timeZone: "UTC",
+    ...(shifted.getUTCFullYear() === today.getUTCFullYear() ? {} : { year: "numeric" }),
+  });
+  return `${day}, ${clock}`;
+}
+
+/** The short "5 мин назад / 3 ч назад / 2 дн назад" of every list; "только что" под минуту. */
 export function agoOf(t: (key: "common.justNow" | "users.ago.m" | "users.ago.h" | "users.ago.d", vars?: { n: number }) => string, unix: number, nowSec: number) {
   const s = Math.max(0, nowSec - unix);
   if (s < 60) return t("common.justNow");
@@ -81,12 +110,14 @@ export type Fmt = ReturnType<typeof makeFmt>;
 
 export function makeFmt(lang: Lang, t: T) {
   const num = (v: number, digits = 1, fixed = false) => numberFormat(lang, digits, fixed).format(v);
+  // a size or a rate keeps its Latin unit after the number inside Persian too ("17 Mbit/s", not "Mbit/s 17"): a left-to-right isolate
+  const ltr = dirOf(lang) === "rtl" ? (s: string) => `\u2066${s}\u2069` : (s: string) => s;
   const bytes = (n: number, base: 1000 | 1024 = 1000, digits = 1) => {
     const { value, unit } = scaleBytes(n, base);
-    return `${num(value, unit === 0 ? 0 : digits)} ${t(unitKeys[unit])}`;
+    return ltr(`${num(value, unit === 0 ? 0 : digits)} ${t(unitKeys[unit])}`);
   };
   /** Bits per second as Mbit/s with the unit: "12,4 Мбит/с". */
-  const mbit = (bps: number) => `${num(bps / 1e6, bps >= 1e7 ? 0 : 1)} ${t("unit.mbit")}`;
+  const mbit = (bps: number) => ltr(`${num(bps / 1e6, bps >= 1e7 ? 0 : 1)} ${t("unit.mbit")}`);
   /** The bare number, for places where the unit sits elsewhere (node cards: "↓12,4"). */
   const mbitNum = (bps: number) => num(bps / 1e6, bps >= 1e7 ? 0 : 1);
   const ago = (unix: number, now = Date.now()) => agoOf(t, unix, Math.floor(now / 1000));
@@ -96,8 +127,8 @@ export function makeFmt(lang: Lang, t: T) {
   };
   return {
     lang,
-    /** The Intl locale of the UI language ("zh" is "zh-CN"): what toLocale*, Intl.* and localeCompare take. */
-    locale: localeOf(lang),
+    /** The Intl locale of the UI language ("zh" is "zh-CN", Persian with Latin digits): what toLocale*, Intl.* and localeCompare take. */
+    locale: intlLocaleOf(lang),
     num,
     bytes,
     mbit,
@@ -106,13 +137,14 @@ export function makeFmt(lang: Lang, t: T) {
     duration,
     clock: (unix: number) => clockOf(unix, lang),
     stamp: (unix: number) => stampOf(unix, lang),
+    stampAt: (unix: number, offsetMinutes: number) => stampAtOffsetOf(unix, offsetMinutes, lang),
     date: (unix: number) => dayOf(unix, lang),
     dateTime: (unix: number) => dateTimeOf(unix, lang),
     /** Country name in the UI language from an ISO 3166-1 alpha-2 code; the code itself when unknown. */
     country: (code: string) => {
       if (!code) return "";
       try {
-        return new Intl.DisplayNames(localeOf(lang), { type: "region" }).of(code.toUpperCase()) ?? code;
+        return new Intl.DisplayNames(intlLocaleOf(lang), { type: "region" }).of(code.toUpperCase()) ?? code;
       } catch {
         return code;
       }
@@ -125,4 +157,12 @@ export function useFmt(): Fmt {
   const lang = useLang();
   const t = useT();
   return useMemo(() => makeFmt(lang, t), [lang, t]);
+}
+
+/** "Today", "Yesterday", else the date; the year only when it is not this one. */
+export function dayLabel(t: T, fmt: Pick<Fmt, "locale">, unix: number, now = new Date()): string {
+  const d = new Date(unix * 1000);
+  if (sameDay(d, now)) return t("node.ev.today");
+  if (sameDay(d, new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1))) return t("node.ev.yesterday");
+  return d.toLocaleDateString(fmt.locale, { day: "numeric", month: "long", ...(sameYear(d, now, fmt.locale) ? {} : { year: "numeric" }) });
 }

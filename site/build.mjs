@@ -7,7 +7,8 @@ import { fileURLToPath } from "node:url";
 import YAML from "yaml";
 import { createHl, createRenderer, parseNav } from "./src/markdown.mjs";
 import { T, renderDoc, render404, THEME_INIT, formatStars } from "./src/layout.mjs";
-import { SITE, GITHUB, LANGS, COMPLETE, pageUrl } from "./src/urls.mjs";
+import { SITE, GITHUB, LANGS, COMPLETE, pageUrl, landingUrl } from "./src/urls.mjs";
+import { gitDates } from "./src/jsonld.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 // MG_DOCS / MG_DIST point the build at another docs tree / output (the test builds a fixture that way)
@@ -16,6 +17,7 @@ const DIST = process.env.MG_DIST ?? join(ROOT, "dist");
 const INSTALLER = join(ROOT, "..", "scripts", "install.sh");
 const SRC = join(ROOT, "src");
 const BRAND = join(ROOT, "..", "web", "src");
+const dates = gitDates(DOCS); // <lang>/<key>.md -> date of its last commit; empty without git history
 const warnings = [];
 const warn = (m) => warnings.push(m);
 
@@ -33,11 +35,13 @@ const assets = { css: hashed("style", "css", css), js: hashed("app", "js", js) }
 out(assets.css, css);
 out(assets.js, js);
 for (const f of readdirSync(join(BRAND, "fonts"))) if (/\.(woff2|txt)$/.test(f)) { mkdirSync(join(DIST, "fonts"), { recursive: true }); copyFileSync(join(BRAND, "fonts", f), join(DIST, "fonts", f)); }
-// the admin screenshot on the home page: the README's own pictures, light and dark, per language
-const SHOTS = join(ROOT, "..", "docs", "images", "readme");
-const SHOT = new RegExp(`^overview-(light|dark)-(${LANGS.join("|")})\\.webp$`);
-for (const f of readdirSync(SHOTS)) if (SHOT.test(f)) { mkdirSync(join(DIST, "img"), { recursive: true }); copyFileSync(join(SHOTS, f), join(DIST, "img", f)); }
+// the product videos (docs/images/video): the MP4s and their posters, played by the docs pages
+const VIDEOS = join(ROOT, "..", "docs", "images", "video");
+for (const f of readdirSync(VIDEOS)) if (/^[a-z]+-(poster-)?[a-z]+\.(mp4|webp)$/.test(f) && (f.endsWith(".mp4") || f.includes("-poster-"))) { mkdirSync(join(DIST, "video"), { recursive: true }); copyFileSync(join(VIDEOS, f), join(DIST, "video", f)); }
 out("install.sh", readFileSync(INSTALLER));
+// the loops of the admin (docs/images/readme): shown on the docs pages in the reader's theme
+const CLIPS = join(ROOT, "..", "docs", "images", "readme");
+for (const f of readdirSync(CLIPS)) if (/^[a-z0-9-]+-(dark|light)-[a-z]+\.webp$/.test(f)) { mkdirSync(join(DIST, "img", "readme"), { recursive: true }); copyFileSync(join(CLIPS, f), join(DIST, "img", "readme", f)); }
 const badge = readFileSync(join(BRAND, "assets", "mistgate-badge.svg"));
 out("mistgate-badge.svg", badge);
 out("favicon.svg", badge);
@@ -45,6 +49,23 @@ for (const [file, dest, key] of [["og.png", "og.png", "og"], ["favicon-32.png", 
   const p = join(SRC, "assets", file);
   if (existsSync(p)) { out(dest, readFileSync(p)); assets[key] = "/" + dest; }
 }
+
+// /favicon.ico: browsers and crawlers ask for it without reading <head>; an .ico may hold a PNG (6-byte header, one 16-byte entry, the PNG)
+if (assets.favicon32) {
+  const png = readFileSync(join(SRC, "assets", "favicon-32.png")), ico = Buffer.alloc(22);
+  ico.writeUInt16LE(1, 2); ico.writeUInt16LE(1, 4); // type icon, one image
+  ico[6] = png.readUInt32BE(16); ico[7] = png.readUInt32BE(20); // width, height (as bytes; 0 would mean 256)
+  ico.writeUInt16LE(1, 10); ico.writeUInt16LE(32, 12); ico.writeUInt32LE(png.length, 14); ico.writeUInt32LE(22, 18);
+  out("favicon.ico", Buffer.concat([ico, png]));
+}
+// /.well-known/security.txt (RFC 9116): how to report a vulnerability is what SECURITY.md in the repository says (privately, through the Security tab)
+out(".well-known/security.txt", [
+  "Contact: https://github.com/Mistgate/mistgate/security",
+  "Expires: " + new Date(Date.now() + 365 * 864e5).toISOString(), // a year from this build
+  "Preferred-Languages: en, ru",
+  "Policy: https://github.com/Mistgate/mistgate/blob/main/SECURITY.md",
+  "Canonical: " + SITE + "/.well-known/security.txt",
+].join("\n") + "\n");
 
 // ---- content ----
 const walk = (dir) => readdirSync(dir).flatMap((n) => { const p = join(dir, n); return statSync(p).isDirectory() ? walk(p) : p.endsWith(".md") ? [p] : []; });
@@ -60,7 +81,7 @@ function readPage(lang, file) {
   }
   if (!fm.title) warn(`${lang}/${key}.md: no title in front matter`);
   if (!fm.description) warn(`${lang}/${key}.md: no description in front matter`);
-  return { lang, key, url: pageUrl(lang, key), title: String(fm.title ?? key), description: String(fm.description ?? ""), body: m ? raw.slice(m[0].length) : raw };
+  return { lang, key, url: pageUrl(lang, key), date: dates.get(`${lang}/${key}.md`), title: String(fm.title ?? key), seoTitle: fm.seoTitle ? String(fm.seoTitle) : undefined, description: String(fm.description ?? ""), body: m ? raw.slice(m[0].length) : raw };
 }
 
 // the star count on the GitHub button, if GitHub answers within 5 s (an offline build has none; app.js refreshes it anyway).
@@ -78,7 +99,11 @@ for (const lang of LANGS) {
   const pages = new Map(walk(dir).map((f) => readPage(lang, f)).map((p) => [p.key, p]));
   if (!pages.has("index")) { warn(`docs/${lang}/index.md is missing: no home page, no sidebar order`); continue; }
 
-  // sidebar order: the H3 groups and bullet links of index.md, and nothing else
+  // sidebar order: the H3 groups and bullet links of index.md, and nothing else. A language still being translated lists
+  // every English page: one it lacks is the English page (en: true, the EN mark) under the name its index.md gives it.
+  const english = lang !== "en" && !COMPLETE[lang] ? site.en?.pages : null;
+  const item = (key, name) => pages.has(key) ? { key, title: pages.get(key).title, url: pageUrl(lang, key) }
+    : { key, title: name || english.get(key).title, titleLang: name ? null : "en", url: pageUrl("en", key), en: true };
   const keyOf = (href) => posix.normalize(href.replace(/\.md(#.*)?$/, ""));
   const listed = new Set(["index"]);
   const nav = [];
@@ -87,12 +112,19 @@ for (const lang of LANGS) {
     for (const l of g.links) {
       if (!/\.md(#.*)?$/.test(l.href) || /^[a-z]+:/i.test(l.href)) continue;
       const key = keyOf(l.href);
-      if (!pages.has(key)) { warn(`${lang}/index.md lists ${key}.md, which does not exist yet (left out of the sidebar)`); continue; }
+      if (!pages.has(key) && !english?.has(key)) { warn(`${lang}/index.md lists ${key}.md, which does not exist yet (left out of the sidebar)`); continue; }
       if (listed.has(key)) continue;
       listed.add(key);
-      items.push({ key, title: pages.get(key).title, url: pageUrl(lang, key) });
+      items.push(item(key, l.text));
     }
     if (items.length) nav.push({ title: g.title, items });
+  });
+  // English pages its index.md does not list (yet) join the group in the same place as in English
+  if (english) site.en.nav.forEach((g, n) => {
+    const missing = g.items.filter((x) => !listed.has(x.key));
+    if (!missing.length) return;
+    missing.forEach((x) => listed.add(x.key));
+    (nav[n] ?? nav[nav.push({ title: g.title, items: [] }) - 1]).items.push(...missing.map((x) => item(x.key)));
   });
   const orphans = [...pages.keys()].filter((k) => !listed.has(k));
   if (orphans.length) {
@@ -115,7 +147,9 @@ for (const lang of Object.keys(site)) {
     page.headings = [];
     page.codes = new Map();
     const w = (m) => warn(`${lang}/${page.key}.md: ${m}`);
-    const env = { lang, key: page.key, dir: dirname(join(DOCS, lang, page.key)), dirEn: dirname(join(DOCS, "en", page.key)), pages, warn: w, headings: page.headings, codes: page.codes, answersFrom: lang === "en" ? null : site.en?.pages.get(page.key)?.answers };
+    const env = { lang, key: page.key, dir: dirname(join(DOCS, lang, page.key)), dirEn: dirname(join(DOCS, "en", page.key)), pages, warn: w, headings: page.headings, codes: page.codes, answersFrom: lang === "en" ? null : site.en?.pages.get(page.key)?.answers,
+      // English is written first: the ids of an English page this language links to but has not translated
+      english: !COMPLETE[lang] && lang !== "en" ? (key) => (site.en?.pages.has(key) ? written.get(pageUrl("en", key)) : null) : null };
     page.html = render(page.body, env);
     page.answers = env.answers;
     const i = seq.findIndex((s) => s.key === page.key);
@@ -133,6 +167,11 @@ for (const lang of Object.keys(site)) {
     page.alternates = alternates;
     searchIdx[lang].push({ t: page.title, d: page.description, g: crumbGroup ?? "", u: page.url, h: page.key === "index" ? [] : page.headings.filter((h) => h.level <= 3).map((h) => [h.title, h.id]), k: page.key === "index" ? [] : [...page.codes].map(([c, x]) => (x.def ? [c, x.id, 1] : [c, x.id])) });
   }
+  // the English pages its sidebar lists are found by the name the sidebar gives them, under its group
+  for (const g of nav) for (const x of g.items) {
+    const en = x.en && searchIdx.en?.find((p) => p.u === x.url);
+    if (en) searchIdx[lang].push({ ...en, t: x.title, g: g.title });
+  }
   out(pageUrl(lang, "search-index.json").slice(1).replace(/\/$/, ""), JSON.stringify(searchIdx[lang]));
 }
 out("404.html", render404({ assets, others: LANGS.filter((l) => l !== "en" && site[l]) }));
@@ -143,7 +182,7 @@ const llmsPages = [...urls].sort((a, b) => a.url.localeCompare(b.url)).map((p) =
 out("llms.txt", `# Mistgate documentation\n\n> Self-hosted VPN fleet panel and Go node agent. The panel and node agent are static Go binaries; no Docker runtime is required.\n\n## AI and installation\n\n- [AI agent guide](${SITE}/getting-started/ai-agents/): ready prompts to install the panel over SSH, run the fleet through owner-approved MCP tools, and contribute to the code.\n- [Install the panel](${SITE}/getting-started/install-panel/): the official release binaries, mistgate setup and the systemd unit.\n- [Install a node over SSH](${SITE}/getting-started/ssh-install/)\n- [Repository agent instructions](https://github.com/Mistgate/mistgate/blob/main/AGENTS.md)\n- [MCP tool reference](${SITE}/reference/mcp/)\n\n## All pages\n\n${llmsPages}\n`);
 out("sitemap.xml", `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:xhtml="http://www.w3.org/1999/xhtml">
-${urls.map((p) => `<url><loc>${SITE}${p.url}</loc>${p.alternates.length > 1 ? "\n" + p.alternates.map((a) => `  <xhtml:link rel="alternate" hreflang="${a.lang}" href="${SITE}${a.url}"/>`).join("\n") + "\n" : ""}</url>`).join("\n")}
+${urls.map((p) => `<url><loc>${SITE}${p.url}</loc>${p.date ? `<lastmod>${p.date}</lastmod>` : ""}${p.alternates.length > 1 ? "\n" + p.alternates.map((a) => `  <xhtml:link rel="alternate" hreflang="${a.lang}" href="${SITE}${a.url}"/>`).join("\n") + "\n" : ""}</url>`).join("\n")}
 </urlset>
 `);
 out("robots.txt", `User-agent: *\nAllow: /\n\nSitemap: ${SITE}/sitemap.xml\n`);
@@ -157,6 +196,7 @@ out("_redirects", Object.entries(MOVED).flatMap(([from, to]) => LANGS.filter((l)
 const initHash = createHash("sha256").update(THEME_INIT).digest("base64");
 out("_headers", `/*
   X-Content-Type-Options: nosniff
+  Strict-Transport-Security: max-age=31536000
   Referrer-Policy: strict-origin-when-cross-origin
   X-Frame-Options: DENY
   Permissions-Policy: camera=(), microphone=(), geolocation=(), interest-cohort=()
@@ -171,12 +211,16 @@ out("_headers", `/*
 /install.sh
   Content-Type: text/plain; charset=utf-8
   Cache-Control: public, max-age=300
+
+https://mistgate-docs.pages.dev/*
+  X-Robots-Tag: noindex
 `);
 
 // ---- link check: every internal href/src must land on a written page, asset or anchor ----
 const files = new Set(walk2(DIST).map((f) => "/" + relative(DIST, f).replace(/\\/g, "/")));
 function walk2(d) { return readdirSync(d).flatMap((n) => { const p = join(d, n); return statSync(p).isDirectory() ? walk2(p) : [p]; }); }
 const broken = [];
+const landings = new Set(LANGS.map(landingUrl));
 for (const f of files) {
   if (!f.endsWith(".html")) continue;
   const html = readFileSync(join(DIST, f), "utf8");
@@ -184,6 +228,7 @@ for (const f of files) {
   for (const m of html.matchAll(/(?:href|src)="([^"]+)"/g)) {
     const h = m[1];
     if (/^(https?:|mailto:|data:)/.test(h)) continue;
+    if (landings.has(h)) continue; // the landing (/, /ru/ ...) is built by landing/ and checked by merge.mjs
     const [path, rawFrag] = h.split("#");
     const frag = rawFrag && decodeURIComponent(rawFrag); // markdown-it percent-encodes a Cyrillic anchor; the id is raw
     const target = path === "" ? self : path;

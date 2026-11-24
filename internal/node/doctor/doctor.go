@@ -4,7 +4,7 @@
 //
 //   - Read-only by default. A check only reads /proc, /sys, a few config files and runs read-only commands
 //     (systemctl list-*, nft list, timedatectl show, dmesg, journalctl -k). Only Apply changes anything, only
-//     for the seven compiled fix ids, never from a string the panel sends (params are validated), and a dry run
+//     for the eight compiled fix ids, never from a string the panel sends (params are validated), and a dry run
 //     changes nothing.
 //   - A check that cannot run here (container, no systemd, not root, not Linux) is SKIP with a reason, never
 //     a false OK.
@@ -55,34 +55,43 @@ func (s Status) String() string {
 
 // Check ids, in the order a full report lists them (agent.proto "CHECK IDS"). Append only.
 const (
-	CheckDiskSpace      = "disk_space"
-	CheckJournaldSize   = "journald_size"
-	CheckDstateTasks    = "dstate_tasks"
-	CheckTimeSync       = "time_sync"
-	CheckResolver       = "resolver"
-	CheckIPv6           = "ipv6"
-	CheckForeignVPN     = "foreign_vpn"
-	CheckForeignNft     = "foreign_nft"
-	CheckPortConflicts  = "port_conflicts"
-	CheckNetBaseline    = "net_baseline"
-	CheckCertExpiry     = "cert_expiry"
-	CheckMemoryPressure = "memory_pressure"
-	CheckCPUSoftirq     = "cpu_softirq"
-	CheckKernelHeaders  = "kernel_headers"
-	CheckAwgBackend     = "awg_backend"
-	CheckWarpPath       = "warp_path"
-	CheckUnitGeneration = "unit_generation"
+	CheckDiskSpace       = "disk_space"
+	CheckJournaldSize    = "journald_size"
+	CheckDstateTasks     = "dstate_tasks"
+	CheckTimeSync        = "time_sync"
+	CheckResolver        = "resolver"
+	CheckIPv6            = "ipv6"
+	CheckForeignVPN      = "foreign_vpn"
+	CheckForeignNft      = "foreign_nft"
+	CheckPortConflicts   = "port_conflicts"
+	CheckNetBaseline     = "net_baseline"
+	CheckCertExpiry      = "cert_expiry"
+	CheckMemoryPressure  = "memory_pressure"
+	CheckCPUSoftirq      = "cpu_softirq"
+	CheckKernelHeaders   = "kernel_headers"
+	CheckAwgBackend      = "awg_backend"
+	CheckWarpPath        = "warp_path"
+	CheckUnitGeneration  = "unit_generation"
+	CheckSecurityUpdates = "security_updates"
+	CheckNftables        = "nftables"
+	CheckCPUSteal        = "cpu_steal"
+	CheckConntrackFill   = "conntrack_fill"
+	CheckAgentFDs        = "agent_fds"
+	CheckRealityTarget   = "reality_target"
 )
 
 // Fix ids (agent.proto "FIX IDS").
 const (
-	FixJournaldVacuum  = "journald_vacuum"
-	FixApplyBaseline   = "apply_baseline"
-	FixRestartInbound  = "restart_inbound"
-	FixSetResolver     = "set_resolver"
-	FixReconnectWarp   = "reconnect_warp"
-	FixRefreshUnit     = "refresh_unit"
-	FixAllowForwarding = "allow_forwarding"
+	FixJournaldVacuum        = "journald_vacuum"
+	FixApplyBaseline         = "apply_baseline"
+	FixRestartInbound        = "restart_inbound"
+	FixSetResolver           = "set_resolver"
+	FixReconnectWarp         = "reconnect_warp"
+	FixRefreshUnit           = "refresh_unit"
+	FixAllowForwarding       = "allow_forwarding"
+	FixEnableSecurityUpdates = "enable_security_updates"
+	FixAwgModuleRepair       = "awg_module_repair"
+	FixInstallNftables       = "install_nftables"
 )
 
 // Result is one check's outcome; it becomes one DoctorResult.
@@ -137,6 +146,12 @@ var checks = []check{
 	{CheckAwgBackend, checkAwgBackend},
 	{CheckWarpPath, checkWarpPath},
 	{CheckUnitGeneration, checkUnitGeneration},
+	{CheckSecurityUpdates, checkSecurityUpdates},
+	{CheckNftables, checkNftables},
+	{CheckCPUSteal, checkCPUSteal},
+	{CheckConntrackFill, checkConntrackFill},
+	{CheckAgentFDs, checkAgentFDs},
+	{CheckRealityTarget, checkRealityTarget},
 }
 
 // CheckIDs returns every check id in report order.
@@ -150,18 +165,21 @@ func CheckIDs() []string {
 
 // FixIDs returns the fix ids.
 func FixIDs() []string {
-	return []string{FixJournaldVacuum, FixApplyBaseline, FixRestartInbound, FixSetResolver, FixReconnectWarp, FixRefreshUnit, FixAllowForwarding}
+	return []string{FixJournaldVacuum, FixApplyBaseline, FixRestartInbound, FixSetResolver, FixReconnectWarp, FixRefreshUnit, FixAllowForwarding, FixEnableSecurityUpdates, FixAwgModuleRepair, FixInstallNftables}
 }
 
 // fixChecks says which checks offer a fix; the agent re-runs them after the fix (agent.proto "ApplyFix"). A unit
 // refresh restarts the agent, so its next periodic report is the re-check; an immediate report would be stale.
 var fixChecks = map[string][]string{
-	FixJournaldVacuum:  {CheckJournaldSize, CheckDiskSpace},
-	FixApplyBaseline:   {CheckNetBaseline},
-	FixRestartInbound:  {CheckPortConflicts, CheckCertExpiry},
-	FixSetResolver:     {CheckResolver},
-	FixReconnectWarp:   {CheckWarpPath},
-	FixAllowForwarding: {CheckAwgBackend},
+	FixJournaldVacuum:        {CheckJournaldSize, CheckDiskSpace},
+	FixApplyBaseline:         {CheckNetBaseline},
+	FixRestartInbound:        {CheckPortConflicts, CheckCertExpiry},
+	FixSetResolver:           {CheckResolver},
+	FixReconnectWarp:         {CheckWarpPath},
+	FixAllowForwarding:       {CheckAwgBackend},
+	FixAwgModuleRepair:       {CheckAwgBackend, CheckKernelHeaders},
+	FixEnableSecurityUpdates: {CheckSecurityUpdates},
+	FixInstallNftables:       {CheckNftables},
 }
 
 // RecheckIDs returns the checks to re-run after a fix, nil for an unknown fix id.

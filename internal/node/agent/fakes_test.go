@@ -30,6 +30,7 @@ type fakeEngine struct {
 	kicked    [][]string
 	kickRet   int
 	applyErr  map[string]error
+	warnings  map[string][]string
 	closed    bool
 	unhealthy map[string]bool // inbounds whose Health says FAILED
 	lateCert  bool            // like ACME: Apply reports no certificate, Health reports leaf once there is one
@@ -48,7 +49,7 @@ type fakeInbound struct {
 }
 
 func newFakeEngine(proto string) *fakeEngine {
-	return &fakeEngine{proto: proto, in: map[string]*fakeInbound{}, applies: map[string]int{}, applyErr: map[string]error{}, upEach: 10, downEach: 5}
+	return &fakeEngine{proto: proto, in: map[string]*fakeInbound{}, applies: map[string]int{}, applyErr: map[string]error{}, warnings: map[string][]string{}, upEach: 10, downEach: 5}
 }
 
 func (e *fakeEngine) factory() engine.Factory {
@@ -75,7 +76,7 @@ func (e *fakeEngine) Apply(_ context.Context, spec plugin.InboundSpec, creds []p
 	if e.lateCert {
 		cert = engine.CertInfo{}
 	}
-	return engine.ApplyReport{SpecHash: statehash.Spec(spec), CredCount: len(creds), Restarted: restarted, Cert: cert}, nil
+	return engine.ApplyReport{SpecHash: statehash.Spec(spec), CredCount: len(creds), Restarted: restarted, Cert: cert, Warnings: append([]string(nil), e.warnings[spec.ID]...)}, nil
 }
 
 func (e *fakeEngine) Remove(_ context.Context, id string) error {
@@ -207,6 +208,7 @@ type fakeHost struct {
 	baselines int
 	hopCalls  [][]hostctl.Hop
 	hopErr    error
+	baseErr   error
 	udpCalls  [][]hostctl.UDPInboundPort
 	tcpCalls  [][]uint16
 	udpErr    error
@@ -219,13 +221,15 @@ func (h *fakeHost) Facts(context.Context) hostctl.Facts {
 		RAMTotal: 1 << 30, DiskTotal: 20 << 30, Virt: "kvm", HasIPv6: true, Boot: time.Unix(1700000000, 0)}
 }
 func (h *fakeHost) Metrics() hostctl.Metrics {
-	return hostctl.Metrics{CPUPct: 12.5, SoftirqPct: 3, Load1: 0.5, RAMUsed: 100, RAMTotal: 200, UptimeS: 99}
+	return hostctl.Metrics{CPUPct: 12.5, SoftirqPct: 3, Load1: 0.5, RAMUsed: 100, RAMTotal: 200, UptimeS: 99,
+		StealPct: 2, IOWaitPct: 1, SwapUsed: 10, SwapTotal: 20, ConntrackCount: 30, ConntrackMax: 40, TCPSockets: 5, UDPSockets: 6, NICSpeedMbps: 1000}
 }
 func (h *fakeHost) ApplyBaseline(context.Context) error {
 	h.mu.Lock()
 	h.baselines++
+	err := h.baseErr
 	h.mu.Unlock()
-	return nil
+	return err
 }
 func (h *fakeHost) SetPortHops(_ context.Context, hops []hostctl.Hop) error {
 	h.mu.Lock()

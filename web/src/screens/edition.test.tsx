@@ -19,6 +19,7 @@ import { ChecksTab } from "@/screens/health/checks";
 import { HealthScreen } from "@/screens/health";
 import { NodeChecks } from "@/screens/node/checks";
 import { IntegrationsScreen } from "@/screens/integrations";
+import { TokensTab } from "@/screens/ai/tokens";
 import { AwgStatusLine } from "@/screens/node/awg-status";
 import { LogsTab } from "@/screens/node/logs";
 import { BackupsPage } from "@/screens/settings-pages/backups";
@@ -140,9 +141,19 @@ describe("EditionNotice", () => {
   });
 });
 
+// Telegram stays on Integrations; MCP and the API tokens moved to AI (ADR 0014): the AI page's cards read the edition the same way.
+function IntegrationsAndAgents() {
+  return (
+    <>
+      <IntegrationsScreen />
+      <TokensTab />
+    </>
+  );
+}
+
 describe("Integrations on the edge", () => {
   it("keeps Telegram available while MCP is unavailable and offers no new API token", async () => {
-    await mount(<IntegrationsScreen />);
+    await mount(<IntegrationsAndAgents />);
     expect(text()).toContain(notice("mcp"));
     expect(getTelegram).toHaveBeenCalled();
     expect(text()).not.toContain("Not available in the Cloudflare edition yet: Telegram alerts.");
@@ -154,7 +165,7 @@ describe("Integrations on the edge", () => {
 
   it("is unchanged on the VPS", async () => {
     edition = "vps";
-    await mount(<IntegrationsScreen />);
+    await mount(<IntegrationsAndAgents />);
     expect(text()).not.toContain("Not available in the Cloudflare edition yet");
     expect(getTelegram).toHaveBeenCalled();
     expect(document.querySelector("[data-testid='mcp-url']")).not.toBeNull();
@@ -202,8 +213,9 @@ describe("Add node on the edge", () => {
   it("offers the SSH install next to the manual command, with no notice", async () => {
     await openAddNode();
     expect(text()).not.toContain("Not available in the Cloudflare edition yet");
-    expect(buttons()).toContain("Install automatically over SSH");
-    expect(buttons()).toContain("Get a manual install command");
+    // the window offers both ways in its rail: over SSH (the page it opens on) and by a command
+    expect([...document.querySelectorAll("[role=radio]")].map((r) => r.textContent)).toEqual(["Over SSH", "By command"]);
+    expect(document.querySelector("[role=radio][aria-checked=true]")?.textContent).toBe("Over SSH");
   });
 });
 
@@ -224,21 +236,20 @@ const updatesPage = {
 };
 
 describe("Updates on the edge", () => {
-  it("lists the nodes and the release but offers no way to start an update", async () => {
+  // The page opens one layer at a time: a panel update is out, so it starts on the panel; ?tab=agents shows the nodes.
+  it("says how the edition's panel is updated and offers no button for it", async () => {
     await mount(<UpdatesScreen />);
-    expect(text()).toContain(notice("agent_updates"));
     // the panel row says how the edition is updated instead of only that it cannot be done from here
     expect(text()).not.toContain(notice("panel_update"));
     expect(text()).toContain("This panel runs on Cloudflare. Update it from your computer");
-    expect(text()).toContain("de1");
     expect(text()).not.toContain("Only the owner");
-    const all = buttons().join("|");
-    expect(all).not.toMatch(/Update \d+ nodes?/);
-    expect(all).not.toContain("Update panel");
-    expect(all).not.toContain("Read the folder again");
+    expect(buttons().join("|")).not.toContain("Update panel");
+    // the edition has two layers: nothing reads the servers' operating systems there
+    expect(text()).not.toContain("Server systems");
   });
 
   it("shows no release bundle card: the edition has no bundle, its scan would only fail", async () => {
+    search = { tab: "agents" };
     await mount(<UpdatesScreen />);
     expect(text()).not.toContain("Release bundle");
     expect(text()).not.toContain("manifest.json");
@@ -248,8 +259,15 @@ describe("Updates on the edge", () => {
     edition = "vps";
     await mount(<UpdatesScreen />);
     expect(text()).not.toContain("Not available in the Cloudflare edition yet");
-    expect(text()).toContain("Release bundle");
     expect(buttons()).toContain("Update panel");
+    expect(text()).toContain("Server systems"); // the third layer exists here
+  });
+
+  it("keeps the fleet card and its button on the VPS", async () => {
+    edition = "vps";
+    search = { tab: "agents" };
+    await mount(<UpdatesScreen />);
+    expect(text()).toContain("Release bundle");
     expect(buttons().some((b) => /^Update \d+ nodes?$/.test(b))).toBe(true);
   });
 });
@@ -352,18 +370,18 @@ describe("the Health page on the edge", () => {
     expect(text()).toContain("No problems · alerts evaluated every minute");
     expect(text()).not.toContain("checks every");
     expect(text()).toContain(edgeAlerts);
-    expect(text()).toContain("All quiet.");
-    expect(text()).toContain("No alert in the last 7 days.");
+    expect(text()).toContain("All quiet");
+    expect(text()).toContain("No alert in the last 7 days");
     expect(document.querySelectorAll('[role="status"]')).toHaveLength(1); // the one notice
   });
 
   it("shows an open alert like the VPS does, and counts it in the line", async () => {
     alertsPage = { nowUnix: 1000, active: [alertOf({})], history: [] };
     await mount(<HealthScreen />);
-    expect(text()).toContain("1 problem · alerts evaluated every minute");
+    expect(text()).toContain("1 problem · 1 critical · alerts evaluated every minute");
     expect(text()).toContain("Node is unreachable");
     expect(text()).toContain(edgeAlerts);
-    expect(text()).not.toContain("All quiet.");
+    expect(text()).not.toContain("All quiet");
   });
 
   it("says it in Russian and Chinese too", async () => {
@@ -384,28 +402,28 @@ describe("the Health page on the edge", () => {
     await mount(<HealthScreen />);
     expect(text()).not.toContain("Not available in the Cloudflare edition yet");
     expect(text()).not.toContain(notice("health_checks"));
-    expect(text()).toContain("Nobody has trouble connecting.");
+    expect(text()).toContain("No open alerts about people");
     act(() => root?.unmount());
     host?.remove();
     alertsPage = { nowUnix: 1000, active: [torrentAlert], history: [] };
     await mount(<HealthScreen />);
     expect(text()).toContain("Torrent attempts");
     expect(text()).toContain("alice");
-    expect(text()).not.toContain("Nobody has trouble connecting.");
+    expect(text()).not.toContain("No open alerts about people");
   });
 
   it("is unchanged on the VPS", async () => {
     edition = "vps";
     await mount(<HealthScreen />);
     expect(text()).toContain("No problems · checks every 5 min");
-    expect(text()).toContain("All quiet.");
+    expect(text()).toContain("All quiet");
     expect(text()).not.toContain("Not available in the Cloudflare edition yet");
     expect(text()).not.toContain("evaluated every minute");
     act(() => root?.unmount());
     host?.remove();
     alertsPage = { nowUnix: 1000, active: [alertOf({})], history: [] };
     await mount(<HealthScreen />);
-    expect(text()).toContain("1 problem · checks every 5 min");
+    expect(text()).toContain("1 problem · 1 critical · checks every 5 min");
     expect(text()).toContain("Node is unreachable");
     expect(text()).not.toContain("Not available in the Cloudflare edition yet");
     act(() => root?.unmount());
@@ -413,7 +431,7 @@ describe("the Health page on the edge", () => {
     alertsPage = { nowUnix: 1000, active: [], history: [] };
     search = { tab: "people" };
     await mount(<HealthScreen />);
-    expect(text()).toContain("Nobody has trouble connecting.");
+    expect(text()).toContain("No open alerts about people");
     expect(text()).not.toContain("Not available in the Cloudflare edition yet");
   });
 });

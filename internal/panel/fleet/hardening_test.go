@@ -172,7 +172,10 @@ func TestStatsFutureEndDoesNotFreezeLiveView(t *testing.T) {
 	year := now + 365*24*3600
 
 	c.send(1, statsBatch(year-10, year, nil, []*agentv1.Session{{CredId: "crd_alice_hy", InboundId: ids.i1, ConnectedAtUnix: year}}))
-	c.send(2, statsBatch(now-10, now, nil, []*agentv1.Session{{CredId: "crd_erin_hy", InboundId: ids.i1, ConnectedAtUnix: now - 5}}))
+	// The future batch's end is clamped to the moment the panel takes it in, which on a slow runner (-race) is a second or
+	// more after `now`: an honest end of exactly `now` would then look older and be skipped. A minute ahead is still honest
+	// (within maxFuture) and always later than that clamp.
+	c.send(2, statsBatch(now-10, now+60, nil, []*agentv1.Session{{CredId: "crd_erin_hy", InboundId: ids.i1, ConnectedAtUnix: now - 5}}))
 	c.wait(func(m *agentv1.ConnectResponse) bool { return m.GetAck() != nil && m.GetAck().UpToSeq >= 2 })
 	on := e.f.Online(e.ctx)
 	if len(on) != 1 || on[0].UserID != "usr_erin" {
@@ -183,9 +186,8 @@ func TestStatsFutureEndDoesNotFreezeLiveView(t *testing.T) {
 	}
 }
 
-// A batch the database refuses is retried once (maybe transient) and then dropped and acked: it must not be
-// resent forever and wedge the node's accounting.
-func TestPoisonBatchIsDroppedAfterASecondRefusal(t *testing.T) {
+// A permanent constraint failure is dropped and acked immediately so it cannot wedge the node's accounting.
+func TestPoisonBatchIsDroppedAfterPermanentRefusal(t *testing.T) {
 	e := newEnv(t)
 	a := e.enroll("nodea")
 	ids := e.fixture(a.nodeID)
@@ -197,23 +199,15 @@ func TestPoisonBatchIsDroppedAfterASecondRefusal(t *testing.T) {
 	}
 
 	c.send(1, poison())
-	if err := c.ended(); code(err) != connect.CodeInternal {
-		t.Fatalf("first refusal: stream ended with %v, want INTERNAL (the agent resends)", err)
-	}
-	c2 := a.open()
-	c2.send(0, hello("inst1", 1, ""))
-	c2.wait(func(m *agentv1.ConnectResponse) bool { return m.GetHelloAck() != nil })
-	c2.desired()
-	c2.send(1, poison()) // resent after the reconnect
-	if ack := c2.ack(); ack.UpToSeq != 1 {
+	if ack := c.ack(); ack.UpToSeq != 1 {
 		t.Fatalf("ack %d, want the poison batch acked and dropped", ack.UpToSeq)
 	}
 	if n := e.count(`SELECT count(*) FROM event WHERE code = 'stats_dropped'`); n != 1 {
 		t.Errorf("stats_dropped events: %d", n)
 	}
 	// The stream and the accounting go on.
-	c2.send(2, statsBatch(now-10, now, []*agentv1.TrafficDelta{{CredId: "crd_alice_hy", InboundId: ids.i1, BytesUp: 7}}, nil))
-	c2.wait(func(m *agentv1.ConnectResponse) bool { return m.GetAck() != nil && m.GetAck().UpToSeq >= 2 })
+	c.send(2, statsBatch(now-10, now, []*agentv1.TrafficDelta{{CredId: "crd_alice_hy", InboundId: ids.i1, BytesUp: 7}}, nil))
+	c.wait(func(m *agentv1.ConnectResponse) bool { return m.GetAck() != nil && m.GetAck().UpToSeq >= 2 })
 	var u int64
 	e.st.R.QueryRow(`SELECT used_bytes FROM user WHERE id = 'usr_alice'`).Scan(&u)
 	if u != 7 {

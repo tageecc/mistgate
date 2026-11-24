@@ -18,9 +18,6 @@ import (
 // never changes node.bandwidth_mbps, the admin chooses to use the number. The one write the panel makes by itself is the
 // first measurement of a node that has just been enrolled, and only while its capacity is still 0.
 
-// capBandwidth is the Hello.capabilities entry of an agent that can measure; the panel sends MeasureBandwidth to no other.
-const capBandwidth = "bandwidth/1"
-
 // node.bandwidth_mbps is validated to this by UpdateNode; an agent's number is held to it too.
 const maxBandwidthMbps = 1_000_000
 
@@ -120,6 +117,7 @@ func (s nodeService) MeasureBandwidth(ctx context.Context, req *connect.Request[
 		return nil, internalErr(f.log.Error, "measure bandwidth", err)
 	}
 	out, err := f.measureBandwidth(ctx, n)
+	f.noteSpeedTest(ctx, n.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -130,7 +128,16 @@ func (s nodeService) MeasureBandwidth(ctx context.Context, req *connect.Request[
 	return connect.NewResponse(out), nil
 }
 
+// noteSpeedTest records that the node has just finished (or given up on) a speed measurement, whatever it found: the
+// capacity report must not read the traffic of that hour as people's.
+func (f *Fleet) noteSpeedTest(ctx context.Context, nodeID string) {
+	if err := f.st.NoteSpeedTest(context.WithoutCancel(ctx), nodeID, f.now()); err != nil {
+		f.log.Warn("note the speed measurement", "code", "speed_test_note_failed", "node", nodeID, "err", err)
+	}
+}
+
 func (f *Fleet) storeAutoMeasureBandwidth(ctx context.Context, nodeID string, out *adminv1.MeasureBandwidthResponse) {
+	f.noteSpeedTest(ctx, nodeID)
 	if out == nil || out.ErrorCode != "" {
 		f.log.Info("first bandwidth measurement did not work", "node", nodeID, "code", out.GetErrorCode())
 		return

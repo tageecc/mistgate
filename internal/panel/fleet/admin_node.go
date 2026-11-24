@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -19,11 +20,15 @@ import (
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
 	agentv1 "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/internal/agentcap"
+	"github.com/mistgate/mistgate/internal/agentlink"
 	"github.com/mistgate/mistgate/internal/decoy"
 	"github.com/mistgate/mistgate/internal/panel/auth"
 	"github.com/mistgate/mistgate/internal/panel/edition"
+	"github.com/mistgate/mistgate/internal/panel/nodeshare"
 	"github.com/mistgate/mistgate/internal/panel/protocols"
 	"github.com/mistgate/mistgate/internal/panel/store"
+	"github.com/mistgate/mistgate/internal/plugin"
 )
 
 type nodeService struct{ f *Fleet }
@@ -63,15 +68,33 @@ func validResolver(r string) bool {
 const (
 	maxNodeText  = 100 // location, provider
 	maxNodeNotes = 500
+	maxNodeLabel = 40 // the public label
 )
+
+// validPublicLabel: the owner's text for people (the Mistgate app shows it). At most maxNodeLabel characters, valid UTF-8, and no
+// control character of any kind (the line and paragraph separators included) and no direction or invisible-space character
+// (store.UnsafeDisplayRune), so that it is one plain line wherever it is shown. The joiner and non-joiner stay.
+func validPublicLabel(s string) bool {
+	return utf8.ValidString(s) && utf8.RuneCountInString(s) <= maxNodeLabel && !strings.ContainsFunc(s, store.UnsafeDisplayRune)
+}
 
 // validText: at most max characters (runes, like the admin's form fields count them), valid UTF-8, no control characters.
 func validText(s string, max int) bool {
+	return validTextWith(s, max, "")
+}
+
+// validNotes is validText for the node's notes, which may also hold line breaks and tabs. Those count toward the limit
+// like any other character: what is checked is what is stored.
+func validNotes(s string) bool {
+	return validTextWith(s, maxNodeNotes, "\n\r\t")
+}
+
+func validTextWith(s string, max int, allowed string) bool {
 	if !utf8.ValidString(s) || utf8.RuneCountInString(s) > max {
 		return false
 	}
 	for _, r := range s {
-		if r < 0x20 || r == 0x7f {
+		if (r < 0x20 || r == 0x7f) && !strings.ContainsRune(allowed, r) {
 			return false
 		}
 	}
@@ -227,39 +250,96 @@ func pct(used, total uint64) float32 {
 	return float32(float64(used) * 100 / float64(total))
 }
 
-// nodeMsg builds the Node message. protos, todayBytes, enabled and live are looked up by the caller once per
-// request.
-func capabilityPresent(caps []string, want string) bool {
-	for _, cap := range caps {
-		if cap == want {
-			return true
-		}
+// nodeMessages is the one way to build the cards of existing nodes: the lookups every card needs are read once for the
+// whole list. A failed read fails the list.
+func (f *Fleet) nodeMessages(ctx context.Context, nodes []store.NodeRow) ([]*adminv1.Node, error) {
+	now := f.now().UTC()
+	protos, err := f.st.FleetNodeProtocols(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("node protocols: %w", err)
 	}
-	return false
+	today, err := f.todayBytesByNode(ctx, now)
+	if err != nil {
+		return nil, fmt.Errorf("traffic today: %w", err)
+	}
+	relayToday, err := f.st.RelayTodayBytesByNode(ctx, todayStart(now))
+	if err != nil {
+		return nil, fmt.Errorf("relay traffic today: %w", err)
+	}
+	enabled, err := f.st.FleetEnabledInbounds(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("node inbounds: %w", err)
+	}
+	liveRows, err := f.liveView(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("node live: %w", err)
+	}
+	live := liveRowsByID(liveRows)
+	panelBundle, _ := f.panelDecoyBundle() // no bundle is a normal state: the card then says the panel has no site
+	healthSummaries := f.healthSummaries(ctx)
+	d6 := f.ipv6Doctors(ctx)
+	shares, err := f.st.NodeShares(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("node shares: %w", err)
+	}
+	out := make([]*adminv1.Node, 0, len(nodes))
+	for _, node := range nodes {
+		out = append(out, f.nodeMsg(ctx, node, protos[node.ID], today[node.ID], relayToday[node.ID], inboundsOf(enabled, node.ID), now, live[node.ID], panelBundle, healthSummaries[node.ID], d6[node.ID], shares[node.ID]))
+	}
+	return out, nil
 }
 
-func (f *Fleet) nodeMsg(ctx context.Context, n store.NodeRow, protos []string, todayBytes uint64, enabled map[string]string, now time.Time, live store.NodeLiveRow, panelBundle *decoy.Bundle, health store.NodeHealthSummary) *adminv1.Node {
+func (f *Fleet) nodeMessage(ctx context.Context, node store.NodeRow) (*adminv1.Node, error) {
+	rows, err := f.nodeMessages(ctx, []store.NodeRow{node})
+	if err != nil {
+		return nil, err
+	}
+	return rows[0], nil
+}
+
+// nodeCardAfterWrite is the card an RPC answers with once its write is done. The write stands, so a failed read of the
+// card is logged and the card comes without its counters instead of the RPC failing.
+func (f *Fleet) nodeCardAfterWrite(ctx context.Context, n store.NodeRow) *adminv1.Node {
+	card, err := f.nodeMessage(ctx, n)
+	if err == nil {
+		return card
+	}
+	f.log.Warn("read the node card after a write", "code", "node_card_failed", "node", n.ID, "err", err)
+	live, err := f.liveRowsForNode(ctx, n.ID, true)
+	if err != nil {
+		f.log.Warn("read the node live projection after a write", "code", "node_card_failed", "node", n.ID, "err", err)
+	}
+	return f.nodeMsg(ctx, n, nil, 0, 0, nil, f.now().UTC(), live, nil, store.NodeHealthSummary{}, f.ipv6Doctor(ctx, n.ID), f.shareOf(ctx, n.ID))
+}
+
+// nodeMsg builds the Node message. protos, todayBytes, enabled and live are looked up by the caller once per
+// request.
+func (f *Fleet) nodeMsg(ctx context.Context, n store.NodeRow, protos []string, todayBytes, relayTodayBytes uint64, enabled map[string]string, now time.Time, live store.NodeLiveRow, panelBundle *decoy.Bundle, health store.NodeHealthSummary, d6 store.IPv6Doctor, share store.NodeShare) *adminv1.Node {
 	view := decodeLiveView(live)
 	st := f.statusOfLive(ctx, n, live, enabled, now, health)
 	out := &adminv1.Node{
-		Id: n.ID, Name: n.Name, CountryCode: n.CountryCode, Location: n.Location, Provider: n.Provider, Address: n.Address, Notes: n.Notes,
-		Status: st.status, Reason: st.reason, Protocols: protos, TrafficTodayBytes: todayBytes, AgentVersion: n.AgentVersion,
+		Id: n.ID, Name: n.Name, CountryCode: n.CountryCode, Location: n.Location, Provider: n.Provider, Address: n.Address, Notes: n.Notes, PublicLabel: n.PublicLabel, LinkSealed: n.LinkSealed,
+		Status: st.status, Reason: st.reason, Protocols: protos, TrafficTodayBytes: todayBytes, RelayTodayBytes: relayTodayBytes, AgentVersion: n.AgentVersion,
 		LastSeenUnix: fleetUnix(live.LastSeenAt), AwgBackend: n.AwgBackend, TorrentBlockerEnabled: n.TorrentBlockerEnabled,
-		BandwidthMbps: uint32(n.BandwidthMbps), ClientIpv6: n.ClientIPv6,
+		BandwidthMbps: uint32(n.BandwidthMbps), ClientIpv6: n.ClientIPv6, Sharing: shareMsg(n, enabled, share, now),
 	}
 	caps := live.AgentCaps
-	out.TorrentBlockerSupported = capabilityPresent(caps, capTorrentGuard)
-	out.ClientIpv6Supported = capabilityPresent(caps, capClientIPv6)
-	out.UserRateLimitSupported = capabilityPresent(caps, capUserRateLimit)
+	out.TorrentBlockerSupported = store.CapabilityPresent(caps, agentcap.TorrentGuard)
+	out.ClientIpv6Supported = store.CapabilityPresent(caps, agentcap.ClientIPv6)
+	out.UserRateLimitSupported = store.CapabilityPresent(caps, agentcap.UserRateLimit)
+	out.BridgePort = uint32(n.BridgePort)
+	out.BridgePortReason, out.BridgePortProfileId = f.bridgePortReason(ctx, n)
 	out.AwgPrepare = awgPrepareMsg(n, caps, now)
+	out.Ipv6 = ipv6Msg(n, d6)
 	if live.Connected {
+		out.LinkViaNodeId = view.LinkViaNodeID
 		out.Online = protocolCounts(onlineByProtocolView(view))
 		if m := view.Metrics; m != nil {
 			out.HasMetrics, out.CpuPct, out.RamPct, out.UptimeS = true, float32(m.CPUPct), pct(m.RAMUsedBytes, m.RAMTotalBytes), m.UptimeS
 		}
 	}
 	out.Warp = f.warpSummary(ctx, n.ID, live.Connected, now)
-	decoySupported := capabilityPresent(caps, capDecoy)
+	decoySupported := store.CapabilityPresent(caps, agentcap.Decoy)
 	agentMode := n.DecoyAgentMode
 	if agentMode == "" && !decoySupported {
 		agentMode = decoy.ModeBuiltin
@@ -312,7 +392,66 @@ func (f *Fleet) nodeMsg(ctx context.Context, n store.NodeRow, protos []string, t
 	out.DecoyOwnAvailable = f.cfg.Remote == nil
 	out.DecoyAgentMode = agentMode
 	out.DecoyAgentSha256 = n.DecoyAgentHash
+	out.DecoySiteId = n.DecoySiteID
 	return out
+}
+
+func (f *Fleet) bridgePortReason(ctx context.Context, n store.NodeRow) (string, string) {
+	if n.BridgePort == 0 || n.BridgePort == 443 {
+		return "", ""
+	}
+	inbounds, err := f.st.FleetInbounds(ctx, n.ID, false)
+	if err != nil {
+		return "port_443_taken", ""
+	}
+	type inboundSpec struct {
+		row  store.FleetInboundRow
+		spec plugin.InboundSpec
+	}
+	var specs []inboundSpec
+	vless443 := false
+	for _, row := range inbounds {
+		if !row.Enabled {
+			continue
+		}
+		spec, err := f.buildSpec(n, row)
+		if err != nil {
+			continue
+		}
+		if spec.Protocol == "vless" && spec.Listen.Network == "tcp" && spec.Listen.Port == 443 {
+			vless443 = true
+			if v, _ := plugin.VLESSOf(spec); v.Security == "reality" && !v.TargetSelf() {
+				return "reality_external_target", row.ProfileID
+			}
+		}
+		specs = append(specs, inboundSpec{row: row, spec: spec})
+	}
+	for _, inbound := range specs {
+		spec := inbound.spec
+		if spec.Protocol == "hysteria2" && plugin.Hy2SitePort(spec) == 443 {
+			if !vless443 {
+				return "", ""
+			}
+			continue
+		}
+		if spec.Protocol == "vless" && spec.Listen.Port == 443 && bridgeVLESSOwnSite([]tcpSpec{{Profile: inbound.row.ProfileName, Spec: spec}}, inbound.row.ProfileName) {
+			continue
+		}
+		holds := spec.Listen.Network == "tcp" && (spec.Listen.Port == 443 || spec.Listen.HopFrom != 0 && spec.Listen.HopFrom <= 443 && spec.Listen.HopTo >= 443)
+		if holds {
+			return "port_443_taken", inbound.row.ProfileID
+		}
+	}
+	relays, err := f.st.RelayLinks(ctx, store.RelayFilter{ViaNodeID: n.ID})
+	if err != nil {
+		return "port_443_taken", ""
+	}
+	for _, relay := range relays {
+		if relay.Network == "tcp" && relay.Port == 443 {
+			return "port_443_taken", ""
+		}
+	}
+	return "", ""
 }
 
 func fleetUnix(t time.Time) int64 {
@@ -339,35 +478,15 @@ func (f *Fleet) todayBytesByNode(ctx context.Context, now time.Time) (map[string
 
 func (s nodeService) ListNodes(ctx context.Context, req *connect.Request[adminv1.ListNodesRequest]) (*connect.Response[adminv1.ListNodesResponse], error) {
 	f := s.f
-	now := f.now().UTC()
 	nodes, err := f.st.Nodes(ctx, req.Msg.IncludeRetired)
 	if err != nil {
 		return nil, internalErr(f.log.Error, "list nodes", err)
 	}
-	protos, err := f.st.FleetNodeProtocols(ctx)
+	cards, err := f.nodeMessages(ctx, nodes)
 	if err != nil {
-		return nil, internalErr(f.log.Error, "node protocols", err)
+		return nil, internalErr(f.log.Error, "list node cards", err)
 	}
-	today, err := f.todayBytesByNode(ctx, now)
-	if err != nil {
-		return nil, internalErr(f.log.Error, "traffic today", err)
-	}
-	enabled, err := f.st.FleetEnabledInbounds(ctx)
-	if err != nil {
-		return nil, internalErr(f.log.Error, "node inbounds", err)
-	}
-	liveRows, err := f.liveView(ctx)
-	if err != nil {
-		return nil, internalErr(f.log.Error, "node live", err)
-	}
-	live := liveRowsByID(liveRows)
-	panelBundle, _ := f.panelDecoyBundle()
-	healthSummaries := f.healthSummaries(ctx)
-	resp := &adminv1.ListNodesResponse{ExpectedAgentVersion: f.cfg.ExpectedAgentVersion}
-	for _, n := range nodes {
-		resp.Nodes = append(resp.Nodes, f.nodeMsg(ctx, n, protos[n.ID], today[n.ID], inboundsOf(enabled, n.ID), now, live[n.ID], panelBundle, healthSummaries[n.ID]))
-	}
-	return connect.NewResponse(resp), nil
+	return connect.NewResponse(&adminv1.ListNodesResponse{Nodes: cards, ExpectedAgentVersion: f.cfg.ExpectedAgentVersion}), nil
 }
 
 func (s nodeService) GetNode(ctx context.Context, req *connect.Request[adminv1.GetNodeRequest]) (*connect.Response[adminv1.GetNodeResponse], error) {
@@ -401,6 +520,10 @@ func (s nodeService) GetNode(ctx context.Context, req *connect.Request[adminv1.G
 	if err != nil {
 		return nil, internalErr(f.log.Error, "traffic today", err)
 	}
+	relayToday, err := f.st.RelayTodayBytesByNode(ctx, todayStart(now))
+	if err != nil {
+		return nil, internalErr(f.log.Error, "relay traffic today", err)
+	}
 	facts, err := f.st.NodeFacts(ctx, n.ID)
 	if err != nil {
 		return nil, internalErr(f.log.Error, "node facts", err)
@@ -414,6 +537,20 @@ func (s nodeService) GetNode(ctx context.Context, req *connect.Request[adminv1.G
 	if err != nil {
 		return nil, internalErr(f.log.Error, "node UDP port checks", err)
 	}
+	protocolOKAt, err := f.portProtocolOKAt(ctx, n, inbounds)
+	if err != nil {
+		return nil, internalErr(f.log.Error, "node protocol probe results", err)
+	}
+	for i := range portChecks {
+		portChecks[i].ProtocolOKAt = protocolOKAt[portChecks[i].Port]
+	}
+	udpFilteredAt, err := f.st.UDPFilteredAt(ctx, n.ID)
+	if err != nil {
+		return nil, internalErr(f.log.Error, "node UDP source-filter state", err)
+	}
+	if !udpFilteredAt.IsZero() {
+		resp.UdpFilteredUnix = udpFilteredAt.Unix()
+	}
 	tcpChecks, err := f.st.TCPChecks(ctx, n.ID)
 	if err != nil {
 		return nil, internalErr(f.log.Error, "node TCP port checks", err)
@@ -426,13 +563,16 @@ func (s nodeService) GetNode(ctx context.Context, req *connect.Request[adminv1.G
 	}
 	resp.PortChecks, _ = portCheckMessages(names, portChecks, "", "")
 	resp.TcpChecks = tcpCheckMessages(names, tcpChecks)
+	if resp.SharedPorts, resp.SharedPortsUnix, err = f.storedSharedPorts(ctx, n.ID); err != nil {
+		return nil, internalErr(f.log.Error, "node shared ports", err)
+	}
 	live, err := f.liveRowsForNode(ctx, n.ID, true)
 	if err != nil {
 		return nil, internalErr(f.log.Error, "node live", err)
 	}
 	view := decodeLiveView(live)
 	panelBundle, _ := f.panelDecoyBundle()
-	resp.Node = f.nodeMsg(ctx, n, protos, today[n.ID], enabled, now, live, panelBundle, f.healthSummaries(ctx)[n.ID])
+	resp.Node = f.nodeMsg(ctx, n, protos, today[n.ID], relayToday[n.ID], enabled, now, live, panelBundle, f.healthSummaries(ctx)[n.ID], f.ipv6Doctor(ctx, n.ID), f.shareOf(ctx, n.ID))
 	if n.State == "pending" {
 		if exp, err := f.st.PendingEnrollmentExpiry(ctx, n.ID, now); err == nil {
 			resp.EnrollmentExpiresUnix = fleetUnix(exp)
@@ -459,6 +599,13 @@ func (s nodeService) GetNode(ctx context.Context, req *connect.Request[adminv1.G
 			resp.Metrics = &adminv1.NodeMetrics{CpuPct: float32(m.CPUPct), SoftirqPct: float32(m.SoftirqPct), Load1: float32(m.Load1), RamUsedBytes: m.RAMUsedBytes,
 				RamTotalBytes: m.RAMTotalBytes, DiskUsedBytes: m.DiskUsedBytes, DiskTotalBytes: m.DiskTotalBytes,
 				NetRxBps: m.RxBPS, NetTxBps: m.TxBPS, AtUnix: view.MetricsAtUnix}
+			if r := m.Res; r != nil {
+				pm := resp.Metrics
+				pm.StealPct, pm.IowaitPct, pm.SwapUsedBytes, pm.SwapTotalBytes = float32(r.StealPct), float32(r.IOWaitPct), r.SwapUsed, r.SwapTotal
+				pm.ConntrackCount, pm.ConntrackMax, pm.TcpSockets, pm.UdpSockets, pm.NicSpeedMbps = r.ConntrackCount, r.ConntrackMax, r.TCPSockets, r.UDPSockets, r.NICSpeedMbps
+				pm.Agent = &adminv1.ProcessUsage{CpuPct: float32(r.AgentCPUPct), RssBytes: r.AgentRSS, GoTotalBytes: r.AgentGoTotal, GoHeapBytes: r.AgentGoHeap,
+					Goroutines: r.Goroutines, Threads: r.Threads, OpenFds: r.FDs, FdLimit: r.FDLimit}
+			}
 		}
 		resp.OnlineUsers, err = f.onlineUsers(ctx, view)
 		if err != nil {
@@ -494,6 +641,21 @@ func (s nodeService) CheckPorts(ctx context.Context, req *connect.Request[adminv
 		requested = append(requested, uint16(port))
 	}
 	out := f.checkPorts(ctx, n.ID, requested, "", true)
+	protocolOKAt, err := f.portProtocolOKAt(ctx, n, nil)
+	if err != nil {
+		return nil, internalErr(f.log.Error, "node protocol probe results", err)
+	}
+	for i := range out.checks {
+		out.checks[i].ProtocolOKAt = protocolOKAt[out.checks[i].Port]
+	}
+	udpFilteredAt, err := f.st.UDPFilteredAt(ctx, n.ID)
+	if err != nil {
+		return nil, internalErr(f.log.Error, "node UDP source-filter state", err)
+	}
+	filteredUnix := int64(0)
+	if !udpFilteredAt.IsZero() {
+		filteredUnix = udpFilteredAt.Unix()
+	}
 	var names map[string]string
 	if len(out.checks)+len(out.tcp) > 0 || out.sender != "" {
 		var err error
@@ -503,7 +665,7 @@ func (s nodeService) CheckPorts(ctx context.Context, req *connect.Request[adminv
 	}
 	rows, senderName := portCheckMessages(names, out.checks, out.sender, out.errorCode)
 	return connect.NewResponse(&adminv1.CheckPortsResponse{Ports: rows, Sender: senderName, ErrorCode: out.errorCode,
-		Tcp: tcpCheckMessages(names, out.tcp)}), nil
+		Tcp: tcpCheckMessages(names, out.tcp), UdpFilteredUnix: filteredUnix}), nil
 }
 
 func (f *Fleet) onlineUsers(ctx context.Context, view liveJSONView) ([]*adminv1.OnlineUser, error) {
@@ -548,20 +710,24 @@ func (f *Fleet) inboundMsg(n store.NodeRow, row store.FleetInboundRow) *adminv1.
 		Id: row.ID, ProfileId: row.ProfileID, ProfileName: row.ProfileName, Protocol: row.Protocol, NodeId: n.ID, NodeName: n.Name,
 		Port: uint32(row.PortOverride), TlsServerName: row.TLSNameOverride, State: inboundStateMsg(row.State), LastError: row.LastError,
 		CertPinSha256: row.CertPin, CertNotAfterUnix: fleetUnix(row.CertNotAfter), Awg: awgStatusMsg(row),
+		DirectInSubscriptions: row.DirectInSubscriptions, Enabled: row.Enabled, RealityTargetOverride: row.RealityTargetOverride,
 	}
 	if !row.Enabled {
 		out.State = adminv1.InboundState_INBOUND_STATE_DISABLED
 	}
 	if spec, err := f.buildSpec(n, row); err == nil {
 		out.Port, out.TlsServerName, out.Egress = uint32(spec.Listen.Port), spec.TLS.ServerName, spec.Egress
+		out.Cdn = plugin.ServerCDN(spec)
+		out.RealityTarget = plugin.RealityTargetShown(spec)
 	}
 	return out
 }
 
+// randomToken is a new enrollment token; its prefix tells a new agent to prove it instead of sending it.
 func randomToken() string {
 	var b [32]byte
 	rand.Read(b[:]) // never fails on supported platforms
-	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b[:]))
+	return agentlink.EnrollTokenPrefix + strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b[:]))
 }
 
 func (s nodeService) CreateEnrollment(ctx context.Context, req *connect.Request[adminv1.CreateEnrollmentRequest]) (*connect.Response[adminv1.CreateEnrollmentResponse], error) {
@@ -584,6 +750,16 @@ func (s nodeService) CreateEnrollment(ctx context.Context, req *connect.Request[
 	now := f.now().UTC()
 	panelBundle, _ := f.panelDecoyBundle()
 	var newNode *store.NodeRow
+	share, err := nodeshare.Choice(m.Sharing)
+	switch {
+	case err != nil:
+		return nil, err
+	case m.NodeId != "" && share.Mode != "":
+		return nil, invalid("sharing is for a new node; set it on an existing one with SetNodeSharing")
+	}
+	if err := f.checkShareGroups(ctx, share); err != nil {
+		return nil, err
+	}
 	if m.NodeId == "" {
 		name := strings.ToLower(m.Name)
 		cc := strings.ToUpper(m.CountryCode)
@@ -597,7 +773,7 @@ func (s nodeService) CreateEnrollment(ctx context.Context, req *connect.Request[
 		case !validText(m.Location, maxNodeText) || !validText(m.Provider, maxNodeText):
 			return nil, invalid("location and provider must be plain text up to 100 characters")
 		}
-		newNode = &store.NodeRow{ID: store.NewID("nod_"), Name: name, Address: m.Address, CountryCode: cc, Location: m.Location, Provider: m.Provider}
+		newNode = &store.NodeRow{ID: store.NewID("nod_"), Name: name, Address: m.Address, CountryCode: cc, Location: m.Location, Provider: m.Provider, Share: share}
 		if panelBundle != nil {
 			newNode.DecoyMode = decoy.ModePanel
 		}
@@ -614,13 +790,17 @@ func (s nodeService) CreateEnrollment(ctx context.Context, req *connect.Request[
 	case err != nil:
 		return nil, internalErr(f.log.Error, "create enrollment", err)
 	}
-	f.audit(ctx, "node.create_enrollment", map[string]string{"node_id": n.ID, "name": n.Name}) // never the token
+	audit := map[string]string{"node_id": n.ID, "name": n.Name} // never the token
+	if newNode != nil {
+		f.auditShare(ctx, audit, n.ID, share)
+	}
+	f.audit(ctx, "node.create_enrollment", audit)
 	install := installCommand(f.cfg.PanelAddr, f.cfg.AgentSNI, f.ca.fingerprint, token)
 	if linkOnly {
 		install = linkInstallCommand(f.cfg.LinkURL, f.ca.fingerprint, token)
 	}
 	return connect.NewResponse(&adminv1.CreateEnrollmentResponse{
-		Node:           f.nodeMsg(ctx, n, nil, 0, nil, now, store.NodeLiveRow{NodeID: n.ID}, panelBundle, store.NodeHealthSummary{}), // pending: no checks yet
+		Node:           f.nodeMsg(ctx, n, nil, 0, 0, nil, now, store.NodeLiveRow{NodeID: n.ID}, panelBundle, store.NodeHealthSummary{}, store.IPv6Doctor{}, f.shareOf(ctx, n.ID)), // pending: no checks yet
 		InstallCommand: install,
 		CaFingerprint:  "sha256:" + f.ca.fingerprint,
 		ExpiresUnix:    now.Add(ttl).Unix(),
@@ -629,6 +809,9 @@ func (s nodeService) CreateEnrollment(ctx context.Context, req *connect.Request[
 }
 
 func nodeDecoyError(f *Fleet, action string, err error) error {
+	if coded := decoyLibraryError(err); coded != nil {
+		return coded
+	}
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		return connect.NewError(connect.CodeNotFound, errors.New("node not found"))
@@ -697,7 +880,7 @@ func (s nodeService) UploadNodeDecoy(ctx context.Context, req *connect.Request[a
 	if err != nil {
 		return nil, internalErr(f.log.Error, "read node decoy bundle", err)
 	}
-	n, err := f.st.SetNodeDecoyBundle(ctx, m.NodeId, bundle.Hash(), bundle.Archive())
+	n, err := f.ownSiteFromUpload(ctx, m.NodeId, bundle)
 	if err != nil {
 		return nil, nodeDecoyError(f, "upload node decoy bundle", err)
 	}
@@ -812,8 +995,15 @@ func (s nodeService) UpdateNode(ctx context.Context, req *connect.Request[adminv
 			return nil, invalid("location and provider must be plain text up to 100 characters")
 		}
 	}
-	if m.Notes != nil && !validText(strings.NewReplacer("\n", "", "\r", "", "\t", "").Replace(*m.Notes), maxNodeNotes) {
+	if m.Notes != nil && !validNotes(*m.Notes) {
 		return nil, invalid("notes must be plain text up to 500 characters")
+	}
+	if m.PublicLabel != nil {
+		label := strings.TrimSpace(*m.PublicLabel)
+		if !validPublicLabel(label) {
+			return nil, invalid("public label must be plain text up to 40 characters")
+		}
+		p.PublicLabel = &label
 	}
 	if m.DnsResolvers != nil {
 		vals := m.DnsResolvers.Values
@@ -865,7 +1055,7 @@ func (s nodeService) UpdateNode(ctx context.Context, req *connect.Request[adminv
 			if err != nil {
 				return nil, internalErr(f.log.Error, "update node", err)
 			}
-			if !capabilityPresent(cur.AgentCaps, capTorrentGuard) {
+			if !store.CapabilityPresent(cur.AgentCaps, agentcap.TorrentGuard) {
 				return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("agent too old"))
 			}
 		}
@@ -884,7 +1074,7 @@ func (s nodeService) UpdateNode(ctx context.Context, req *connect.Request[adminv
 			if err != nil {
 				return nil, internalErr(f.log.Error, "update node", err)
 			}
-			if !capabilityPresent(cur.AgentCaps, capClientIPv6) {
+			if !store.CapabilityPresent(cur.AgentCaps, agentcap.ClientIPv6) {
 				return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("agent too old"))
 			}
 		}
@@ -899,13 +1089,35 @@ func (s nodeService) UpdateNode(ctx context.Context, req *connect.Request[adminv
 	}
 	oldAddress := ""
 	if m.Address != nil {
-		if cur, err := f.st.Node(ctx, m.NodeId); err == nil { // a missing node is answered by the update
+		cur, err := f.st.Node(ctx, m.NodeId)
+		switch {
+		case errors.Is(err, store.ErrNotFound): // answered by the update
+		case err != nil:
+			return nil, internalErr(f.log.Error, "update node", err)
+		default:
 			oldAddress = cur.Address
+			// The address is where every subscription sends people and what the health checks of the panel dial: moving
+			// it is the owner's call. Sending the same address back (a form that saves all its fields) stays open.
+			if *m.Address != cur.Address {
+				if a, ok := auth.AdminFrom(ctx); !ok || a.Role != store.RoleOwner {
+					return nil, connect.NewError(connect.CodePermissionDenied, errors.New("only the owner can change the address of a node"))
+				}
+			}
 		}
 	}
-	live, err := f.liveRowsForNode(ctx, m.NodeId, true)
-	if err != nil {
-		return nil, internalErr(f.log.Error, "read node live projection", err)
+	if p.DNSResolvers != nil {
+		// The resolvers name the servers the agent's engines ask for every destination of its users: the owner's call,
+		// like the address. Sending the same list back (a form that saves all its fields) stays open.
+		cur, err := f.st.Node(ctx, m.NodeId)
+		switch {
+		case errors.Is(err, store.ErrNotFound): // answered by the update
+		case err != nil:
+			return nil, internalErr(f.log.Error, "update node", err)
+		case !slices.Equal(*p.DNSResolvers, cur.DNSResolvers):
+			if a, ok := auth.AdminFrom(ctx); !ok || a.Role != store.RoleOwner {
+				return nil, connect.NewError(connect.CodePermissionDenied, errors.New("only the owner can change the DNS resolvers of a node"))
+			}
+		}
 	}
 	n, err := f.st.UpdateNode(ctx, m.NodeId, p)
 	switch {
@@ -921,18 +1133,48 @@ func (s nodeService) UpdateNode(ctx context.Context, req *connect.Request[adminv
 			return nil, internalErr(f.log.Error, "mark devices stale", err)
 		}
 	}
-	audit := map[string]string{"node_id": n.ID}
-	if m.ClientIpv6 != nil {
-		audit["client_ipv6"] = map[bool]string{true: "on", false: "off"}[n.ClientIPv6]
-	}
-	f.audit(ctx, "node.update", audit)
+	f.audit(ctx, "node.update", nodeUpdateAudit(n, m))
 	f.StateChanged() // address, DNS, timeouts and node settings feed the desired state
-	now := f.now().UTC()
-	protos, _ := f.st.FleetNodeProtocols(ctx)
-	today, _ := f.todayBytesByNode(ctx, now)
-	enabled, _ := f.st.FleetEnabledInbounds(ctx)
-	panelBundle, _ := f.panelDecoyBundle()
-	return connect.NewResponse(&adminv1.UpdateNodeResponse{Node: f.nodeMsg(ctx, n, protos[n.ID], today[n.ID], inboundsOf(enabled, n.ID), now, live, panelBundle, f.healthSummaries(ctx)[n.ID])}), nil
+	return connect.NewResponse(&adminv1.UpdateNodeResponse{Node: f.nodeCardAfterWrite(ctx, n)}), nil
+}
+
+// nodeUpdateAudit is the audit record of an UpdateNode: the names of the fields the request carried and, for the
+// short non-secret settings, their new values (addresses, resolvers and free text stay out).
+func nodeUpdateAudit(n store.NodeRow, m *adminv1.UpdateNodeRequest) map[string]string {
+	onOff := func(v bool) string { return map[bool]string{true: "on", false: "off"}[v] }
+	var fields []string
+	add := func(present bool, name string) bool {
+		if present {
+			fields = append(fields, name)
+		}
+		return present
+	}
+	audit := map[string]string{"node_id": n.ID}
+	add(m.Name != nil, "name")
+	add(m.Address != nil, "address")
+	add(m.CountryCode != nil, "country_code")
+	add(m.Location != nil, "location")
+	add(m.Provider != nil, "provider")
+	add(m.Notes != nil, "notes")
+	add(m.PublicLabel != nil, "public_label")
+	add(m.DnsResolvers != nil, "dns_resolvers")
+	if add(m.Timeouts != nil, "timeouts") {
+		audit["timeouts_s"] = fmt.Sprintf("%d/%d/%d", n.LivenessTimeoutS, n.ApplyTimeoutS, n.DialTimeoutS)
+	}
+	if add(m.AwgBackend != nil, "awg_backend") {
+		audit["awg_backend"] = n.AwgBackend
+	}
+	if add(m.TorrentBlockerEnabled != nil, "torrent_blocker_enabled") {
+		audit["torrent_blocker"] = onOff(n.TorrentBlockerEnabled)
+	}
+	if add(m.BandwidthMbps != nil, "bandwidth_mbps") {
+		audit["bandwidth_mbps"] = strconv.Itoa(n.BandwidthMbps)
+	}
+	if add(m.ClientIpv6 != nil, "client_ipv6") {
+		audit["client_ipv6"] = onOff(n.ClientIPv6)
+	}
+	audit["fields"] = strings.Join(fields, ",")
+	return audit
 }
 
 // staleKeysOn marks the issued configs of every per-device (AmneziaWG) profile on the node stale: each one holds the
@@ -1024,6 +1266,7 @@ func (s nodeService) RetireNode(ctx context.Context, req *connect.Request[adminv
 		return nil, internalErr(f.log.Error, "retire node", err)
 	}
 	notified := f.notifyRetire(ctx, n.ID, live)
+	f.forgetStatsBudget(n.ID)
 	f.event(ctx, 1, "node_retired", n.ID, map[string]string{"actor": f.cfg.Actor(ctx)})
 	f.audit(ctx, "node.retire", map[string]string{"node_id": n.ID, "name": n.Name})
 	for _, l := range relays {

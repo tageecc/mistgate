@@ -1,0 +1,661 @@
+/* Node graph editor (components/graph). The canvas is a dot grid in a rounded frame; node cards, ports and wires use the
+   panel's tokens, so both themes work. Ports: hollow = free, filled = connected, coloured by --pc (the port type). */
+[data-tone="muted"] {
+  --t: var(--muted);
+}
+.mg-graph {
+  --shadow-node: 0 1px 0 rgb(255 255 255 / 0.04) inset, 0 8px 24px rgb(0 0 0 / 0.35);
+  --wp: 100%; /* how much of a type or state colour a wire and a port keep: darkened a little on the light theme */
+  --node-bg: var(--surface);
+  --node-border: color-mix(in oklch, var(--border-solid) 72%, #fff);
+  --gstep: 24px;
+  --gdot: 7%;
+  --gx: 0px;
+  --gy: 0px;
+  /* a quieter plane than the page, so the cards stand out of it */
+  background-color: color-mix(in oklch, var(--bg) 55%, #000);
+  background-image: radial-gradient(circle, color-mix(in oklch, var(--text) var(--gdot), transparent) 1px, transparent 1.3px);
+  background-size: var(--gstep) var(--gstep);
+  background-position: var(--gx) var(--gy);
+  touch-action: none;
+  cursor: default;
+}
+:root[data-theme="light"] .mg-graph {
+  --wp: 90%;
+  --shadow-node: 0 1px 2px rgb(20 20 30 / 0.06), 0 8px 24px -8px rgb(20 20 30 / 0.2);
+  --node-border: color-mix(in oklch, var(--border-solid) 82%, #000);
+  background-color: color-mix(in oklch, var(--surface-2) 78%, var(--border-solid));
+}
+.mg-graph[data-space] {
+  cursor: grab;
+}
+.mg-graph[data-mode="pan"],
+.mg-graph[data-mode="drag"] {
+  cursor: grabbing;
+}
+.mg-graph[data-mode="wire"] {
+  cursor: crosshair;
+}
+.mg-gworld {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 0;
+  height: 0;
+  transform-origin: 0 0;
+}
+.mg-gsvg {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 1px;
+  height: 1px;
+  overflow: visible;
+  pointer-events: none;
+  z-index: 0;
+}
+.mg-gsvg.mg-gtop {
+  z-index: 4;
+}
+.mg-gnode {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 1;
+  border: 1px solid var(--node-border);
+  border-radius: 10px;
+  background: var(--node-bg);
+  box-shadow: var(--shadow-node);
+  color: var(--text);
+  outline: none;
+  cursor: default;
+  transition:
+    border-color 0.15s,
+    box-shadow 0.15s,
+    opacity 0.18s,
+    filter 0.18s;
+}
+.mg-gnode:not([data-fixed]) {
+  cursor: grab;
+}
+.mg-graph[data-mode="drag"] .mg-gnode {
+  cursor: grabbing;
+}
+.mg-gnode[data-selected] {
+  z-index: 2;
+  border-color: var(--accent);
+  box-shadow:
+    0 0 0 2px color-mix(in oklch, var(--accent) 38%, transparent),
+    var(--shadow-node);
+}
+.mg-gnode:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+.mg-ghead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 40px;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--node-border);
+  border-radius: 9px 9px 0 0;
+  background: color-mix(in oklch, var(--t, var(--muted)) 7%, var(--node-bg));
+  font-size: 13.5px;
+  font-weight: 650;
+  letter-spacing: -0.005em;
+  white-space: nowrap;
+}
+.mg-gport {
+  --tx: -50%;
+  --s: 1;
+  position: absolute;
+  top: 50%;
+  z-index: 3;
+  width: 12px;
+  height: 12px;
+  padding: 0;
+  border: 2px solid color-mix(in oklch, var(--pc, var(--muted)) var(--wp), #000);
+  border-radius: 999px;
+  background: var(--node-bg);
+  cursor: crosshair;
+  transform: translate(var(--tx), -50%) scale(var(--s));
+  transition:
+    transform 0.14s var(--ease-out-soft),
+    box-shadow 0.18s,
+    opacity 0.18s,
+    background-color 0.18s;
+}
+.mg-gport::before {
+  content: "";
+  position: absolute;
+  inset: -8px;
+  border-radius: 999px;
+}
+.mg-gport[data-side="in"] {
+  left: -0.5px;
+}
+.mg-gport[data-side="out"] {
+  --tx: 50%;
+  right: -0.5px;
+}
+.mg-gport[data-connected] {
+  background: color-mix(in oklch, var(--pc, var(--muted)) var(--wp), #000);
+}
+.mg-gport:hover,
+.mg-gport:focus-visible {
+  --s: 1.28;
+}
+.mg-gport:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.mg-gport[data-role="source"] {
+  --s: 1.2;
+  background: color-mix(in oklch, var(--pc, var(--muted)) var(--wp), #000);
+  box-shadow: 0 0 0 4px color-mix(in oklch, var(--pc, var(--muted)) 26%, transparent);
+}
+.mg-gport[data-role="target"] {
+  --s: 1.15;
+  box-shadow: 0 0 0 4px color-mix(in oklch, var(--pc, var(--muted)) 28%, transparent);
+  animation: mg-gpulse 1.4s ease-in-out infinite;
+}
+.mg-gport[data-role="dim"] {
+  opacity: 0.2;
+}
+.mg-gport[data-role="current"],
+.mg-gport[data-snap] {
+  --s: 1.4;
+  background: color-mix(in oklch, var(--pc, var(--muted)) var(--wp), #000);
+  box-shadow:
+    0 0 0 3px var(--surface),
+    0 0 0 5px color-mix(in oklch, var(--pc, var(--muted)) var(--wp), #000);
+  animation: none;
+}
+.mg-gport[data-bad] {
+  --s: 1.2;
+  border-color: var(--danger);
+  box-shadow: 0 0 0 4px var(--danger-soft);
+  opacity: 1;
+}
+.mg-gport[data-disabled] {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+@keyframes mg-gpulse {
+  50% {
+    box-shadow: 0 0 0 6px color-mix(in oklch, var(--pc, var(--muted)) 12%, transparent);
+  }
+}
+/* wires */
+.mg-gwire {
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  pointer-events: none;
+  transition: stroke-width 0.12s;
+}
+.mg-gwire-hit {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 14px;
+  pointer-events: stroke;
+  cursor: pointer;
+  outline: none;
+}
+.mg-gwire-hit:focus-visible {
+  stroke: color-mix(in oklch, var(--accent) 30%, transparent);
+}
+.mg-gwire-halo {
+  fill: none;
+  stroke-width: 8px;
+  stroke-linecap: round;
+  opacity: 0.16;
+  pointer-events: none;
+}
+.mg-gwire-drag {
+  stroke-width: 2px;
+  stroke-dasharray: 2 5;
+}
+.mg-gwire-flow {
+  stroke-dasharray: 6 10;
+  animation: mg-gflow 1.8s linear infinite;
+}
+.mg-gwire-pending {
+  stroke-dasharray: 4 7;
+  animation: mg-gflow 0.9s linear infinite;
+}
+@keyframes mg-gflow {
+  to {
+    stroke-dashoffset: -32;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .mg-gwire-flow,
+  .mg-gwire-pending,
+  .mg-gport[data-role="target"] {
+    animation: none;
+  }
+}
+.mg-glabels {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 0;
+  height: 0;
+  z-index: 0;
+  pointer-events: none;
+}
+.mg-glabel {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  max-width: 220px;
+  padding: 2px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: auto;
+  cursor: pointer;
+}
+.mg-glabel[data-error] {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+  color: var(--danger-text);
+  cursor: default;
+}
+/* chrome: toolbar, minimap, menu, marquee, hint */
+.mg-gtoolbar {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 13px;
+  background: color-mix(in oklch, var(--surface) 88%, transparent);
+  backdrop-filter: blur(10px);
+  box-shadow: var(--shadow-dock);
+}
+.mg-gminimap {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  z-index: 10;
+  overflow: hidden;
+  border: 1px solid var(--node-border);
+  border-radius: 11px;
+  background: color-mix(in oklch, var(--surface) 85%, transparent);
+  backdrop-filter: blur(10px);
+  box-shadow: var(--shadow-dock);
+}
+.mg-gmenu {
+  position: absolute;
+  z-index: 11;
+  min-width: 168px;
+  padding: 4px;
+  transform: translate(-50%, 14px);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: var(--shadow-toast);
+}
+.mg-gmarquee {
+  position: absolute;
+  z-index: 9;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  background: color-mix(in oklch, var(--accent) 12%, transparent);
+  pointer-events: none;
+}
+.mg-ghint {
+  position: absolute;
+  z-index: 12;
+  max-width: 260px;
+  padding: 5px 9px;
+  border: 1px solid var(--danger);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--danger-text);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.35;
+  pointer-events: none;
+  box-shadow: var(--shadow-toast);
+}
+/* a slider in a node: a thin track with the accent up to the thumb */
+.mg-range {
+  display: block;
+  width: 100%;
+  height: 16px;
+  margin: 0;
+  background: transparent;
+  appearance: none;
+  cursor: pointer;
+}
+.mg-range::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 99px;
+  background: linear-gradient(to right, var(--accent) var(--p, 50%), var(--surface-2) var(--p, 50%));
+}
+.mg-range::-moz-range-track {
+  height: 4px;
+  border-radius: 99px;
+  background: var(--surface-2);
+}
+.mg-range::-moz-range-progress {
+  height: 4px;
+  border-radius: 99px;
+  background: var(--accent);
+}
+.mg-range::-webkit-slider-thumb {
+  width: 14px;
+  height: 14px;
+  margin-top: -5px;
+  border: 2px solid var(--accent);
+  border-radius: 99px;
+  background: var(--surface);
+  appearance: none;
+  transition: transform 0.12s;
+}
+.mg-range::-moz-range-thumb {
+  width: 10px;
+  height: 10px;
+  border: 2px solid var(--accent);
+  border-radius: 99px;
+  background: var(--surface);
+}
+.mg-range:hover::-webkit-slider-thumb {
+  transform: scale(1.15);
+}
+.mg-range:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 6px;
+}
+
+/* a port that states its way: filled works, hollow is none, a ring with a slash is blocked */
+.mg-gport[data-status] {
+  background: var(--node-bg);
+}
+.mg-gport[data-status="ok"] {
+  background: color-mix(in oklch, var(--pc, var(--muted)) var(--wp), #000);
+}
+.mg-gport[data-status="warn"] {
+  background: color-mix(in oklch, var(--pc, var(--muted)) var(--wp), #000);
+  box-shadow:
+    0 0 0 2px var(--surface),
+    0 0 0 3.5px var(--warning);
+}
+.mg-gport[data-status="none"] {
+  border-style: solid;
+  opacity: 0.8;
+}
+.mg-gport[data-status="blocked"] {
+  border-color: color-mix(in oklch, var(--danger) 45%, var(--muted));
+}
+.mg-gport[data-status="blocked"]::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 9px;
+  height: 2px;
+  border-radius: 2px;
+  background: color-mix(in oklch, var(--danger) 45%, var(--muted));
+  transform: translate(-50%, -50%) rotate(-45deg);
+}
+/* a badge on a wire's end: a quiet pill, rose only as a tint */
+.mg-glabel[data-end] {
+  transform: translate(-100%, -50%);
+}
+.mg-glabel[data-state="warn"] {
+  border-color: color-mix(in oklch, var(--warning) 40%, var(--border-solid));
+  color: var(--warning-text);
+}
+/* the legend, bottom-left */
+.mg-glegend {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+.mg-glegend-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: color-mix(in oklch, var(--surface) 88%, transparent);
+  backdrop-filter: blur(10px);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+.mg-glegend-btn:hover,
+.mg-glegend[data-open] .mg-glegend-btn {
+  color: var(--text);
+}
+.mg-glegend-body {
+  width: 292px;
+  max-width: calc(100vw - 48px);
+  padding: 12px 14px;
+  border: 1px solid var(--node-border);
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: var(--shadow-node);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+  max-height: min(480px, 70vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  transform-origin: bottom left;
+  animation: mg-ghelp-in 0.16s var(--ease-out-soft);
+}
+@keyframes mg-ghelp-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(4px);
+  }
+}
+.mg-kbd {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  min-width: 18px;
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.mg-keyrow {
+  display: grid;
+  grid-template-columns: 116px 1fr;
+  align-items: center;
+  gap: 8px;
+  min-height: 22px;
+}
+.mg-keys {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 3px;
+}
+.mg-gzoomhint {
+  position: absolute;
+  left: 50%;
+  top: 14px;
+  z-index: 12;
+  transform: translateX(-50%);
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: color-mix(in oklch, var(--text) 88%, transparent);
+  color: var(--bg);
+  font-size: 12px;
+  font-weight: 600;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.25s;
+}
+.mg-gzoomhint[data-show] {
+  opacity: 1;
+}
+.mg-gminimap {
+  opacity: 0.9;
+  box-shadow: none;
+  background: color-mix(in oklch, var(--surface) 70%, transparent);
+}
+/* the handle on a wire's end: grab it to move or unhook that end */
+.mg-ghandle {
+  fill: var(--node-bg);
+  stroke: var(--text);
+  stroke-width: 2px;
+  pointer-events: none;
+  filter: drop-shadow(0 1px 3px rgb(0 0 0 / 0.35));
+}
+.mg-graph[data-handle] {
+  cursor: grab;
+}
+
+/* cards of the route map: wires attach to invisible anchors at the middle of the left and right edges */
+.mg-ganchor {
+  top: 50%;
+  width: 2px;
+  height: 2px;
+  margin: 0;
+  border: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+.mg-ganchor::before {
+  display: none;
+}
+.mg-gnode[data-variant="ghost"] {
+  border-style: dashed;
+  border-color: color-mix(in oklch, var(--muted) 38%, transparent);
+  background: transparent;
+  box-shadow: none;
+  color: var(--muted);
+}
+.mg-gnode[data-variant="label"] {
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  pointer-events: none;
+}
+
+/* a card that just appeared (a way made by the relay dialog) rings once */
+.mg-gnode[data-fresh] {
+  animation: mg-gfresh 1.2s ease-out;
+}
+@keyframes mg-gfresh {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in oklch, var(--accent) 70%, transparent), var(--shadow-node);
+  }
+  35% {
+    box-shadow: 0 0 0 5px color-mix(in oklch, var(--accent) 45%, transparent), var(--shadow-node);
+    border-color: var(--accent);
+  }
+  100% {
+    box-shadow: 0 0 0 10px transparent, var(--shadow-node);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .mg-gnode[data-fresh] {
+    animation: none;
+    border-color: var(--accent);
+  }
+}
+.mg-gnode[data-variant="ghost"]:hover,
+.mg-gnode[data-variant="ghost"]:has([aria-expanded="true"]) {
+  border-color: var(--accent);
+  background: color-mix(in oklch, var(--accent) 6%, transparent);
+}
+
+/* focusPaths: what is not on the paths of the focused card fades back, so the paths read at a glance on a busy map; the
+   faded cards still answer the mouse and keep their own selection look. */
+.mg-gnode[data-dim] {
+  opacity: 0.32;
+  filter: saturate(0.35);
+}
+.mg-gedge {
+  transition: opacity 0.18s;
+}
+.mg-gedge[data-dim] {
+  opacity: 0.1;
+}
+.mg-glabel {
+  transition: opacity 0.18s;
+}
+.mg-glabel[data-dim] {
+  opacity: 0.25;
+}
+.mg-gfocus {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: min(560px, calc(100% - 220px));
+  transform: translateX(-50%);
+  padding: 4px 4px 4px 12px;
+  border: 1px solid var(--border);
+  border-radius: 13px;
+  background: color-mix(in oklch, var(--surface) 88%, transparent);
+  backdrop-filter: blur(10px);
+  box-shadow: var(--shadow-dock);
+  font-size: 12.5px;
+  color: var(--text);
+}
+.mg-gfocus-all {
+  flex: none;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 9px;
+  font-weight: 600;
+  color: var(--accent-text, var(--accent));
+}
+.mg-gfocus-all:hover {
+  background: var(--surface-2);
+}
+.mg-gfocus-key {
+  flex: none;
+  margin-right: 6px;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11px;
+  color: var(--muted);
+}
+@media (prefers-reduced-motion: reduce) {
+  .mg-gnode,
+  .mg-gedge,
+  .mg-glabel {
+    transition: none;
+  }
+}

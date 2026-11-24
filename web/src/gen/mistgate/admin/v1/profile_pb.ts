@@ -14,7 +14,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file mistgate/admin/v1/profile.proto.
  */
 export const file_mistgate_admin_v1_profile: GenFile = /*@__PURE__*/
-  fileDesc("Ch9taXN0Z2F0ZS9hZG1pbi92MS9wcm9maWxlLnByb3RvEhFtaXN0Z2F0ZS5hZG1pbi52MSKTAQoMUHJvdG9jb2xJbmZvEgoKAmlkGAEgASgJEhQKDGRpc3BsYXlfbmFtZRgCIAEoCRIcChRzZXR0aW5nc19zY2hlbWFfanNvbhgDIAEoCRIdChVkZWZhdWx0X3NldHRpbmdzX2pzb24YBCABKAkSJAoEYXBwcxgFIAMoDjIWLm1pc3RnYXRlLmFkbWluLnYxLkFwcCIWChRMaXN0UHJvdG9jb2xzUmVxdWVzdCJLChVMaXN0UHJvdG9jb2xzUmVzcG9uc2USMgoJcHJvdG9jb2xzGAEgAygLMh8ubWlzdGdhdGUuYWRtaW4udjEuUHJvdG9jb2xJbmZvIuwBCg5Qcm9maWxlU3VtbWFyeRIKCgJpZBgBIAEoCRIMCgRuYW1lGAIgASgJEhAKCHByb3RvY29sGAMgASgJEg8KB3N1bW1hcnkYBCABKAkSEgoKbm9kZV9jb3VudBgFIAEoDRISCgp1c2VyX2NvdW50GAYgASgNEjEKCHdhcm5pbmdzGAcgAygLMh8ubWlzdGdhdGUuYWRtaW4udjEuU3RhdHVzUmVhc29uEg8KB3ZlcnNpb24YCCABKA0SMQoHZm9ybWF0cxgJIAMoCzIgLm1pc3RnYXRlLmFkbWluLnYxLlByb2ZpbGVGb3JtYXQiVwoNUHJvZmlsZUZvcm1hdBIsCgZmb3JtYXQYASABKA4yHC5taXN0Z2F0ZS5hZG1pbi52MS5TdWJGb3JtYXQSCgoCb2sYAiABKAgSDAoEbm90ZRgDIAEoCSIVChNMaXN0UHJvZmlsZXNSZXF1ZXN0IksKFExpc3RQcm9maWxlc1Jlc3BvbnNlEjMKCHByb2ZpbGVzGAEgAygLMiEubWlzdGdhdGUuYWRtaW4udjEuUHJvZmlsZVN1bW1hcnkiJwoRR2V0UHJvZmlsZVJlcXVlc3QSEgoKcHJvZmlsZV9pZBgBIAEoCSKNAQoSR2V0UHJvZmlsZVJlc3BvbnNlEjIKB3Byb2ZpbGUYASABKAsyIS5taXN0Z2F0ZS5hZG1pbi52MS5Qcm9maWxlU3VtbWFyeRIVCg1zZXR0aW5nc19qc29uGAIgASgJEiwKCGluYm91bmRzGAMgAygLMhoubWlzdGdhdGUuYWRtaW4udjEuSW5ib3VuZCJNChRDcmVhdGVQcm9maWxlUmVxdWVzdBIQCghwcm90b2NvbBgBIAEoCRIMCgRuYW1lGAIgASgJEhUKDXNldHRpbmdzX2pzb24YAyABKAkiSwoVQ3JlYXRlUHJvZmlsZVJlc3BvbnNlEjIKB3Byb2ZpbGUYASABKAsyIS5taXN0Z2F0ZS5hZG1pbi52MS5Qcm9maWxlU3VtbWFyeSK5AQoUVXBkYXRlUHJvZmlsZVJlcXVlc3QSEgoKcHJvZmlsZV9pZBgBIAEoCRIRCgRuYW1lGAIgASgJSACIAQESGgoNc2V0dGluZ3NfanNvbhgDIAEoCUgBiAEBEhgKEGV4cGVjdGVkX3ZlcnNpb24YBCABKA0SDwoHZHJ5X3J1bhgFIAEoCBIYChBhbGxvd19sb3NzeV9wb3J0GAYgASgIQgcKBV9uYW1lQhAKDl9zZXR0aW5nc19qc29uIpUBCg1Qcm9maWxlSW1wYWN0EhoKEmluYm91bmRzX3Jlc3RhcnRlZBgBIAEoDRIUCgx1c2Vyc19vbmxpbmUYAiABKA0SHAoUZGV2aWNlc19uZWVkX3JlaXNzdWUYAyABKA0SGwoTYWZmZWN0ZWRfdXNlcl9uYW1lcxgEIAMoCRIXCg9jcml0aWNhbF9maWVsZHMYBSADKAkifQoVVXBkYXRlUHJvZmlsZVJlc3BvbnNlEjIKB3Byb2ZpbGUYASABKAsyIS5taXN0Z2F0ZS5hZG1pbi52MS5Qcm9maWxlU3VtbWFyeRIwCgZpbXBhY3QYAiABKAsyIC5taXN0Z2F0ZS5hZG1pbi52MS5Qcm9maWxlSW1wYWN0IqYBCgpGaWVsZEVycm9yEg8KB3BvaW50ZXIYASABKAkSDAoEY29kZRgCIAEoCRIPCgdtZXNzYWdlGAMgASgJEjkKBnBhcmFtcxgEIAMoCzIpLm1pc3RnYXRlLmFkbWluLnYxLkZpZWxkRXJyb3IuUGFyYW1zRW50cnkaLQoLUGFyYW1zRW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4ASJRChVQcmV2aWV3UHJvZmlsZVJlcXVlc3QSEAoIcHJvdG9jb2wYASABKAkSFQoNc2V0dGluZ3NfanNvbhgCIAEoCRIPCgdub2RlX2lkGAMgASgJIqoCChZQcmV2aWV3UHJvZmlsZVJlc3BvbnNlEi0KBmVycm9ycxgBIAMoCzIdLm1pc3RnYXRlLmFkbWluLnYxLkZpZWxkRXJyb3ISFgoOY2xpZW50X3ByZXZpZXcYAiABKAkSFAoMY2xpZW50X2xhYmVsGAMgASgJEg8KB3N1bW1hcnkYBCABKAkSLwoId2FybmluZ3MYBSADKAsyHS5taXN0Z2F0ZS5hZG1pbi52MS5GaWVsZEVycm9yEj4KEW9iZnVzY2F0aW9uX3Njb3JlGAYgASgLMiMubWlzdGdhdGUuYWRtaW4udjEuT2JmdXNjYXRpb25TY29yZRIxCgdmb3JtYXRzGAcgAygLMiAubWlzdGdhdGUuYWRtaW4udjEuUHJvZmlsZUZvcm1hdCJqChBPYmZ1c2NhdGlvblNjb3JlEg0KBXZhbHVlGAEgASgNEgwKBGJhc2UYAiABKA0SDAoEdGllchgDIAEoCRIrCgVpdGVtcxgEIAMoCzIcLm1pc3RnYXRlLmFkbWluLnYxLlNjb3JlSXRlbSKiAQoJU2NvcmVJdGVtEgwKBGNvZGUYASABKAkSDwoHcG9pbnRlchgCIAEoCRINCgVkZWx0YRgDIAEoERI4CgZwYXJhbXMYBCADKAsyKC5taXN0Z2F0ZS5hZG1pbi52MS5TY29yZUl0ZW0uUGFyYW1zRW50cnkaLQoLUGFyYW1zRW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4ASLOAQoUQ3JlYXRlSW5ib3VuZFJlcXVlc3QSEgoKcHJvZmlsZV9pZBgBIAEoCRIPCgdub2RlX2lkGAIgASgJEhUKDXBvcnRfb3ZlcnJpZGUYAyABKA0SIAoYdGxzX3NlcnZlcl9uYW1lX292ZXJyaWRlGAQgASgJEhUKDXZhbGlkYXRlX29ubHkYBSABKAgSGAoQYWxsb3dfbG9zc3lfcG9ydBgGIAEoCBIQCghwcm90b2NvbBgHIAEoCRIVCg1zZXR0aW5nc19qc29uGAggASgJIooBChVDcmVhdGVJbmJvdW5kUmVzcG9uc2USKwoHaW5ib3VuZBgBIAEoCzIaLm1pc3RnYXRlLmFkbWluLnYxLkluYm91bmQSMQoId2FybmluZ3MYAiADKAsyHy5taXN0Z2F0ZS5hZG1pbi52MS5TdGF0dXNSZWFzb24SEQoJZnJlZV9wb3J0GAMgASgNIu8BChRVcGRhdGVJbmJvdW5kUmVxdWVzdBISCgppbmJvdW5kX2lkGAEgASgJEhoKDXBvcnRfb3ZlcnJpZGUYAiABKA1IAIgBARIlChh0bHNfc2VydmVyX25hbWVfb3ZlcnJpZGUYAyABKAlIAYgBARIUCgdlbmFibGVkGAQgASgISAKIAQESFQoNdmFsaWRhdGVfb25seRgFIAEoCBIYChBhbGxvd19sb3NzeV9wb3J0GAYgASgIQhAKDl9wb3J0X292ZXJyaWRlQhsKGV90bHNfc2VydmVyX25hbWVfb3ZlcnJpZGVCCgoIX2VuYWJsZWQiigEKFVVwZGF0ZUluYm91bmRSZXNwb25zZRIrCgdpbmJvdW5kGAEgASgLMhoubWlzdGdhdGUuYWRtaW4udjEuSW5ib3VuZBIxCgh3YXJuaW5ncxgCIAMoCzIfLm1pc3RnYXRlLmFkbWluLnYxLlN0YXR1c1JlYXNvbhIRCglmcmVlX3BvcnQYAyABKA0ibgoSVHdpblByb2ZpbGVSZXF1ZXN0EhIKCnByb2ZpbGVfaWQYASABKAkSDgoGZWdyZXNzGAIgASgJEg8KB2RyeV9ydW4YAyABKAgSDAoEcG9ydBgEIAEoDRIVCg1za2lwX25vZGVfaWRzGAUgAygJIuIBChNUd2luUHJvZmlsZVJlc3BvbnNlEjIKB3Byb2ZpbGUYASABKAsyIS5taXN0Z2F0ZS5hZG1pbi52MS5Qcm9maWxlU3VtbWFyeRIMCgRuYW1lGAIgASgJEg4KBmVncmVzcxgDIAEoCRIMCgRwb3J0GAQgASgNEhAKCG5vZGVfaWRzGAUgAygJEhEKCWdyb3VwX2lkcxgGIAMoCRITCgtob3BfZHJvcHBlZBgHIAEoCBIxCgtwb3J0X2NoZWNrcxgIIAMoCzIcLm1pc3RnYXRlLmFkbWluLnYxLlBvcnRDaGVjayIqChREZWxldGVQcm9maWxlUmVxdWVzdBISCgpwcm9maWxlX2lkGAEgASgJIhcKFURlbGV0ZVByb2ZpbGVSZXNwb25zZSIqChREZWxldGVJbmJvdW5kUmVxdWVzdBISCgppbmJvdW5kX2lkGAEgASgJIhcKFURlbGV0ZUluYm91bmRSZXNwb25zZTLNCAoOUHJvZmlsZVNlcnZpY2USYgoNTGlzdFByb3RvY29scxInLm1pc3RnYXRlLmFkbWluLnYxLkxpc3RQcm90b2NvbHNSZXF1ZXN0GigubWlzdGdhdGUuYWRtaW4udjEuTGlzdFByb3RvY29sc1Jlc3BvbnNlEl8KDExpc3RQcm9maWxlcxImLm1pc3RnYXRlLmFkbWluLnYxLkxpc3RQcm9maWxlc1JlcXVlc3QaJy5taXN0Z2F0ZS5hZG1pbi52MS5MaXN0UHJvZmlsZXNSZXNwb25zZRJZCgpHZXRQcm9maWxlEiQubWlzdGdhdGUuYWRtaW4udjEuR2V0UHJvZmlsZVJlcXVlc3QaJS5taXN0Z2F0ZS5hZG1pbi52MS5HZXRQcm9maWxlUmVzcG9uc2USYgoNQ3JlYXRlUHJvZmlsZRInLm1pc3RnYXRlLmFkbWluLnYxLkNyZWF0ZVByb2ZpbGVSZXF1ZXN0GigubWlzdGdhdGUuYWRtaW4udjEuQ3JlYXRlUHJvZmlsZVJlc3BvbnNlEmIKDVVwZGF0ZVByb2ZpbGUSJy5taXN0Z2F0ZS5hZG1pbi52MS5VcGRhdGVQcm9maWxlUmVxdWVzdBooLm1pc3RnYXRlLmFkbWluLnYxLlVwZGF0ZVByb2ZpbGVSZXNwb25zZRJlCg5QcmV2aWV3UHJvZmlsZRIoLm1pc3RnYXRlLmFkbWluLnYxLlByZXZpZXdQcm9maWxlUmVxdWVzdBopLm1pc3RnYXRlLmFkbWluLnYxLlByZXZpZXdQcm9maWxlUmVzcG9uc2USYgoNRGVsZXRlUHJvZmlsZRInLm1pc3RnYXRlLmFkbWluLnYxLkRlbGV0ZVByb2ZpbGVSZXF1ZXN0GigubWlzdGdhdGUuYWRtaW4udjEuRGVsZXRlUHJvZmlsZVJlc3BvbnNlEmIKDUNyZWF0ZUluYm91bmQSJy5taXN0Z2F0ZS5hZG1pbi52MS5DcmVhdGVJbmJvdW5kUmVxdWVzdBooLm1pc3RnYXRlLmFkbWluLnYxLkNyZWF0ZUluYm91bmRSZXNwb25zZRJiCg1VcGRhdGVJbmJvdW5kEicubWlzdGdhdGUuYWRtaW4udjEuVXBkYXRlSW5ib3VuZFJlcXVlc3QaKC5taXN0Z2F0ZS5hZG1pbi52MS5VcGRhdGVJbmJvdW5kUmVzcG9uc2USYgoNRGVsZXRlSW5ib3VuZBInLm1pc3RnYXRlLmFkbWluLnYxLkRlbGV0ZUluYm91bmRSZXF1ZXN0GigubWlzdGdhdGUuYWRtaW4udjEuRGVsZXRlSW5ib3VuZFJlc3BvbnNlElwKC1R3aW5Qcm9maWxlEiUubWlzdGdhdGUuYWRtaW4udjEuVHdpblByb2ZpbGVSZXF1ZXN0GiYubWlzdGdhdGUuYWRtaW4udjEuVHdpblByb2ZpbGVSZXNwb25zZULHAQoVY29tLm1pc3RnYXRlLmFkbWluLnYxQgxQcm9maWxlUHJvdG9QAVo6Z2l0aHViLmNvbS9taXN0Z2F0ZS9taXN0Z2F0ZS9nZW4vbWlzdGdhdGUvYWRtaW4vdjE7YWRtaW52MaICA01BWKoCEU1pc3RnYXRlLkFkbWluLlYxygIRTWlzdGdhdGVcQWRtaW5cVjHiAh1NaXN0Z2F0ZVxBZG1pblxWMVxHUEJNZXRhZGF0YeoCE01pc3RnYXRlOjpBZG1pbjo6VjFiBnByb3RvMw", [file_mistgate_admin_v1_common, file_mistgate_admin_v1_subscription]);
+  fileDesc("Ch9taXN0Z2F0ZS9hZG1pbi92MS9wcm9maWxlLnByb3RvEhFtaXN0Z2F0ZS5hZG1pbi52MSKpAQoMUHJvdG9jb2xJbmZvEgoKAmlkGAEgASgJEhQKDGRpc3BsYXlfbmFtZRgCIAEoCRIcChRzZXR0aW5nc19zY2hlbWFfanNvbhgDIAEoCRIdChVkZWZhdWx0X3NldHRpbmdzX2pzb24YBCABKAkSJAoEYXBwcxgFIAMoDjIWLm1pc3RnYXRlLmFkbWluLnYxLkFwcBIUCgxleHBlcmltZW50YWwYBiABKAgiFgoUTGlzdFByb3RvY29sc1JlcXVlc3QiSwoVTGlzdFByb3RvY29sc1Jlc3BvbnNlEjIKCXByb3RvY29scxgBIAMoCzIfLm1pc3RnYXRlLmFkbWluLnYxLlByb3RvY29sSW5mbyLsAQoOUHJvZmlsZVN1bW1hcnkSCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCRIQCghwcm90b2NvbBgDIAEoCRIPCgdzdW1tYXJ5GAQgASgJEhIKCm5vZGVfY291bnQYBSABKA0SEgoKdXNlcl9jb3VudBgGIAEoDRIxCgh3YXJuaW5ncxgHIAMoCzIfLm1pc3RnYXRlLmFkbWluLnYxLlN0YXR1c1JlYXNvbhIPCgd2ZXJzaW9uGAggASgNEjEKB2Zvcm1hdHMYCSADKAsyIC5taXN0Z2F0ZS5hZG1pbi52MS5Qcm9maWxlRm9ybWF0IlcKDVByb2ZpbGVGb3JtYXQSLAoGZm9ybWF0GAEgASgOMhwubWlzdGdhdGUuYWRtaW4udjEuU3ViRm9ybWF0EgoKAm9rGAIgASgIEgwKBG5vdGUYAyABKAkiFQoTTGlzdFByb2ZpbGVzUmVxdWVzdCJLChRMaXN0UHJvZmlsZXNSZXNwb25zZRIzCghwcm9maWxlcxgBIAMoCzIhLm1pc3RnYXRlLmFkbWluLnYxLlByb2ZpbGVTdW1tYXJ5IicKEUdldFByb2ZpbGVSZXF1ZXN0EhIKCnByb2ZpbGVfaWQYASABKAkijQEKEkdldFByb2ZpbGVSZXNwb25zZRIyCgdwcm9maWxlGAEgASgLMiEubWlzdGdhdGUuYWRtaW4udjEuUHJvZmlsZVN1bW1hcnkSFQoNc2V0dGluZ3NfanNvbhgCIAEoCRIsCghpbmJvdW5kcxgDIAMoCzIaLm1pc3RnYXRlLmFkbWluLnYxLkluYm91bmQiTQoUQ3JlYXRlUHJvZmlsZVJlcXVlc3QSEAoIcHJvdG9jb2wYASABKAkSDAoEbmFtZRgCIAEoCRIVCg1zZXR0aW5nc19qc29uGAMgASgJIksKFUNyZWF0ZVByb2ZpbGVSZXNwb25zZRIyCgdwcm9maWxlGAEgASgLMiEubWlzdGdhdGUuYWRtaW4udjEuUHJvZmlsZVN1bW1hcnkiuQEKFFVwZGF0ZVByb2ZpbGVSZXF1ZXN0EhIKCnByb2ZpbGVfaWQYASABKAkSEQoEbmFtZRgCIAEoCUgAiAEBEhoKDXNldHRpbmdzX2pzb24YAyABKAlIAYgBARIYChBleHBlY3RlZF92ZXJzaW9uGAQgASgNEg8KB2RyeV9ydW4YBSABKAgSGAoQYWxsb3dfbG9zc3lfcG9ydBgGIAEoCEIHCgVfbmFtZUIQCg5fc2V0dGluZ3NfanNvbiKVAQoNUHJvZmlsZUltcGFjdBIaChJpbmJvdW5kc19yZXN0YXJ0ZWQYASABKA0SFAoMdXNlcnNfb25saW5lGAIgASgNEhwKFGRldmljZXNfbmVlZF9yZWlzc3VlGAMgASgNEhsKE2FmZmVjdGVkX3VzZXJfbmFtZXMYBCADKAkSFwoPY3JpdGljYWxfZmllbGRzGAUgAygJIn0KFVVwZGF0ZVByb2ZpbGVSZXNwb25zZRIyCgdwcm9maWxlGAEgASgLMiEubWlzdGdhdGUuYWRtaW4udjEuUHJvZmlsZVN1bW1hcnkSMAoGaW1wYWN0GAIgASgLMiAubWlzdGdhdGUuYWRtaW4udjEuUHJvZmlsZUltcGFjdCKmAQoKRmllbGRFcnJvchIPCgdwb2ludGVyGAEgASgJEgwKBGNvZGUYAiABKAkSDwoHbWVzc2FnZRgDIAEoCRI5CgZwYXJhbXMYBCADKAsyKS5taXN0Z2F0ZS5hZG1pbi52MS5GaWVsZEVycm9yLlBhcmFtc0VudHJ5Gi0KC1BhcmFtc0VudHJ5EgsKA2tleRgBIAEoCRINCgV2YWx1ZRgCIAEoCToCOAEiUQoVUHJldmlld1Byb2ZpbGVSZXF1ZXN0EhAKCHByb3RvY29sGAEgASgJEhUKDXNldHRpbmdzX2pzb24YAiABKAkSDwoHbm9kZV9pZBgDIAEoCSKqAgoWUHJldmlld1Byb2ZpbGVSZXNwb25zZRItCgZlcnJvcnMYASADKAsyHS5taXN0Z2F0ZS5hZG1pbi52MS5GaWVsZEVycm9yEhYKDmNsaWVudF9wcmV2aWV3GAIgASgJEhQKDGNsaWVudF9sYWJlbBgDIAEoCRIPCgdzdW1tYXJ5GAQgASgJEi8KCHdhcm5pbmdzGAUgAygLMh0ubWlzdGdhdGUuYWRtaW4udjEuRmllbGRFcnJvchI+ChFvYmZ1c2NhdGlvbl9zY29yZRgGIAEoCzIjLm1pc3RnYXRlLmFkbWluLnYxLk9iZnVzY2F0aW9uU2NvcmUSMQoHZm9ybWF0cxgHIAMoCzIgLm1pc3RnYXRlLmFkbWluLnYxLlByb2ZpbGVGb3JtYXQiagoQT2JmdXNjYXRpb25TY29yZRINCgV2YWx1ZRgBIAEoDRIMCgRiYXNlGAIgASgNEgwKBHRpZXIYAyABKAkSKwoFaXRlbXMYBCADKAsyHC5taXN0Z2F0ZS5hZG1pbi52MS5TY29yZUl0ZW0iogEKCVNjb3JlSXRlbRIMCgRjb2RlGAEgASgJEg8KB3BvaW50ZXIYAiABKAkSDQoFZGVsdGEYAyABKBESOAoGcGFyYW1zGAQgAygLMigubWlzdGdhdGUuYWRtaW4udjEuU2NvcmVJdGVtLlBhcmFtc0VudHJ5Gi0KC1BhcmFtc0VudHJ5EgsKA2tleRgBIAEoCRINCgV2YWx1ZRgCIAEoCToCOAEi7wEKFENyZWF0ZUluYm91bmRSZXF1ZXN0EhIKCnByb2ZpbGVfaWQYASABKAkSDwoHbm9kZV9pZBgCIAEoCRIVCg1wb3J0X292ZXJyaWRlGAMgASgNEiAKGHRsc19zZXJ2ZXJfbmFtZV9vdmVycmlkZRgEIAEoCRIVCg12YWxpZGF0ZV9vbmx5GAUgASgIEhgKEGFsbG93X2xvc3N5X3BvcnQYBiABKAgSEAoIcHJvdG9jb2wYByABKAkSFQoNc2V0dGluZ3NfanNvbhgIIAEoCRIfChdyZWFsaXR5X3RhcmdldF9vdmVycmlkZRgJIAEoCSKKAQoVQ3JlYXRlSW5ib3VuZFJlc3BvbnNlEisKB2luYm91bmQYASABKAsyGi5taXN0Z2F0ZS5hZG1pbi52MS5JbmJvdW5kEjEKCHdhcm5pbmdzGAIgAygLMh8ubWlzdGdhdGUuYWRtaW4udjEuU3RhdHVzUmVhc29uEhEKCWZyZWVfcG9ydBgDIAEoDSLzAgoUVXBkYXRlSW5ib3VuZFJlcXVlc3QSEgoKaW5ib3VuZF9pZBgBIAEoCRIaCg1wb3J0X292ZXJyaWRlGAIgASgNSACIAQESJQoYdGxzX3NlcnZlcl9uYW1lX292ZXJyaWRlGAMgASgJSAGIAQESFAoHZW5hYmxlZBgEIAEoCEgCiAEBEhUKDXZhbGlkYXRlX29ubHkYBSABKAgSGAoQYWxsb3dfbG9zc3lfcG9ydBgGIAEoCBIkChdkaXJlY3RfaW5fc3Vic2NyaXB0aW9ucxgHIAEoCEgDiAEBEiQKF3JlYWxpdHlfdGFyZ2V0X292ZXJyaWRlGAggASgJSASIAQFCEAoOX3BvcnRfb3ZlcnJpZGVCGwoZX3Rsc19zZXJ2ZXJfbmFtZV9vdmVycmlkZUIKCghfZW5hYmxlZEIaChhfZGlyZWN0X2luX3N1YnNjcmlwdGlvbnNCGgoYX3JlYWxpdHlfdGFyZ2V0X292ZXJyaWRlIooBChVVcGRhdGVJbmJvdW5kUmVzcG9uc2USKwoHaW5ib3VuZBgBIAEoCzIaLm1pc3RnYXRlLmFkbWluLnYxLkluYm91bmQSMQoId2FybmluZ3MYAiADKAsyHy5taXN0Z2F0ZS5hZG1pbi52MS5TdGF0dXNSZWFzb24SEQoJZnJlZV9wb3J0GAMgASgNIm4KElR3aW5Qcm9maWxlUmVxdWVzdBISCgpwcm9maWxlX2lkGAEgASgJEg4KBmVncmVzcxgCIAEoCRIPCgdkcnlfcnVuGAMgASgIEgwKBHBvcnQYBCABKA0SFQoNc2tpcF9ub2RlX2lkcxgFIAMoCSLiAQoTVHdpblByb2ZpbGVSZXNwb25zZRIyCgdwcm9maWxlGAEgASgLMiEubWlzdGdhdGUuYWRtaW4udjEuUHJvZmlsZVN1bW1hcnkSDAoEbmFtZRgCIAEoCRIOCgZlZ3Jlc3MYAyABKAkSDAoEcG9ydBgEIAEoDRIQCghub2RlX2lkcxgFIAMoCRIRCglncm91cF9pZHMYBiADKAkSEwoLaG9wX2Ryb3BwZWQYByABKAgSMQoLcG9ydF9jaGVja3MYCCADKAsyHC5taXN0Z2F0ZS5hZG1pbi52MS5Qb3J0Q2hlY2siKgoURGVsZXRlUHJvZmlsZVJlcXVlc3QSEgoKcHJvZmlsZV9pZBgBIAEoCSIXChVEZWxldGVQcm9maWxlUmVzcG9uc2UiKgoURGVsZXRlSW5ib3VuZFJlcXVlc3QSEgoKaW5ib3VuZF9pZBgBIAEoCSIXChVEZWxldGVJbmJvdW5kUmVzcG9uc2UicwodUmVtb3ZlUHJvZmlsZUZyb21Ob2Rlc1JlcXVlc3QSEgoKcHJvZmlsZV9pZBgBIAEoCRIQCghub2RlX2lkcxgCIAMoCRIWCg5kZWxldGVfcHJvZmlsZRgDIAEoCBIUCgxjb25maXJtX25hbWUYBCABKAkiYgoeUmVtb3ZlUHJvZmlsZUZyb21Ob2Rlc1Jlc3BvbnNlEg8KB3JlbW92ZWQYASABKA0SFwoPcHJvZmlsZV9kZWxldGVkGAIgASgIEhYKDnJlbGF5c19yZW1vdmVkGAMgASgNMswJCg5Qcm9maWxlU2VydmljZRJiCg1MaXN0UHJvdG9jb2xzEicubWlzdGdhdGUuYWRtaW4udjEuTGlzdFByb3RvY29sc1JlcXVlc3QaKC5taXN0Z2F0ZS5hZG1pbi52MS5MaXN0UHJvdG9jb2xzUmVzcG9uc2USXwoMTGlzdFByb2ZpbGVzEiYubWlzdGdhdGUuYWRtaW4udjEuTGlzdFByb2ZpbGVzUmVxdWVzdBonLm1pc3RnYXRlLmFkbWluLnYxLkxpc3RQcm9maWxlc1Jlc3BvbnNlElkKCkdldFByb2ZpbGUSJC5taXN0Z2F0ZS5hZG1pbi52MS5HZXRQcm9maWxlUmVxdWVzdBolLm1pc3RnYXRlLmFkbWluLnYxLkdldFByb2ZpbGVSZXNwb25zZRJiCg1DcmVhdGVQcm9maWxlEicubWlzdGdhdGUuYWRtaW4udjEuQ3JlYXRlUHJvZmlsZVJlcXVlc3QaKC5taXN0Z2F0ZS5hZG1pbi52MS5DcmVhdGVQcm9maWxlUmVzcG9uc2USYgoNVXBkYXRlUHJvZmlsZRInLm1pc3RnYXRlLmFkbWluLnYxLlVwZGF0ZVByb2ZpbGVSZXF1ZXN0GigubWlzdGdhdGUuYWRtaW4udjEuVXBkYXRlUHJvZmlsZVJlc3BvbnNlEmUKDlByZXZpZXdQcm9maWxlEigubWlzdGdhdGUuYWRtaW4udjEuUHJldmlld1Byb2ZpbGVSZXF1ZXN0GikubWlzdGdhdGUuYWRtaW4udjEuUHJldmlld1Byb2ZpbGVSZXNwb25zZRJiCg1EZWxldGVQcm9maWxlEicubWlzdGdhdGUuYWRtaW4udjEuRGVsZXRlUHJvZmlsZVJlcXVlc3QaKC5taXN0Z2F0ZS5hZG1pbi52MS5EZWxldGVQcm9maWxlUmVzcG9uc2USYgoNQ3JlYXRlSW5ib3VuZBInLm1pc3RnYXRlLmFkbWluLnYxLkNyZWF0ZUluYm91bmRSZXF1ZXN0GigubWlzdGdhdGUuYWRtaW4udjEuQ3JlYXRlSW5ib3VuZFJlc3BvbnNlEmIKDVVwZGF0ZUluYm91bmQSJy5taXN0Z2F0ZS5hZG1pbi52MS5VcGRhdGVJbmJvdW5kUmVxdWVzdBooLm1pc3RnYXRlLmFkbWluLnYxLlVwZGF0ZUluYm91bmRSZXNwb25zZRJiCg1EZWxldGVJbmJvdW5kEicubWlzdGdhdGUuYWRtaW4udjEuRGVsZXRlSW5ib3VuZFJlcXVlc3QaKC5taXN0Z2F0ZS5hZG1pbi52MS5EZWxldGVJbmJvdW5kUmVzcG9uc2USfQoWUmVtb3ZlUHJvZmlsZUZyb21Ob2RlcxIwLm1pc3RnYXRlLmFkbWluLnYxLlJlbW92ZVByb2ZpbGVGcm9tTm9kZXNSZXF1ZXN0GjEubWlzdGdhdGUuYWRtaW4udjEuUmVtb3ZlUHJvZmlsZUZyb21Ob2Rlc1Jlc3BvbnNlElwKC1R3aW5Qcm9maWxlEiUubWlzdGdhdGUuYWRtaW4udjEuVHdpblByb2ZpbGVSZXF1ZXN0GiYubWlzdGdhdGUuYWRtaW4udjEuVHdpblByb2ZpbGVSZXNwb25zZULHAQoVY29tLm1pc3RnYXRlLmFkbWluLnYxQgxQcm9maWxlUHJvdG9QAVo6Z2l0aHViLmNvbS9taXN0Z2F0ZS9taXN0Z2F0ZS9nZW4vbWlzdGdhdGUvYWRtaW4vdjE7YWRtaW52MaICA01BWKoCEU1pc3RnYXRlLkFkbWluLlYxygIRTWlzdGdhdGVcQWRtaW5cVjHiAh1NaXN0Z2F0ZVxBZG1pblxWMVxHUEJNZXRhZGF0YeoCE01pc3RnYXRlOjpBZG1pbjo6VjFiBnByb3RvMw", [file_mistgate_admin_v1_common, file_mistgate_admin_v1_subscription]);
 
 /**
  * @generated from message mistgate.admin.v1.ProtocolInfo
@@ -52,6 +52,13 @@ export type ProtocolInfo = Message<"mistgate.admin.v1.ProtocolInfo"> & {
    * @generated from field: repeated mistgate.admin.v1.App apps = 5;
    */
   apps: App[];
+
+  /**
+   * The protocol is new and not proven in the field (MTProto today): the list marks it, and the owner knows it may change.
+   *
+   * @generated from field: bool experimental = 6;
+   */
+  experimental: boolean;
 };
 
 /**
@@ -653,7 +660,12 @@ export const ScoreItemSchema: GenMessage<ScoreItem> = /*@__PURE__*/
  * "sni_needs_domain: name=1.2.3.4" (an IP where Let's Encrypt wants a domain), "sni_invalid: name=..." (neither a domain
  * nor an IP), "already_on_node", "node_retired", "port_lossy: port=8443&node=de1&sent=300&got=190&at=<unix>&sender=nl1&free=2053"
  * (FAILED_PRECONDITION: the UDP delivery check of design/udp-port-check.md found the port losing packets on that node;
- * free = a port the same run proved, else the picker's choice from stored checks, 0 = none; allow_lossy_port saves anyway).
+ * free = a port the same run proved, else the picker's choice from stored checks, 0 = none; allow_lossy_port saves anyway),
+ * "reality_target_unsupported" (a REALITY target override on an inbound that is not VLESS REALITY), "reality_target_invalid:
+ * target=..." (not a host name and a port), "reality_target_same_node: target=...&node=de1" (the node itself at its own port),
+ * "reality_target_own: target=...&node=de1" (the host is one of the panel's own: the address of a node, the panel, a name a service of the
+ * fleet holds a certificate for). A warning that is not a refusal: "bridge_site_lost: node=fi1&port=443" (the node's own site on 443, which
+ * the bridge of reverse relays rides, would give way to another site).
  *
  * @generated from message mistgate.admin.v1.CreateInboundRequest
  */
@@ -711,6 +723,15 @@ export type CreateInboundRequest = Message<"mistgate.admin.v1.CreateInboundReque
    * @generated from field: string settings_json = 8;
    */
   settingsJson: string;
+
+  /**
+   * VLESS REALITY only: "host:port" of a site this node shows instead of the profile's target (the host is a name, not an IP);
+   * the host becomes the one name REALITY accepts there. Empty = the profile's target. Refusals: reality_target_unsupported,
+   * reality_target_invalid, reality_target_same_node, reality_target_own (as listed above).
+   *
+   * @generated from field: string reality_target_override = 9;
+   */
+  realityTargetOverride: string;
 };
 
 /**
@@ -793,6 +814,21 @@ export type UpdateInboundRequest = Message<"mistgate.admin.v1.UpdateInboundReque
    * @generated from field: bool allow_lossy_port = 6;
    */
   allowLossyPort: boolean;
+
+  /**
+   * Whether the server at the node's own address is included in subscriptions; absent = leave unchanged.
+   *
+   * @generated from field: optional bool direct_in_subscriptions = 7;
+   */
+  directInSubscriptions?: boolean | undefined;
+
+  /**
+   * As CreateInboundRequest.reality_target_override; absent = leave unchanged, "" = back to the profile's target. A change
+   * restarts the server and clients get the new name with their next subscription update.
+   *
+   * @generated from field: optional string reality_target_override = 8;
+   */
+  realityTargetOverride?: string | undefined;
 };
 
 /**
@@ -999,6 +1035,77 @@ export const DeleteInboundResponseSchema: GenMessage<DeleteInboundResponse> = /*
   messageDesc(file_mistgate_admin_v1_profile, 28);
 
 /**
+ * @generated from message mistgate.admin.v1.RemoveProfileFromNodesRequest
+ */
+export type RemoveProfileFromNodesRequest = Message<"mistgate.admin.v1.RemoveProfileFromNodesRequest"> & {
+  /**
+   * @generated from field: string profile_id = 1;
+   */
+  profileId: string;
+
+  /**
+   * The nodes to take the profile off; at least one.
+   *
+   * @generated from field: repeated string node_ids = 2;
+   */
+  nodeIds: string[];
+
+  /**
+   * Delete the profile too, when this call takes it off its last nodes. The groups lose it, as with DeleteProfile.
+   *
+   * @generated from field: bool delete_profile = 3;
+   */
+  deleteProfile: boolean;
+
+  /**
+   * With delete_profile: the profile name typed by the admin; must equal the current name.
+   *
+   * @generated from field: string confirm_name = 4;
+   */
+  confirmName: string;
+};
+
+/**
+ * Describes the message mistgate.admin.v1.RemoveProfileFromNodesRequest.
+ * Use `create(RemoveProfileFromNodesRequestSchema)` to create a new message.
+ */
+export const RemoveProfileFromNodesRequestSchema: GenMessage<RemoveProfileFromNodesRequest> = /*@__PURE__*/
+  messageDesc(file_mistgate_admin_v1_profile, 29);
+
+/**
+ * @generated from message mistgate.admin.v1.RemoveProfileFromNodesResponse
+ */
+export type RemoveProfileFromNodesResponse = Message<"mistgate.admin.v1.RemoveProfileFromNodesResponse"> & {
+  /**
+   * How many inbounds were removed (nodes the profile was not on do not count).
+   *
+   * @generated from field: uint32 removed = 1;
+   */
+  removed: number;
+
+  /**
+   * The profile is gone.
+   *
+   * @generated from field: bool profile_deleted = 2;
+   */
+  profileDeleted: boolean;
+
+  /**
+   * Relay links through the removed inbounds that went with them.
+   *
+   * @generated from field: uint32 relays_removed = 3;
+   */
+  relaysRemoved: number;
+};
+
+/**
+ * Describes the message mistgate.admin.v1.RemoveProfileFromNodesResponse.
+ * Use `create(RemoveProfileFromNodesResponseSchema)` to create a new message.
+ */
+export const RemoveProfileFromNodesResponseSchema: GenMessage<RemoveProfileFromNodesResponse> = /*@__PURE__*/
+  messageDesc(file_mistgate_admin_v1_profile, 30);
+
+/**
  * Profiles screen (protocol presets) and the placement of a profile on nodes (inbounds).
  *
  * A profile is protocol + name + settings. The settings are a JSON document whose shape belongs to the
@@ -1119,6 +1226,20 @@ export const ProfileService: GenService<{
     methodKind: "unary";
     input: typeof DeleteInboundRequestSchema;
     output: typeof DeleteInboundResponseSchema;
+  },
+  /**
+   * Remove the profile from several nodes at once, optionally deleting the profile in the same step. One transaction on the
+   * panel: the inbounds are gone together or not at all, and a node that is offline drops the profile when it connects
+   * again (the desired state is read from the panel). A node of the list that does not carry the profile is skipped, so a
+   * repeated call is harmless. With delete_profile the list must cover every node the profile is on, else FAILED_PRECONDITION
+   * "profile_deployed" names those left and nothing changes. Owner only.
+   *
+   * @generated from rpc mistgate.admin.v1.ProfileService.RemoveProfileFromNodes
+   */
+  removeProfileFromNodes: {
+    methodKind: "unary";
+    input: typeof RemoveProfileFromNodesRequestSchema;
+    output: typeof RemoveProfileFromNodesResponseSchema;
   },
   /**
    * "The same server with and without WARP": a twin of a profile whose exit is flipped (direct <-> WARP). Same

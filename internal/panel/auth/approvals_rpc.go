@@ -24,6 +24,17 @@ const maxApprovalIDLen = 64
 
 type approvalRPC struct{ s *Service }
 
+// ApproveAssistantMCPPlan is the same awaiting -> approved operation used by ApprovalService.Approve, for the
+// AssistantService's human-click path. Its caller must have checked the signed-in owner and RequireStepUp first.
+func (s *Service) ApproveAssistantMCPPlan(ctx context.Context, id string, admin store.Admin) (store.MCPPlan, error) {
+	p, err := s.st.DecideMCPPlan(ctx, id, admin.ID, true, s.now())
+	if err != nil {
+		return store.MCPPlan{}, err
+	}
+	s.audit(ctx, admin.ID, "approval_approve", "ok", ClientIPFrom(ctx), map[string]any{"plan_id": p.ID, "tool": p.Tool, "token_id": p.TokenID})
+	return p, nil
+}
+
 // ApprovalHandler returns the Connect path prefix and the handler of ApprovalService. Mount it behind
 // RequireSession.
 func (s *Service) ApprovalHandler() (string, http.Handler) {
@@ -105,24 +116,26 @@ func (r *approvalRPC) ListApprovals(ctx context.Context, req *connect.Request[ad
 	return connect.NewResponse(resp), nil
 }
 
-// NodeInstallTool is the MCP tool whose approval carries the owner's SSH password (ApproveRequest.ssh_password).
+// NodeInstallTool is the MCP tool whose approval carries the owner's SSH login choice.
 const NodeInstallTool = "node_install"
 
-// NodeInstallSecret is what the owner enters when approving a node_install plan. The approval seals it to the plan;
-// ProvisioningService.StartNodeProvision opens it once, for that plan's apply, and uses the password only with this
-// fingerprint. The agent never sees it.
+// NodeInstallSecret is what the owner chooses when approving a node_install plan. The approval seals it to the plan;
+// ProvisioningService.StartNodeProvision opens it once, for that plan's apply, and uses that login only with this
+// fingerprint. The agent never sees a password or private key.
 type NodeInstallSecret struct {
 	Password    string `json:"password"`
 	Fingerprint string `json:"fingerprint"`
+	PanelKey    bool   `json:"panel_key,omitempty"`
 }
 
-func nodeInstallSecretAAD(planID string) string { return "mcp-plan-node-install:" + planID }
+// NodeInstallSecretAAD is the vault AAD for the secret the owner supplied while approving an MCP install plan.
+func NodeInstallSecretAAD(planID string) string { return "mcp-plan-node-install:" + planID }
 
 // SealNodeInstallSecret seals what the owner entered to plan planID (the approval does it; tests too).
 func SealNodeInstallSecret(v *vault.Vault, planID string, s NodeInstallSecret) []byte {
 	plain, _ := json.Marshal(s)
 	defer clear(plain)
-	return v.Seal(plain, nodeInstallSecretAAD(planID))
+	return v.Seal(plain, NodeInstallSecretAAD(planID))
 }
 
 // OpenNodeInstallSecret opens what ApproveMCPPlanWithSecret stored for plan planID.
@@ -131,7 +144,7 @@ func OpenNodeInstallSecret(v *vault.Vault, planID string, sealed []byte) (NodeIn
 	if v == nil {
 		return out, errors.New("auth: no vault")
 	}
-	plain, err := v.Open(sealed, nodeInstallSecretAAD(planID))
+	plain, err := v.Open(sealed, NodeInstallSecretAAD(planID))
 	if err != nil {
 		return out, err
 	}
@@ -146,29 +159,35 @@ func (r *approvalRPC) nodeInstallSecret(ctx context.Context, m *adminv1.ApproveR
 	s := r.s
 	p, err := s.st.GetMCPPlan(ctx, m.Id)
 	if err != nil || p.Tool != NodeInstallTool {
-		if m.SshPassword != "" || m.ConfirmedFingerprint != "" {
-			return nil, invalid("only a node installation takes a password")
+		if m.SshPassword != "" || m.ConfirmedFingerprint != "" || m.UsePanelKey {
+			return nil, invalid("only a node installation takes an SSH login choice")
 		}
 		return nil, nil // an unknown id: decide answers it
 	}
-	if m.SshPassword == "" || len(m.SshPassword) > 1024 || !utf8.ValidString(m.SshPassword) || strings.ContainsAny(m.SshPassword, "\x00\r\n") {
-		return nil, invalid("enter the server's SSH password")
-	}
 	var facts []struct{ Key, Value string }
 	_ = json.Unmarshal([]byte(p.FactsJSON), &facts)
-	shown := ""
+	shown, panelKeyShown := "", false
 	for _, f := range facts {
 		if f.Key == "host_key" {
 			shown = f.Value
+		} else if f.Key == "panel_ssh_key" {
+			panelKeyShown = f.Value != ""
 		}
 	}
 	if shown == "" || m.ConfirmedFingerprint != shown {
 		return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("confirm the exact host key fingerprint shown in the approval"))
 	}
+	if m.UsePanelKey {
+		if m.SshPassword != "" || !panelKeyShown {
+			return nil, invalid("the panel key is not available in this installation plan")
+		}
+	} else if m.SshPassword == "" || len(m.SshPassword) > 1024 || !utf8.ValidString(m.SshPassword) || strings.ContainsAny(m.SshPassword, "\x00\r\n") {
+		return nil, invalid("enter the server's SSH password")
+	}
 	if s.vault == nil {
 		return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("the panel has no master key"))
 	}
-	return SealNodeInstallSecret(s.vault, p.ID, NodeInstallSecret{Password: m.SshPassword, Fingerprint: shown}), nil
+	return SealNodeInstallSecret(s.vault, p.ID, NodeInstallSecret{Password: m.SshPassword, Fingerprint: shown, PanelKey: m.UsePanelKey}), nil
 }
 
 // decide is Approve and Reject: the compare-and-swap, the errors, the audit row. secret, for an approval, is what the
@@ -204,6 +223,7 @@ func (r *approvalRPC) decide(ctx context.Context, admin store.Admin, req connect
 
 // Approve is the owner agreeing to exactly what the approval lists. Needs a step-up.
 func (r *approvalRPC) Approve(ctx context.Context, req *connect.Request[adminv1.ApproveRequest]) (*connect.Response[adminv1.ApproveResponse], error) {
+	defer func() { req.Msg.SshPassword = "" }() // sealed to the plan below; no plaintext copy outlives the call
 	admin, err := ownerSession(ctx)
 	if err != nil {
 		return nil, err

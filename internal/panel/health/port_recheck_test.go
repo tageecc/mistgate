@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mistgate/mistgate/internal/agentcap"
 	"github.com/mistgate/mistgate/internal/panel/store"
 )
 
@@ -49,6 +50,24 @@ func TestDuePortCheckNodesUsesSixHourMinimumAndEligibility(t *testing.T) {
 	}
 }
 
+func TestDuePortCheckNodesThrottlesSourceFilteredNodesToDaily(t *testing.T) {
+	now := portCheckTimeFor("node-a", time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC))
+	filtered := PortCheckScheduleNode{ID: "node-a", State: "active", Online: true, UDPCheck: true, HasEnabledInbound: true,
+		LastCheckedAt: now.Add(-store.UDPFilteredCheckInterval), UDPFilteredAt: now.Add(-48 * time.Hour)}
+	if got := DuePortCheckNodes(now, []PortCheckScheduleNode{filtered}); len(got) != 1 || got[0] != filtered.ID {
+		t.Fatalf("source-filtered node did not become due after 24 hours: %v", got)
+	}
+	filtered.LastCheckedAt = now.Add(-store.UDPFilteredCheckInterval + time.Second)
+	if got := DuePortCheckNodes(now, []PortCheckScheduleNode{filtered}); len(got) != 0 {
+		t.Fatalf("source-filtered node was due before 24 hours: %v", got)
+	}
+	filtered.LastCheckedAt = now.Add(-2 * store.UDPFilteredCheckInterval)
+	filtered.UDPFilteredCheckedAt = now.Add(-store.UDPFilteredCheckInterval + time.Second)
+	if got := DuePortCheckNodes(now, []PortCheckScheduleNode{filtered}); len(got) != 0 {
+		t.Fatalf("source-filtered node ignored its more recent attempt: %v", got)
+	}
+}
+
 func TestDuePortCheckNodesSpreadsNodesAcrossSixHourWindow(t *testing.T) {
 	ids := []string{"node-a", "node-b", "node-c", "node-d", "node-e"}
 	var first, second string
@@ -86,27 +105,27 @@ func TestPortCheckScheduleCandidatesUseLiveStateEnabledInboundsAndStoredChecks(t
 	e.clock.Advance(now.Sub(e.clock.Now()))
 	e.node("node-a", "provider-a", true)
 	e.inbound("node-a", 8443)
-	e.fl.set("node-a", liveState{up: true, caps: []string{portCheckCapability}})
+	e.fl.set("node-a", liveState{up: true, caps: []string{agentcap.UDPCheck}})
 
 	e.node("node-b", "provider-b", true)
 	e.inbound("node-b", 8443)
-	e.fl.set("node-b", liveState{up: true, caps: []string{portCheckCapability}})
+	e.fl.set("node-b", liveState{up: true, caps: []string{agentcap.UDPCheck}})
 
 	e.node("node-c", "provider-c", false)
 	e.inbound("node-c", 8443)
-	e.fl.set("node-c", liveState{up: false, caps: []string{portCheckCapability}})
+	e.fl.set("node-c", liveState{up: false, caps: []string{agentcap.UDPCheck}})
 
 	e.node("node-d", "provider-d", true)
 	e.inbound("node-d", 8443)
-	e.fl.set("node-d", liveState{up: true, caps: []string{capDoctor}})
+	e.fl.set("node-d", liveState{up: true, caps: []string{agentcap.Doctor}})
 
 	e.node("node-e", "provider-e", true)
 	disabled := e.inbound("node-e", 8443)
 	e.exec(`UPDATE inbound SET enabled = 0 WHERE id = ?`, disabled)
-	e.fl.set("node-e", liveState{up: true, caps: []string{portCheckCapability}})
+	e.fl.set("node-e", liveState{up: true, caps: []string{agentcap.UDPCheck}})
 
 	e.node("node-f", "provider-f", true) // no enabled inbound
-	e.fl.set("node-f", liveState{up: true, caps: []string{portCheckCapability}})
+	e.fl.set("node-f", liveState{up: true, caps: []string{agentcap.UDPCheck}})
 
 	putStoredPortCheck(t, e, "node-a", 8443, now.Add(-PortCheckInterval), "panel")
 	putStoredPortCheck(t, e, "node-b", 8443, now.Add(-5*time.Hour), "node-c")
@@ -130,7 +149,7 @@ func putStoredPortCheck(t *testing.T, e *env, nodeID string, port uint16, checke
 	if err != nil {
 		t.Fatal(err)
 	}
-	check := store.PortCheck{NodeID: nodeID, Address: node.Address, Port: port, Sent: 300, Got: 300,
+	check := store.PortCheck{NodeID: nodeID, Address: node.Address, Port: port, Sent: 150, Got: 150,
 		Verdict: "ok", Sender: sender, CheckedAt: checkedAt}
 	if err := e.st.PutPortChecks(e.ctx, []store.PortCheck{check}); err != nil {
 		t.Fatal(err)
@@ -150,19 +169,19 @@ func TestPeriodicPortCheckConfirmsOnlyBadEnabledInboundPorts(t *testing.T) {
 			e.clock.Advance(now.Sub(e.clock.Now()))
 			e.node("node-a", "provider-a", true)
 			e.inbound("node-a", 8443)
-			e.fl.set("node-a", liveState{up: true, caps: []string{portCheckCapability}})
+			e.fl.set("node-a", liveState{up: true, caps: []string{agentcap.UDPCheck}})
 			calls := 0
 			e.s.cfg.CheckPorts = func(ctx context.Context, nodeID string, _ []uint16) ([]store.PortCheck, string, string) {
 				calls++
 				verdict, got := tc.firstState, uint32(100)
 				port := tc.firstPort
 				if calls > 1 {
-					verdict, got, port = "ok", 300, 8443
+					verdict, got, port = "ok", 150, 8443
 				}
 				if verdict == "ok" {
-					got = 300
+					got = 150
 				}
-				check := store.PortCheck{NodeID: nodeID, Address: nodeID + ".example.com", Port: port, Sent: 300,
+				check := store.PortCheck{NodeID: nodeID, Address: nodeID + ".example.com", Port: port, Sent: 150,
 					Got: got, Verdict: verdict, Sender: "panel", CheckedAt: e.clock.Now().Add(time.Duration(calls) * time.Second)}
 				if err := e.st.PutPortChecks(ctx, []store.PortCheck{check}); err != nil {
 					e.t.Fatal(err)
@@ -189,7 +208,7 @@ func TestPeriodicPortChecksRunOneAtATime(t *testing.T) {
 	e.clock.Advance(now.Sub(e.clock.Now()))
 	e.node("node-a", "provider-a", true)
 	e.inbound("node-a", 8443)
-	e.fl.set("node-a", liveState{up: true, caps: []string{portCheckCapability}})
+	e.fl.set("node-a", liveState{up: true, caps: []string{agentcap.UDPCheck}})
 	entered, release, done := make(chan struct{}), make(chan struct{}), make(chan bool, 1)
 	var mu sync.Mutex
 	calls := 0
@@ -223,10 +242,10 @@ func TestPeriodicPortCheckConfirmationIsUDPOnly(t *testing.T) {
 	e.clock.Advance(now.Sub(e.clock.Now()))
 	e.node("node-a", "provider-a", true)
 	e.inbound("node-a", 8443)
-	e.fl.set("node-a", liveState{up: true, caps: []string{portCheckCapability}})
+	e.fl.set("node-a", liveState{up: true, caps: []string{agentcap.UDPCheck}})
 	var full, udpOnly int
 	lossy := func(nodeID string) []store.PortCheck {
-		return []store.PortCheck{{NodeID: nodeID, Address: nodeID + ".example.com", Port: 8443, Sent: 300, Got: 100,
+		return []store.PortCheck{{NodeID: nodeID, Address: nodeID + ".example.com", Port: 8443, Sent: 150, Got: 100,
 			Verdict: "lossy", Sender: "panel", CheckedAt: e.clock.Now()}}
 	}
 	e.s.cfg.CheckPorts = func(_ context.Context, nodeID string, _ []uint16) ([]store.PortCheck, string, string) {
@@ -239,5 +258,72 @@ func TestPeriodicPortCheckConfirmationIsUDPOnly(t *testing.T) {
 	}
 	if !e.s.runOnePortRecheck(e.ctx) || full != 1 || udpOnly != 1 {
 		t.Fatalf("full runs %d, UDP-only confirmations %d, want one of each", full, udpOnly)
+	}
+}
+
+func TestPeriodicSourceFilteredPortCheckDoesNotRecruitConfirmationSender(t *testing.T) {
+	e := newEnv(t)
+	now := portCheckTimeFor("node-a", e.clock.Now())
+	e.clock.Advance(now.Sub(e.clock.Now()))
+	e.node("node-a", "provider-a", true)
+	inbound := e.inbound("node-a", 8443)
+	e.fl.set("node-a", liveState{up: true, caps: []string{agentcap.UDPCheck}})
+	node, err := e.st.Node(e.ctx, "node-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.st.PutPortChecks(e.ctx, []store.PortCheck{{NodeID: node.ID, Address: node.Address, Port: 8443, Sent: 150, Got: 100,
+		Verdict: "lossy", Sender: "node-b", CheckedAt: now.Add(-store.UDPFilteredCheckInterval)}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.st.SetUDPFilteredAt(e.ctx, node.ID, now.Add(-48*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	var full, udpOnly int
+	e.s.cfg.CheckPorts = func(ctx context.Context, nodeID string, _ []uint16) ([]store.PortCheck, string, string) {
+		full++
+		return []store.PortCheck{{NodeID: nodeID, Address: node.Address, Port: 8443, Sent: 150, Got: 100,
+			Verdict: "lossy", Sender: "node-b", CheckedAt: e.clock.Now()}}, "node-b", ""
+	}
+	e.s.cfg.CheckPortsUDP = func(context.Context, string, []uint16) ([]store.PortCheck, string, string) {
+		udpOnly++
+		return nil, "node-c", ""
+	}
+	if !e.s.runOnePortRecheck(e.ctx) || full != 1 || udpOnly != 0 {
+		t.Fatalf("source-filtered recheck calls = full:%d udp-only:%d", full, udpOnly)
+	}
+	_ = inbound
+}
+
+func TestPeriodicSourceFilteredNoSenderAttemptIsCappedAtOneDay(t *testing.T) {
+	e := newEnv(t)
+	now := portCheckTimeFor("node-a", e.clock.Now())
+	e.clock.Advance(now.Sub(e.clock.Now()))
+	e.node("node-a", "provider-a", true)
+	e.inbound("node-a", 8443)
+	e.fl.set("node-a", liveState{up: true, caps: []string{agentcap.UDPCheck}})
+	if err := e.st.SetUDPFilteredState(e.ctx, "node-a", now.Add(-48*time.Hour), "node-b"); err != nil {
+		t.Fatal(err)
+	}
+	var calls int
+	e.s.cfg.CheckPorts = func(context.Context, string, []uint16) ([]store.PortCheck, string, string) {
+		calls++
+		return nil, "", "no_sender"
+	}
+	if !e.s.runOnePortRecheck(e.ctx) || calls != 1 {
+		t.Fatalf("first no-sender attempt: calls=%d", calls)
+	}
+	state, err := e.st.UDPFilteredNodes(e.ctx)
+	if err != nil || len(state) != 1 || !state[0].CheckedAt.Equal(now) {
+		t.Fatalf("stored no-sender attempt = %+v, %v", state, err)
+	}
+
+	e.clock.Advance(PortCheckInterval)
+	if e.s.runOnePortRecheck(e.ctx) || calls != 1 {
+		t.Fatalf("filtered node was retried inside one day: calls=%d", calls)
+	}
+	e.clock.Advance(store.UDPFilteredCheckInterval - PortCheckInterval)
+	if !e.s.runOnePortRecheck(e.ctx) || calls != 2 {
+		t.Fatalf("filtered node was not retried after one day: calls=%d", calls)
 	}
 }

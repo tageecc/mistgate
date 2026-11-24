@@ -2,10 +2,13 @@ syntax = "proto3";
 
 package mistgate.admin.v1;
 
+import "mistgate/admin/v1/common.proto";
+
 // Owner-only SSH installation of a Mistgate node. Credentials are accepted only after the
 // administrator has confirmed the SSH host-key fingerprint shown by GetSSHFingerprint.
 service ProvisioningService {
   rpc GetSSHFingerprint(GetSSHFingerprintRequest) returns (GetSSHFingerprintResponse);
+  rpc GetPanelSSHKey(GetPanelSSHKeyRequest) returns (GetPanelSSHKeyResponse);
   rpc CheckSSH(CheckSSHRequest) returns (CheckSSHResponse);
   rpc StartNodeProvision(StartNodeProvisionRequest) returns (StartNodeProvisionResponse);
   rpc RetryNodeProvision(RetryNodeProvisionRequest) returns (RetryNodeProvisionResponse);
@@ -13,10 +16,21 @@ service ProvisioningService {
   rpc ListNodeProvisions(ListNodeProvisionsRequest) returns (ListNodeProvisionsResponse);
   rpc ListNodeProvisionEvents(ListNodeProvisionEventsRequest) returns (ListNodeProvisionEventsResponse);
   rpc ListNodeServerAccess(ListNodeServerAccessRequest) returns (ListNodeServerAccessResponse);
+  rpc ListNodeServerKeys(ListNodeServerKeysRequest) returns (ListNodeServerKeysResponse);
+  rpc AddNodeServerKey(AddNodeServerKeyRequest) returns (AddNodeServerKeyResponse);
+  rpc RemoveNodeServerKey(RemoveNodeServerKeyRequest) returns (RemoveNodeServerKeyResponse);
+  rpc AttachNodeServerAccess(AttachNodeServerAccessRequest) returns (AttachNodeServerAccessResponse);
   rpc RotateNodeServerPassword(RotateNodeServerPasswordRequest) returns (RotateNodeServerPasswordResponse);
   rpc RevealNodeServerPassword(RevealNodeServerPasswordRequest) returns (RevealNodeServerPasswordResponse);
   // Owner-only, step-up protected: deletes the saved access of a retired node, its sealed password included.
   rpc ForgetNodeServerAccess(ForgetNodeServerAccessRequest) returns (ForgetNodeServerAccessResponse);
+}
+
+message GetPanelSSHKeyRequest {}
+
+message GetPanelSSHKeyResponse {
+  string public_key = 1;
+  string fingerprint = 2;
 }
 
 message GetSSHFingerprintRequest {
@@ -39,6 +53,11 @@ message CheckSSHRequest {
   string fingerprint = 3;
   string password = 4;
   string username = 5;
+  // When true, password must be empty and the panel uses its public key's private half.
+  bool use_panel_key = 6;
+  // An owner's private key is used only for this check. It is never retained.
+  string private_key = 7;
+  string private_key_passphrase = 8;
 }
 
 message NodePreflight {
@@ -52,6 +71,9 @@ message NodePreflight {
   bool systemd = 8;
   bool already_enrolled = 9;
   bool panel_reachable = 10;
+  // The nft command is on the server. When it is not, the install adds a step of its own and installs the nftables package
+  // (a cloud image of Debian 13 has none); a server where that fails stops with nftables_install_failed.
+  bool nftables = 11;
 }
 
 message CheckSSHResponse {
@@ -71,8 +93,17 @@ message StartNodeProvisionRequest {
   string password = 10;
   string ssh_username = 11;
   // MCP only: the approved node_install plan being applied. password stays empty: the panel uses the password the owner
-  // entered on that plan's approval screen, and only with the fingerprint the owner confirmed there.
+  // chose on that plan's approval screen, and only with the fingerprint the owner confirmed there.
   string plan_id = 12;
+  // Direct installs: when true, password must be empty and the panel key is used.
+  bool use_panel_key = 13;
+  // For wizard requests, the UI sends true by default and false only when the owner opts out.
+  bool install_panel_key = 14;
+  // An owner's private key is used for this install only; the worker replaces it with the panel key for saved access.
+  string private_key = 15;
+  string private_key_passphrase = 16;
+  // Who the new node is handed out to once installed (see CreateEnrollmentRequest.sharing); unset = the panel decides.
+  NodeSharing sharing = 17;
 }
 
 message RetryNodeProvisionRequest {
@@ -80,6 +111,12 @@ message RetryNodeProvisionRequest {
   bool confirm_install = 2;
   string password = 3;
   string ssh_username = 4;
+  // When true, password must be empty and the panel key is used.
+  bool use_panel_key = 5;
+  string private_key = 6;
+  string private_key_passphrase = 7;
+  // When true, the panel key is added and verified before access is saved.
+  bool install_panel_key = 8;
 }
 
 message StartNodeProvisionResponse {
@@ -150,10 +187,66 @@ message NodeServerAccess {
   bool password_generated = 9;
   // The node is retired. Its access stays, so the owner can still reveal the password, until it is forgotten.
   bool node_retired = 10;
+  // False when this node has no saved SSH password (for example, a panel-key install).
+  bool password_saved = 11;
+  // Whether the saved password last authenticated over SSH; false also for key-only installs not yet checked.
+  bool password_login = 12;
+  // SHA256 fingerprint of the panel key, empty when this node uses another login method.
+  string panel_key_fingerprint = 13;
 }
 
 message ListNodeServerAccessRequest {}
 message ListNodeServerAccessResponse { repeated NodeServerAccess access = 1; }
+
+// A public authorized_keys entry. Comments are untrusted server text and are cleaned before they are returned.
+message NodeServerKey {
+  string type = 1;
+  uint32 bits = 2;
+  string fingerprint = 3;
+  string comment = 4;
+  bool panel_key = 5;
+  bool restricted = 6;
+  uint32 lines = 7;
+}
+message ListNodeServerKeysRequest { string node_id = 1; }
+message ListNodeServerKeysResponse {
+  repeated NodeServerKey keys = 1;
+  uint32 other_lines = 2;
+}
+message AddNodeServerKeyRequest {
+  string node_id = 1;
+  string public_key = 2;
+  bool panel_key = 3;
+  bool confirm = 4;
+}
+message AddNodeServerKeyResponse { NodeServerKey key = 1; }
+message RemoveNodeServerKeyRequest {
+  string node_id = 1;
+  string fingerprint = 2;
+  bool confirm = 3;
+  bool confirm_panel_key = 4;
+}
+message RemoveNodeServerKeyResponse {}
+
+// Attach access to a node that was enrolled outside the SSH installer.
+message AttachNodeServerAccessRequest {
+  string node_id = 1;
+  string ssh_host = 2;
+  uint32 ssh_port = 3;
+  string fingerprint = 4;
+  string username = 5;
+  string password = 6;
+  bool use_panel_key = 7;
+  string private_key = 8;
+  string private_key_passphrase = 9;
+  bool install_panel_key = 10;
+  bool confirm = 11;
+}
+message AttachNodeServerAccessResponse {
+  NodeServerAccess access = 1;
+  // Non-empty when password access was attached but the optional panel key could not be installed.
+  string panel_key_error = 2;
+}
 
 message RotateNodeServerPasswordRequest {
   string node_id = 1;

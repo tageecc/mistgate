@@ -1,5 +1,6 @@
 ---
 title: 安装面板
+seoTitle: "在自己的 Linux 服务器上安装 VPN 面板 — Mistgate"
 description: 下载或构建 Mistgate，使用 mistgate setup 准备面板，通过 systemd 运行，并首次登录。
 ---
 
@@ -15,7 +16,7 @@ description: 下载或构建 Mistgate，使用 mistgate setup 准备面板，通
 curl -fsSL https://mistgate.app/install.sh | sudo bash -s -- --public-url https://panel.example.com
 ```
 
-默认情况下，安装器会为 URL 中的主机名申请 Let’s Encrypt 证书。它会在更改前询问；非交互式运行时添加 `--yes`。使用 `--dry-run` 下载并验证发布版本，但不更改主机；使用 `--version vX.Y.Z` 安装指定版本。`--admin-host`、`--admin-listen`、`--acme-domain` 和 `--data-dir` 用于选择下文介绍的 setup 和服务选项。
+默认情况下，安装器会为 URL 中的主机名申请 Let’s Encrypt 证书。它会在更改前询问；非交互式运行时添加 `--yes`。使用 `--dry-run` 下载并验证发布版本，但不更改主机；使用 `--version vX.Y.Z` 安装指定版本，或使用 `--channel testing`、`--channel dev` 安装更早[发布渠道](../operations/updates.md#发布渠道)的最新版本，此后面板会跟随该渠道。`--restore FILE` 配合 `--identity-file KEY` 或 `--passphrase-file FILE` 会恢复备份，而不是设置新面板：参见[备份](../operations/backups.md#在新面板上恢复)。`--admin-host`、`--admin-listen`、`--acme-domain` 和 `--data-dir` 用于选择下文介绍的 setup 和服务选项。
 
 安装完成后，在浏览器中打开一次性设置链接并创建所有者账户。链接 30 分钟后过期。然后通过**节点 → 添加节点**添加节点。
 
@@ -207,7 +208,7 @@ journalctl -u mistgate -f
 如果同一主机上的其他 Web 服务器必须占用端口 443，Mistgate 可以在它后面运行：
 
 - 在 回环地址 上运行无 TLS 的公网监听器（`--listen 127.0.0.1:8080`，不传入 `--acme-domain`、`--tls-cert`），让代理为 `panel.example.com` 终止 TLS，并原样传递 Host 请求头和路径。
-- 添加 `--trusted-proxy 127.0.0.1`，这样速率限制、会话和审计日志可以从 `X-Forwarded-For` 或 `Forwarded` 获取真实客户端地址。
+- 添加 `--trusted-proxy 127.0.0.1`，这样速率限制、会话和审计日志可以从 `X-Forwarded-For` 获取真实客户端地址。代理必须自行设置或覆盖该请求头，这样客户端无法自行伪造；只写入 `Forwarded` 的代理不受支持。
 - 节点 Agent 必须从面板本身获取 TLS。为它们单独配置一个监听器，并将其地址放入安装命令：`--agent-listen :8443 --agent-addr panel.example.com:8443`。代理不能处理该端口。
 
 这样，Agent 端口会作为独立端口，只响应私密 TLS 名称；在共用的 443 端口上，它会隐藏在伪装站点后面。条件允许时，优先使用上面的直接配置。
@@ -216,7 +217,7 @@ journalctl -u mistgate -f
 
 在浏览器中打开第 3 步生成的设置链接，包括 `#` 后面的部分。
 
-1. **语言。** 选择英语、俄语或简体中文。之后可以更改。
+1. **语言。** 选择英语、俄语、简体中文、波斯语或土耳其语。之后可以更改。
 2. **创建管理员。** LOGIN 字段（默认为 `admin`）是你的用户名，也是面板中显示的名称。然后：
    - **创建通行密钥**：浏览器会要求使用指纹、人脸、PIN 或安全密钥验证。密钥保留在你的设备上。推荐使用此方式。
    - **改用密码 + 身份验证器验证码**：设置至少 12 个字符的密码，然后使用身份验证器应用（Google Authenticator、1Password、Aegis 等）扫描二维码，输入 6 位验证码，并点击**创建管理员**。

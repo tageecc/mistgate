@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,21 @@ import (
 // fileLastVersion remembers which version started last in this state directory, so the next start can say whether it is
 // an update (agent_started.prev_version differs) or a plain restart.
 const fileLastVersion = "last_version"
+
+const maxAgentStateFileBytes = 4 << 10
+
+func readAgentStateFile(path string) []byte {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, maxAgentStateFileBytes+1))
+	if err != nil || len(b) > maxAgentStateFileBytes {
+		return nil
+	}
+	return b
+}
 
 // bootWindow is how young the host must be for an agent start to read as "the machine booted" rather than "the service
 // restarted".
@@ -41,8 +57,9 @@ func startReason(prev, cur string, updated bool, sinceBoot time.Duration) string
 // Run, so it is the first event of the run and the engine starts that follow can be told apart from later ones.
 func (a *Agent) announceStart(ctx context.Context) {
 	p := filepath.Join(a.cfg.StateDir, fileLastVersion)
-	b, _ := os.ReadFile(p)
+	b := readAgentStateFile(p)
 	prev := strings.TrimSpace(string(b))
+	hadPrevious := prev != ""
 	updated := a.upMarker != nil
 	if updated && prev == "" {
 		prev = a.upMarker.FromVersion
@@ -56,10 +73,13 @@ func (a *Agent) announceStart(ctx context.Context) {
 	if prev != "" {
 		params["prev_version"] = prev
 	}
+	for k, v := range a.previousExit(ctx, hadPrevious, updated, reason) {
+		params[k] = v
+	}
 	a.event(pb.Severity_SEVERITY_INFO, "agent_started", "", params)
 	if prev != a.cfg.Version {
 		if err := writeFileAtomic(p, []byte(a.cfg.Version+"\n"), 0o600); err != nil {
-			a.log.Warn("could not remember the started version", "err", err)
+			a.log.Warn("could not remember the started version", "code", "started_version_write_failed", "err", err)
 		}
 	}
 }

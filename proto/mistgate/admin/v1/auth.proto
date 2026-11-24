@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package mistgate.admin.v1;
 
+import "mistgate/admin/v1/common.proto";
+
 // AuthService signs admins in and manages their sign-in methods and sessions.
 // Passkeys (WebAuthn) are the primary factor; "password + authenticator code" is the
 // fallback an admin may choose at setup instead.
@@ -143,6 +145,8 @@ message BeginSetupResponse {
   // PASSWORD: otpauth://totp/... for the QR code, and the same secret in base32 for typing in.
   string totp_uri = 3;
   string totp_secret = 4;
+  // PASSWORD: totp_uri as a QR code to draw; absent for PASSKEY. Setup has no session yet, so it cannot ask EncodeQr.
+  QrCode totp_qr = 5;
 }
 
 message FinishSetupRequest {
@@ -336,6 +340,8 @@ message BeginTotpEnrollmentResponse {
   // otpauth://totp/... for the QR code, and the same secret in base32 for typing in.
   string totp_uri = 2;
   string totp_secret = 3;
+  // totp_uri as a QR code to draw.
+  QrCode totp_qr = 4;
 }
 
 message FinishTotpEnrollmentRequest {
@@ -388,6 +394,7 @@ enum AuditSource {
   AUDIT_SOURCE_BOT = 2;
   AUDIT_SOURCE_MCP = 3;
   AUDIT_SOURCE_API = 4;
+  AUDIT_SOURCE_ASSISTANT = 5;
 }
 
 message AuditEntry {
@@ -430,6 +437,14 @@ message ListAuditRequest {
   uint32 page_size = 3;
   // Only one kind of action; unspecified = all. Combines with source.
   AuditKind kind = 4;
+  // Only entries of the last hours (1..8760); 0 = any age. Combines with every other filter.
+  uint32 hours = 5;
+  // Only rows whose result is not "ok" (what AUDIT_KIND_FAILURES does), also together with another kind.
+  bool failed_only = 6;
+  // Literal substrings (at most 100 characters, ASCII case-insensitive): the action contains action_contains; the actor's
+  // id or name contains actor_contains. "" = any. Applied in the query, before the page is cut.
+  string action_contains = 7;
+  string actor_contains = 8;
 }
 
 message ListAuditResponse {

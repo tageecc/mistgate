@@ -13,21 +13,29 @@
 package update
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"connectrpc.com/connect"
 
 	"github.com/mistgate/mistgate/gen/mistgate/admin/v1/adminv1connect"
 	agentv1 "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/internal/asndb"
+	"github.com/mistgate/mistgate/internal/node/osupdate"
 	"github.com/mistgate/mistgate/internal/panel/auth"
 	"github.com/mistgate/mistgate/internal/panel/store"
+	"github.com/mistgate/mistgate/internal/release"
 )
 
 // Fleet is what the module needs from the fleet module (*fleet.Fleet implements it).
@@ -40,41 +48,74 @@ type Fleet interface {
 	HasSession(nodeID string) bool
 	// UpdateAgent sends a signed manifest and waits for the CommandResult (the download is part of it).
 	// FAILED_PRECONDITION when the node is not connected or did not list "update/1": nothing was sent.
-	UpdateAgent(ctx context.Context, nodeID string, manifest, signature []byte, wait time.Duration) (*agentv1.CommandResult, error)
+	UpdateAgentWithRequestID(ctx context.Context, nodeID, requestID string, manifest, signature []byte, wait, downloadTimeout time.Duration, options UpdateAgentOptions) (*agentv1.CommandResult, error)
 	// RollbackAgent asks the node to put its previous binary back; same preconditions.
 	RollbackAgent(ctx context.Context, nodeID string, wait time.Duration) (*agentv1.CommandResult, error)
 	// SendUpdateAgent hands an edge update command to the live node link without waiting for its result.
-	SendUpdateAgent(ctx context.Context, nodeID, requestID string, manifest, signature []byte, downloadToken string, deadline time.Time) error
+	SendUpdateAgent(ctx context.Context, nodeID, requestID string, manifest, signature []byte, downloadToken string, deadline time.Time, downloadTimeout time.Duration) error
 	// SendRollbackAgent hands an edge rollback command to the live node link without waiting for its result.
 	SendRollbackAgent(ctx context.Context, nodeID, requestID string, deadline time.Time) error
+	// UpdateOs sends one OS job and waits up to wait for the CommandResult (params.state: started, running, finished or
+	// unsupported). FAILED_PRECONDITION when the node is offline or did not list "os-update/1": nothing was sent.
+	UpdateOs(ctx context.Context, nodeID string, req OsJobRequest, wait time.Duration) (*agentv1.CommandResult, error)
+	// CheckPortsForGate is the gate's second vantage point: the system port check of a node from another node (never the panel or
+	// the target itself). code is "" for a finished run, else the check's own error code ("no_sender", "same_host", ...).
+	CheckPortsForGate(ctx context.Context, nodeID string) (sender string, udp []store.PortCheck, tcp []store.TCPCheck, code string)
 }
+
+// UpdateAgentOptions carries optional fields for an agent that advertised the matching capability.
+type UpdateAgentOptions struct {
+	Sources []string
+}
+
+const bundleSendStallTimeout = 120 * time.Second
+
+// bundleNodeSlotWait is how long a request waits when another file is live or a zombie cap blocks hand-over.
+// A same-file resume otherwise takes over immediately.
+const bundleNodeSlotWait = 5 * time.Second
 
 // Health is what the rollout gate needs from the health module (*health.Service implements it); nil = no probe gate.
 type Health interface {
 	// RunChecksNow schedules an immediate synthetic round for the inbounds of a node (rate limited to one per 30 s).
 	RunChecksNow(ctx context.Context, nodeID string) (scheduled, skipped int, retry time.Duration, err error)
 	// NodeChecksSince counts probeable inbounds and rounds ended at or after since; read errors are returned to the gate.
-	NodeChecksSince(ctx context.Context, nodeID string, since time.Time) (probeable, ok, failed int, err error)
+	// timeoutsOnly: something failed and every failed round since was a timeout; failedFor: how long the failures have lasted.
+	NodeChecksSince(ctx context.Context, nodeID string, since time.Time) (probeable, ok, failed int, timeoutsOnly bool, failedFor time.Duration, err error)
+	// NodeChecksPending lists the probeable inbounds NodeChecksSince does not count as ok (no OK round ended at or after since).
+	NodeChecksPending(ctx context.Context, nodeID string, since time.Time) ([]string, error)
+	// NodeLastRounds returns the newest stored round of each probeable inbound of the node: what was failing before an update, and why.
+	NodeLastRounds(ctx context.Context, nodeID string) ([]store.CheckSample, error)
 }
 
 // Timing of the module. The zero value is production; tests shorten what they need.
 type Timing struct {
-	Tick          time.Duration // worker period; default 5 s
-	Rescan        time.Duration // bundle directory poll; default 60 s
-	BundlePoll    time.Duration // GitHub agent bundle poll; default 10 min
-	AnswerWait    time.Duration // UpdateAgent: the agent's CommandResult, download included; default 10 min
-	ReconnectWait time.Duration // after the answer: the node is back with the new build; default 3 min
-	GateWait      time.Duration // after the reconnect: the gate passes or fails; default 5 min
-	RollbackWait  time.Duration // RollbackAgent answer; default 60 s
-	InboundGrace  time.Duration // an inbound FAILED that long (two evaluations) fails the gate at once; default 30 s
-	Prune         time.Duration // retention sweep period; default 6 h
+	Tick              time.Duration // worker period; default 5 s
+	Rescan            time.Duration // bundle directory poll; default 60 s
+	BundlePoll        time.Duration // GitHub agent bundle poll; default 10 min
+	BundleSyncWait    time.Duration // RescanBundle waits this long for the GitHub check before it says the download goes on; default 10 s
+	GitHubSourceCheck time.Duration // bound for the optional GitHub manifest check; default 10 s
+	AnswerWait        time.Duration // UpdateAgent: the agent's CommandResult, download included; default 10 min
+	ReconnectWait     time.Duration // after the answer: the node is back with the new build; default 3 min
+	GateWait          time.Duration // after the reconnect: the gate passes or fails; default 5 min
+	RollbackWait      time.Duration // RollbackAgent answer; default 60 s
+	InboundGrace      time.Duration // an inbound FAILED that long (two evaluations) fails the gate at once; default 30 s
+	Prune             time.Duration // retention sweep period; default 6 h
+	OsAnswerWait      time.Duration // UpdateOs: the node's CommandResult; default 45 s
+	OsResendAfter     time.Duration // an unanswered, unseen job id is sent again after this, then after twice this; default 90 s
+	OsJobWait         time.Duration // a job that shows nothing for this long after it was sent fails the step; default 90 min (the unit lives 75 min, then 10 of waiting and 2 of settling)
+	OsBackWait        time.Duration // after the reboot began: the node is back on a new boot; default 15 min
+	OsGateWait        time.Duration // after it is back (or the job ended): the checks pass; default 8 min, the node's own settling takes up to 5
+	OsRefreshGap      time.Duration // one refresh of the package lists per node in this time; default 30 min
 }
 
 func (t *Timing) defaults() {
 	for p, d := range map[*time.Duration]time.Duration{
-		&t.Tick: 5 * time.Second, &t.Rescan: time.Minute, &t.BundlePoll: 10 * time.Minute,
-		&t.AnswerWait: 10 * time.Minute, &t.ReconnectWait: 3 * time.Minute,
+		&t.Tick: 5 * time.Second, &t.Rescan: time.Minute, &t.BundlePoll: 10 * time.Minute, &t.BundleSyncWait: 10 * time.Second,
+		&t.GitHubSourceCheck: 10 * time.Second,
+		&t.AnswerWait:        10 * time.Minute, &t.ReconnectWait: 3 * time.Minute,
 		&t.GateWait: 5 * time.Minute, &t.RollbackWait: time.Minute, &t.InboundGrace: 30 * time.Second, &t.Prune: 6 * time.Hour,
+		&t.OsAnswerWait: 45 * time.Second, &t.OsResendAfter: 90 * time.Second, &t.OsJobWait: 90 * time.Minute, &t.OsBackWait: 15 * time.Minute,
+		&t.OsGateWait: 8 * time.Minute, &t.OsRefreshGap: 30 * time.Minute,
 	} {
 		if *p <= 0 {
 			*p = d
@@ -88,6 +129,9 @@ const (
 	rolloutAge   = 90 * 24 * time.Hour
 )
 
+// UpdateChannelSetting is the setting key that controls panel and node-bundle release discovery.
+const UpdateChannelSetting = "update_channel"
+
 // Config configures Service.
 type Config struct {
 	// DataDir holds dist/ (the bundle). Empty = no bundle directory at all (tests).
@@ -98,11 +142,15 @@ type Config struct {
 	// PanelVersion and PanelBuilt describe this panel's own build (buildinfo.Version, buildinfo.BuiltUnix()).
 	PanelVersion string
 	PanelBuilt   int64
+	// InitialChannel is seeded only when update_channel is unset, as by the installer's systemd environment.
+	InitialChannel string
 	// PanelUpdater checks official GitHub releases and schedules a checked panel binary replacement when available.
 	PanelUpdater PanelUpdater
 	// NodeBundleSource polls the official GitHub release for a bundle signed by this installation's release key.
 	// A trusted newer bundle is installed into dist and made available for owner-triggered node updates.
 	NodeBundleSource NodeBundleSource
+	// OSStatusReader enables the read-only panel-host snapshot on the VPS edition. Nil disables the reader (tests/edge).
+	OSStatusReader *osupdate.Reader
 	// Edge uses the panel's own signed release and link-only commands for node updates. RPC availability is edition policy.
 	Edge bool
 	// StepUp is auth.Service.RequireStepUp: every change calls it first. Required.
@@ -124,10 +172,27 @@ type Service struct {
 	now  func() time.Time
 	dist string
 
-	bmu    sync.Mutex // guards the bundle state and the file hash cache
-	bundle *bundleState
-	hashes map[string]hashEntry
-	serves int // concurrent downloads, guarded by bmu
+	sourceMu    sync.Mutex
+	sourceCheck releaseSourceCheck
+
+	bmu          sync.Mutex // guards the bundle state and the file hash cache
+	scanMu       sync.Mutex // serializes scans and their follow-up table reloads
+	bundle       *bundleState
+	hashes       map[string]hashEntry
+	serves       int                   // live downloads, guarded by bmu
+	servingNodes map[string]*serveSlot // each node's live download, guarded by bmu
+	zombies      map[string]int        // per node: handlers a resume replaced that have not returned yet, guarded by bmu
+	zombieTotal  int                   // the same for the whole fleet, guarded by bmu
+	nodeSlotWait time.Duration         // how long a request that cannot take the node's slot waits before it is refused
+	sendTimeout  time.Duration
+
+	networkTableMu       sync.Mutex
+	networkTableSHA      string
+	networkTable         atomic.Pointer[asndb.DB]
+	networkTableRejected atomic.Pointer[string]
+	parseNetworkTable    func(io.Reader) (*asndb.DB, error)
+	networkChangedMu     sync.RWMutex
+	networkBundleChanged func()
 
 	releaseCacheUntil time.Time
 	edgeBundle        *bundleState
@@ -137,16 +202,39 @@ type Service struct {
 	bundleSyncing   bool
 	runCtx          context.Context
 	wg              sync.WaitGroup
+	osInflight      map[string]bool      // node id -> an UpdateOs goroutine owns its step
+	osMu            sync.Mutex           // guards osRefreshes
+	bootHash        string               // this panel host's boot id as the agents hash it, "" when unknown
 	inflight        map[string]bool      // node id -> a command goroutine owns its step (UpdateAgent or RollbackAgent)
+	preparing       map[string]string    // node id -> rollout id while a source check runs before the step is SENT
 	orphans         map[string]bool      // node id -> its step was SENT when this process started (nobody waits for the answer)
 	failing         map[string]time.Time // node id -> since when a new FAILED inbound has been seen in the gate
+	vantageMu       sync.Mutex           // guards vantage
+	vantage         map[vantageKey]*vantageRun
+	progressMu      sync.RWMutex
+	progress        map[string]progressState // node id -> latest update progress
+	progressActive  map[string]progressExpectation
+	osStatusMonitor *osupdate.Monitor
+	osRefreshes     map[string]osRefresh // node id -> its last refresh of the package lists, guarded by osMu
+	hostname        string               // this panel's host name, "" when unknown
 
 	updMu             sync.RWMutex
 	updating          map[string]bool // node id -> has a SENT or GATING step (fleet.Updates.Updating)
+	osUpdating        map[string]bool // node id -> has an OS step in flight (sent, rebooting, gating)
 	updatingCheckedAt time.Time
 	updRefreshMu      sync.Mutex
 
 	wake chan struct{}
+}
+
+type progressState struct {
+	RequestID   string
+	Phase       string
+	Downloaded  uint64
+	Total       uint64
+	Speed       uint64
+	UpdatedUnix int64
+	Source      string
 }
 
 // New builds the module and reads the bundle directory once. Call Run to start the worker, fleet.SetUpdates and
@@ -161,6 +249,14 @@ func New(st *store.Store, fl Fleet, hl Health, cfg Config) (*Service, error) {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	if cfg.InitialChannel != "" {
+		if _, ok := release.ParseChannel(cfg.InitialChannel); !ok {
+			return nil, fmt.Errorf("update: invalid initial update channel %q", cfg.InitialChannel)
+		}
+		if _, err := st.SetSettingsIfAbsent(context.Background(), map[string]string{UpdateChannelSetting: cfg.InitialChannel}); err != nil {
+			return nil, fmt.Errorf("update: seed initial update channel: %w", err)
+		}
+	}
 	if cfg.Actor == nil {
 		cfg.Actor = func(ctx context.Context) string {
 			if a, ok := auth.AdminFrom(ctx); ok {
@@ -169,17 +265,51 @@ func New(st *store.Store, fl Fleet, hl Health, cfg Config) (*Service, error) {
 			return "unknown"
 		}
 	}
+	// An interrupted bundle swap is finished before dist/ is first read. A directory that cannot be recovered must not
+	// keep the panel down: the next sync tries again and reports the same error.
+	if preparer, ok := cfg.NodeBundleSource.(interface{ Prepare() error }); ok {
+		if err := preparer.Prepare(); err != nil {
+			cfg.Log.Warn("update: prepare node bundle directory", "code", "node_bundle_prepare_failed", "err", err)
+		}
+	}
 	cfg.Timing.defaults()
 	s := &Service{st: st, fl: fl, hl: hl, cfg: cfg, log: cfg.Log, now: cfg.Now,
 		hashes: map[string]hashEntry{}, runCtx: context.Background(),
-		inflight: map[string]bool{}, orphans: map[string]bool{}, failing: map[string]time.Time{},
-		updating: map[string]bool{}, wake: make(chan struct{}, 1)}
+		servingNodes: map[string]*serveSlot{}, zombies: map[string]int{}, nodeSlotWait: bundleNodeSlotWait, sendTimeout: bundleSendStallTimeout,
+		parseNetworkTable: asndb.Parse,
+		inflight:          map[string]bool{}, preparing: map[string]string{}, orphans: map[string]bool{}, failing: map[string]time.Time{}, vantage: map[vantageKey]*vantageRun{},
+		updating: map[string]bool{}, osUpdating: map[string]bool{}, osInflight: map[string]bool{}, osRefreshes: map[string]osRefresh{}, progress: map[string]progressState{}, progressActive: map[string]progressExpectation{}, wake: make(chan struct{}, 1)}
+	if shouldReadPanelHostStatus(cfg.Edge, osupdate.IsRoot(), cfg.OSStatusReader != nil) {
+		s.osStatusMonitor = osupdate.NewMonitor(cfg.OSStatusReader)
+	}
 	if cfg.DataDir != "" { // without one there is no bundle (and no relative "dist" in whatever the working directory is)
 		s.dist = filepath.Join(cfg.DataDir, "dist")
 	}
+	s.hostname, _ = os.Hostname()
+	if !cfg.Edge { // no root is needed to read it
+		if b, err := os.ReadFile("/proc/sys/kernel/random/boot_id"); err == nil && len(bytes.TrimSpace(b)) > 0 {
+			s.bootHash = osupdate.BootIDHash(string(b))
+		}
+	}
 	s.rescan()
 	s.loadUpdating(context.Background())
+	s.loadOsUpdating(context.Background())
 	return s, nil
+}
+
+func (s *Service) updateChannel(ctx context.Context) (release.Channel, error) {
+	value, err := s.st.Setting(ctx, UpdateChannelSetting)
+	if errors.Is(err, store.ErrNotFound) {
+		return release.ChannelStable, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	channel, ok := release.ParseChannel(value)
+	if !ok {
+		return "", fmt.Errorf("stored update channel %q is invalid", value)
+	}
+	return channel, nil
 }
 
 // Handler is the admin UpdateService (see fleet.NodeHandler for how it is mounted behind the session).
@@ -194,13 +324,21 @@ func (s *Service) Run(ctx context.Context) {
 	s.runCtx = ctx
 	s.mu.Unlock()
 	s.recover(ctx)
-	s.syncNodeBundle(ctx)
+	s.recoverOs(ctx)
+	s.startNodeBundleSync(ctx)
 	s.processScheduledNodeUpdates(ctx)
 	if s.cfg.PanelUpdater != nil {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
 			s.cfg.PanelUpdater.Run(ctx)
+		}()
+	}
+	if s.osStatusMonitor != nil {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.osStatusMonitor.Run(ctx, nil)
 		}()
 	}
 	tick := time.NewTicker(s.cfg.Tick)
@@ -219,15 +357,17 @@ func (s *Service) Run(ctx context.Context) {
 			return
 		case <-tick.C:
 			s.tick(ctx)
+			s.tickOs(ctx)
 			s.processScheduledNodeUpdates(ctx)
 		case <-s.wake:
 			s.tick(ctx)
+			s.tickOs(ctx)
 			s.processScheduledNodeUpdates(ctx)
 		case <-poll.C:
 			s.rescanIfChanged()
 			s.processScheduledNodeUpdates(ctx)
 		case <-bundlePoll.C:
-			s.syncNodeBundle(ctx)
+			s.startNodeBundleSync(ctx)
 			s.processScheduledNodeUpdates(ctx)
 		case <-prune.C:
 			s.pruneOld(ctx)
@@ -243,6 +383,7 @@ func (s *Service) kick() {
 }
 
 func (s *Service) pruneOld(ctx context.Context) {
+	s.pruneOsOld(ctx)
 	if n, err := s.st.PruneRollouts(ctx, keepRollouts, s.now().Add(-rolloutAge)); err != nil {
 		if ctx.Err() == nil {
 			s.log.Warn("update: prune rollouts", "err", err)
@@ -259,18 +400,19 @@ func (s *Service) audit(ctx context.Context, action string, params map[string]st
 func (s *Service) auditAs(ctx context.Context, actor, action string, params map[string]string) {
 	b := jsonString(params)
 	if err := s.st.Audit(ctx, s.now(), store.AuditEntry{Actor: actor, Action: action, Params: b, Result: "ok"}); err != nil {
-		s.log.Warn("update: audit", "action", action, "err", err)
+		s.log.Warn("update: audit", "code", "update_audit_failed", "action", action, "err", err)
 	}
 }
 
-// Updating is fleet.Updates.Updating: a SENT or GATING step of an active rollout exists for the node.
+// Updating is fleet.Updates.Updating: a SENT or GATING step of an active rollout exists for the node, or an OS step is in
+// flight (sent, rebooting, gating): the stream drops when the agent re-executes or the host reboots, neither a blip nor an outage.
 func (s *Service) Updating(nodeID string) bool {
 	if s.cfg.Edge {
 		s.refreshUpdatingIfStale()
 	}
 	s.updMu.RLock()
 	defer s.updMu.RUnlock()
-	return s.updating[nodeID]
+	return s.updating[nodeID] || s.osUpdating[nodeID]
 }
 
 func (s *Service) refreshUpdatingIfStale() {

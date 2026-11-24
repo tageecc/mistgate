@@ -16,10 +16,12 @@ import { meQuery } from "@/lib/session";
 import { updatesQuery } from "@/lib/updates";
 import { AlertsTab } from "@/screens/health/alerts";
 import { useFixFlow } from "@/screens/health/fix";
-import { ApprovalHistory } from "@/screens/integrations/approvals";
+import { ApprovalsTab } from "@/screens/ai/approvals";
 import { EventsTab } from "@/screens/node/events";
 import { AuditPage } from "@/screens/settings-pages/audit";
+import { UpdateDownloadSourcesCard, UpdateDownloadTimeoutCard } from "@/screens/settings-pages/system";
 import { UpdatesScreen } from "@/screens/updates";
+import { ChannelDialog } from "@/screens/updates/channel";
 import { UsersScreen } from "@/screens/users/list";
 import { groupsQuery } from "@/screens/users/rpc";
 
@@ -33,7 +35,7 @@ const D = 86_400;
 
 type Seed = [readonly unknown[], unknown][];
 
-function Shot({ id, title, seed = [], children }: { id: string; title: string; seed?: Seed; children: ReactNode }) {
+export function Shot({ id, title, seed = [], children }: { id: string; title: string; seed?: Seed; children: ReactNode }) {
   const [qc] = useState(() => {
     const c = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity, retry: false, refetchOnWindowFocus: false, refetchInterval: false } } });
     c.setQueryData(meQuery.queryKey, { admin: { id: "adm_1", displayName: "Owner", role: Role.OWNER }, version: "0.1.24", stepUpUntilUnix: 0n } as never);
@@ -67,6 +69,7 @@ const person = (i: number) => {
     name: `${names[i % names.length]}${i >= names.length ? ` ${Math.floor(i / names.length) + 1}` : ""}`,
     groupId: g.id,
     groupName: g.name,
+    extraGroupIds: [], extraGroupNames: [], extraGroupColors: [],
     groupColor: g.color,
     status: i % 23 === 7 ? UserStatus.DISABLED : UserStatus.ACTIVE,
     devicesUsed: 1 + (i % 4),
@@ -182,7 +185,7 @@ export function PagingKit() {
         id="paging-users"
         title="Users: 137 people, the server counts and skips rows (offset)"
         seed={[
-          [groupsQuery.queryKey, groups.map((g) => ({ id: g.id, name: g.name, profileIds: [], userCount: 40, dnsPresetId: "", happNodes: 2, amneziaNodes: 1, color: g.color }))],
+          [groupsQuery.queryKey, groups.map((g) => ({ id: g.id, name: g.name, profileIds: [], userCount: 40, extraUserCount: 0, dnsPresetId: "", happNodes: 2, amneziaNodes: 1, color: g.color, disabledNodeIds: [] }))],
           [userCountQuery.queryKey, { counts: { all: 137, online: 28 } }],
           [nodesQuery.queryKey, { nodes: [{ id: "nod_1", name: "de1", status: NodeStatus.ONLINE }] }],
           ...[1, 2, 3, 4, 5, 6].flatMap((p) => [25, 50, 100].map((s): [readonly unknown[], unknown] => [["users", "list", "all", "", "", p, s], userPage(p, s)])),
@@ -201,7 +204,7 @@ export function PagingKit() {
         <EventsTab nodeId="nod_1" />
       </Shot>
       <Shot id="paging-approvals" title="Integrations → recent decisions: ten to a page, no size picker">
-        <ApprovalHistory data={{ approvals: Array.from({ length: 25 }, (_, i) => decided(i + 1)), awaiting: 0, nowUnix: NOW, receivedMs: NOW * 1000 } as never} />
+        <ApprovalsTab data={{ approvals: Array.from({ length: 25 }, (_, i) => decided(i + 1)), awaiting: 0, nowUnix: NOW, receivedMs: NOW * 1000 } as never} />
       </Shot>
       <p className="text-xs text-muted">page {pageNo}</p>
     </div>
@@ -261,6 +264,8 @@ export const page = (over: object) => ({
   distDir: "/var/lib/mistgate/dist",
   agentNotes: [],
   panelNotes: [],
+  updateDownloadTimeoutSeconds: 1800,
+  updateDownloadSources: ["github"],
   ...over,
 });
 const doneStep = (nodeId: string, nodeName: string, stage: number, from: number) => ({ nodeId, nodeName, stage, state: StepState.PASSED, fromVersion: V_OLD, fromBuilt: B_OLD, startedUnix: NOW - from, finishedUnix: NOW - from + 420, errorKey: "", params: {} });
@@ -311,6 +316,46 @@ const running = page({
     ],
   },
 });
+// A node that falls back to GitHub is still "updating"; the one that tried both sources and lost has stopped the rollout.
+const githubNodes = [
+  upNode({ nodeId: "nod_nl1", name: "nl1", onlineUsers: 1, address: "nl1.example.com", lastUpdate: lastOk(V_OLD, V_NEW, 20 * 60) }),
+  upNode({ nodeId: "nod_de1", name: "de1", version: V_OLD, built: B_OLD, state: NodeUpdateState.UPDATING, onlineUsers: 5 }),
+  upNode({ nodeId: "nod_fi1", name: "fi1", version: V_OLD, built: B_OLD, state: NodeUpdateState.OUTDATED, onlineUsers: 2, address: "fi1.example.com" }),
+];
+const sourcesRollout = (status: RolloutStatus, steps: object[], over: object = {}) => ({
+  id: "rol_2",
+  status,
+  toVersion: V_NEW,
+  toBuilt: B_NEW,
+  batchSize: 1,
+  createdUnix: NOW - 25 * 60,
+  finishedUnix: 0,
+  pauseKey: "",
+  pauseParams: {},
+  steps,
+  ...over,
+});
+const canaryDone = { ...doneStep("nod_nl1", "nl1", 0, 25 * 60), finishedUnix: NOW - 20 * 60 };
+const viaGithub = page({
+  nodes: githubNodes,
+  rollout: sourcesRollout(RolloutStatus.RUNNING, [
+    canaryDone,
+    { ...runningStep("nod_de1", "de1", 1, StepState.SENT), downloadPhase: "downloading", downloadedBytes: 10_530_000, totalBytes: 23_400_000, bytesPerSecond: 1_258_291, downloadSource: "github" },
+    runningStep("nod_fi1", "fi1", 2, StepState.PENDING),
+  ]),
+});
+const bothFailed = page({
+  nodes: githubNodes.map((n) => (n.name === "de1" ? { ...n, state: NodeUpdateState.FAILED } : n)),
+  rollout: sourcesRollout(
+    RolloutStatus.PAUSED,
+    [
+      canaryDone,
+      { ...runningStep("nod_de1", "de1", 1, StepState.FAILED), finishedUnix: NOW - 60, errorKey: "updates.step.err.download_failed", params: { sources_failed: "panel:stalled,github:http_404" } },
+      runningStep("nod_fi1", "fi1", 2, StepState.PENDING),
+    ],
+    { pauseKey: "updates.pause.step_failed", pauseParams: { node: "de1", reason: "download_failed" } },
+  ),
+});
 export const panelOffer = page({
   panel: {
     version: "v0.1.24",
@@ -325,6 +370,23 @@ export const panelOffer = page({
     upNode({ nodeId: "nod_nl1", name: "nl1", address: "nl1.example.com", lastUpdate: lastOk(V_OLD, V_NEW, 4 * H) }),
   ],
 });
+// the panel follows Testing, the root-owned policy file says stable (or cannot be read): a state of the panel card with the command
+const policyOffer = (errorKey: string) =>
+  page({
+    updateChannel: "testing",
+    panel: {
+      version: "v0.1.24",
+      built: B_NEW,
+      hasReleaseKey: true,
+      releaseKeyFingerprint: "abcd1234abcd1234",
+      update: { version: "v0.1.25-testing.1", url: "https://github.com/Mistgate/mistgate/releases/tag/v0.1.25-testing.1", publishedUnix: NOW - H, checkedUnix: NOW - 300, available: true, supported: true, installable: false, installing: false, errorKey, built: NOW - H, sha256: "" },
+    },
+    nodes: [
+      upNode({ nodeId: "nod_de1", name: "de1", lastUpdate: lastOk(V_OLD, V_NEW, 5 * H) }),
+      upNode({ nodeId: "nod_fi1", name: "fi1", address: "fi1.example.com", lastUpdate: lastOk(V_OLD, V_NEW, 5 * H) }),
+      upNode({ nodeId: "nod_nl1", name: "nl1", address: "nl1.example.com", lastUpdate: lastOk(V_OLD, V_NEW, 4 * H) }),
+    ],
+  });
 const untrusted = page({
   bundle: { ...bundle, status: BundleStatus.UNTRUSTED, errorKey: "updates.bundle.err.file_mismatch", params: { file: "mistgate-node-linux-amd64" } },
   nodes: [upNode({ state: NodeUpdateState.OUTDATED, version: V_OLD, built: B_OLD }), upNode({ nodeId: "nod_fi1", name: "fi1", state: NodeUpdateState.OFFLINE, version: V_OLD, built: B_OLD, address: "fi1.example.com" })],
@@ -428,6 +490,18 @@ export function UpdatesKit() {
       <Shot id="updates-running" title="Updates: a rollout of 4 nodes running, one stage at a time (the server's batch plan: the canary, then 1 at a time while fewer than 5 are to be updated)" seed={[[updatesQuery.queryKey, running]]}>
         <UpdatesScreen />
       </Shot>
+      <Shot id="updates-source-github" title="Updates: a node that fell back to GitHub says so on its progress line" seed={[[updatesQuery.queryKey, viaGithub]]}>
+        <UpdatesScreen />
+      </Shot>
+      <Shot id="updates-source-failed" title="Updates: a download that failed on every source lists what was tried, under the error" seed={[[updatesQuery.queryKey, bothFailed]]}>
+        <UpdatesScreen />
+      </Shot>
+      <Shot id="settings-download-sources" title="Settings → System: the download timeout and the download sources (GitHub on, GitHub off, read-only for a non-owner)">
+        <UpdateDownloadTimeoutCard data={page({}) as never} owner busy={false} onChange={async () => true} />
+        <UpdateDownloadSourcesCard data={page({}) as never} owner busy={false} onChange={async () => true} />
+        <UpdateDownloadSourcesCard data={page({ updateDownloadSources: [] }) as never} owner busy={false} onChange={async () => true} />
+        <UpdateDownloadSourcesCard data={page({}) as never} owner={false} busy={false} onChange={async () => true} />
+      </Shot>
       <Shot id="updates-panel" title="Updates: every node current, a signed panel release is out" seed={[[updatesQuery.queryKey, panelOffer]]}>
         <UpdatesScreen />
       </Shot>
@@ -436,6 +510,15 @@ export function UpdatesKit() {
       </Shot>
       <Shot id="updates-notes-panel" title="Updates: what's new in the panel card, a signed release is out" seed={[[updatesQuery.queryKey, panelOfferNotes]]}>
         <UpdatesScreen />
+      </Shot>
+      <Shot id="updates-panel-channel-not-allowed" title="Updates: the panel follows Testing, the root policy file allows stable" seed={[[updatesQuery.queryKey, policyOffer("channel_not_allowed")]]}>
+        <UpdatesScreen />
+      </Shot>
+      <Shot id="updates-panel-channel-invalid" title="Updates: the root policy file cannot be used" seed={[[updatesQuery.queryKey, policyOffer("channel_config_invalid")]]}>
+        <UpdatesScreen />
+      </Shot>
+      <Shot id="updates-channel-dialog" title={`Updates: the channel window (${new URLSearchParams(location.search).get("dialog") === "channel" ? "open" : "?dialog=channel opens it"})`}>
+        <ChannelDialog open={new URLSearchParams(location.search).get("dialog") === "channel"} onOpenChange={() => {}} current="testing" running={{ version: "v0.1.24", channel: "testing" }} onPick={async () => true} />
       </Shot>
       <Shot id="updates-untrusted" title="Updates: the bundle failed the check (its details open by themselves)" seed={[[updatesQuery.queryKey, untrusted]]}>
         <UpdatesScreen />

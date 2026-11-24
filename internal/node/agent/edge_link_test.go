@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
@@ -53,6 +54,7 @@ type edgeOpts struct {
 	backoff    time.Duration // the reconnect delay (min = max), 0 = 20 ms
 	noEnroll   bool          // the test enrols the agent itself
 	updateHTTP http.Handler  // optional link download route
+	plain      bool          // the agent dials as an older one that does not seal its session
 }
 
 type edgeRig struct {
@@ -307,22 +309,31 @@ func TestStoppingAgentCancelsLinkUpdateDownload(t *testing.T) {
 
 func (r *edgeRig) linkURL() string { return "wss://" + r.host + r.prefix }
 
+// linkSealed reports whether a session runs over a sealed link.
+func linkSealed(s *session) bool {
+	t, ok := s.stream.(*websocketAgentTransport)
+	return ok && t.link.Sealed()
+}
+
 // publicClient is a client of the Worker's public TLS: the test listener's certificate is its only root.
 func (r *edgeRig) publicClient() *http.Client {
 	return &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: r.pool, ServerName: "127.0.0.1"}}}
 }
 
+// edgeEnrollToken is a proven token (agentlink.EnrollTokenPrefix), as the panel issues them.
+const edgeEnrollToken = "mg2_edgelinkenrollmenttoken"
+
 // enrol is `mistgate-node enroll --link-url …` with the seeded one-time token.
 func (r *edgeRig) enrol(pin string) (Meta, error) {
 	return Enroll(context.Background(), EnrollConfig{StateDir: r.stateDir, LinkURL: r.linkURL(), CASHA256: pin,
-		Token: "edge-link-enrollment-token", httpClient: r.publicClient()})
+		Token: edgeEnrollToken, httpClient: r.publicClient()})
 }
 
 // seed creates the node (one enrolment), one inbound and the user whose credential carries the traffic.
 func (r *edgeRig) seed() {
 	r.t.Helper()
 	ctx := context.Background()
-	tokenHash := sha256.Sum256([]byte("edge-link-enrollment-token"))
+	tokenHash := sha256.Sum256(agentlink.EnrollKey(edgeEnrollToken).Public().(ed25519.PublicKey)) // what the panel stores for a proven token
 	now := time.Now().UTC()
 	if _, err := r.st.CreateEnrollment(ctx, &store.NodeRow{ID: r.nodeID, Name: edgeNodeName, Address: "de1.example.com"}, "", tokenHash[:], "test", now, now.Add(time.Hour)); err != nil {
 		r.t.Fatal(err)
@@ -334,12 +345,16 @@ func (r *edgeRig) seed() {
 		}
 	}
 	exec(`UPDATE node SET bandwidth_mbps = 100 WHERE id = ?`, r.nodeID) // no automatic bandwidth test
+	// A node the panel last heard of hours ago starts with that time as stats credit (a session without it has one minute): the
+	// 20 ms batches of these tests, each claiming at least a second, would spend a minute within a second or two.
+	exec(`UPDATE node SET last_seen_at = ? WHERE id = ?`, now.Add(-6*time.Hour).Unix(), r.nodeID)
 	if r.o.liveness != 0 {
 		exec(`UPDATE node SET liveness_timeout_s = ? WHERE id = ?`, r.o.liveness, r.nodeID)
 	}
 	unix := now.Unix()
 	exec(`INSERT INTO user_group (id, name, created_at) VALUES ('grp_edge', 'g1', ?)`, unix)
 	exec(`INSERT INTO profile (id, protocol, name, settings_json, version, created_at, updated_at) VALUES ('prf_edge', 'fake', 'p1', '{}', 1, ?, ?)`, unix, unix)
+	exec(`INSERT INTO user_group_profile (group_id, profile_id) VALUES ('grp_edge', 'prf_edge')`) // the group reaches the node: the panel books stats only for the node's users
 	exec(`INSERT INTO inbound (id, profile_id, node_id, spec_version, created_at, updated_at) VALUES ('inb_edge', 'prf_edge', ?, 1, ?, ?)`, r.nodeID, unix, unix)
 	h := sha256.Sum256([]byte("alice"))
 	exec(`INSERT INTO user (id, name, group_id, disabled, status, app_happ, app_amnezia, all_nodes, quota_bytes, period_start,
@@ -424,6 +439,7 @@ func (r *edgeRig) start(tune func(*Agent)) *edgeAgent {
 		stats = 20 * time.Millisecond
 	}
 	a.backoffMin, a.backoffMax, a.statsEvery, a.sweepEvery = backoff, backoff, stats, time.Hour
+	a.linkPlain = r.o.plain
 	if tune != nil {
 		tune(a)
 	}
@@ -682,6 +698,9 @@ func TestEdgeLinkSessionDesiredStatsAndAsk(t *testing.T) {
 	ag := r.start(nil)
 	eventually(t, func() bool { return ag.eng.has("inb_edge") && r.inboundState() == "active" }, "desired state applied over the emulated link")
 	eventually(t, func() bool { return r.session() == 1 }, "node_live.session is the generation of the first session")
+	if s := ag.a.cur.Load(); s == nil || !linkSealed(s) {
+		t.Error("the edge link session is not sealed")
+	}
 
 	sent := r.em.sent(r.nodeID)
 	if len(sent) < 2 || sent[0].Frame.GetHelloAck() == nil || sent[1].Frame.GetDesiredState() == nil {
@@ -786,10 +805,14 @@ func TestEdgeLinkQuotaChangePokesItsOwnNodeAfterStep(t *testing.T) {
 // state: on workerd no state write means no frames) ends in one full resend after the reconnect, and so does a step whose
 // state alone was lost (a harsher case the platform cannot produce). The agent converges each time.
 func TestEdgeLinkReconnectDeltaBaseAndStaleState(t *testing.T) {
-	// A quiet agent (no stats), so that the alarm the object armed is its liveness deadline and nothing else.
-	r := newEdgeRig(t, edgeOpts{backoff: time.Second, statsEvery: time.Hour})
+	// A quiet agent (no stats), so that the alarm the object armed is its liveness deadline and nothing else. It is an older,
+	// plain one: a lost state would also roll back a sealed session's frame counters, which ends that session instead.
+	r := newEdgeRig(t, edgeOpts{backoff: time.Second, statsEvery: time.Hour, plain: true})
 	ag := r.start(nil)
 	eventually(t, func() bool { return ag.eng.has("inb_edge") && r.session() == 1 }, "first session")
+	if s := ag.a.cur.Load(); s == nil || linkSealed(s) {
+		t.Fatal("an older agent's session must be plain, and work")
+	}
 	first := r.desiredFrames(1)
 	if len(first) != 1 {
 		t.Fatalf("desired states in generation 1 = %d", len(first))
@@ -897,7 +920,7 @@ func TestEdgeLinkLivenessCloseByAlarm(t *testing.T) {
 		return ag.eng.has("inb_edge") && rev > 0 && r.session() == 1 && agentFirstUnacked(ag.a) == 0
 	}, "connected, applied and acknowledged: the agent has nothing more to say")
 
-	r.em.advance(16 * time.Second)
+	r.em.advanceBetweenSteps(r.nodeID, 16*time.Second)
 	r.em.runAlarm(r.nodeID)
 
 	steps := r.em.steps(r.nodeID)
@@ -968,7 +991,7 @@ func TestEdgeLinkRetireByAlarmWithSilentClient(t *testing.T) {
 	}
 
 	// The client says nothing and does not close. Five seconds later the core closes the session.
-	r.em.advance(6 * time.Second)
+	r.em.advanceBetweenSteps(r.nodeID, 6*time.Second)
 	r.em.runAlarm(r.nodeID)
 	closes := r.em.closes(r.nodeID)
 	if len(closes) != 1 || closes[0].Code != 1008 || closes[0].Reason != "node retired" {
@@ -994,9 +1017,11 @@ func TestEdgeLinkRetireByAlarmWithSilentClient(t *testing.T) {
 		}
 		break
 	}
-	// The pending socket still has its deadline: it is closed by the alarm, and then nothing is left at all.
+	// The pending socket still has its deadline: it is closed by the alarm, and then nothing is left at all. The raw client's
+	// close echo may reach the object only after the clock has moved; it re-arms the alarm for a deadline that is then already
+	// due, and the platform fires such an alarm by itself.
 	r.em.advance(5 * time.Second)
-	r.em.runAlarm(r.nodeID)
+	r.em.runAlarmIfArmed(r.nodeID)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_, _, err := pending.Read(ctx)
@@ -1029,6 +1054,10 @@ func TestEdgeLinkSupersededSocket(t *testing.T) {
 		}
 	})
 
+	// The raw client speaks plain frames, as an agent that cannot seal: the node's seal mark (set by the real agent) would refuse it.
+	if _, err := r.st.W.ExecContext(context.Background(), `UPDATE node SET link_sealed = 0 WHERE id = ?`, r.nodeID); err != nil {
+		t.Fatal(err)
+	}
 	c := r.dialRaw(r.agentKey())
 	c.hello("inst-raw")
 	if got := r.session(); got != 2 {
@@ -1137,7 +1166,8 @@ func TestEdgeLinkFramesBeforeThePeersCloseAreStepped(t *testing.T) {
 // 6. A failed step closes the socket 1011 and writes nothing; frames queued behind it are dropped; after the reconnect every
 // stats batch is counted exactly once, also the one whose step failed after its database write committed.
 func TestEdgeLinkFailedStepCountsEveryBatchOnce(t *testing.T) {
-	r := newEdgeRig(t, edgeOpts{})
+	// seed() gives the node a six-hour stats bucket (last seen hours ago), so this test can keep exercising its original 20 ms batches.
+	r := newEdgeRig(t, edgeOpts{statsEvery: 20 * time.Millisecond})
 	ag := r.start(nil)
 	eventually(t, func() bool { return ag.eng.has("inb_edge") && r.session() == 1 }, "connected")
 	ag.eng.setEmit(true)
@@ -1146,18 +1176,18 @@ func TestEdgeLinkFailedStepCountsEveryBatchOnce(t *testing.T) {
 		return up > 0 && countSteps(r.em.steps(r.nodeID), stepIs(1, fleet.LinkFrame, "stats")) >= 3
 	}, "stats counted")
 
-	// The failing step is slow, so that frames queue behind it (the agent sends a batch every 20 ms).
+	// The failing step lasts longer than a stats interval, so a later batch queues behind it.
 	var slow atomic.Bool
 	r.em.setBefore(func(ctx context.Context, in fleet.LinkIn) {
 		if in.Kind == fleet.LinkFrame && slow.CompareAndSwap(true, false) {
 			select {
-			case <-time.After(200 * time.Millisecond):
+			case <-time.After(1500 * time.Millisecond):
 			case <-ctx.Done():
 			}
 		}
 	})
 	slow.Store(true)
-	r.em.failNext(r.nodeID, fleet.LinkFrame)
+	r.em.failNextFrame(r.nodeID, "stats")
 	eventually(t, func() bool { return slices.IndexFunc(r.em.steps(r.nodeID), func(s emuStep) bool { return s.Err }) >= 0 }, "the injected failure")
 	eventually(t, func() bool { return r.session() == 2 }, "the agent reconnects as generation 2")
 	eventually(t, func() bool { return countSteps(r.em.steps(r.nodeID), stepIs(2, fleet.LinkFrame, "stats")) >= 3 }, "stats of generation 2")
@@ -1290,7 +1320,7 @@ func TestEdgeLinkHandshakeRefusalsStoreNothing(t *testing.T) {
 	if st := r.em.storage(r.nodeID); st.Sockets != 1 || st.Gen != 0 || st.Live != 0 || st.HasState || st.AlarmAt != 0 || !st.AlarmSet {
 		t.Errorf("storage with a silent socket = %+v, want only the handshake alarm", st)
 	}
-	r.em.advance(11 * time.Second)
+	r.em.advanceBetweenSteps(r.nodeID, 11*time.Second)
 	r.em.runAlarm(r.nodeID)
 	if ce := closedWith(silent); ce.Code != 1008 || ce.Reason != "handshake timeout" {
 		t.Errorf("silent socket closed with %v %q, want 1008 \"handshake timeout\"", ce.Code, ce.Reason)
@@ -1321,7 +1351,7 @@ func TestEdgeLinkNoHelloKeepsItsDeadlineAndIsClosedByAlarm(t *testing.T) {
 		t.Errorf("alarm moved from %d to %d: a step that does nothing must keep the Hello deadline", before.AlarmAt, after.AlarmAt)
 	}
 
-	r.em.advance(16 * time.Second)
+	r.em.advanceBetweenSteps(r.nodeID, 16*time.Second)
 	r.em.runAlarm(r.nodeID)
 	if closes := r.em.closes(r.nodeID); len(closes) != 1 || closes[0].Code != 1008 || closes[0].Reason != "no Hello" {
 		t.Fatalf("closes = %+v, want one 1008 \"no Hello\"", closes)

@@ -1,0 +1,358 @@
+syntax = "proto3";
+
+package mistgate.probe.v1;
+
+// On-demand probes between fleet nodes, for the MCP tools path_probe, node_trace and node_dns_check and for an operator.
+//
+// A separate package on purpose: nothing here is served or compiled on the Cloudflare edition, where the admin Worker has a
+// size limit (scripts/check-edge-sizes.sh) and no caller for these. The panel VPS mounts the service (internal/panel/fleet
+// path_probe.go); the generated code is imported by files that are not built for js/wasm only. Every procedure is operator
+// and up (role helper), open to API tokens directly (internal/panel/auth policy.go, policy_tokens.go).
+//
+// Every target is a fleet node or one of its ports, named by node id: a caller can never name a host or a URL. The probes send
+// bounded test traffic and are rate limited (per caller, per node, one per node pair at a time). Responses carry node names,
+// counts and timings: never an address, a certificate pin or a router.
+service ProbeService {
+  // An on-demand probe from one fleet node to another: UDP (optionally an MTU sweep), TCP connect or TLS handshake with the
+  // target's pin, against the target's own ports. Kept 7 days.
+  rpc PathProbe(PathProbeRequest) returns (PathProbeResponse);
+  // A TCP SYN TTL walk from one fleet node to another: hops with their round trip, whether a router answered, and a diff
+  // against the previous trace of the pair (the last 20 are kept). No router address is returned.
+  rpc NodeTrace(NodeTraceRequest) returns (NodeTraceResponse);
+  // Lookup timing (p50, p95, failures) of the doctor's control domains from a node's resolver, with a trend over the last 24
+  // runs.
+  rpc NodeDnsCheck(NodeDnsCheckRequest) returns (NodeDnsCheckResponse);
+  // A bounded throughput test between two fleet nodes: the target serves 8 to 32 MB over a short-lived TCP listener opened for one
+  // connection with a one-time token, the sender pulls (or pushes) it and measures. It moves bulk traffic, so the MCP tool is
+  // plan/apply with the owner's approval. At most one test per node at a time and a few per node per day. Kept 7 days.
+  rpc PathSpeed(PathSpeedRequest) returns (PathSpeedResponse);
+  // The speed tests kept in the last 7 days, newest first (for the MCP tool path_speed_results): what an approved path_speed plan
+  // measured, so a later question is answered from the figures and not from a guess. Names and figures only.
+  rpc PathSpeedResults(PathSpeedResultsRequest) returns (PathSpeedResultsResponse);
+  // What "measure the channel" of a node would do now, and whether it can: the partners (the nodes with the widest known channel), the
+  // most data it may move and how long it takes, how long the pause lasts when the last measure is recent. Moves nothing.
+  rpc ChannelMeasurePlan(ChannelMeasurePlanRequest) returns (ChannelMeasurePlanResponse);
+  // Starts the channel measure of one node: 8 parallel TCP streams for 10 seconds in each direction (receive, send) against up to
+  // three partner nodes, the same mechanism as PathSpeed (a one-time listener on the partner, a token), capped at 2 GiB and 15 seconds
+  // per direction on both ends. It fills the links of the node and its partners, so it is the owner's alone (and an MCP token's only
+  // through an approved plan). It runs on in the panel after the call returns; read it with ChannelMeasureStatus. One per node at a time
+  // and not more often than once in 10 minutes per node.
+  rpc ChannelMeasureStart(ChannelMeasureStartRequest) returns (ChannelMeasureStartResponse);
+  // The run of a node now or last (steps with their figures) and its last stored measure. Moves nothing.
+  rpc ChannelMeasureStatus(ChannelMeasureStatusRequest) returns (ChannelMeasureStatusResponse);
+  // Stops the run of a node: both ends close their streams at once.
+  rpc ChannelMeasureCancel(ChannelMeasureCancelRequest) returns (ChannelMeasureCancelResponse);
+  // REALITY targets among the neighbours of a node: the node walks the /24 of its own address on TCP 443 (agent.proto "NEIGHBOR SITES")
+  // and the panel keeps what it found. run = false reads the last result kept; run = true scans, owner only, and the scan is
+  // refused when the last one is less than 30 minutes old. It takes up to a minute, longer than a plain unary call.
+  rpc NodeSniScan(NodeSniScanRequest) returns (NodeSniScanResponse);
+}
+
+message PathProbeRequest {
+  // The sender and the target: fleet node ids.
+  string from_node_id = 1;
+  string to_node_id = 2;
+  // "udp", "tcp" or "tls".
+  string kind = 3;
+  // The target's ports to probe; empty = the target's own server ports of that kind. Only ports the target serves are accepted.
+  repeated uint32 ports = 4;
+  // udp only: a non-empty list runs the MTU sweep with the don't-fragment flag over these payload sizes (at most 5 of 64 to 1472;
+  // 256, 576, 1200, 1350, 1452 are the usual set).
+  repeated uint32 sizes = 5;
+}
+
+// One port of a probe. udp: sent and got of its datagrams. tcp and tls: the verdict and the milliseconds to it.
+message PathProbePort {
+  uint32 port = 1;
+  uint32 sent = 2;
+  uint32 got = 3;
+  // "ok", "lossy" or "broken" (udp); "ours", "other", "refused" or "timeout" (tcp, tls); "failed" for a verdict the panel does not know.
+  string verdict = 4;
+  // 0 = not measured (an agent that predates the timing).
+  uint32 ms = 5;
+}
+
+message PathProbeSize {
+  uint32 size = 1;
+  uint32 sent = 2;
+  uint32 got = 3;
+}
+
+message PathProbeResponse {
+  string from_name = 1;
+  string to_name = 2;
+  string kind = 3;
+  int64 at_unix = 4 [jstype = JS_NUMBER];
+  // Empty when the probe ran. Otherwise a short code: node_offline, agent_too_old (the sender lacks "probe/1"), busy, no_route,
+  // no_ports (the target serves no port of that kind), bad_port (a requested port the target does not serve), failed.
+  string error = 5;
+  repeated PathProbePort ports = 6;
+  // The sweep, one row per size, in the order asked.
+  repeated PathProbeSize sizes = 7;
+  // The largest size of which at least half the datagrams arrived; 0 = none (or no sweep).
+  uint32 largest_size = 8;
+}
+
+message NodeTraceRequest {
+  string from_node_id = 1;
+  string to_node_id = 2;
+}
+
+message TraceHop {
+  uint32 ttl = 1;
+  // Milliseconds until a router (or the target) answered; 0 when nothing did.
+  uint32 rtt_ms = 2;
+  // A router answered this hop.
+  bool answered = 3;
+  // "hop N", or the node name for the hop where the target itself answered. Never an address.
+  string label = 4;
+}
+
+message NodeTraceResponse {
+  string from_name = 1;
+  string to_name = 2;
+  int64 at_unix = 3 [jstype = JS_NUMBER];
+  // Empty when the trace ran; otherwise node_offline, agent_too_old, busy, unsupported, no_route, failed.
+  string error = 4;
+  // The target (or a RST from its address) answered.
+  bool reached = 5;
+  repeated TraceHop hops = 6;
+  // The first hop whose answering state differs from the previous trace of the pair; 0 = no change or no previous trace.
+  uint32 changed_at_hop = 7;
+  // "route changed at hop N: ...", "same as before", "first trace of this pair" or a note on a hop that stopped answering.
+  string diff = 8;
+  int64 previous_unix = 9 [jstype = JS_NUMBER];
+  // How many traces of the pair are kept (at most 20).
+  uint32 kept = 10;
+}
+
+message NodeDnsCheckRequest {
+  string node_id = 1;
+  // Run the resolver check on the node now (false = read the stored runs only).
+  bool run = 2;
+}
+
+message DnsRun {
+  int64 at_unix = 1 [jstype = JS_NUMBER];
+  uint32 p50_ms = 2;
+  uint32 p95_ms = 3;
+  uint32 failed = 4;
+  uint32 domains = 5;
+}
+
+message NodeDnsCheckResponse {
+  string node_name = 1;
+  // Empty when a run was read; otherwise node_offline, agent_too_old, failed.
+  string error = 2;
+  // The newest run, from this call or the stored doctor result.
+  DnsRun latest = 3;
+  // Oldest first, at most 24.
+  repeated DnsRun history = 4;
+  // "steady", "slower", "faster" or "unknown", from the last runs against the earlier ones.
+  string trend = 5;
+}
+
+message PathSpeedRequest {
+  string from_node_id = 1;
+  string to_node_id = 2;
+  // 8 to 32.
+  uint32 mb = 3;
+  // "down" (the sender pulls from the target) or "up" (the sender pushes to the target).
+  string direction = 4;
+}
+
+message PathSpeedResponse {
+  string from_name = 1;
+  string to_name = 2;
+  string direction = 3;
+  uint32 mb = 4;
+  int64 at_unix = 5 [jstype = JS_NUMBER];
+  // Empty when the test ran. Otherwise a short code: node_offline, agent_too_old (an end lacks "speed/1"), busy, unreachable (the
+  // sender could not connect to the target's test port), timeout, no_route, failed.
+  string error = 6;
+  // Megabits per second over the whole transfer.
+  double mbit_s = 7;
+  uint32 connect_ms = 8;
+  // Milliseconds from the start of the transfer to its first byte (down); 0 for up.
+  uint32 first_byte_ms = 9;
+  uint32 duration_ms = 10;
+  uint64 bytes = 11;
+  // 0 for a test of one stream (PathSpeed); 1 to 8 for a channel measure, whose figure is the sum of its streams over the window.
+  uint32 streams = 12;
+  // A channel measure that reached its volume cap before the window ended: the figure is at least that.
+  bool capped = 13;
+}
+
+message PathSpeedResultsRequest {
+  // Only the tests that had this node as the sender or the target; empty = every node.
+  string node_id = 1;
+  // At most this many, newest first; 0 = 20, at most 50.
+  uint32 limit = 2;
+}
+
+message PathSpeedResultsResponse {
+  // Newest first. Only tests that ran are kept: error is always empty here.
+  repeated PathSpeedResponse tests = 1;
+  // The last channel measure of each node that has one (only the asked node when node_id is set), newest first. They are also in
+  // `tests`, one per direction and partner, while those are kept (7 days); this is the answer that stays.
+  repeated ChannelNodeLast channels = 2;
+}
+
+message ChannelNodeLast {
+  string node_name = 1;
+  ChannelLast last = 2;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The channel measure: how much a node can carry, measured against the fleet's own nodes.
+
+message ChannelMeasurePlanRequest {
+  string node_id = 1;
+}
+
+message ChannelPartner {
+  string name = 1;
+  // The widest channel known for it: the owner's number or the fastest kept speed test, Mbit/s; 0 = unknown.
+  uint32 known_mbps = 2;
+}
+
+// The figure of one direction of a channel measure.
+message ChannelDirection {
+  // Megabits per second of all the streams together over the window; 0 = this direction did not work.
+  double mbit_s = 1;
+  // The partner node that gave the best figure.
+  string partner = 2;
+  uint32 streams = 3;
+  // The volume cap was reached before the window ended: the figure is a lower bound.
+  bool capped = 4;
+}
+
+// The last channel measure of a node that gave a figure.
+message ChannelLast {
+  int64 at_unix = 1 [jstype = JS_NUMBER];
+  // The node receives (it pulls from the partner).
+  ChannelDirection down = 2;
+  // The node sends (it pushes to the partner).
+  ChannelDirection up = 3;
+  // How many partners were tried.
+  uint32 partners = 4;
+}
+
+message ChannelMeasurePlanResponse {
+  string node_name = 1;
+  // Empty when a measure can start now. Otherwise node_offline, agent_too_old, busy (the node, or a partner that was the only one,
+  // is running a test), no_partner (no other node is connected with a new enough agent), too_soon (see retry_after_s), limit.
+  string error = 2;
+  // The nodes it would measure against, widest known channel first, at most three. Names only.
+  repeated ChannelPartner partners = 3;
+  // The channel the owner wrote for this node, Mbit/s; 0 = none.
+  uint32 configured_mbps = 4;
+  // The most one direction against one partner may move, MiB (the cap both ends hold).
+  uint32 max_mb = 5;
+  // The most the whole measure may move, GB (every partner, both directions, at the cap), rounded up.
+  uint32 max_gb = 6;
+  // About how long the channel stays busy, seconds.
+  uint32 est_seconds = 7;
+  uint32 retry_after_s = 8;
+  ChannelLast last = 9;
+}
+
+message ChannelMeasureStartRequest {
+  string node_id = 1;
+}
+
+message ChannelMeasureStatusRequest {
+  string node_id = 1;
+}
+
+message ChannelMeasureCancelRequest {
+  string node_id = 1;
+}
+
+// The status right after the call.
+message ChannelMeasureStartResponse {
+  ChannelMeasureStatusResponse status = 1;
+}
+
+message ChannelMeasureCancelResponse {
+  ChannelMeasureStatusResponse status = 1;
+}
+
+// One direction against one partner.
+message ChannelStep {
+  string partner = 1;
+  // "down" (the node receives) or "up" (the node sends).
+  string direction = 2;
+  // "waiting", "running", "done" or "failed".
+  string state = 3;
+  double mbit_s = 4;
+  // Set when state is failed: node_offline, agent_too_old, busy, too_soon, unreachable, timeout, no_route, failed.
+  string error = 5;
+  uint32 streams = 6;
+  bool capped = 7;
+}
+
+message ChannelMeasureStatusResponse {
+  string node_name = 1;
+  // "idle" (no run since the panel started), "running", "done", "failed" (nothing was measured) or "canceled".
+  string state = 2;
+  // Set when the call could not start or the run failed as a whole (the codes of ChannelMeasurePlanResponse.error, or failed).
+  string error = 3;
+  uint32 retry_after_s = 4;
+  int64 started_unix = 5 [jstype = JS_NUMBER];
+  repeated ChannelStep steps = 6;
+  // The best figure per direction of the run now or last, the same as `last` once it is stored.
+  ChannelLast result = 7;
+  // The last stored measure of the node (this run included once it is done); unset when there is none.
+  ChannelLast last = 8;
+  uint32 configured_mbps = 9;
+}
+
+message NodeSniScanRequest {
+  string node_id = 1;
+  // Scan now (false = read the last result kept).
+  bool run = 2;
+}
+
+// One neighbour site of a scan: a name the node saw in the certificate of an address of its /24. The name is the text of a stranger's
+// certificate (a plain host name, checked by the node and again by the panel) and is shown as text only: never as a link.
+message SniCandidate {
+  string ip = 1;
+  string name = 2;
+  // Where the node's own resolver says the name leads: "here" (this address), "subnet" (another address of the /24), "elsewhere", "none".
+  string dns = 3;
+  bool h2 = 4;
+  // The certificate belongs to one site (at most two registrable domains in it), not to a shared hosting or CDN one.
+  bool single_site = 5;
+  // The status of GET / (redirects not followed); 0 = no answer.
+  uint32 http = 6;
+  // The TLS handshake in milliseconds.
+  uint32 ms = 7;
+  // Days the certificate still holds.
+  uint32 days = 8;
+}
+
+message NodeSniScanResponse {
+  string node_name = 1;
+  // Empty when the scan ran or a stored result is shown. Otherwise a short code: node_offline, agent_too_old (the agent lacks "sni-scan/1"),
+  // busy, too_soon (retry_after_s says when), not_my_address (the node's address is not on its own interface: a NAT or a name behind a CDN),
+  // no_ipv4 (the panel knows no IPv4 address of the node), no_roots (the node has no CA roots), failed. A refused call still carries the
+  // last stored result, if there is one.
+  string error = 2;
+  uint32 retry_after_s = 3;
+  // When the stored result was made (the panel's clock); 0 = no scan of this node was ever kept.
+  int64 at_unix = 4 [jstype = JS_NUMBER];
+  // The /24 that was scanned ("192.0.2.0/24").
+  string range = 5;
+  // Counts of addresses: looked at, answering on 443, TLS 1.3, with a name whose handshake chose X25519MLKEM768, with a candidate.
+  uint32 addresses = 6;
+  uint32 open = 7;
+  uint32 tls13 = 8;
+  uint32 mlkem = 9;
+  uint32 valid = 10;
+  // The budget ran out before every address was done.
+  bool partial = 11;
+  // Candidates that were left out because they are this panel's own: an address or a name of one of its nodes or of the panel.
+  uint32 own_left_out = 12;
+  repeated SniCandidate candidates = 13;
+}

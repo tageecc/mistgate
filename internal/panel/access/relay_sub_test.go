@@ -174,6 +174,16 @@ func TestNoTwinUnlessTheRelayIsUsableForThePerson(t *testing.T) {
 			t.Errorf("%s: %d servers", name, n)
 		}
 	}
+	unverifiable := store.RelayCheck{At: 1,
+		Leg:  store.RelayStage{Status: "skipped", Code: "unverifiable"},
+		Path: store.RelayStage{Status: "skipped", Code: "unverifiable"}}
+	unverifiable.Settle()
+	if err := f.st.SetRelayCheck(f.ctx, r.Id, unverifiable); err != nil {
+		t.Fatal(err)
+	}
+	if n := servers(); n != 2 {
+		t.Errorf("an enabled relay whose identity cannot be checked: %d servers", n)
+	}
 	f.switchOn(r.Id)
 	if n := servers(); n != 2 {
 		t.Fatalf("a proven relay: %d servers", n)
@@ -223,8 +233,7 @@ func TestNoTwinForAPersonWhoseNodesLeaveTheEntryOut(t *testing.T) {
 	}
 }
 
-// A server that cannot go through a relay never gets a twin, whatever the rows say (CreateRelay refuses it, but the rule is also
-// kept where the view is built): an AmneziaWG key has no twin in any format.
+// A relay row without its path credential never gets an AmneziaWG twin; direct access stays available in every format.
 func TestNoTwinForAnAmneziaWGServer(t *testing.T) {
 	f := newTwinFix(t)
 	awg := must(f.s.CreateProfile(f.ctx, req(&adminv1.CreateProfileRequest{Protocol: "awg", Name: "awg31"}))).Msg.Profile

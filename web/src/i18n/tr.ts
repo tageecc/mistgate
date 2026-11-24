@@ -1,0 +1,331 @@
+import { tr as cloudTr } from "./cloud-usage";
+import type { CoreMessages, Messages } from "./en";
+import { tr as opsTr } from "./ops";
+import { tr as usersTr } from "./users";
+import { tr as securityTr } from "./security";
+import { tr as profilesTr } from "./profiles";
+import { tr as subsTr } from "./subs";
+import { tr as healthTr } from "./health";
+import { tr as updatesTr } from "./updates";
+import { tr as awgTr } from "./awg";
+import { tr as warpTr } from "./warp";
+import { tr as integrationsTr } from "./integrations";
+import { tr as telegramTr } from "./telegram";
+import { tr as portsTr } from "./ports";
+import { tr as editionTr } from "./edition";
+import { tr as decoyTr } from "./decoy";
+import { tr as bulkTr } from "./bulk";
+import { tr as countryTr } from "./country";
+import { tr as probesTr } from "./probes";
+import { tr as connectionsTr } from "./connections";
+import { tr as journalTr } from "./journal";
+import { tr as relayTr } from "./relay";
+import { tr as waysTr } from "./ways";
+import { tr as tgproxyTr } from "./tgproxy";
+import { tr as clientcompatTr } from "./clientcompat";
+import { tr as protocolsTr } from "./protocols";
+import { tr as aiTr } from "./ai";
+import { tr as graphTr } from "./graph";
+import { tr as waysgraphTr } from "./waysgraph";
+import { tr as fleetmapTr } from "./fleetmap";
+import { tr as observabilityTr } from "./observability";
+import { tr as debugTr } from "./debug";
+import { tr as resourcesTr } from "./resources";
+import { tr as tasksTr } from "./tasks";
+import { tr as followupTr } from "./followup";
+import { tr as osupdatesTr } from "./osupdates";
+import { tr as fleetuiTr } from "./fleetui";
+import { tr as clientlogsTr } from "./clientlogs";
+import { tr as trusttunnelTr } from "./trusttunnel";
+import { tr as tcpshareTr } from "./tcpshare";
+import { tr as shellTr } from "./shell";
+import { tr as nodesviewTr } from "./nodesview";
+import { tr as nodeswaysTr } from "./nodesways";
+import { tr as userslistTr } from "./userslist";
+import { tr as userspageTr } from "./userspage";
+import { tr as profilenewTr } from "./profilenew";
+import { tr as settingspageTr } from "./settingspage";
+import { tr as aipageTr } from "./aipage";
+import { tr as igpageTr } from "./igpage";
+import { tr as aspageTr } from "./aspage";
+import { tr as nodeshareTr } from "./nodeshare";
+import { tr as channelTr } from "./channel";
+import { tr as countrynowTr } from "./countrynow";
+import { tr as sniTr } from "./sni";
+import { tr as overviewTr } from "./overview";
+import { tr as windowsTr } from "./windows";
+import { tr as nodepageTr } from "./nodepage";
+import { tr as nodewaysTr } from "./nodeways";
+import { tr as subspnTr } from "./subspn";
+import { tr as subshxTr } from "./subshx";
+import { tr as subsrtTr } from "./subsrt";
+import { tr as subsdnsTr } from "./subsdns";
+import { tr as usersgroupTr } from "./usersgroup";
+import { tr as usersextraTr } from "./usersextra";
+import { tr as decoysitesTr } from "./decoysites";
+import { tr as planwordsTr } from "./planwords";
+import { tr as profilespageTr } from "./profilespage";
+import { tr as healthpageTr } from "./healthpage";
+import { tr as reachpageTr } from "./reachpage";
+import { tr as updatespageTr } from "./updatespage";
+import { tr as profilesrvTr } from "./profilesrv";
+
+// Turkish (tr). Typed against the English shape: a missing or extra key fails `pnpm typecheck`.
+// The admin speaks to the owner as «sen» (İstersen…, ajanı güncelle, emin misin?); buttons and tabs are short imperatives
+// or nouns (Kaydet, Düğüm ekle). Plurals: usually one form, since a noun stays singular after a number ("3 düğüm");
+// "one|other" only where the sentence for 1 really differs. No case suffix is glued to a {placeholder} (vowel harmony
+// cannot know the value): a head noun carries it ("{name} düğümünde", "{version} sürümüne"). Quotes “ ”. Product,
+// protocol and app names stay as they are (Mistgate, VLESS, REALITY, Hysteria2, AmneziaWG, WARP, Happ, kl!ck, Telegram).
+// Glossary: node düğüm · server sunucu · the fleet tüm düğümler · profile profil · subscription abonelik ·
+// subscription link abonelik bağlantısı · group grup · user kullanıcı (people counted: kişi) · device cihaz ·
+// alert uyarı · mute sessize al · doctor Teşhis · Health Sağlık · health check sağlık kontrolü · check kontrol ·
+// probe ölçüm noktası · relay aktarıcı · decoy site kamuflaj sitesi · agent ajan · rollout dağıtım · rollback geri alma ·
+// update güncelleme · owner sahip · admin yönetici · quota kota · expiry bitiş tarihi · key anahtar · token token ·
+// passkey geçiş anahtarı · backup yedek · Reachability Erişilebilirlik · verdict sonuç · egress çıkış ·
+// handshake el sıkışma · approve onayla · rule kural · wizard sihirbaz.
+const core: CoreMessages = {
+  "common.loading": "Yükleniyor…",
+  "common.retry": "Yeniden dene",
+  "common.undo": "Geri al",
+  "common.quoted": "“{name}”",
+  "common.labeled": "{label}: {value}",
+  "common.fromTo": "{from} → {to}",
+  "pager.nav": "Sayfalar",
+  "pager.range": "{total} içinden {from}–{to} gösteriliyor",
+  "pager.rangeFrom": "{from}–{to} arası kayıtlar",
+  "pager.count": "{n} kayıt",
+  "pager.prev": "Geri",
+  "pager.next": "İleri",
+  "pager.prevAria": "Önceki sayfa",
+  "pager.nextAria": "Sonraki sayfa",
+  "pager.page": "Sayfa {n}",
+  "pager.pageOf": "{page} / {count}",
+  "pager.perPage": "Sayfa başına {n}",
+  "pager.perPageLabel": "Sayfa başına satır",
+  "pager.newer": "Daha yeni",
+  "pager.older": "Daha eski",
+  "pager.toNewest": "En yeniye",
+  "pager.newerAria": "Daha yeni kayıtlar",
+  "pager.olderAria": "Daha eski kayıtlar",
+  "pager.toNewestAria": "En yeni kayıtlara dön",
+  "nav.overview": "Genel bakış",
+  "nav.nodes": "Düğümler",
+  "nav.users": "Kullanıcılar",
+  "nav.profiles": "Profiller",
+  "nav.subscriptions": "Abonelikler",
+  "nav.health": "Sağlık",
+  "nav.reachability": "Erişilebilirlik",
+  "nav.updates": "Güncellemeler",
+  "nav.integrations": "Entegrasyonlar",
+  "nav.settings": "Ayarlar",
+  "nav.more": "Daha fazla",
+  "nav.main": "Ana gezinme",
+  "nav.skip": "İçeriğe geç",
+  "nav.group.setup": "Kurulum",
+  "nav.group.ops": "İşletim",
+  "section.overview.desc": "Tüm düğümlerin durumu tek bakışta: düğüm kartları, trafik ve son olaylar.",
+  "section.nodes.desc": "Düğümlerin çalıştığı sunucular, protokolleri, yükleri ve yeni düğüm eklemek için sihirbaz.",
+  "section.users.desc": "Erişimi olan kişiler: uygulamalar, cihazlar, trafik kotaları ve bitiş tarihleri.",
+  "section.profiles.desc": "Düğümlere ve kullanıcılara dağıttığın hazır protokol ayarları.",
+  "section.subscriptions.desc": "Abonelik biçimleri, teslim kuralları ve kullanıcıların gördüğü sayfa.",
+  "section.health.desc": "Uyarılar, istemci gözüyle kontroller ve Teşhis.",
+  "section.reachability.desc": "Düğümlerin bir ülkenin içinden açılıp açılmadığı: kaynaklar, her düğümün sonucu ve haftalık geçmişi.",
+  "section.updates.desc": "Panel ve düğüm ajanı sürümleri, aşamalı dağıtımlar ve geri alma.",
+  "section.integrations.desc": "Telegram uyarıları: her yönetici kendi sohbetini bağlar.",
+  "section.settings.desc": "Yöneticiler, güvenlik, yedekler ve alan adları.",
+  "section.empty": "Burada henüz bir şey yok",
+  "header.search": "Düğüm, kullanıcı ve bölüm ara",
+  "header.language": "Dil",
+  "header.theme": "Tema",
+  "header.signOut": "Çıkış yap",
+  "header.version": "Panel sürümü {version}",
+  "stale.title": "Panel {version} sürümüne güncellendi",
+  "stale.msg": "Yönetim panelinin yeni sürümle çalışması için sayfayı yenile.",
+  "stale.reload": "Yenile",
+  "stale.expand": "Yenileme uyarısını göster",
+  "header.source": "Kaynak kod",
+  "header.star": "GitHub'da yıldızla",
+  "health.none": "Düğüm yok",
+  "health.ok": "Tüm düğümler çalışıyor",
+  "health.okShort": "Her şey yolunda",
+  "health.problems": "{n} sorun",
+  "palette.title": "Komut paleti",
+  "palette.placeholder": "Düğüm, kişi, bölüm veya işlem",
+  "palette.empty": "Hiçbir şey bulunamadı",
+  "palette.searching": "Aranıyor…",
+  "palette.nodes": "Düğümler",
+  "palette.users": "Kişiler",
+  "palette.places": "Bölümler",
+  "palette.actions": "İşlemler",
+  "palette.createUser": "Kişi ekle",
+  "palette.newToken": "Yeni API token'ı",
+  "palette.newProfile": "Yeni profil",
+  "palette.approvals": "Onaylar",
+  "role.owner": "Sahip",
+  "role.helper": "Yardımcı",
+  "role.readonly": "Salt okunur",
+  "role.unknown": "Yönetici",
+  "status.ok": "Çalışıyor",
+  "status.warn": "Dikkat",
+  "status.bad": "Bozuk",
+  "status.off": "Kapalı",
+  "status.busy": "Güncelleniyor",
+  "status.blip": "Sağlayıcı kesintisi",
+  "settings.interface": "Arayüz",
+  "settings.system": "Sistem",
+  "settings.admins": "Yöneticiler",
+  "settings.security": "Güvenlik",
+  "settings.sessions": "Oturumlar",
+  "settings.audit": "Denetim",
+  "settings.backups": "Yedekler",
+  "settings.domains": "Alan adları",
+  "settings.nav": "Ayar bölümleri",
+  "settings.language": "Dil",
+  "settings.theme": "Tema",
+  "settings.theme.dark": "Koyu",
+  "settings.theme.light": "Açık",
+  "settings.accent": "Vurgu rengi",
+  "settings.accent.follow": "Panelle aynı",
+  "settings.accent.own": "Bu cihazın kendi rengi var",
+  "settings.accent.reset": "Sıfırla",
+  "settings.accent.custom": "Özel",
+  "settings.accent.mint": "Nane",
+  "settings.accent.lavender": "Lavanta",
+  "settings.accent.sky": "Gök mavisi",
+  "settings.accent.sand": "Kum",
+  "settings.accent.rose": "Gül",
+  "settings.accent.sage": "Adaçayı",
+  "settings.local": "Bu tercihler yalnızca bu cihazda saklanır.",
+  "settings.fx": "Belirme animasyonu",
+  "settings.device": "Yalnızca bu cihazda",
+  "auth.setup.welcomeTitle": "Merhaba!",
+  "auth.setup.welcomeBody": "Burası {brand}: VPN sunucuların için bir panel. Önce bir dil seç; sonra değiştirebilirsin.",
+  "auth.next": "İleri",
+  "auth.setup.adminTitle": "Yöneticiyi oluştur",
+  "auth.setup.adminBody": "En iyisi geçiş anahtarı: parmak izi ya da Face ID ile giriş yaparsın, parola yok. Anahtar yalnızca cihazında durur.",
+  "auth.login": "Kullanıcı adı",
+  "auth.password": "Parola",
+  "auth.code": "Doğrulayıcı kodu",
+  "auth.createPasskey": "Geçiş anahtarı oluştur",
+  "auth.waitingPasskey": "Geçiş anahtarı bekleniyor",
+  "auth.setup.passkeyHint": "Tarayıcı parmak izi, yüz ya da PIN isteyecek",
+  "auth.setup.otherWay": "parola + doğrulayıcı kodu",
+  "auth.setup.totpScan": "Google Authenticator, 1Password veya Aegis ile tara",
+  "auth.setup.createAdmin": "Yöneticiyi oluştur",
+  "auth.setup.doneTitle": "Tamam",
+  "auth.setup.doneBody": "Yönetici oluşturuldu. Sırada ne var?",
+  "auth.setup.addFirst": "İlk düğümünü ekle",
+  "auth.setup.addFirstBody": "Ubuntu ya da Debian kurulu ve SSH ile root erişimi olan bir sunucu gerekir. Kurulum komutunu panel verir.",
+  "auth.setup.later": "Sonra, önce bir göz atayım",
+  "auth.recover.title": "Girişi sıfırla",
+  "auth.recover.body": "Yeni bir parola ve yeni bir doğrulayıcı kodu alırsın. Bu yöneticinin tüm oturumları sonlanır; geçiş anahtarları kalır.",
+  "auth.recover.loginHint": "Girişi sıfırlanacak yöneticinin kullanıcı adı. Yalnızca geçiş anahtarı olan yönetici bu kullanıcı adını alır.",
+  "auth.recover.refused": "Hiçbir şey sıfırlanmadı.",
+  "auth.recover.whichAdmin": "Kimin girişinin sıfırlanacağı belli değil. Yöneticinin kullanıcı adını yazıp yeniden dene.",
+  "auth.recover.submit": "Girişi sıfırla",
+  "auth.recover.doneTitle": "Yeni giriş bilgileri",
+  "auth.recover.doneBody": "{admin} için. Parolayı şimdi kaydet ve QR kodunu şimdi tara.",
+  "auth.recover.password": "Yeni parola",
+  "auth.recover.onceTitle": "Yalnızca bir kez gösterilir.",
+  "auth.recover.onceBody": "Sayfa yenilenirse ya da sayfadan ayrılırsan bir daha gösterilemez.",
+  "auth.recover.nextTitle": "Sonraki adım",
+  "auth.recover.nextSignIn": "Bu kullanıcı adı, parola ve uygulamadaki kodla giriş yap.",
+  "auth.recover.nextPasskey": "Ayarlar → Güvenlik bölümünden geçiş anahtarı ekle, kaybolanı da oradan kaldır.",
+  "auth.recover.sessions": "Her yerden çıkış yapıldı: {n} oturum sonlandırıldı.",
+  "auth.recover.linkTitle": "Bu bağlantı çalışmıyor",
+  "auth.recover.linkBody": "Eksik, süresi dolmuş ya da daha önce kullanılmış. Kurtarma bağlantısı yalnızca bir kez ve 30 dakika içinde çalışır. Yenisini anahtar dosyasının bulunduğu bilgisayardan al:",
+  "auth.login.title": "Panele giriş yap",
+  "auth.login.body": "admin · {host}",
+  "auth.login.passkey": "Geçiş anahtarıyla giriş yap",
+  "auth.login.passkeyHint": "Parmak izi, Face ID ya da güvenlik anahtarı",
+  "auth.login.otherWay": "başka bir yolla",
+  "auth.hideOtherWay": "gizle",
+  "auth.login.submit": "Giriş yap",
+  "auth.checking": "Kontrol ediliyor…",
+  "auth.noPasskeyTitle": "Bu tarayıcı geçiş anahtarlarını desteklemiyor.",
+  "auth.noPasskeyBody": "Parola ve kodla giriş yap ya da paneli Safari, Chrome veya Firefox'un daha yeni bir sürümünde aç.",
+  "auth.badCode": "Kod kabul edilmedi. Telefonunun saatinin otomatik ayarlandığından emin ol.",
+  "auth.attemptsLeft": "{n} deneme hakkın kaldı",
+  "auth.lockedTitle": "Çok fazla deneme",
+  "auth.lockedBody": "Giriş 15 dakika kilitlendi. Kilitlenme, IP adresi ve saatiyle birlikte Ayarlar → Denetim bölümüne kaydedilir.",
+  "auth.missingToken.title": "Bu kurulum bağlantısı eksik",
+  "auth.missingToken.body": "`mistgate setup` komutunun yazdırdığı bağlantıyı # işaretinden sonraki kısım dahil tamamen aç. Süresi dolduysa komutu yeniden çalıştır.",
+  "auth.toLogin": "Girişe git",
+  "auth.step": "Adım {n} / {total}",
+  "err.unsupported": "Bu tarayıcı geçiş anahtarlarını desteklemiyor. Paneli HTTPS üzerinden Chrome, Safari, Firefox veya Edge'in güncel bir sürümünde aç.",
+  "err.cancelled": "Geçiş anahtarı isteği iptal edildi ya da zaman aşımına uğradı. Hazır olunca yeniden dene.",
+  "err.alreadyRegistered": "Bu cihazda bu panel için zaten bir geçiş anahtarı var.",
+  "err.origin": "Tarayıcı bu adres için geçiş anahtarını reddetti. Panelin alan adı WebAuthn ayarlarıyla eşleşmeli.",
+  "err.setupLink": "Kurulum bağlantısı geçersiz ya da süresi dolmuş. Yenisini almak için `mistgate setup` komutunu çalıştır.",
+  "err.notRecognised": "Bu geçiş anahtarı panele kayıtlı değil.",
+  "err.rateLimited": "Çok fazla deneme. Bir dakika bekleyip yeniden dene.",
+  "err.captcha": "Cloudflare kontrolü geçilemedi. Bitmesini bekleyip yeniden dene.",
+  "err.network": "Panele ulaşılamıyor. Bağlantını kontrol edip yeniden dene.",
+  "err.generic": "Bir şeyler ters gitti. Yeniden dene.",
+  "err.guard": "Panel yüklenemiyor",
+  "err.name_taken": "Bu ad zaten kullanımda. Başka bir ad seç.",
+  "err.group_not_empty": "Bu grupta hâlâ kullanıcılar var: {users}. Onları başka bir gruba taşı, sonra grubu sil.",
+  "err.page_password_removed": "Bu kişinin sayfasında şu an parola yok. Önce parolayı geri getir.",
+  "err.group_in_both": "Aynı grup iki listede de var: ya ekle ya çıkar, ikisini birden yapma.",
+  "err.main_group": "Ana grup çıkarılamaz: onun yerine başka bir grubu ana grup yap.",
+  "err.too_many_groups": "Bir kişi en fazla 16 grupta olabilir.",
+  "err.profile_deployed": "Profil şu düğümlere dağıtılmış: {nodes}. Önce oralardan kaldır.",
+  "err.stale_version": "Profil başka bir sekmede değiştirildi. Sayfayı yenile.",
+  "err.stale_inbound": "Sunucunun ayarları az önce başka bir yerde değiştirildi. Liste yenilendi: kontrol et ve değişikliği tekrarla.",
+  "err.stale_user": "Bu kişi az önce başka bir yerde değiştirildi (kapatıldı, uzatıldı veya düzenlendi). Sayfayı yenile, kişiyi kontrol et ve değişikliği tekrarla.",
+  "err.node_offline": "Düğümle bağlantı yok. Ajan geri gelince yeniden dene.",
+  "err.agent_too_old": "Düğümdeki ajan bunun için çok eski. Güncellemeler sayfasından güncelle.",
+  "err.node_retired": "Düğüm kullanımdan kaldırıldı.",
+  "err.sub_address_missing": "Abonelik bağlantısı adresi ayarlanmamış. Adresi panelin sunucusunda `mistgate setup` ayarlar.",
+  "err.preset_is_default": "Bu varsayılan ön ayar. Önce başka birini varsayılan yap.",
+  "err.preset_builtin": "Yerleşik ön ayar silinemez.",
+  "field.port.out_of_range": "Port 1 ile 65535 arasında olmalı",
+  "field.obfuscation.jc.handshake_budget": "Jc, boş olmayan I1–I5 paketleri ve bir el sıkışma paketi toplamı 128'i aşmamalı.",
+  "field.obfuscation.header_protection_key.rt_range_requires_hpk": "Rastgele kuyruklar açıkken tek değerden geniş her H1–H4 aralığı bir başlık koruma anahtarı gerektirir.",
+  "field.hop.from.invalid": "Port, atlama aralığının dışında olmalı",
+  "field.hop.from.out_of_range": "Aralık 1024 ile 65535 arasında başlamalı, SSH ve diğer bilinen portlara denk gelmemeli",
+  "field.hop.to.too_wide": "Aralıkta en fazla 20.000 port olabilir",
+  "field.obfs.password.length": "Parola 8 ile 128 karakter olmalı",
+  "field.sni.invalid": "Bu bir alan adına benzemiyor",
+  "field.port.reserved": "80 portu Let’s Encrypt için ayrılmış: başka bir port seç",
+  "field.reality.target.required": "Sitenin adresini yaz, örneğin www.example.org:443",
+  "field.reality.target.format": "host:port biçiminde yaz, örneğin www.example.org:443",
+  "field.reality.target.host": "Host düz bir ad ya da IP adresi olmalı; boşluk ve eğik çizgi içermemeli",
+  "field.reality.target.port_range": "Port 1 ile 65535 arasında olmalı",
+  "field.reality.target.same_port": "Hedef bu girişin kendisini gösteriyor: başka bir adres veya port seçin",
+  "field.reality.target.unspecified": "Belirsiz adres (0.0.0.0, ::) bir site değildir: bir ad veya gerçek bir adres girin",
+  "field.reality.target.same_node": "Hedef bu düğümün kendisi: başka bir adres veya port seçin",
+  "field.reality.server_names.required": "Hedef bir IP adresi: sertifikasındaki adları listele",
+  "field.reality.server_names.length": "En fazla 8 ad",
+  "field.reality.server_names.invalid": "Joker karakter içermeyen bir host adı, örneğin www.example.org",
+  "field.reality.server_names.duplicate": "Her ad yalnızca bir kez",
+  "field.reality.short_ids.invalid": "Onaltılık rakamlar, çift sayıda ve en fazla 16 tane",
+  "field.reality.short_ids.length": "1 ile 8 arasında değer",
+  "field.xhttp.path.invalid": "/ ile başlar, sonra harfler, rakamlar ve / _ - gelir; en fazla 64 karakter",
+  "field.xhttp.host.invalid": "Boş ya da cover.example.org gibi bir host adı",
+  "field.xhttp.mode.invalid": "Otomatik, packet up, stream up veya stream one",
+  "field.xhttp.x_padding_bytes.invalid": "min-maks biçiminde yaz, örneğin 100-1000: her biri 1 ile 4096 arasında, ilki ikincisinden büyük olmamalı",
+  "field.reality.short_ids.duplicate": "Her değer yalnızca bir kez",
+  "field.security.invalid_enum": "REALITY veya TLS",
+  "field.transport.invalid_enum": "XHTTP, TCP veya WebSocket",
+  "field.transport.requires_tls": "WebSocket yalnızca TLS ile çalışır: Güvenlik ayarını TLS yap",
+  "field.transport.unsupported": "Vision'lı TCP yalnızca REALITY ile çalışır: TLS için XHTTP ya da WebSocket seç",
+  "field.tls_mode.required": "Kaynak sertifikasını seç: Let’s Encrypt ya da kendinden imzalı",
+  "field.tls_mode.invalid_enum": "Let’s Encrypt veya kendinden imzalı",
+  "field.tls_mode.unsupported": "Sertifika modu TLS'e aittir; REALITY'de yoktur",
+  "field.sni.format": "node.example.org gibi bir alan adı (Let’s Encrypt için gerçek bir alan adı gerekir)",
+  "field.sni.unsupported": "Sunucu adı TLS'e aittir; REALITY'de yoktur",
+  "field.cdn.unsupported": "CDN, TLS'e aittir; REALITY'de yoktur",
+  "field.cdn.host.required": "Kendinden imzalı kaynak sunucu için CDN hostu gerekir: yalnızca bir CDN bunu kabul eder",
+  "field.cdn.host.format": "cdn.example.org gibi düz bir alan adı; şema ya da yol olmadan",
+  "field.cdn.port.out_of_range": "CDN portu 1 ile 65535 arasında olmalı",
+  "field.ws.path.format": "/ ile başlar, sonra harfler, rakamlar ve / _ - gelir; en fazla 64 karakter",
+  "field.ws.host.format": "Boş ya da cover.example.org gibi bir host adı",
+  "field.xhttp.host.unsupported": "TLS istemcileri Host olarak CDN hostunu ya da sunucu adını kullanır: boş bırak",
+  "field.egress.invalid_enum": "Doğrudan veya WARP",
+  "field.reality.fingerprint.invalid_enum": "Chrome, Firefox, Safari, iOS, Edge veya rastgele",
+  "field.reality.target_kind.invalid_enum": "Bu düğümün sitesi ya da başka bir site",
+  "field.hysteria2.tls_mode.unsupported": "IP adresi için Let’s Encrypt sertifikası henüz yok: bir alan adı ya da kendi imzalı sertifikayı seç",
+};
+
+export const tr: Messages = { ...cloudTr, ...core, ...opsTr, ...usersTr, ...securityTr, ...profilesTr, ...subsTr, ...healthTr, ...updatesTr, ...awgTr, ...warpTr, ...integrationsTr, ...telegramTr, ...portsTr, ...editionTr, ...decoyTr, ...bulkTr, ...countryTr, ...probesTr, ...connectionsTr, ...journalTr, ...relayTr, ...waysTr, ...tgproxyTr, ...clientcompatTr, ...protocolsTr, ...aiTr, ...graphTr, ...waysgraphTr, ...fleetmapTr, ...observabilityTr, ...debugTr, ...resourcesTr, ...tasksTr, ...followupTr, ...osupdatesTr, ...fleetuiTr, ...clientlogsTr, ...trusttunnelTr, ...tcpshareTr, ...shellTr, ...overviewTr, ...nodesviewTr, ...windowsTr, ...nodepageTr, ...userslistTr, ...userspageTr, ...usersgroupTr, ...usersextraTr, ...decoysitesTr, ...planwordsTr, ...nodeswaysTr, ...nodewaysTr, ...profilespageTr, ...healthpageTr, ...reachpageTr, ...profilesrvTr, ...profilenewTr, ...subspnTr, ...subshxTr, ...subsrtTr, ...subsdnsTr, ...updatespageTr, ...settingspageTr, ...aipageTr, ...igpageTr, ...aspageTr, ...nodeshareTr, ...channelTr, ...countrynowTr, ...sniTr };

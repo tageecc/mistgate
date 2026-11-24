@@ -10,6 +10,7 @@ import { DoctorStatus } from "@/gen/mistgate/admin/v1/health_pb";
 import { PrepareAwgOutcome } from "@/gen/mistgate/admin/v1/node_pb";
 import { ProfilesTab } from "./profiles";
 
+let role = 1; // Role.OWNER
 const getNodeConnections = vi.fn();
 const listProfiles = vi.fn();
 const createInbound = vi.fn();
@@ -40,7 +41,7 @@ vi.mock("@/lib/api", () => ({
   },
   groups: { listGroups: (...a: unknown[]) => listGroups(...a), updateGroup: (...a: unknown[]) => updateGroup(...a) },
   health: { getDoctor: (...a: unknown[]) => getDoctor(...a) },
-  auth: { me: () => Promise.resolve({ admin: { id: "adm_1", role: 1 } }) },
+  auth: { me: () => Promise.resolve({ admin: { id: "adm_1", role } }) },
   fleet: {},
   users: {},
   assetUrl: (p: string) => p,
@@ -62,6 +63,7 @@ beforeAll(() => {
 let root: Root | null = null;
 let host: HTMLDivElement | null = null;
 beforeEach(() => {
+  role = 1;
   updateNode.mockResolvedValue({});
   createInbound.mockResolvedValue({});
   updateInbound.mockResolvedValue({});
@@ -104,6 +106,7 @@ async function mount(d: never, props: { addProfile?: string; onAddClosed?: () =>
       </QueryClientProvider>,
     ),
   );
+  await settle(); // the signed-in admin's role arrives: the actions are the owner's
 }
 const settle = async () => {
   for (let i = 0; i < 4; i++) await act(async () => void (await new Promise((r) => setTimeout(r, 0))));
@@ -114,8 +117,14 @@ const checked = async () => {
   await settle();
 };
 const text = () => document.body.textContent ?? "";
-const button = (label: string) => [...document.querySelectorAll("button")].find((b) => b.textContent?.trim() === label || b.textContent?.trim() === `+ ${label}`);
+const button = (label: string) => [...document.querySelectorAll("button")].find((b) => b.textContent?.trim() === label || b.textContent?.trim() === `+ ${label}` || b.getAttribute("aria-label") === label);
 const click = (b: Element | undefined | null) => act(async () => void b?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+/** "Add profile" opens the list of what can be put; the form of the first profile is one "Set up…" away. */
+const openAdd = async () => {
+  await click(button("Add profile"));
+  await settle();
+  await click(button("Set up…"));
+};
 const radio = (label: string) => [...document.querySelectorAll("[role=radio]")].find((r) => r.textContent?.trim() === label);
 const submit = () => click(document.querySelector("[role=dialog] button[type=submit]"));
 const input = (label: string) => [...document.querySelectorAll<HTMLInputElement>("[role=dialog] input")].find((i) => i.labels?.[0]?.textContent === label);
@@ -152,7 +161,7 @@ describe("adding a profile to a node", () => {
     listProfiles.mockResolvedValue({ profiles: [{ id: "prf_awg", name: "Amnezia 3.1 test", protocol: "awg" }] });
     getDoctor.mockResolvedValue(doctorWith("kernel_headers.no_awg"));
     await mount(data());
-    await click(button("Add profile"));
+    await openAdd();
     await settle();
 
     expect(text()).toContain("AmneziaWG on this node");
@@ -179,7 +188,7 @@ describe("adding a profile to a node", () => {
     getDoctor.mockResolvedValue(doctorWith("kernel_headers.userspace", { missing: "headers,dkms" }));
     const inbounds = [{ id: "inb_9", profileId: "prf_other", profileName: "other", protocol: "awg", state: InboundState.ACTIVE, port: 51820, awg: { backend: "userspace", backendVersion: "amneziawg-go v3.1", peers: 3, peersOnline: 1 } }];
     await mount(data({ inbounds }));
-    await click(button("Add profile"));
+    await openAdd();
     await settle();
 
     expect(text()).toContain("userspace · amneziawg-go v3.1");
@@ -200,7 +209,7 @@ describe("adding a profile to a node", () => {
     getDoctor.mockResolvedValue(doctorWith("kernel_headers.userspace", { missing: "headers,dkms" }));
     prepareAwgKernel.mockResolvedValue({ outcome: PrepareAwgOutcome.NEEDS_PREPARE });
     await mount(capable());
-    await click(button("Add profile"));
+    await openAdd();
     await settle();
     await click(radio("Kernel module"));
     expect(text()).not.toContain("Run the command first"); // the command is not what this node needs
@@ -219,7 +228,7 @@ describe("adding a profile to a node", () => {
     getDoctor.mockResolvedValue(doctorWith("kernel_headers.ready"));
     prepareAwgKernel.mockResolvedValue({ outcome: PrepareAwgOutcome.READY });
     await mount(capable());
-    await click(button("Add profile"));
+    await openAdd();
     await settle();
     await click(radio("Kernel module"));
     await submit();
@@ -252,7 +261,7 @@ describe("adding a profile to a node", () => {
     listProfiles.mockResolvedValue({ profiles: [{ id: "prf_hy", name: "test", protocol: "hysteria2", summary: "UDP 443 · Salamander · Let's Encrypt · WARP" }] });
     createInbound.mockResolvedValue({ inbound: { port: 443, tlsServerName: "de1.example.com", nodeName: "de1" }, warnings: [], freePort: 8443 });
     await mount(data());
-    await click(button("Add profile"));
+    await openAdd();
     await settle();
     expect(text()).not.toContain("AmneziaWG on this node");
     expect(getDoctor).not.toHaveBeenCalled();
@@ -279,7 +288,7 @@ describe("the check before the click", () => {
     );
     updateProfile.mockResolvedValue({});
     await mount(ipNode);
-    await click(button("Add profile"));
+    await openAdd();
     await settle();
 
     expect(text()).toContain("Let’s Encrypt will not issue a certificate for an IP");
@@ -308,7 +317,7 @@ describe("the check before the click", () => {
       r.tlsServerNameOverride ? Promise.resolve({ inbound: { port: 443, tlsServerName: r.tlsServerNameOverride }, warnings: [] }) : Promise.reject(refuse("reality_needs_domain: address=203.0.113.10&node=ip1")),
     );
     await mount(ipNode);
-    await click(button("Add profile"));
+    await openAdd();
     await settle();
 
     // the field a VLESS profile does not have otherwise is there now, with the sentence of the refusal
@@ -330,7 +339,7 @@ describe("the check before the click", () => {
     listProfiles.mockResolvedValue({ profiles: [hy({ nodeCount: 2 })] });
     createInbound.mockRejectedValue(refuse("acme_needs_domain: address=203.0.113.10&node=ip1"));
     await mount(ipNode);
-    await click(button("Add profile"));
+    await openAdd();
     await settle();
     expect(button("Switch “Main” to self-signed")).toBeUndefined();
     expect(text()).toContain("“Main” stays with Let’s Encrypt on the nodes it already runs on.");
@@ -354,7 +363,7 @@ describe("the check before the click", () => {
           : Promise.resolve({ inbound: { port: r.portOverride }, warnings: [] }),
     );
     await mount(data());
-    await click(button("Add profile"));
+    await openAdd();
     await settle();
     await checked();
     expect(input("Port")?.value).toBe("8443");
@@ -375,7 +384,7 @@ describe("the check before the click", () => {
     listProfiles.mockResolvedValue({ profiles: [hy({ summary: "UDP 8443 · Salamander · Let's Encrypt · WARP" })] });
     createInbound.mockResolvedValue({ inbound: { port: 8443, nodeName: "de1" }, warnings: [{ code: "warp_missing", params: { state: "none" } }] });
     await mount(data());
-    await click(button("Add profile"));
+    await openAdd();
     await settle();
     expect(text()).toContain("de1 has no WARP — a profile with a WARP exit will not pass traffic there.");
     expect(document.querySelector('a[href="/nodes/$id#warp"]')?.textContent).toBe("Set up WARP on de1");
@@ -387,7 +396,7 @@ describe("the check before the click", () => {
     const params = { node: "de1", port: "443", hy2: "Main", vless: "vless 443", via: "site", target: "www.example.org", port80: "unchecked" };
     createInbound.mockResolvedValue({ inbound: { port: 443, nodeName: "de1" }, warnings: [{ code: "hy2_decoy_paused", params }] });
     await mount(data());
-    await click(button("Add profile"));
+    await openAdd();
     await settle();
     expect(text()).toContain(
       "TCP 443 on de1 goes to “vless 443”. The site of “Main” is off while it does and comes back when the port is free; visitors of TCP 443 see www.example.org instead (REALITY passes them on). The Hysteria2 certificate now renews only through TCP 80.",
@@ -405,7 +414,7 @@ describe("the check before the click", () => {
     listProfiles.mockResolvedValue({ profiles: [hy({ summary: "UDP 8443 · Salamander · Let's Encrypt · WARP" })] });
     createInbound.mockResolvedValue({ inbound: { port: 8443, nodeName: "de1" }, warnings: [{ code: "warp_missing", params: { state: "down" } }] });
     await mount(data());
-    await click(button("Add profile"));
+    await openAdd();
     await settle();
     expect(text()).toContain("WARP on de1 does not work now");
     expect(document.querySelector('a[href="/nodes/$id#warp"]')?.textContent).toBe("Open WARP on de1");
@@ -415,7 +424,7 @@ describe("the check before the click", () => {
     listProfiles.mockResolvedValue({ profiles: [hy()] });
     createInbound.mockImplementation((r: { validateOnly?: boolean }) => (r.validateOnly ? Promise.resolve({ inbound: { port: 443 }, warnings: [] }) : Promise.reject(refuse("node_retired", Code.FailedPrecondition))));
     await mount(data());
-    await click(button("Add profile"));
+    await openAdd();
     await settle();
     await submit();
     await settle();
@@ -437,7 +446,7 @@ describe("a node with no profile and a panel with none", () => {
     listGroups.mockResolvedValue({ groups: [{ id: "grp_all", name: "Все", profileIds: [], userCount: 4 }] });
     createProfile.mockResolvedValue({ profile: { id: "prf_new", version: 1 } });
     await mount(data({ node: node({ name: "ip1", address: "203.0.113.10" }) }));
-    await click(button("Add profile"));
+    await openAdd();
     await settle();
     expect(text()).toContain("There are no profiles yet");
     expect(text()).toContain("The address of ip1 is an IP.");
@@ -495,6 +504,20 @@ describe("the profiles list by protocol", () => {
     expect(t).not.toContain("ignored.example.com");
   });
 
+  it("names the port by the network of the protocol (MTProto and VLESS are tcp, Hysteria2 and AmneziaWG udp) and matches the checks of that network", async () => {
+    const mt = { ...hy, id: "inb_3", profileId: "prf_3", profileName: "tg", protocol: "mtproto", port: 8443 };
+    const vl = { ...hy, id: "inb_4", profileId: "prf_4", profileName: "vl", protocol: "vless", port: 443 };
+    await mount(data({ inbounds: [hy, awg, mt, vl], portChecks: [{ port: 8443, verdict: 4, sent: 300, got: 189 }], tcpChecks: [] }));
+    const t = text();
+    expect(t).toContain("tcp/8443");
+    expect(t).toContain("tcp/443");
+    expect(t).toContain("udp/443");
+    expect(t).toContain("udp/51820");
+    expect(t).not.toContain("udp/8443");
+    // the UDP check on 8443 is not MTProto's: no verdict on its row
+    expect(t).not.toContain("189");
+  });
+
   it("puts what the node counted of connection attempts under each profile, and says so when there were none", async () => {
     getNodeConnections.mockResolvedValue({
       supported: true, sinceUnix: 0n, nowUnix: 0n,
@@ -521,7 +544,7 @@ describe("the profiles list by protocol", () => {
   it("marks a certificate that runs out soon, and says 'none' instead of a dash for a profile that is not running", async () => {
     const soon = Math.floor(Date.now() / 1000) + 5 * 86400 - 60;
     await mount(data({ inbounds: [{ ...hy, certNotAfterUnix: soon }, { ...hy, id: "inb_3", profileName: "down", state: InboundState.FAILED, certNotAfterUnix: 0 }] }));
-    const cell = [...document.querySelectorAll("span")].find((s) => s.textContent?.includes("5 d left"));
+    const cell = [...document.querySelectorAll("dd")].find((s) => s.textContent?.includes("5 d left"));
     expect(cell?.className).toContain("text-warn-text");
     expect(text()).toContain("none: the profile is not running");
   });
@@ -551,6 +574,14 @@ describe("a profile that did not start", () => {
     expect(text()).toContain("Failed to start");
     expect(text()).toContain("Port udp/8443 is taken by another program (xray)");
     expect(text()).toContain("listen udp :8443: bind: address already in use");
+  });
+
+  it("names the port of a failed MTProto profile with tcp, not udp", async () => {
+    const tg = { ...failed, protocol: "mtproto", profileName: "tg", lastError: "listen tcp :8443: bind: address already in use" };
+    await mount(data({ inbounds: [tg] }));
+    await settle();
+    expect(text()).toContain("Port tcp/8443 is taken by another program");
+    expect(text()).not.toContain("Port udp/8443");
   });
 
   it("changes the port from the row: the edit opens on a port that is free on the node", async () => {
@@ -626,7 +657,7 @@ describe("a port that loses UDP packets", () => {
       r.portOverride === 0 ? Promise.reject(refuse(lossy(8443), Code.FailedPrecondition)) : Promise.resolve({ inbound: { port: r.portOverride }, warnings: [] }),
     );
     await mount(data());
-    await click(button("Add profile"));
+    await openAdd();
     await settle();
     await checked();
     expect(input("Port")?.value).toBe("2053");
@@ -643,7 +674,7 @@ describe("a port that loses UDP packets", () => {
       r.portOverride === 8443 && !r.allowLossyPort ? Promise.reject(refuse(lossy(8443, 4443), Code.FailedPrecondition)) : Promise.resolve({ inbound: { port: r.portOverride }, warnings: [] }),
     );
     await mount(data());
-    await click(button("Add profile"));
+    await openAdd();
     await settle();
     await type(input("Port"), "8443");
     await checked();
@@ -662,7 +693,7 @@ describe("a port that loses UDP packets", () => {
       r.validateOnly ? Promise.resolve({ inbound: { port: 8443 }, warnings: [] }) : r.portOverride === 4443 ? Promise.resolve({ inbound: {}, warnings: [] }) : Promise.reject(refuse(lossy(8443, 4443), Code.FailedPrecondition)),
     );
     await mount(data());
-    await click(button("Add profile"));
+    await openAdd();
     await settle();
     await submit();
     await settle();
@@ -684,7 +715,7 @@ describe("a port that loses UDP packets", () => {
       r.validateOnly ? Promise.resolve({ inbound: { port: 8443 }, warnings: [] }) : new Promise((res) => (finish = res)),
     );
     await mount(data());
-    await click(button("Add profile"));
+    await openAdd();
     await settle();
     await checked();
     await submit();
@@ -721,7 +752,7 @@ describe("a port that loses UDP packets", () => {
     updateProfile.mockResolvedValue({ profile: { id: "prf_new", version: 2 } });
     createInbound.mockImplementation((r: { validateOnly?: boolean }) => (r.validateOnly ? Promise.reject(refuse(lossy(443, 2053), Code.FailedPrecondition)) : Promise.resolve({ inbound: {}, warnings: [] })));
     await mount(data());
-    await click(button("Add profile"));
+    await openAdd();
     await settle();
     await click(button("Create Hysteria2 · 443 and put it on de1"));
     await settle();
@@ -737,12 +768,204 @@ describe("a port that loses UDP packets", () => {
     let real = 0;
     createInbound.mockImplementation((r: { validateOnly?: boolean }) => (r.validateOnly || real++ > 0 ? Promise.resolve({ inbound: {}, warnings: [] }) : Promise.reject(refuse(lossy(443, 4443), Code.FailedPrecondition))));
     await mount(data());
-    await click(button("Add profile"));
+    await openAdd();
     await settle();
     await click(button("Create Hysteria2 · 443 and put it on de1"));
     await settle();
     expect(updateProfile).toHaveBeenCalledTimes(1);
     expect(updateProfile).toHaveBeenCalledWith(expect.objectContaining({ settingsJson: JSON.stringify({ port: 4443 }), expectedVersion: 1 }));
     expect(adds()).toHaveLength(2);
+  });
+});
+
+describe("the domain of a VLESS server", () => {
+  const vless = { id: "inb_v", profileId: "prf_v", profileName: "vl", protocol: "vless", state: InboundState.ACTIVE, port: 443, tlsServerName: "", certNotAfterUnix: 0, certPinSha256: "", lastError: "" };
+  const domain = () => input("Domain (SNI)");
+  const edit = async (inbound: object) => {
+    updateInbound.mockResolvedValue({ inbound: {}, warnings: [], freePort: 0 });
+    await mount(data({ inbounds: [inbound] }));
+    await click(button("Edit"));
+    await settle();
+  };
+
+  it("is in the edit window when the server has a name for it (the node's own site, TLS), and is sent as tlsServerNameOverride", async () => {
+    await edit({ ...vless, tlsServerName: "de1.example.com" });
+    expect(domain()?.value).toBe("de1.example.com");
+    await type(domain(), "vpn.example.com");
+    await checked();
+    await click(document.querySelector("[role=dialog] button[type=submit]"));
+    await settle();
+    expect(updateInbound.mock.calls.filter(([r]) => !(r as { validateOnly?: boolean }).validateOnly).at(-1)?.[0]).toMatchObject({ inboundId: "inb_v", tlsServerNameOverride: "vpn.example.com" });
+  });
+
+  it("is there to fix a certificate that could not be made, and to clear a name that was set", async () => {
+    await edit({ ...vless, state: InboundState.FAILED, lastError: "cannot build inbound: a host name is required for a Let's Encrypt certificate" });
+    expect(domain()).toBeDefined();
+    act(() => root?.unmount());
+    host?.remove();
+    await edit({ ...vless, tlsServerNameOverride: "old.example.com" });
+    expect(domain()).toBeDefined();
+  });
+
+  it("is not there for REALITY with another site, which has no certificate name", async () => {
+    await edit(vless);
+    expect(domain()).toBeUndefined();
+  });
+});
+
+describe("the site of a REALITY server on this node", () => {
+  const vless = { id: "inb_v", profileId: "prf_v", profileName: "vl", protocol: "vless", state: InboundState.ACTIVE, port: 443, tlsServerName: "", certNotAfterUnix: 0, certPinSha256: "", lastError: "", realityTarget: "www.example.org:443", realityTargetOverride: "" };
+  const field = () => input("Site on this node");
+  const edit = async (inbound: object) => {
+    updateInbound.mockResolvedValue({ inbound: {}, warnings: [], freePort: 0 });
+    await mount(data({ inbounds: [inbound] }));
+    await click(button("Edit"));
+    await settle();
+  };
+  const saves = () => updateInbound.mock.calls.filter(([r]) => !(r as { validateOnly?: boolean }).validateOnly).map(([r]) => r as Record<string, unknown>);
+
+  it("is a field where the profile shows another site, with the profile's target as its placeholder, and is sent as realityTargetOverride", async () => {
+    await edit(vless);
+    expect(field()?.placeholder).toBe("from the profile: www.example.org:443");
+    expect(input("Domain (SNI)")).toBeUndefined();
+    await type(field(), "shop.example.com:443");
+    await checked();
+    expect(updateInbound.mock.calls.some(([r]) => (r as { validateOnly?: boolean; realityTargetOverride?: string }).validateOnly && (r as { realityTargetOverride?: string }).realityTargetOverride === "shop.example.com:443")).toBe(true);
+    await submit();
+    await settle();
+    expect(saves()).toHaveLength(1);
+    expect(saves()[0]).toMatchObject({ inboundId: "inb_v", realityTargetOverride: "shop.example.com:443" });
+    expect(saves()[0]!.tlsServerNameOverride).toBeUndefined();
+  });
+
+  it("is not there for the node's own site, nor for a server that is not REALITY, and an untouched field sends nothing", async () => {
+    await edit({ ...vless, realityTarget: "self", tlsServerName: "de1.example.com" });
+    expect(field()).toBeUndefined();
+    expect(input("Domain (SNI)")).toBeDefined(); // the node's own site keeps its domain
+    act(() => root?.unmount());
+    host?.remove();
+    await edit({ ...vless, protocol: "hysteria2", realityTarget: "" });
+    expect(field()).toBeUndefined();
+  });
+
+  it("holds the site the node chose, in place of the domain, and 'Back to the profile's target' sends an empty one", async () => {
+    await edit({ ...vless, realityTarget: "shop.example.com:443", realityTargetOverride: "shop.example.com:443", tlsServerName: "shop.example.com" });
+    expect(field()?.value).toBe("shop.example.com:443");
+    expect(input("Domain (SNI)")).toBeUndefined();
+    await click(button("Back to the profile’s target"));
+    await checked();
+    expect(field()?.value).toBe("");
+    await submit();
+    await settle();
+    expect(saves()[0]).toMatchObject({ inboundId: "inb_v", realityTargetOverride: "" });
+  });
+
+  it("is there to reset the site of a server that shows nothing now (its profile went to TLS), and sends an empty one", async () => {
+    await edit({ ...vless, state: InboundState.FAILED, realityTarget: "", realityTargetOverride: "shop.example.com:443", tlsServerName: "", lastError: "reality_target_unsupported" });
+    expect(field()?.value).toBe("shop.example.com:443");
+    await click(button("Back to the profile’s target"));
+    await checked();
+    await submit();
+    await settle();
+    expect(saves()[0]).toMatchObject({ inboundId: "inb_v", realityTargetOverride: "" });
+  });
+
+  it("takes the same site written another way for no change", async () => {
+    await edit({ ...vless, realityTarget: "shop.example.com:443", realityTargetOverride: "shop.example.com:443", tlsServerName: "shop.example.com" });
+    await type(field(), " Shop.Example.com.:0443 ");
+    await checked();
+    expect(updateInbound.mock.calls.every(([r]) => !(r as { realityTargetOverride?: string }).realityTargetOverride)).toBe(true);
+    await submit();
+    await settle();
+    expect(saves().every((r) => r.realityTargetOverride === undefined)).toBe(true);
+  });
+
+  it("tells of the port the server shares, and of a second face, when the site typed makes one", async () => {
+    await edit(vless);
+    updateInbound.mockResolvedValue({
+      inbound: {},
+      freePort: 0,
+      warnings: [
+        { code: "tcp_port_shared", params: { node: "de1", port: "443", profiles: "“vl” and “TT”", default: "TT" } },
+        { code: "share_two_faces", params: { node: "de1", port: "443", profile: "vl", default: "TT" } },
+      ],
+    });
+    await type(field(), "shop.example.com:443");
+    await checked();
+    const notes = document.querySelector("[role=dialog] [data-testid=share-notes]")?.textContent ?? "";
+    expect(notes).toContain("TCP 443 on de1 is shared by");
+    expect(notes).toContain("“vl” shows another site");
+    expect(document.querySelectorAll("[role=dialog] [data-testid=share-notes]")).toHaveLength(1); // the window's own check says it once
+  });
+
+  it("says why the panel refuses what is typed, and does not save it", async () => {
+    await edit(vless);
+    updateInbound.mockRejectedValue(refuse("reality_target_invalid: target=198.51.100.7:443"));
+    await type(field(), "198.51.100.7:443");
+    await checked();
+    expect(text()).toContain("“198.51.100.7:443” does not fit: write a site name and a port");
+    expect(document.querySelector<HTMLButtonElement>("[role=dialog] button[type=submit]")?.disabled).toBe(true);
+    await submit();
+    expect(saves()).toHaveLength(0);
+  });
+
+  it("leads to the card of neighbouring sites, which closes the window", async () => {
+    await edit(vless);
+    const scroll = vi.fn(function (this: Element) {
+      return this.id;
+    });
+    Element.prototype.scrollIntoView = scroll;
+    try {
+      await click(button("Find sites nearby…"));
+      await settle();
+      expect(document.querySelector("[role=dialog]")).toBeNull();
+      // the scroll waits for the window to go: by then the test's page may be gone too, so the timer must not look the card up itself
+      vi.stubGlobal("document", undefined);
+      await new Promise((r) => setTimeout(r, 150));
+      vi.unstubAllGlobals();
+      expect(scroll.mock.results.map((r) => r.value)).toEqual(["sni-scan"]);
+    } finally {
+      vi.unstubAllGlobals();
+      delete (Element.prototype as { scrollIntoView?: unknown }).scrollIntoView;
+    }
+  });
+});
+
+describe("who may change the servers on a node", () => {
+  const hy = { id: "inb_1", profileId: "prf_1", profileName: "test", protocol: "hysteria2", state: InboundState.ACTIVE, port: 443, tlsServerName: "example.com", certNotAfterUnix: 0, certPinSha256: "", lastError: "" };
+  const failed = { ...hy, id: "inb_2", state: InboundState.FAILED, lastError: "listen udp :443: bind: address already in use" };
+  const labels = () => [...document.querySelectorAll("button")].map((b) => b.textContent?.trim() || b.getAttribute("aria-label"));
+
+  it("the owner has every action", async () => {
+    await mount(data({ inbounds: [hy, failed] }));
+    expect(labels()).toEqual(expect.arrayContaining(["Add profile", "Edit", "Restart", "Remove", "Change port"]));
+    expect(text()).not.toContain("Only the owner can add");
+  });
+
+  it("a helper reads the rows and may only restart: RestartInbounds is theirs, the rest is the owner's; one line says so", async () => {
+    role = 2; // Role.HELPER
+    await mount(data({ inbounds: [hy, failed] }));
+    await settle();
+    expect(labels()).toContain("Restart");
+    for (const gone of ["Add profile", "Edit", "Remove", "Change port"]) expect(labels()).not.toContain(gone);
+    expect(text().split("Only the owner can add, change or remove profiles on a node.").length - 1).toBe(1);
+    expect(text()).toContain("Port udp/443 is taken by another program");
+  });
+
+  it("an observer has no action at all", async () => {
+    role = 3; // Role.READONLY
+    await mount(data({ inbounds: [hy] }));
+    await settle();
+    expect(labels()).toEqual([]);
+    expect(text()).toContain("Only the owner can add");
+  });
+
+  it("with no server on the node a non-owner gets the reason instead of 'Add profile', and the dialog does not open for the profile page's request", async () => {
+    role = 2;
+    await mount(data(), { addProfile: "prf_1" });
+    await settle();
+    expect(labels()).not.toContain("Add profile");
+    expect(text()).toContain("Only the owner can add, change or remove profiles on a node.");
+    expect(document.querySelector("[role=dialog]")).toBeNull();
   });
 });

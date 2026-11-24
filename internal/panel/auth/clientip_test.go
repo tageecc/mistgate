@@ -1,8 +1,12 @@
 package auth
 
 import (
+	"bytes"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
+	"strings"
 	"testing"
 )
 
@@ -59,12 +63,9 @@ func TestClientIP(t *testing.T) {
 		{"garbage in the chain: fall back to the peer", tr, "10.0.0.1:1", hdr("X-Forwarded-For", "203.0.113.5, unknown"), "10.0.0.1"},
 		{"empty header value", tr, "10.0.0.1:1", hdr("X-Forwarded-For", ""), "10.0.0.1"},
 		{"XFF with port and IPv4-mapped", tr, "10.0.0.1:1", hdr("X-Forwarded-For", "[::ffff:203.0.113.5]:4711"), "203.0.113.5"},
-		{"Forwarded", tr, "10.0.0.1:1", hdr("Forwarded", `for=203.0.113.5;proto=https;by=10.0.0.1`), "203.0.113.5"},
-		{"Forwarded, quoted IPv6 with port, chain", tr, "10.0.0.1:1", hdr("Forwarded", `for=1.2.3.4, for="[2001:db8::7]:4711";proto=https, For=10.0.0.3`), "2001:db8::7"},
-		{"Forwarded obfuscated node", tr, "10.0.0.1:1", hdr("Forwarded", `for=_hidden`), "10.0.0.1"},
-		{"Forwarded element without for", tr, "10.0.0.1:1", hdr("Forwarded", `proto=https`), "10.0.0.1"},
+		{"Forwarded alone is ignored", tr, "10.0.0.1:1", hdr("Forwarded", `for=203.0.113.5;proto=https`), "10.0.0.1"},
 		{"both headers agree", tr, "10.0.0.1:1", hdr("X-Forwarded-For", "203.0.113.5", "Forwarded", "for=203.0.113.5"), "203.0.113.5"},
-		{"both headers disagree: neither is believed", tr, "10.0.0.1:1", hdr("X-Forwarded-For", "203.0.113.5", "Forwarded", "for=203.0.113.99"), "10.0.0.1"},
+		{"Forwarded cannot override XFF", tr, "10.0.0.1:1", hdr("X-Forwarded-For", "203.0.113.5", "Forwarded", "for=203.0.113.99"), "203.0.113.5"},
 		{"IPv6 proxy", tr, "[fd00::1]:443", hdr("X-Forwarded-For", "2001:db8::9"), "2001:db8::9"},
 		{"IPv4-mapped peer", tr, "[::ffff:10.0.0.1]:443", hdr("X-Forwarded-For", "203.0.113.5"), "203.0.113.5"},
 		{"unparseable peer", tr, "garbage", hdr("X-Forwarded-For", "203.0.113.5"), ""},
@@ -73,6 +74,24 @@ func TestClientIP(t *testing.T) {
 		if g := map[bool]string{true: got.String(), false: ""}[got.IsValid()]; g != tc.want {
 			t.Errorf("%s: got %q, want %q", tc.name, g, tc.want)
 		}
+	}
+}
+
+func TestUntrustedForwardedHeaderWarningIsLoggedOnce(t *testing.T) {
+	untrustedForwardedWarning.Store(false)
+	s, _, _ := newTestService(t)
+	var output bytes.Buffer
+	s.log = slog.New(slog.NewTextHandler(&output, nil))
+	for range 2 {
+		req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+		req.RemoteAddr = "127.0.0.1:1234"
+		req.Header.Set("X-Forwarded-For", "203.0.113.7")
+		if got := s.ClientIP(req); got.String() != "127.0.0.1" {
+			t.Fatalf("untrusted forwarded address: %v", got)
+		}
+	}
+	if count := strings.Count(output.String(), "no trusted proxy is configured"); count != 1 {
+		t.Fatalf("warning count = %d, want one: %q", count, output.String())
 	}
 }
 

@@ -1,3 +1,5 @@
+//go:build !js
+
 package mcp
 
 import (
@@ -27,6 +29,7 @@ const (
 	planTTL         = 10 * time.Minute
 	maxOpenPerToken = 20
 	maxAwaiting     = 50
+	retryLaterDelay = 10 * time.Second
 )
 
 // env is what the tools share.
@@ -67,6 +70,31 @@ func (e *outcomeError) Error() string { return e.msg }
 // failure is an error for the agent (msg) that the owner's UI words by code.
 func failure(code, msg string, kv ...string) error {
 	return &outcomeError{msg: msg, out: outcomeOf(code, kv...)}
+}
+
+// retryLaterFailure marks an apply refusal that happened before any side effect. The executor returns the plan to the
+// state it had before BeginApply, so the caller can retry the same confirmation until the original expiry.
+type retryLaterFailure struct {
+	code  string
+	msg   string
+	after time.Duration
+}
+
+func retryLater(code, msg string, after time.Duration) error {
+	if after <= 0 {
+		after = time.Second
+	}
+	return &retryLaterFailure{code: code, msg: msg, after: after}
+}
+
+func (e *retryLaterFailure) Error() string { return e.msg }
+
+func (e *retryLaterFailure) response() string {
+	seconds := int((e.after + time.Second - 1) / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	return fmt.Sprintf("busy (%s): %s; retry the same confirm_token after %d s", e.code, clean(e.msg, maxError), seconds)
 }
 
 func outcomeOf(code string, kv ...string) Outcome {
@@ -112,7 +140,7 @@ func (o Outcome) paramsJSON() string {
 type planned struct {
 	Summary  string // one English paragraph; never embeds untrusted text (that goes in Facts)
 	Facts    []Fact
-	Danger   []string // step_up | fleet | bulk: any entry makes the plan wait for the owner
+	Danger   []string // the danger codes of tools_change.go: any entry makes the plan wait for the owner
 	InnerRef string   // node_fix: the dry run's own plan id, never shown to the agent
 	// Params, when set, are the arguments as the plan resolved them (a node name became its id, "every outdated node" became
 	// the list the owner sees); they are what gets stored and applied. Nil: the arguments as given.
@@ -177,10 +205,10 @@ type changeSpec[P any] struct {
 // change builds the two tools of a change.
 func change[P any, PP reasoned[P]](s changeSpec[P]) []toolDef {
 	planTool := toolDef{
-		name: s.name + "_plan", min: s.min, procs: s.procs, free: true, isPlan: true, danger: s.danger,
-		desc: s.desc + " Changes nothing yet: it returns a plan and a confirm_token for " + s.name + "_apply.",
+		name: PlanTool(s.name), min: s.min, procs: s.procs, free: true, isPlan: true, danger: s.danger,
+		desc: s.desc + " Changes nothing yet: it returns a plan and a confirm_token for " + ApplyTool(s.name) + ".",
 		add: func(srv *mcp.Server, e *env, desc string) {
-			mcp.AddTool(srv, &mcp.Tool{Name: s.name + "_plan", Description: desc, Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: ptr(false)}},
+			mcp.AddTool(srv, &mcp.Tool{Name: PlanTool(s.name), Description: desc, Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: ptr(false)}},
 				func(ctx context.Context, req *mcp.CallToolRequest, in P) (*mcp.CallToolResult, any, error) {
 					c, err := e.begin(ctx, req, readTimeout)
 					if err != nil {
@@ -213,11 +241,11 @@ func change[P any, PP reasoned[P]](s changeSpec[P]) []toolDef {
 		},
 	}
 	applyTool := toolDef{
-		name: s.name + "_apply", min: s.min, procs: s.procs, danger: s.danger,
-		desc: "Executes the plan made by " + s.name + "_plan, once. Takes only the confirm_token. Call it only after the user agreed to the plan" +
+		name: ApplyTool(s.name), min: s.min, procs: s.procs, danger: s.danger,
+		desc: "Executes the plan made by " + PlanTool(s.name) + ", once. Takes only the confirm_token. Call it only after the user agreed to the plan" +
 			" (and, when the plan says it needs the owner, after the owner approved it in the admin panel).",
 		add: func(srv *mcp.Server, e *env, desc string) {
-			mcp.AddTool(srv, &mcp.Tool{Name: s.name + "_apply", Description: desc, Annotations: &mcp.ToolAnnotations{DestructiveHint: ptr(s.danger), OpenWorldHint: ptr(false)}},
+			mcp.AddTool(srv, &mcp.Tool{Name: ApplyTool(s.name), Description: desc, Annotations: &mcp.ToolAnnotations{DestructiveHint: ptr(s.danger), OpenWorldHint: ptr(false)}},
 				func(ctx context.Context, req *mcp.CallToolRequest, in applyIn) (*mcp.CallToolResult, any, error) {
 					c, err := e.begin(ctx, req, applyTimeout)
 					if err != nil {
@@ -266,6 +294,9 @@ func (e *env) createPlan(c *call, tool string, params []byte, reason string, pl 
 	now := e.now()
 	confirm := newConfirm()
 	needs := len(pl.Danger) > 0
+	if c.assistant != nil && c.assistant.FollowUp && needs {
+		return nil, errors.New("this plan needs owner approval; tell the person to request it in a live turn")
+	}
 	status := StatusPlanned
 	if needs {
 		status = StatusAwaiting
@@ -289,6 +320,23 @@ func (e *env) createPlan(c *call, tool string, params []byte, reason string, pl 
 		NeedsApproval: needs, Reason: reason, InnerRef: pl.InnerRef, Status: status,
 		CreatedAt: now, ExpiresAt: now.Add(planTTL),
 	}
+	out := &PlanOut{
+		PlanID: p.ID, Summary: pl.Summary, Facts: facts, NeedsApproval: needs, Danger: pl.Danger,
+		ExpiresInS: int(planTTL / time.Second), ConfirmToken: confirm,
+	}
+	if needs {
+		out.Next = fmt.Sprintf("Waiting for the owner to approve plan %s in the admin panel (Integrations, Waiting for you). Tell the user. "+
+			"Do not poll more than once every 30 seconds; call %s_apply with the confirm_token after the owner approved.", p.ID, tool)
+	} else {
+		out.Next = "Show the plan to the user and, once they agree, call " + tool + "_apply with the confirm_token."
+	}
+	encodedOut, err := json.Marshal(out)
+	if err != nil {
+		return nil, errors.New("internal error")
+	}
+	if len(encodedOut) > maxResultBytes {
+		return nil, errors.New("approval details are too large to show whole; shorten the change before planning")
+	}
 	if err := e.cfg.Plans.CreateMCPPlan(c.ctx, p, maxOpenPerToken, maxAwaiting); err != nil {
 		if errors.Is(err, ErrTooManyPlans) {
 			return nil, errors.New("too many open plans: apply or let the old ones expire first")
@@ -301,22 +349,24 @@ func (e *env) createPlan(c *call, tool string, params []byte, reason string, pl 
 		auditParams["params"] = pl.AuditParams
 	}
 	e.audit(c, "mcp_plan", auditParams, "ok")
-	out := &PlanOut{
-		PlanID: p.ID, Summary: pl.Summary, Facts: facts, NeedsApproval: needs, Danger: pl.Danger,
-		ExpiresInS: int(planTTL / time.Second), ConfirmToken: confirm,
-	}
-	if needs {
-		out.Next = fmt.Sprintf("Waiting for the owner to approve plan %s in the admin panel (Integrations, Waiting for you). Tell the user. "+
-			"Do not poll more than once every 30 seconds; call %s_apply with the confirm_token after the owner approved.", p.ID, tool)
-	} else {
-		out.Next = "Show the plan to the user and, once they agree, call " + tool + "_apply with the confirm_token."
-	}
 	return out, nil
 }
 
 func (e *env) audit(c *call, action string, params map[string]any, result string) {
 	if e.cfg.Audit != nil {
-		e.cfg.Audit(context.WithoutCancel(c.ctx), AuditEntry{Actor: "mcp:" + c.tokenID, Action: action, Params: params, Result: result})
+		actor, source := "mcp:"+c.tokenID, "mcp"
+		if c.assistant != nil {
+			who := c.assistant.AdminName
+			if who == "" {
+				who = c.assistant.AdminID
+			}
+			actor = "Assistant of " + who
+			if c.assistant.Scheduled {
+				actor = "Scheduled tasks of " + who
+			}
+			source = "assistant"
+		}
+		e.cfg.Audit(context.WithoutCancel(c.ctx), AuditEntry{Actor: actor, Action: action, Params: params, Result: result, Source: source})
 	}
 }
 
@@ -344,6 +394,8 @@ func stateError(p Plan, now time.Time) error {
 		return errors.New("already running")
 	case StatusFailed:
 		return errors.New("failed: " + clean(p.Error, maxError) + ". Make a new plan.")
+	case StatusApplied:
+		return errors.New("already applied")
 	case StatusCancelled:
 		return errors.New("the token was revoked")
 	}
@@ -374,6 +426,7 @@ func (e *env) apply(c *call, tool, confirm string, run func(c *call, pl Plan) (d
 	if err := stateError(pl, e.now()); err != nil {
 		return nil, err
 	}
+	previousStatus := pl.Status
 	// The hash is of the stored arguments as they are now: a row edited behind our back refuses to start.
 	started, err := e.cfg.Plans.BeginApply(c.ctx, pl.ID, c.tokenID, tool, hashOf(pl.ParamsJSON), confirmHash, e.now())
 	if err != nil {
@@ -396,6 +449,17 @@ func (e *env) apply(c *call, tool, confirm string, run func(c *call, pl Plan) (d
 	res, runErr := run(&rc, started)
 	fctx := context.WithoutCancel(c.ctx) // a cancelled request must not leave the plan "applying"
 	if runErr != nil {
+		var retry *retryLaterFailure
+		if errors.As(runErr, &retry) && !errors.Is(runErr, context.DeadlineExceeded) && !errors.Is(c.ctx.Err(), context.DeadlineExceeded) {
+			msg := retry.response()
+			if ferr := e.cfg.Plans.ReleaseApply(fctx, started.ID, previousStatus); ferr != nil {
+				e.cfg.Log.Error("mcp: release apply", "code", "mcp_plan_release_failed", "err", ferr)
+				e.audit(c, "mcp_apply", map[string]any{"plan_id": started.ID, "tool": tool, "result": "busy", "reason_code": retry.code}, "fail")
+				return nil, errors.New("busy (" + retry.code + "): the plan could not be released; check its status before retrying")
+			}
+			e.audit(c, "mcp_apply", map[string]any{"plan_id": started.ID, "tool": tool, "result": "busy", "reason_code": retry.code}, "busy")
+			return nil, errors.New(msg)
+		}
 		msg, out := clean(runErr.Error(), maxError), outcomeOfError(runErr)
 		if errors.Is(runErr, context.DeadlineExceeded) || errors.Is(c.ctx.Err(), context.DeadlineExceeded) {
 			msg = "timeout, outcome unknown: check before retrying"

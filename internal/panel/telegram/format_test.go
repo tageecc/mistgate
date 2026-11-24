@@ -1,6 +1,7 @@
 package telegram
 
 import (
+	"github.com/mistgate/mistgate/internal/node/osupdate"
 	"strconv"
 	"strings"
 	"testing"
@@ -62,6 +63,28 @@ func TestRelayDownTelegramTextIsLocalized(t *testing.T) {
 		}
 		if lang == "zh" && (!hasHan(title) || !hasHan(reason)) {
 			t.Errorf("Chinese relay text has no Han characters: %q / %q", title, reason)
+		}
+	}
+}
+
+func TestWarpReachTelegramText(t *testing.T) {
+	a := store.HealthAlert{Kind: "warp_reach", Subject: "notes.example.com", NodeID: "de1", WhyKey: "health.alert.warp_reach.why",
+		Params: map[string]string{"domain": "notes.example.com", "colo": "FRA", "http_status": "403", "streak": "2"}}
+	wantTitle := "A site blocks the WARP exit of the node"
+	wantReason := "notes.example.com showed a block page through the node's WARP in two checks (Cloudflare colo FRA). Restarting WARP may give another exit."
+	if got := alertTitle("en", a); got != wantTitle {
+		t.Errorf("English title = %q, want %q", got, wantTitle)
+	}
+	if got := alertReason("en", a); got != wantReason {
+		t.Errorf("English reason = %q, want %q", got, wantReason)
+	}
+	for _, lang := range []L{"ru", "zh"} {
+		title, reason := alertTitle(lang, a), alertReason(lang, a)
+		if title == wantTitle || reason == wantReason || !strings.Contains(reason, "notes.example.com") || !strings.Contains(reason, "FRA") {
+			t.Errorf("%s text: %q / %q", lang, title, reason)
+		}
+		if lang == "zh" && (!hasHan(title) || !hasHan(reason)) {
+			t.Errorf("Chinese text has no Han characters: %q / %q", title, reason)
 		}
 	}
 }
@@ -338,6 +361,24 @@ func TestPortLossyAlertTextsAreLocalized(t *testing.T) {
 	}
 }
 
+func TestPathLossyAlertTextsAreLocalized(t *testing.T) {
+	a := store.HealthAlert{Kind: "path_lossy", Severity: 2, NodeID: "minsk1", Subject: "nl1",
+		TitleKey: "health.alert.path_lossy.title", WhyKey: "health.alert.path_lossy.why", Params: map[string]string{
+			"node": "minsk1", "target": "nl1", "target_id": "nl1", "ports": "2053, 2083", "sent": "300", "got": "237",
+			"other": "de1", "other_got": "299", "region": "cis", "other_region": "other",
+		}}
+	for _, lang := range []L{"en", "ru", "zh"} {
+		if title := alertTitle(lang, a); title == "" {
+			t.Errorf("%s title is empty", lang)
+		}
+		if reason := alertReason(lang, a); reason == "" {
+			t.Errorf("%s reason is empty", lang)
+		} else if lang == "en" && reason != "UDP from minsk1 (CIS) to nl1 loses 21% on ports 2053, 2083; from de1 (other region) it arrives 299/300. The loss is on the way from minsk1, not on nl1." {
+			t.Errorf("English path-loss reason = %q", reason)
+		}
+	}
+}
+
 func TestUserHealthAlertsAreLocalized(t *testing.T) {
 	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
 	accessEnded := store.HealthAlert{
@@ -534,6 +575,33 @@ func TestPartialCountryBlockedAlertIncludesMixedSourceNetworks(t *testing.T) {
 	}
 }
 
+// A long network list is cut at a whole network, never inside a bracket ("Республика Саха (Якутия)" has its own).
+func TestCountryBlockedNetworksCutAtAWholeNetwork(t *testing.T) {
+	var nets []string
+	for _, region := range []string{"Республика Саха (Якутия)", "Кировская область", "Республика Саха (Якутия)", "Пермский край", "Тюменская область"} {
+		nets = append(nets, "Rostelecom (AS12389, "+region+", cheburcheck)")
+	}
+	list := strings.Join(nets, ", ")
+	got := networksText(list, 160)
+	want := strings.Join(nets[:2], ", ") + "…" // 59 runes each: the third would end at 181
+	if got != want {
+		t.Errorf("networksText = %q, want %q", got, want)
+	}
+	if got := networksText("MTS (AS30881, Республика Саха (Якутия), cheburcheck)", 20); got != "MTS…" {
+		t.Errorf("one long network = %q, want its name", got)
+	}
+	if got := networksText("MTS, Tele2", 160); got != "MTS, Tele2" {
+		t.Errorf("a short list = %q", got)
+	}
+	a := store.HealthAlert{Kind: "country_blocked", Severity: 2, NodeID: "nl1", WhyKey: "health.alert.country_blocked.why.blocked",
+		Params: map[string]string{"node": "nl1", "country": "RU", "verdict": "blocked", "sources": "cheburcheck", "networks": list}}
+	for _, lang := range []L{"en", "ru", "zh"} {
+		if got := alertReason(lang, a); strings.Count(got, "(") != strings.Count(got, ")") {
+			t.Errorf("%s reason has a half bracket: %q", lang, got)
+		}
+	}
+}
+
 // The alert says which sources saw the block: the probe node alone (a data-centre view of TCP only), Globalping with it, and a
 // disagreement between the two.
 func TestCountryBlockedAlertNamesTheSources(t *testing.T) {
@@ -614,6 +682,73 @@ func TestUpdateFailedReasonIsASentence(t *testing.T) {
 		a := store.HealthAlert{Kind: "update_failed", Params: map[string]string{"node": "de1", "reason": tc.reason}}
 		if got := alertReason(L(tc.lang), a); got != tc.want {
 			t.Errorf("alertReason(%s, %s) = %q, want %q", tc.lang, tc.reason, got, tc.want)
+		}
+	}
+}
+
+// The alert of an OS update that stopped says what happened to the node and what to do, in the three languages, with no way
+// round the node's refusal in it.
+func TestOsUpdateFailedIsASentenceWithAnAdvice(t *testing.T) {
+	a := store.HealthAlert{Kind: "os_update_failed", Params: map[string]string{"node": "de1", "reason": "reboot_held", "code": "boot_default_custom"}}
+	if got, want := alertTitle("en", a), "The OS update of a node stopped"; got != want {
+		t.Errorf("title = %q, want %q", got, want)
+	}
+	for _, lang := range []L{"en", "ru", "zh"} {
+		got := alertReason(lang, a)
+		if got == "" || got == "reboot_held" || strings.Contains(strings.ToLower(got), "anyway") || strings.Contains(got, "всё равно") {
+			t.Errorf("reason (%s) = %q", lang, got)
+		}
+	}
+	if got := alertReason("en", a); !strings.Contains(got, "installed") || !strings.Contains(got, "GRUB_DEFAULT=0") {
+		t.Errorf("reason = %q: what happened and what to do are both needed", got)
+	}
+	if got := alertReason("zh", a); !hasHan(got) {
+		t.Errorf("Chinese reason %q has no Chinese", got)
+	}
+	// every node code and every step reason has a text in all three languages
+	for code, text := range osJobCodes {
+		if text.en == "" || text.ru == "" || text.zh == "" {
+			t.Errorf("node code %s lacks a language", code)
+		}
+	}
+	for key, text := range osUpdateReasons {
+		if text.en == "" || text.ru == "" || text.zh == "" {
+			t.Errorf("step reason %s lacks a language", key)
+		}
+	}
+	notBack := store.HealthAlert{Kind: "os_update_failed", Params: map[string]string{"node": "de1", "reason": "not_back"}}
+	if got := alertReason("en", notBack); !strings.Contains(got, "previous kernel") {
+		t.Errorf("not_back reason = %q: it has to send the owner to the provider’s console", got)
+	}
+	if got := alertReason("en", store.HealthAlert{Kind: "os_update_failed", Params: map[string]string{"reason": "something_new"}}); got != "something_new" {
+		t.Errorf("an unknown reason = %q, want it as it came", got)
+	}
+}
+
+// the reboot-only run installs nothing: its refusal must not say the updates were installed
+func TestOsUpdateFailedRebootHeldIsToldByMode(t *testing.T) {
+	only := store.HealthAlert{Kind: "os_update_failed", Params: map[string]string{"reason": "reboot_held", "mode": "reboot_only", "code": "reboot_limit"}}
+	sec := store.HealthAlert{Kind: "os_update_failed", Params: map[string]string{"reason": "reboot_held", "mode": "security", "code": "reboot_limit"}}
+	for _, lang := range []L{"en", "ru", "zh"} {
+		o, s := alertReason(lang, only), alertReason(lang, sec)
+		if o == s {
+			t.Errorf("%s: the same text for both modes: %q", lang, o)
+		}
+	}
+	if got := alertReason("en", only); strings.Contains(got, "installed") {
+		t.Errorf("a reboot-only run says it installed something: %q", got)
+	}
+	if got := alertReason("en", store.HealthAlert{Kind: "os_update_failed", Params: map[string]string{"reason": "node_lost"}}); !strings.Contains(got, "dropped off") {
+		t.Errorf("node_lost: %q", got)
+	}
+}
+
+// every code the agent can send has its sentence in the three languages
+func TestEveryOsJobCodeHasATelegramText(t *testing.T) {
+	for _, code := range osupdate.Codes {
+		text, ok := osJobCodes[code]
+		if !ok || text.en == "" || text.ru == "" || text.zh == "" {
+			t.Errorf("code %s has no text in en, ru and zh", code)
 		}
 	}
 }

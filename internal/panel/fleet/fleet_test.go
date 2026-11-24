@@ -1202,9 +1202,20 @@ func TestSweepUsesStaleNodeLiveProjection(t *testing.T) {
 	if err != nil || !liveRowsByID(rows)[a.nodeID].Exists || liveRowsByID(rows)[a.nodeID].Connected {
 		t.Fatalf("stale node_live row = %+v, %v; want an existing offline row", rows, err)
 	}
+	hour := time.Now().UTC().Truncate(time.Hour).Unix()
+	e.exec(`INSERT INTO node_traffic_hour (node_id, protocol, hour_start, bytes_up, bytes_down) VALUES (?, 'vless', ?, 100, 200), (?, 'vless', ?, 1000, 2000)`,
+		a.nodeID, hour-2*3600, a.nodeID, hour-48*3600)
 	e.f.sweep(e.ctx)
 	if got := e.count(`SELECT count(*) FROM event WHERE node_id = ? AND code = 'node_down'`, a.nodeID); got != 1 {
 		t.Fatalf("node_down events after stale projection = %d, want 1", got)
+	}
+	// the event says how busy the node was: the last day and the last week
+	var params string
+	if err := e.st.R.QueryRowContext(e.ctx, `SELECT params_json FROM event WHERE node_id = ? AND code = 'node_down'`, a.nodeID).Scan(&params); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(params, `"traffic_24h_bytes":"300"`) || !strings.Contains(params, `"traffic_7d_bytes":"3300"`) {
+		t.Fatalf("node_down event params = %s, want the traffic of the last 24 hours (300) and 7 days (3300)", params)
 	}
 }
 
@@ -1215,7 +1226,10 @@ func (e *env) adminClients() (adminv1connect.NodeServiceClient, adminv1connect.F
 	mux.Handle(p, h)
 	p, h = e.f.FleetHandler()
 	mux.Handle(p, h)
-	srv := httptest.NewServer(mux)
+	// RequireSession puts the signed-in admin into the context in front of these handlers; the tests act as the owner.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mux.ServeHTTP(w, r.WithContext(asOwner(r.Context())))
+	}))
 	e.t.Cleanup(srv.Close)
 	return adminv1connect.NewNodeServiceClient(srv.Client(), srv.URL), adminv1connect.NewFleetServiceClient(srv.Client(), srv.URL)
 }
@@ -1255,12 +1269,16 @@ func TestAdminNodeAndFleetViews(t *testing.T) {
 		t.Errorf("node B %+v", by[ids.nodeB])
 	}
 
+	if _, err := e.st.W.ExecContext(e.ctx, "UPDATE inbound SET direct_in_subscriptions = 0 WHERE id = ?", ids.i1); err != nil {
+		t.Fatal(err)
+	}
 	gn, err := nodes.GetNode(e.ctx, connect.NewRequest(&adminv1.GetNodeRequest{NodeId: a.nodeID}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	g := gn.Msg
 	if len(g.Inbounds) != 2 || g.Inbounds[0].Port != 443 || g.Inbounds[0].TlsServerName != "nodea.example.com" || g.Inbounds[0].ProfileName != "p1" ||
+		g.Inbounds[0].DirectInSubscriptions || g.Inbounds[0].Cdn ||
 		g.Metrics == nil || g.Metrics.RamTotalBytes != 1024 || g.Facts.Hostname != "h" || g.Timeouts.LivenessTimeoutS != 90 {
 		t.Errorf("GetNode %+v", g)
 	}
@@ -1342,6 +1360,18 @@ func TestAdminNodeAndFleetViews(t *testing.T) {
 	}
 	if code(up(&adminv1.UpdateNodeRequest{DnsResolvers: &adminv1.DnsResolvers{Values: []string{"not an ip"}}})) != connect.CodeInvalidArgument {
 		t.Error("bad resolver accepted")
+	}
+	// Notes: line breaks and tabs are allowed and count toward the 500 characters like any other; other control
+	// characters are not.
+	for _, n := range []string{strings.Repeat("\n", 501), strings.Repeat("\t", 300) + strings.Repeat("x", 201), strings.Repeat("я", 501), "bell\a", "nul\x00", "del\x7f", "esc\x1b[2J"} {
+		if code(up(&adminv1.UpdateNodeRequest{Notes: &n})) != connect.CodeInvalidArgument {
+			t.Errorf("notes %q (%d bytes) accepted", n[:min(len(n), 16)], len(n))
+		}
+	}
+	for _, n := range []string{"line one\r\nline two\n\tindented", strings.Repeat("\n", 250) + strings.Repeat("я", 250), ""} {
+		if err := up(&adminv1.UpdateNodeRequest{Notes: &n}); err != nil {
+			t.Errorf("notes %q refused: %v", n[:min(len(n), 16)], err)
+		}
 	}
 	notes, loc := "hoster blocks udp", "Tallinn"
 	if err := up(&adminv1.UpdateNodeRequest{Notes: &notes, Location: &loc, DnsResolvers: &adminv1.DnsResolvers{Values: []string{"77.88.8.8", "1.1.1.1:53"}},

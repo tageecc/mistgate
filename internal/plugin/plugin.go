@@ -50,10 +50,6 @@ type WarpSpec struct {
 	Backend       string // "auto" | "kernel" | "userspace"
 }
 
-// CapRelayForward is the Hello capability of an agent that can forward ports (DesiredState.relays, ApplyResult.relays).
-// The panel sends relays only to a stream that listed it.
-const CapRelayForward = "relay-forward/1"
-
 // RelayForward is one forwarded port of the node (agent.v1.RelayForward): connections to Port go, unchanged, to ToHost:ToPort.
 // ToHost is an IPv4 literal or a name the agent resolves.
 type RelayForward struct {
@@ -62,6 +58,53 @@ type RelayForward struct {
 	Port    uint16
 	ToHost  string
 	ToPort  uint16
+	// Mode is "" (and "dnat": the same plain forward) or "reverse"; ExitNodeID names the exit whose bridge carries a reverse forward.
+	// Both are empty for an agent without agentcap.RelayReverse (the omitempty keeps the JSON the panel digests of a plain forward as it was).
+	Mode       string `json:"Mode,omitempty"`
+	ExitNodeID string `json:"ExitNodeID,omitempty"`
+}
+
+// BridgeHTTP2Streams is MAX_CONCURRENT_STREAMS of the bridge's site (the Go server's 250; it is part of the site's look, so it is
+// not raised), BridgePendingPairs the waiting pairs an exit keeps open on each connection (2 streams each), and BridgePeoplePerConn
+// what is left for people, 2 streams a person: the most people one TLS connection of the bridge carries. A burst may take more
+// waiting pairs for a moment; the figure is the steady one.
+const (
+	BridgeHTTP2Streams  = 250
+	BridgePendingPairs  = 4
+	BridgePeoplePerConn = (BridgeHTTP2Streams - 2*BridgePendingPairs) / 2
+)
+
+// BridgeServe is the entry side of the bridge (agent.v1.BridgeServe): where the exits call and which of them are accepted.
+type BridgeServe struct {
+	Port        uint16 // the TCP port of the entry's site; 0 = 443 of the node's own site
+	Path        string
+	ExitNodeIDs []string
+	PanelVia    bool
+}
+
+// IsZero: nothing is served (an empty BridgeServe on the wire stops the bridge; it hashes like an absent one).
+func (b BridgeServe) IsZero() bool {
+	return b.Port == 0 && b.Path == "" && len(b.ExitNodeIDs) == 0 && !b.PanelVia
+}
+
+// BridgeDial is one entry an exit calls (agent.v1.BridgeDial).
+type BridgeDial struct {
+	EntryNodeID string
+	Host        string // an IP literal or a name
+	Port        uint16
+	SNI         string // optional server name sent as SNI; one of SNI or PinSHA256 is required
+	PinSHA256   string // lowercase hex SHA-256 of the leaf certificate's DER
+	Path        string
+	Pool        uint32 // TLS connections to keep; 0 = the agent's default
+	Targets     []BridgeTarget
+	PanelVia    bool
+}
+
+// BridgeTarget is where the exit passes the connections of one relay: its own server, by network and port (agent.v1.BridgeTarget).
+type BridgeTarget struct {
+	RelayID string
+	Network string
+	Port    uint16
 }
 
 // Listen is what the HOST layer needs. The engine binds Port only; the agent installs the hop DNAT.
@@ -107,6 +150,7 @@ type UserTraffic struct {
 
 // LinkStat is a connection-counter delta. Event counters are reported in the next stats batch; hello, handshake,
 // connection-quality, and packet-volume counters are accumulated by the agent until its next UTC ten-minute boundary.
+// agent.proto LinkCounters says which is which and which engine counts what.
 type LinkStat struct {
 	CredID, InboundID                             string
 	Connects, Rejects, Drops, Stalls, UnknownKeys uint32
@@ -116,7 +160,66 @@ type LinkStat struct {
 	RTTMSSum                                      uint64
 	RTTSamples                                    uint32
 	PktsSent, PktsLost                            uint64
+	// links/3. Volume: the handshake failures of the inbound row and the AmneziaWG handshake counts of a key. Event: the
+	// TCP stalls of a VLESS key (or of the inbound, behind the TLS front).
+	HsUnfinished, TLSAlertsSent, TLSAlertsRecv, TLSCertRefused uint32
+	RealityFallback, AuthFailed                                uint32
+	TCPStalls, TCPStalls16K                                    uint32
+	Initiations, Responses, ResponsesUnmatched                 uint32
+	// vless-hello-kex/1. Event, on a VLESS REALITY key: the ClientHellos of its connections by key exchange.
+	HelloPQ, HelloClassic, HelloUnknown uint32
+	// trusttunnel-refusals/1. Event, on the inbound row: the tunnel requests the engine refused after the credential had
+	// passed, by reason. No credential, person or destination is attached.
+	Refusals TunnelRefusals
 }
+
+// Zero reports a delta without any counter (an engine leaves it out).
+func (s LinkStat) Zero() bool {
+	return s.Connects|s.Rejects|s.Drops|s.Stalls|s.UnknownKeys|s.Hellos|s.Handshakes|s.ClientCloses|s.Freezes|s.Quiet|s.Accepted|
+		s.HellosForeign|s.RTTSamples|s.HsUnfinished|s.TLSAlertsSent|s.TLSAlertsRecv|s.TLSCertRefused|s.RealityFallback|s.AuthFailed|
+		s.TCPStalls|s.TCPStalls16K|s.Initiations|s.Responses|s.ResponsesUnmatched|s.HelloPQ|s.HelloClassic|s.HelloUnknown == 0 &&
+		s.RTTMSSum|s.PktsSent|s.PktsLost == 0 && s.Refusals.Zero()
+}
+
+// TunnelRefusal is why a TrustTunnel engine refused a tunnel request (CONNECT host:port or _udp2) of a credential that had
+// authenticated. The list is closed: agent.proto LinkCounters (capability "trusttunnel-refusals/1") has one counter for each.
+type TunnelRefusal uint8
+
+const (
+	RefusedBlocked         TunnelRefusal = iota // the egress forbids the address (X-Warning 310)
+	RefusedNoIPv4                               // the destination has no IPv4 address and IPv6 is off for clients (301)
+	RefusedConnRefused                          // the connection was refused (301)
+	RefusedConnUnreachable                      // no route to the network or the host (301)
+	RefusedConnDNS                              // the name did not resolve (301)
+	RefusedConnOther                            // any other connection error (301)
+	RefusedTimeout                              // the connect timeout (302)
+	RefusedOtherDeadlines                       // the site's deadlines could not be lifted (300)
+	RefusedOtherAuthority                       // the request's authority could not be read (300)
+	RefusedOtherICMP                            // an ICMP tunnel, which the engine does not carry (300)
+	RefusedOtherDial                            // the egress failed in a way none of the above names (300)
+	RefusedStreamClosed                         // the connection was closing (the client left, or the connection expired)
+	RefusedStreamCredGone                       // the credential was removed, kicked or expired
+	RefusedStreamLimit                          // the credential already holds the most connections it may
+
+	TunnelRefusalKinds = iota
+)
+
+// Name is the reason as the journal and the counters' documentation call it.
+func (r TunnelRefusal) Name() string {
+	if int(r) < len(tunnelRefusalNames) {
+		return tunnelRefusalNames[r]
+	}
+	return "unknown"
+}
+
+var tunnelRefusalNames = [TunnelRefusalKinds]string{"blocked", "no_ipv4", "conn_refused", "conn_unreachable", "conn_dns", "conn_other",
+	"timeout", "other_deadlines", "other_authority", "other_icmp", "other_dial", "stream_closed", "stream_cred_gone", "stream_conn_limit"}
+
+// TunnelRefusals counts refusals by reason, indexed by TunnelRefusal.
+type TunnelRefusals [TunnelRefusalKinds]uint32
+
+// Zero reports no refusal at all.
+func (r TunnelRefusals) Zero() bool { return r == TunnelRefusals{} }
 
 // Session is one open client connection (QUIC connection for Hysteria2, recent handshake for AWG).
 type Session struct {
@@ -153,10 +256,13 @@ type EngineHealth struct {
 type ClientID string
 
 const (
-	ClientHapp    ClientID = "happ"    // user toggle "Happ"
-	ClientAmnezia ClientID = "amnezia" // user toggle "Amnezia"
-	ClientMihomo  ClientID = "mihomo"
-	ClientSingbox ClientID = "singbox" // the official sing-box apps (SFA, SFI, SFM); no user toggle of their own
+	ClientHapp        ClientID = "happ"        // user toggle "Happ"
+	ClientAmnezia     ClientID = "amnezia"     // user toggle "Amnezia"
+	ClientTelegram    ClientID = "telegram"    // user toggle "Telegram": MTProto proxy links
+	ClientTrustTunnel ClientID = "trusttunnel" // user toggle "TrustTunnel": official-app tt:// links
+	ClientMistgate    ClientID = "mistgate"    // the first-party app, enrolled by its client API key
+	ClientMihomo      ClientID = "mihomo"
+	ClientSingbox     ClientID = "singbox" // the official sing-box apps (SFA, SFI, SFM); no user toggle of their own
 )
 
 // ClientFormat is a subscription wire format.
@@ -167,8 +273,14 @@ const (
 	FormatXrayJSON   ClientFormat = "xray-json" // one Xray outbound as a JSON object, see Fragment
 	FormatSingbox    ClientFormat = "singbox"   // one sing-box outbound as a JSON object, see Fragment
 	FormatMihomo     ClientFormat = "mihomo-yaml"
+	FormatMistgate   ClientFormat = "mistgate"    // the first-party client API's structured protocol settings
 	FormatAmneziaVPN ClientFormat = "amnezia-vpn" // vpn://
 	FormatAWGConf    ClientFormat = "awg-conf"
+	// FormatTelegramLink is one tg://proxy link. It is no subscription format: no subscription carries it, the person's
+	// own list of Telegram links does (access.SubView.Telegram).
+	FormatTelegramLink ClientFormat = "tg-link"
+	// FormatTTLink is one official-app tt:// key. It is not a subscription format; a person receives it in their key block.
+	FormatTTLink ClientFormat = "tt-link"
 )
 
 // ClientSupport says which client can consume a protocol, in which formats.

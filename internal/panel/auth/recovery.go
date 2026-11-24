@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/mistgate/mistgate/internal/panel/adminqr"
 	"github.com/mistgate/mistgate/internal/panel/store"
 )
 
@@ -23,13 +24,30 @@ type recoveryRequest struct {
 }
 
 type recoveryResponse struct {
-	AdminDisplayName string `json:"adminDisplayName"`
-	Login            string `json:"login"`
-	Password         string `json:"password"`
-	TOTPURI          string `json:"totpUri"`
-	TOTPSecret       string `json:"totpSecret"`
-	Created          bool   `json:"created"`
-	SessionsEnded    int    `json:"sessionsEnded"`
+	AdminDisplayName string      `json:"adminDisplayName"`
+	Login            string      `json:"login"`
+	Password         string      `json:"password"`
+	TOTPURI          string      `json:"totpUri"`
+	TOTPSecret       string      `json:"totpSecret"`
+	TOTPQr           *recoveryQr `json:"totpQr,omitempty"`
+	Created          bool        `json:"created"`
+	SessionsEnded    int         `json:"sessionsEnded"`
+}
+
+// recoveryQr is the QR code of the new secret, as adminv1.QrCode but for this plain JSON route: n, the modules row by row eight to
+// a byte (base64), and the window for the logo. The recover screen has no session, so it cannot ask EncodeQr.
+type recoveryQr struct {
+	N      uint32  `json:"n"`
+	Bits   []byte  `json:"bits"`
+	Window float64 `json:"window"`
+}
+
+func recoveryQrOf(text string) *recoveryQr {
+	q := adminqr.Encode(text)
+	if q == nil {
+		return nil
+	}
+	return &recoveryQr{N: q.N, Bits: q.Bits, Window: q.Window}
 }
 
 // RecoveryHandler is the public, edge-only endpoint used by the recover screen. The regular Connect auth service stays
@@ -111,6 +129,10 @@ func (s *Service) recoverLoginHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := ResetLogin(r.Context(), s.st, s.vault, resetInput, now)
 	if err != nil {
+		// The token was spent for a reset that did not happen: give it back, the link still has to work.
+		if rerr := s.st.ReleaseRecoveryToken(context.WithoutCancel(r.Context()), tokenHash, now); rerr != nil {
+			s.log.Error("release recovery token", "code", "recovery_token_release_failed", "err", rerr)
+		}
 		var target *ResetTargetError
 		if errors.As(err, &target) {
 			writeRecoveryError(w, http.StatusBadRequest, "invalid_argument", target.Error())
@@ -132,6 +154,7 @@ func (s *Service) recoverLoginHTTP(w http.ResponseWriter, r *http.Request) {
 		Password:         result.Password,
 		TOTPURI:          result.TOTPURI,
 		TOTPSecret:       result.TOTPSecret,
+		TOTPQr:           recoveryQrOf(result.TOTPURI),
 		Created:          result.Created,
 		SessionsEnded:    result.SessionsEnded,
 	}); err != nil {

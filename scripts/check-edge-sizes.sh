@@ -18,19 +18,56 @@ entries=(
   # The program with every role: no longer in the release bundle (the five entries below are), it is what the Node tests and the e2e
   # bridge run, and the size the roles split. 42 MiB: about 3 MB above its size after the October 2026 diet, so a regression like
   # the 7.9 MB template one fails here. 45 MiB since the external reachability sources (cheburcheck, bsbord): every role's code.
-  "mistgate-edge:45"
+  # 46 MiB in November 2026: closing alerts, the server-side audit filters and retention, the split check rollup and the
+  # agent crash-loop alert are admin and jobs code the shipped Workers already carry within their own limits; this entry is
+  # their sum and ships nowhere. The node runtime, host history and path loss reads stay out of the edge (no MCP there).
+  # 47 MiB with the November 2026 audit fixes (46.01 MiB measured): the sign-in reservations, the cold-link window of
+  # subscriptions, the per-node stats budget and the event limits are code of the public, link and admin Workers, each
+  # of which stays within its own limit below; this entry is their sum.
+  # 48 MiB with the client compatibility catalogue (46.94 MiB measured): its admin service and the devices query are code of
+  # the admin Worker, which keeps 1.5 MiB under its own limit; this entry still ships nowhere.
+  # 49 MiB with relay keys for AmneziaWG devices (48.02 MiB measured): a key per relay path, the relay twin in subscriptions,
+  # the audience and traffic of a relay are code of the public and admin Workers, each within its own limit below.
+  # 50 MiB with who a node is handed out to (48.999 MiB measured, 814 bytes under 49): the rule of what a group receives is
+  # the subscription's own rule, so it runs in the public Worker, and setting it is the admin Worker's; this entry is their
+  # sum and ships nowhere.
+  "mistgate-edge:50"
   # Hot path: subscriptions, the person's page, devices. Measured 24.7 MiB (fleet + access + subs, no auth service).
-  "mistgate-edge-public:28"
+  # 29 MiB with the reverse relay (28.23 MiB measured with TrustTunnel and own probes also in, 28.03 MiB for the relay alone):
+  # the agent contract grew by the bridge messages, and every Worker that builds an agent's desired state or reads its reports
+  # carries the generated code; nothing of the bridge itself runs here.
+  "mistgate-edge-public:29"
   # The agent link: wireCore plus the link driver. Measured 26.4 MiB.
-  "mistgate-edge-link:30"
-  # Scheduled work: wireCore, so Telegram, updates and WARP are in it for the work that will move here. Measured 25.1 MiB.
-  "mistgate-edge-jobs:28"
+  # 31 MiB in November 2026 (30.003 MiB measured, 2.9 KiB over 30): nothing of own probes runs here (the service, its
+  # proto package and its health code are VPS-only and are not linked), but the fields a probe point adds to the shared
+  # CountryVantage message (why, probe name, port) are part of adminv1, which wireCore links into every Worker, and the
+  # previous steps had left this entry 5 KiB of room. The message cannot move: the admin reads it from the same package.
+  # With the reverse relay (30.29 MiB measured with TrustTunnel and own probes also in, limit 31 as above): the bridge part of
+  # the desired state and of the agents' reports (BridgeServe, BridgeDial, BridgeState) is this Worker's own job; the generated
+  # agent messages alone are about 80 KB.
+  "mistgate-edge-link:31"
+  # Scheduled work: wireCore, so Telegram, updates and WARP are in it for the work that will move here. Measured 25.1 MiB;
+  # 28.1 MiB in November 2026 with the two-sender UDP port check (fleet, in wireCore: the periodic port recheck runs here).
+  "mistgate-edge-jobs:31"
   # The admin API and the SPA: the largest role, every admin service. Measured 37.6 MiB; 40.1 MiB with the external reachability
   # sources (cheburcheck, bsbord), whose owner RPCs (settings, sealed keys, the paid-check preview) need the admin's step-up and
   # cannot live in jobs, where their ticks run.
-  "mistgate-edge-admin:43"
-  # The Provisioner: wireCore plus the SSH client. Measured 29.4 MiB.
-  "mistgate-edge-provision:32"
+  # 46 MiB in November 2026 (43.0 MiB measured, 4 KiB left): closing alerts, the server-side audit filters, the check
+  # rollup, retention settings and the request ids are admin RPCs and their messages, which is this Worker's job and has
+  # no other Worker to go to. What the edge does not use stays out: the node runtime, host history, path loss, probes and
+  # the panel's logs, export and metrics are VPS-only services (ProbeService, OpsService). Cloudflare's ceiling is 64 MiB;
+  # past about 55 MiB the owner-only rare functions move to a Worker of their own. The debug capture's agent messages
+  # (DebugCapture, DebugCaptureReport, SEVERITY_DEBUG) cost about 15 KB in every Worker, since each links the generated
+  # agentv1 package; its RPCs are the VPS-only OpsService. The Agent update timeout/progress controls are owner-facing
+  # admin RPCs and UI state, so they stay here rather than adding another Worker boundary. 47 MiB with the owner's own
+  # subscription response headers (46.01 MiB measured, 9 KiB over 46): the settings RPC, its validation and the preview are
+  # admin RPCs, and the TrustTunnel and bridge settings merged just before had left 91 KiB of room.
+  # 48 MiB with who a node is handed out to (46.97 MiB measured, 28 KiB under 47): SetNodeSharing and the sharing a node
+  # carries in every list are admin calls and cannot live in another Worker; the connect handler of one new call is most of it.
+  "mistgate-edge-admin:48"
+  # The Provisioner: wireCore plus the SSH client. Measured 29.4 MiB; 31.9 MiB in November 2026 with the panel's SSH key, the
+  # authorized_keys management and the login by an own private key, which need that SSH client and so cannot live elsewhere.
+  "mistgate-edge-provision:35"
 )
 
 status=0

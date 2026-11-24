@@ -1,0 +1,93 @@
+syntax = "proto3";
+
+package mistgate.ownprobe.v1;
+
+// A separate package from mistgate.admin.v1 on purpose, like mistgate.ops.v1 and mistgate.probe.v1: the Cloudflare edition's
+// Workers link every admin message (about 100 KB for this service), and the probes do not run there (ownprobe_wiring_js.go).
+// Every procedure is the owner's and the ones that create, revoke or switch probes need a fresh step-up (internal/panel/auth
+// policy_ownprobe.go); API tokens and the MCP have none of them.
+
+// Owner-managed probes that measure the fleet from a network the owner controls.
+service OwnProbeService {
+  rpc Get(OwnProbeServiceGetRequest) returns (OwnProbeServiceGetResponse);
+  rpc Update(OwnProbeServiceUpdateRequest) returns (OwnProbeServiceUpdateResponse);
+  rpc Create(OwnProbeServiceCreateRequest) returns (OwnProbeServiceCreateResponse);
+  rpc UpdateCommand(OwnProbeServiceUpdateCommandRequest) returns (OwnProbeServiceUpdateCommandResponse);
+  rpc Revoke(OwnProbeServiceRevokeRequest) returns (OwnProbeServiceRevokeResponse);
+  rpc ConfirmNetwork(OwnProbeServiceConfirmNetworkRequest) returns (OwnProbeServiceConfirmNetworkResponse);
+  rpc CheckNow(OwnProbeServiceCheckNowRequest) returns (OwnProbeServiceCheckNowResponse);
+  rpc Disconnect(OwnProbeServiceDisconnectRequest) returns (OwnProbeServiceDisconnectResponse);
+}
+
+message OwnProbeSettings {
+  bool enabled = 1;
+  uint32 interval_min = 2;
+  string fallback_url = 3;
+}
+
+message OwnProbe {
+  string id = 1;
+  string name = 2;
+  string city = 3;
+  string kind = 4;
+  string state = 5;
+  uint32 asn = 6;
+  string operator = 7;
+  string pinned_operator = 8;
+  string version = 9;
+  int64 last_seen_unix = 10 [jstype = JS_NUMBER];
+  int64 last_result_unix = 11 [jstype = JS_NUMBER];
+  uint32 checks_day = 12;
+  int64 token_expires_unix = 13 [jstype = JS_NUMBER];
+  // What the probe's last finished round said of the reference address that a filter blocks: "" (no round yet), "filtered" (the
+  // reference was blocked: the probe's network filters), "open" (it opened: nothing is filtered on the path, so "reachable"
+  // proves nothing) or "unavailable" (the probe could not try it: its network is down or it has the reference switched off).
+  string reference = 14;
+}
+
+message OwnProbeServiceGetRequest {}
+message OwnProbeServiceGetResponse {
+  OwnProbeSettings settings = 1;
+  repeated OwnProbe probes = 2;
+  // The version of the script this panel hands out now (the first 12 characters of its sha256): the same value a probe reports
+  // in OwnProbe.version, so a probe whose version differs is out of date.
+  string script_version = 3;
+}
+
+message OwnProbeServiceUpdateRequest { OwnProbeSettings settings = 1; }
+message OwnProbeServiceUpdateResponse { OwnProbeSettings settings = 1; }
+
+message OwnProbeServiceCreateRequest {
+  string name = 1;
+  string city = 2;
+  // home, mobile or dc.
+  string kind = 3;
+}
+message OwnProbeServiceCreateResponse {
+  OwnProbe probe = 1;
+  // Shown once. The database stores only its hash.
+  string token = 2;
+  // The command for a router with Entware (a Keenetic): it installs the packages first.
+  string command = 3;
+  string script_sha256 = 4;
+  // The command for a server (systemd): the same download and hash check, no packages, the script run through sudo.
+  string server_command = 5;
+}
+
+message OwnProbeServiceUpdateCommandRequest {}
+// The commands that update a probe already standing, built like the install ones (download, sha256 check, then `upgrade`), with
+// no token in them. Empty while the panel has no public HTTPS address (the call then fails).
+message OwnProbeServiceUpdateCommandResponse {
+  string command = 1;
+  string server_command = 2;
+  string script_version = 3;
+}
+
+message OwnProbeServiceRevokeRequest { string id = 1; }
+message OwnProbeServiceRevokeResponse { OwnProbe probe = 1; }
+message OwnProbeServiceConfirmNetworkRequest { string id = 1; }
+message OwnProbeServiceConfirmNetworkResponse { OwnProbe probe = 1; }
+message OwnProbeServiceCheckNowRequest { string id = 1; }
+message OwnProbeServiceCheckNowResponse { OwnProbe probe = 1; }
+message OwnProbeServiceDisconnectRequest {}
+message OwnProbeServiceDisconnectResponse { OwnProbeSettings settings = 1; }

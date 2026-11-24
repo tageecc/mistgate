@@ -3,13 +3,15 @@ title: User page
 description: What a person sees when they open their link in a browser, how the page password works, and how the admin previews the page.
 ---
 
+![A person's card in the admin: traffic, the subscription link and the window with its QR code](../../images/readme/link-dark-en.webp)
+
 The user page is what a browser gets at a person's subscription link: a page made for that person, with their status, their traffic and simple steps to connect. It is the page you send people to; they do not need an account or the admin. Its options and the apps it recommends are set on the **User page** tab of **Subscriptions** (see [Subscriptions](subscriptions.md)).
 
 ## What the person sees
 
 The greeting uses the optional **Name shown on the subscription page** from the user's settings. Leave it blank to use the account name shown in **Users**. This public name is separate from the account name and does not change the user's access or connection details.
 
-The page speaks English, Russian or Simplified Chinese: the first of them in the browser's language list (any Chinese counts), else the panel's default language. A switch in the top bar changes it, and the choice is remembered on that device. The top bar carries the panel's name and logo, and the accent colour of the brand (set in **Settings** → **Interface**).
+The page speaks English, Russian, Simplified Chinese, Persian or Turkish: the first of them in the browser's language list (any Chinese counts), else the panel's default language. Persian reads right to left, with dates in the Persian calendar. A switch in the top bar changes it, and the choice is remembered on that device. The top bar carries the panel's name and logo, and the accent colour of the brand (set in **Settings** → **Interface**).
 
 From top to bottom:
 
@@ -20,9 +22,10 @@ From top to bottom:
    - **Your device**: the platform, detected from the browser (iPhone, Android, Windows, Mac, Linux) and switchable.
    - **With an app** (the names come from the apps list; only link apps are listed, never a key app): the app, then install it (with the store or download button and the card's description) and **Add to Happ**, the one-tap link from the app's template. "Won't open? Copy the link" sits right under it. "All your servers (4) appear in Happ — pick any". A QR code of the link, for connecting a phone, when **QR for a second device** is on. "Connected with the subscription" says when the apps on the link last fetched it. Opening the page does not update this time, and does not add a device; only an app fetch does.
    - **With a key**: install AmneziaVPN, **Add a device** (the key form opens), paste the key. When self-service is off the step says "Ask for a key".
-5. **My devices**: one list with the apps on the link and the person's keys, and one **Add a device** button for both ways (see [My devices](#my-devices)).
-6. **Support**: "Something not working?" with a button to the support link, when **Support button** is on and a link is set.
-7. A line at the bottom: "This link is personal — don't share it. Works while the subscription is active."
+5. **Telegram proxy** and **TrustTunnel**, when the owner switched them on for the person, under the servers (see [Telegram proxy](#telegram-proxy)).
+6. **My devices**: one list with the apps on the link and the person's keys, and one **Add a device** button for both ways (see [My devices](#my-devices)).
+7. **Support**: "Something not working?" with a button to the support link, when **Support button** is on and a link is set.
+8. A line at the bottom: "This link is personal — don't share it. Works while the subscription is active."
 
 A platform with no app gets "There's no app for … — pick another device above". A person who gets nothing yet sees "The server is still being set up — message the admin."
 
@@ -44,7 +47,12 @@ The apps show the same reason as the subscription's only entry: see [Subscriptio
 With **Password on the page** on (the default), the page asks for a password before it shows anything, and the self-service calls need it too. The subscription itself, which apps fetch from the same address, never asks for it: apps cannot type a password.
 
 - The password looks like `k7m2-x9pq`: eight lower-case letters and digits, without the look-alikes 0, 1, l and o. Capitals, spaces and dashes are ignored when it is typed.
-- It is not stored anywhere: the panel derives it from the person's link. A new link means a new password, and the old link and password stop working.
+- It is not stored anywhere: the panel computes it from the person's link and a small number it keeps for the person, the generation of the password (0 until you change it, so nobody's password changed when the number was added). The database holds that number and nothing else: no password, no hash of one.
+- **Change** gives the person a new password for the same link. It asks first, in the password block (in the person's row, in the link window and on the person's page). The old password stops working at once and every browser that entered it asks again; the link and the apps are not touched.
+- **Remove** opens this person's page on their link alone, with no question (it asks first as well). Everyone else keeps their password. **Bring the password back** asks again, with a new password: the old one does not come back.
+- **New link** gives a new password together with the link and starts the number again. A password that was removed stays removed.
+- **Password on the page** stays the main switch: with it off nobody is asked, and the block says that page passwords are switched off for everyone, with a link to the setting.
+- Only the owner and helpers see the password. A token or an agent can change, remove or bring it back (`user_update`, field `page_password`) but never sees it.
 - The admin sees it in the link window next to the link (**Page password**, with its own copy button). **Copy to send** copies the link and the password together as one message:
 
   ```ini
@@ -75,6 +83,24 @@ The steps come from the apps list of the **User page** tab. For the chosen platf
 
 For keys the page gives the AmneziaVPN steps: on a phone "Open AmneziaVPN", "Tap "+" and paste the key", "Tap "Continue""; on a computer "AmneziaVPN → "+" → "Connection settings file" → pick the downloaded file", with the warning to add the file, not the key. "Needs AmneziaVPN 5.0.1.5 or newer" names the oldest client for the key's protocol version.
 
+## Telegram proxy
+
+When the owner has switched **Telegram proxy** on for the person (see [Users and groups](users-and-groups.md#telegram-proxy)), the page has a block **Telegram proxy** with the line "Connect to Telegram through the proxy without a VPN app". It is for the Telegram app only and is independent of the steps above.
+
+- Each row is one [MTProto](mtproto.md) link, named by the server's country and place, like the other servers of the page, and never by the node's or the profile's name in the panel. A second link at the node's IPv6 address ends with **· IPv6**, and one through a relay with **· via RU** (the entry's country code, in the language of the page).
+- **Open in Telegram** opens the link in the Telegram app, which asks the person to confirm the proxy. **Copy link** copies it, to paste into a chat or into Telegram's proxy settings.
+- Before the owner has made the person's key, or while no MTProto server runs for them, the block says "The proxy is still being prepared — message the admin." A person with Telegram switched off has no block.
+- The person cannot re-issue or remove the key on the page. The owner does it in the admin.
+
+The links carry the person's key, so they are as private as the subscription link.
+
+**TrustTunnel.** When the owner has switched **TrustTunnel** on for the person (see [Users and groups](users-and-groups.md#trusttunnel)), the page has a block **TrustTunnel** for the official TrustTunnel apps. It is independent of the steps above.
+
+- Each row is one [TrustTunnel](trusttunnel.md) server, named by the server's country and place, never by the node's or the profile's name in the panel, with a QR code and **Copy link** for its `tt://` link. The person installs the TrustTunnel app (the block links the apps), scans the code or opens the link, and the server appears in the app. The link is always HTTP/2.
+- A server whose certificate is self-signed has no link; its row says "needs a domain with a public certificate". The Mistgate app uses it without a link.
+- Before the owner has made the person's key, or while no TrustTunnel server runs for them, the block says the key is still being prepared. A person with TrustTunnel switched off has no block, and a revoked key leaves no links.
+- The person cannot issue or revoke the key on the page. The owner does it in the admin.
+
 ## My devices
 
 One card holds everything that takes a slot of the person's device limit:
@@ -99,14 +125,14 @@ A way the person cannot use stays on the sheet as a quiet card with the reason: 
 
 ## Self-service devices
 
-With **Devices on the page** on (the default), a person manages their own devices: the apps on the link can be renamed and removed (see [My devices](#my-devices)), and the AmneziaVPN keys as follows. All changes together are limited to 20 an hour per link; past that the page says in how many minutes to try again.
+With **Devices on the page** on (the default), a person manages their own devices: the apps on the link can be renamed and removed (see [My devices](#my-devices)), and the AmneziaVPN keys as follows. All changes together are limited to 20 an hour per client network and 100 an hour per link in total; past that the page says in how many minutes to try again.
 
 - **Add a device** asks first how the device will connect (see [My devices](#my-devices)); the **With a key** way is the form: "Connection option" (the main one is named by the countries of its nodes; a WARP profile is "Spare exit (if some site won't open)"; a 2.0 profile is "For old AmneziaVPN versions (before 5.0.1.5)"), "What kind of device", and "Name (optional)". The key opens at once.
 - For each device: **Show key** as the main action, and the **⋯** menu with **Rename**, **Replace key** (the old one stops working at once) and **Remove** (the VPN on it stops at once). Remove and Replace ask first, in the row.
 - The key window: **Country** (one connection per node; "Each country is a separate connection"), **Copy key**, **Download file**, the steps and a QR code. A server is named as on the **Channel utilization** card and in the person's app: by its country and location, never by the node's name in the panel; a node with neither is "Server", and a repeated name gets a number ("Germany 2"). The key's connection in AmneziaVPN carries the same name after the subscription title ("Mistgate · Germany 2").
 - When an old key stops working (a critical change of the profile, a new port or address of a node), the device says "new key needed", and **Get a new key** walks the person through replacing it.
 
-Limits: only an active person can add a device, show a key or replace one; the device limit applies ("All slots are used. Remove a device you no longer use, or message us"); and one link may make 20 such requests an hour, showing a key included. With the option off, the page lists the keys and says "Keys come from the admin — message us if you need a new one."
+Limits: only an active person can add a device, show a key or replace one; the device limit applies ("All slots are used. Remove a device you no longer use, or message us"); and one client network may make 20 such requests an hour, with a total ceiling of 100 per link. Showing a key counts too. With the option off, the page lists the keys and says "Keys come from the admin — message us if you need a new one."
 
 A person whose subscription is not active still sees their AmneziaVPN keys, and can rename and remove them; adding new ones is not possible.
 
@@ -134,7 +160,7 @@ For each of the person's servers the page gets:
 ### Choosing and applying
 
 - The choice for the apps on the link is written to the audit log as `page_link_dns_choice`: the person's name and the preset. A choice for the keys of a server is made for one server at a time and written as `page_dns_choice`: the person's name, the node's name and the preset. Neither has the link or an address.
-- It counts against the same limit as the other actions on the page: 20 changes an hour per link.
+- It counts against the same limit as the other actions on the page: 20 changes an hour per client network, up to 100 an hour per link overall.
 - Where it works differs by format:
   - **AmneziaVPN and AmneziaWG keys** (`.conf`, `vpn://`, QR code): the DNS is written inside the key, so the person has to press **Get a new key** again. The key itself does not change; the device is marked "new key needed" with the reason DNS until they do. The mark follows what the key holds against what applies to the person on that server now, whatever changed it: their pick or going back to the default, the owner changing the offered presets or the default, a preset edited or deleted. The key counts as received only when the person's own device fetches it: an admin opening the key in the panel does not clear the mark. A key made before this was tracked gets no mark until the person fetches it once.
   - **The AmneziaWG proxies of a Mihomo profile** (Clash Verge Rev, FlClash and the like): the choice applies at the next subscription update.

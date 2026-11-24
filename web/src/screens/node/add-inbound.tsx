@@ -24,7 +24,12 @@ import { groupsQuery, profileListQuery } from "@/screens/users/rpc";
 import { useTx, type Tx } from "@/screens/users/t";
 import { asMode, AwgBackendChoice, canPrepare, useSaveAwgBackend, type AwgMode } from "./awg-backend";
 import { DecoyNotice, portOk, sniPlaceholder, useInboundCheck, useInboundRefresh, WarpWarnings } from "./inbound-check";
+import { ShareFix, ShareNotes } from "./share-fix";
+import { isShareCode } from "@/lib/tcpshare";
+import { markFresh } from "@/components/fx/registry";
 import { LossyNotice, lossyRefusal } from "./port-lossy";
+import { tlsHint } from "./reality-target";
+import { AddProfilesList } from "./add-profiles";
 
 type Node = NonNullable<Plain<GetNodeResponse>["node"]>;
 
@@ -53,35 +58,44 @@ export function AddInbound({ open, onOpenChange, data, initialProfile }: { open:
   const all = list.data ?? [];
   const here = new Set(data.inbounds.map((i) => i.profileId));
   const available = all.filter((p) => !here.has(p.id));
+  // the list of the profiles that can be put (the board's window); a profile that needs a field or a choice opens its form from there, and a
+  // profile named by the caller (a link "add this one") goes straight to its form
+  const [formFor, setFormFor] = useState<string | undefined>(undefined);
+  const form = formFor ?? initialProfile;
+  const showList = open && !list.isPending && all.length > 0 && !selfSigned && available.length > 0 && !form;
   const close = () => {
     onOpenChange(false);
     setSelfSigned(false);
+    setFormFor(undefined);
   };
 
   return (
-    <Modal
-      open={open}
-      onOpenChange={(o) => (o ? onOpenChange(true) : close())}
-      title={t("node.profiles.addTitle", { name: node.name })}
-      description={t("node.profiles.addBody")}
-    >
-      {list.isPending ? (
-        <p className="text-sm text-muted">{t("common.loading")}</p>
-      ) : all.length === 0 || selfSigned ? (
-        <QuickProfile node={node} taken={all.map((p) => p.name)} selfSigned={selfSigned} onDone={close} onBack={selfSigned ? () => setSelfSigned(false) : undefined} />
-      ) : available.length === 0 ? (
-        <div className="flex flex-col gap-3">
-          <Notice>{t("node.profiles.allDeployed")}</Notice>
-          <div className="flex justify-end">
-            <Button variant="ghost" size="md" onClick={close}>
-              {t("common.close")}
-            </Button>
+    <>
+      {showList && <AddProfilesList data={data} available={available} onClose={close} onForm={setFormFor} />}
+      <Modal
+        open={open && !showList}
+        onOpenChange={(o) => (o ? onOpenChange(true) : close())}
+        title={t("node.profiles.addTitle", { name: node.name })}
+        description={t("node.profiles.addBody")}
+      >
+        {list.isPending ? (
+          <p className="text-sm text-muted">{t("common.loading")}</p>
+        ) : all.length === 0 || selfSigned ? (
+          <QuickProfile node={node} taken={all.map((p) => p.name)} selfSigned={selfSigned} onDone={close} onBack={selfSigned ? () => setSelfSigned(false) : undefined} />
+        ) : available.length === 0 ? (
+          <div className="flex flex-col gap-3">
+            <Notice>{t("node.profiles.allDeployed")}</Notice>
+            <div className="flex justify-end">
+              <Button variant="ghost" size="md" onClick={close}>
+                {t("common.close")}
+              </Button>
+            </div>
           </div>
-        </div>
-      ) : (
-        <AddForm data={data} available={available} initialProfile={initialProfile} onDone={close} onSelfSigned={() => setSelfSigned(true)} />
-      )}
-    </Modal>
+        ) : (
+          <AddForm data={data} available={available} initialProfile={form} onDone={close} onSelfSigned={() => setSelfSigned(true)} />
+        )}
+      </Modal>
+    </>
   );
 }
 
@@ -123,6 +137,7 @@ function AddForm({
 
   const check = useInboundCheck(chosen && portOk(port) ? { kind: "create", nodeId: node.id, profileId: chosen, port, sni: noSni ? "" : sni.trim() } : null);
   const refused = check.state === "refused" ? check : null;
+  const share = refused && isShareCode(refused.code) ? { code: refused.code, vars: refused.vars } : null;
   if ((refused?.code === "port_taken" || refused?.code === "port_lossy") && port === "" && !auto && Number(refused.vars.free) > 0) {
     setAuto(refused.vars);
     setPort(refused.vars.free!);
@@ -130,7 +145,7 @@ function AddForm({
   // a Let's Encrypt profile on an IP node: the domain field is where it gets fixed, so the cursor goes there (unless the
   // admin is typing in another field)
   const acme = refused?.code === "acme_needs_domain";
-  const realityDomain = refused?.code === "reality_needs_domain";
+  const realityDomain = refused?.code === "reality_needs_domain" || refused?.code === "mtproto_needs_domain"; // a name for the node's own site / Fake TLS name
   if (realityDomain && domainFor !== chosen) setDomainFor(chosen);
   useEffect(() => {
     if (acme && chosen && !(document.activeElement instanceof HTMLInputElement)) document.getElementById(sniId)?.focus();
@@ -152,6 +167,7 @@ function AddForm({
     },
     onSuccess: (r) => {
       onDone();
+      if (r?.inbound) markFresh("inbound", r.inbound.id); // the new server's card on the node's Profiles tab is washed once
       // the UDP check could not run (port_unchecked), or the port was added although it loses packets: said once, a bit longer
       const notes = portNotes(t, r?.warnings);
       toast(withNotes(t("node.profiles.added", { name: node.name }), notes), notes.length > 0 ? { ms: 8000 } : undefined);
@@ -173,7 +189,9 @@ function AddForm({
     : taken
       ? taken.hop
         ? t("node.check.port.hop", { port: taken.port!, node: node.name, profile: taken.profile!, hop: taken.hop })
-        : t("err.port_taken", taken)
+        : profile?.protocol === "trusttunnel"
+          ? t("where.portTakenTt", { port: taken.port!, node: node.name, profile: taken.profile! })
+          : t("err.port_taken", taken)
       : refused?.code === "port_in_hop"
         ? t("err.port_in_hop", refused.vars)
         : undefined;
@@ -231,6 +249,25 @@ function AddForm({
           </div>
         )}
       </div>
+      {share && (
+        <ShareFix
+          key={chosen}
+          code={share.code}
+          vars={share.vars}
+          node={node}
+          onLeave={onDone}
+          onPut={(name) => {
+            setSni(name);
+            setDomainFor(chosen); // the field of a REALITY profile on the node's own site is hidden until it is asked for
+            add.reset();
+          }}
+          onTake={(p) => {
+            setPort(String(p));
+            setAuto(null);
+            add.reset();
+          }}
+        />
+      )}
       {lossy && (
         <LossyNotice
           vars={lossy}
@@ -253,7 +290,7 @@ function AddForm({
           value={sni}
           onChange={(e) => setSni(e.target.value)}
           placeholder={acme || realityDomain ? "vpn.example.com" : sniPlaceholder(t, effective?.tlsServerName, node.address)}
-          hint={acme || realityDomain ? undefined : t("node.profiles.tlsHint")}
+          hint={acme || realityDomain ? undefined : tlsHint(t, profile?.protocol)}
           error={sniError}
           mono
           autoFocus={realityDomain} // the field of the node's own site appears with the refusal: the cursor goes there as it does
@@ -261,7 +298,7 @@ function AddForm({
           spellCheck={false}
         />
       )}
-      {realityDomain && <Notice tone="danger">{t("err.reality_needs_domain", refused.vars)}</Notice>}
+      {realityDomain && <Notice tone="danger">{t(refused.code === "mtproto_needs_domain" ? "err.mtproto_needs_domain" : "err.reality_needs_domain", refused.vars)}</Notice>}
       {acme && profile && <AcmeBlock vars={refused.vars} profile={profile} nodeName={node.name} onEnter={() => document.getElementById(sniId)?.focus()} onSelfSigned={onSelfSigned} />}
       {blocking && (
         <Notice tone="danger" className="items-start">
@@ -277,6 +314,7 @@ function AddForm({
       )}
       <WarpWarnings check={check} nodeId={node.id} nodeName={node.name} onLeave={onDone} />
       <DecoyNotice check={check} />
+      <ShareNotes check={check} node={node} />
       {add.isError && !lossyRefusal(add.error) && (
         <Notice tone="danger" className="items-start">
           {codedError(add.error, t, "awg.err")}
@@ -327,11 +365,11 @@ function AcmeBlock({ vars, profile, nodeName, onEnter, onSelfSigned }: { vars: R
         <div className="flex flex-col items-start gap-1 pt-1">
           {/* a long profile name wraps instead of running out of the sheet */}
           {unused ? (
-            <Button variant="secondary" size="sm" className="h-auto! min-h-7 py-1 text-left whitespace-normal!" disabled={switchIt.isPending} onClick={() => switchIt.mutate()}>
+            <Button variant="secondary" size="sm" className="h-auto! min-h-7 py-1 text-start whitespace-normal!" disabled={switchIt.isPending} onClick={() => switchIt.mutate()}>
               {t("node.check.self.switch", { profile: profile.name })}
             </Button>
           ) : (
-            <Button variant="secondary" size="sm" className="h-auto! min-h-7 py-1 text-left whitespace-normal!" onClick={onSelfSigned}>
+            <Button variant="secondary" size="sm" className="h-auto! min-h-7 py-1 text-start whitespace-normal!" onClick={onSelfSigned}>
               {t("node.check.self.create", { node: nodeName })}
             </Button>
           )}
@@ -418,6 +456,8 @@ function QuickProfile({ node, taken, selfSigned, onDone, onBack }: { node: Node;
       for (const g of groups.data ?? []) {
         if (chosen.includes(g.id)) await groupsApi.updateGroup({ groupId: g.id, profileIds: { values: [...g.profileIds, made.id] } });
       }
+      markFresh("profile", made.id);
+      if (added?.inbound) markFresh("inbound", added.inbound.id);
       return { name: final, notes: portNotes(t, added?.warnings) };
     },
     onSuccess: ({ name, notes }) => {

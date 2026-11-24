@@ -21,6 +21,7 @@ import (
 	"github.com/mistgate/mistgate/internal/panel/protocols/awg"
 	"github.com/mistgate/mistgate/internal/panel/securitylimit"
 	"github.com/mistgate/mistgate/internal/panel/store"
+	"github.com/mistgate/mistgate/internal/panel/subhdr"
 	"github.com/mistgate/mistgate/internal/panel/subsettings"
 	"github.com/mistgate/mistgate/internal/plugin"
 )
@@ -37,7 +38,7 @@ import (
 //
 // Answers carry `Cache-Control: no-store`. The keys are never embedded in the page: they leave only through these calls,
 // on demand. Every call goes through http.CrossOriginProtection (a browser page of another origin cannot post), counts
-// against a per-token hourly budget of its own, and is refused when the admin switched self-service off.
+// against a per-token-and-network hourly budget of its own, with a larger per-token ceiling, and is refused when the admin switched self-service off.
 
 // Devices is what the endpoints call; *access.Service implements it. A Source that does not leaves the endpoints off.
 type Devices interface {
@@ -154,10 +155,13 @@ func amneziaData(v access.SubView, link string, selfService, preview bool, now t
 func online(last, now time.Time) bool { return !last.IsZero() && now.Sub(last) < awgOnlineWindow }
 
 type configJSON struct {
-	NodeID string `json:"node_id"`
+	NodeID    string `json:"node_id"`
+	ViaNodeID string `json:"via_node_id,omitempty"`
 	// Label is the public name of the server, the same as servers[].label ("Germany · Frankfurt", "Germany 2", "Server").
 	Label       string          `json:"label"`
 	CountryCode string          `json:"country_code"`
+	ViaCountry  string          `json:"via_country,omitempty"`
+	IPv6        bool            `json:"ipv6,omitempty"` // the config goes to the node's IPv6 entry
 	Version     string          `json:"version"`
 	Conf        string          `json:"conf"`    // the .conf text (AmneziaVPN and the AmneziaWG apps import it; one QR)
 	VPNKey      string          `json:"vpn_key"` // vpn:// for AmneziaVPN
@@ -165,6 +169,7 @@ type configJSON struct {
 	Stale       bool            `json:"stale"`
 	Warnings    []string        `json:"warnings"` // codes the page translates: amnezia_desktop_mtu, dns_fallback, dns_no_split
 	MinClients  []pageMinClient `json:"min_clients"`
+	QR          *pageQR         `json:"qr"` // the code of Conf (null when it is too long for a QR code)
 }
 
 type deviceAnswer struct {
@@ -192,8 +197,9 @@ func configsOf(cfgs []access.DeviceConfig) []configJSON {
 	out := make([]configJSON, 0, len(cfgs))
 	for _, c := range cfgs {
 		out = append(out, configJSON{
-			NodeID: c.NodeID, Label: c.Server, CountryCode: c.CountryCode, Version: c.AWGVersion, Conf: c.Conf, VPNKey: c.VPNKey,
-			Filename: c.ConfFilename, Stale: c.Stale, Warnings: nonNil(c.Warnings), MinClients: minClientsJSON(c.MinClients),
+			NodeID: c.NodeID, ViaNodeID: c.ViaNodeID, Label: c.Server, CountryCode: c.CountryCode, ViaCountry: c.ViaCountry, IPv6: c.IPv6,
+			Version: c.AWGVersion, Conf: c.Conf, VPNKey: c.VPNKey,
+			Filename: c.ConfFilename, Stale: c.Stale, Warnings: nonNil(c.Warnings), MinClients: minClientsJSON(c.MinClients), QR: pageQROf(c.Conf),
 		})
 	}
 	return out
@@ -257,7 +263,7 @@ func (h *handler) serveDevices(w http.ResponseWriter, r *http.Request, token, su
 		}
 	}
 	// The keys leave only for a user who can use them; removing a device and renaming one never hurt.
-	if !h.admitWrite(r.Context(), w, token, v, rest == "" || action == "configs" || action == "rotate") {
+	if !h.admitWrite(r.Context(), w, token, client, v, rest == "" || action == "configs" || action == "rotate") {
 		return
 	}
 
@@ -306,8 +312,10 @@ func (h *handler) serveDevices(w http.ResponseWriter, r *http.Request, token, su
 }
 
 // enter is the start every call under a link shares (the devices and the DNS pick), in this order: the page password (a
-// locked page locks what it calls: answered before the database work, which only a cookie of this token earns; the
-// answer is the same for a token that does not exist), the token (unknown = the decoy and a miss), the Source can do the
+// locked page locks what it calls: without a genuine cookie of this token the person's row is looked up first, an unknown token
+// gets the decoy and a miss like on every other route, and a person whose password was removed goes on; the identify work behind
+// it only a cookie of the current generation, or a removed password, earns), the
+// token (unknown = the decoy and a miss), the Source can do the
 // call (else the decoy: the endpoint does not exist), the cross-origin check, the owner's switch (403 off). It answers
 // and returns false when the call ends there. exists says whether the Source can do the call.
 //
@@ -319,9 +327,35 @@ func (h *handler) enter(w http.ResponseWriter, r *http.Request, token, client st
 	on func(*adminv1.SubscriptionSettings) bool, off string) (access.SubView, *tokenState, bool) {
 	ctx := r.Context()
 	set := h.settings(ctx)
-	if exists && h.gated(set) && !h.unlocked(r, token) {
-		jsonError(w, http.StatusUnauthorized, "locked", "")
-		return access.SubView{}, nil, false
+	// The page password. The instance asks (the main switch) and the request holds no cookie that could be right: the call is open
+	// only for a person whose password was removed, which only their row says, so one lookup tells (the same one-row read that
+	// confirms a link). "locked" is the answer of a token that exists; one that does not gets the decoy and a miss, as everywhere
+	// else. A request with a genuine cookie goes on without the lookup and is judged against the person's current generation as
+	// soon as their row is read below (identify).
+	earnedGen, earned := 0, false
+	if exists && h.asks(set) {
+		if earnedGen, earned = h.cookieEarned(r, token); !earned {
+			checker, ok := h.src.(TokenChecker)
+			if !ok { // a source that cannot read the person's state cannot tell that the password was removed
+				jsonError(w, http.StatusUnauthorized, "locked", "")
+				return access.SubView{}, nil, false
+			}
+			page, err := checker.CheckSubscriptionToken(ctx, token)
+			if errors.Is(err, access.ErrUnknownToken) {
+				h.tokens.Delete(token)
+				h.miss(ctx, client)
+				h.decoy.ServeHTTP(w, r)
+				return access.SubView{}, nil, false
+			}
+			if err != nil {
+				jsonError(w, http.StatusInternalServerError, "internal", "")
+				return access.SubView{}, nil, false
+			}
+			if h.gated(set, page) {
+				jsonError(w, http.StatusUnauthorized, "locked", "")
+				return access.SubView{}, nil, false
+			}
+		}
 	}
 	if _, ok := h.tokens.Get(token); ok && exists {
 		switch {
@@ -338,7 +372,7 @@ func (h *handler) enter(w http.ResponseWriter, r *http.Request, token, client st
 			jsonError(w, http.StatusForbidden, off, "")
 			return access.SubView{}, nil, false
 		}
-		if retry := h.writeWait(ctx, token); retry > 0 {
+		if retry := h.writeWait(ctx, token, client); retry > 0 {
 			if !h.confirmCachedToken(ctx, w, r, token, client) {
 				return access.SubView{}, nil, false
 			}
@@ -355,6 +389,11 @@ func (h *handler) enter(w http.ResponseWriter, r *http.Request, token, client st
 	}
 	if err != nil { // the access module logged the cause (never the token)
 		jsonError(w, http.StatusInternalServerError, "internal", "")
+		return access.SubView{}, nil, false
+	}
+	if exists && h.gated(set, v.Page) && !(earned && earnedGen == v.Page.Gen) {
+		// the row is read now: a cookie of an older generation (the password was changed) is locked like none at all
+		jsonError(w, http.StatusUnauthorized, "locked", "")
 		return access.SubView{}, nil, false
 	}
 	if !exists {
@@ -376,9 +415,9 @@ func (h *handler) enter(w http.ResponseWriter, r *http.Request, token, client st
 func (h *handler) confirmCachedToken(ctx context.Context, w http.ResponseWriter, r *http.Request, token, client string) bool {
 	var err error
 	if checker, ok := h.src.(TokenChecker); ok {
-		err = checker.CheckSubscriptionToken(ctx, token)
+		_, err = checker.CheckSubscriptionToken(ctx, token)
 	} else {
-		_, err = h.fetch(ctx, token, plugin.FormatURIList, access.DeviceHint{}, false, false)
+		_, err = h.fetch(ctx, token, plugin.FormatURIList, access.DeviceHint{}, false, false, false)
 	}
 	if errors.Is(err, access.ErrUnknownToken) {
 		h.tokens.Delete(token)
@@ -394,54 +433,74 @@ func (h *handler) confirmCachedToken(ctx context.Context, w http.ResponseWriter,
 }
 
 // admitWrite is the end of the shared start: the user's status (needActive: the call needs a user who can use the
-// servers, 409 user_inactive otherwise) and the hourly budget of writes of the token (429), counted for the devices and
-// the DNS together. It answers and returns false when the call ends there.
-func (h *handler) admitWrite(ctx context.Context, w http.ResponseWriter, token string, v access.SubView, needActive bool) bool {
+// servers, 409 user_inactive otherwise) and the hourly budget of writes for the token and client network (429), counted
+// for the devices and the DNS together. It answers and returns false when the call ends there.
+func (h *handler) admitWrite(ctx context.Context, w http.ResponseWriter, token, client string, v access.SubView, needActive bool) bool {
 	if needActive && v.Status != access.StatusActive {
 		jsonError(w, http.StatusConflict, "user_inactive", v.Status)
 		return false
 	}
-	if retry := h.writeAdmit(ctx, token); retry > 0 {
+	if retry := h.writeAdmit(ctx, token, client); retry > 0 {
 		tooManyWrites(w, retry)
 		return false
 	}
 	return true
 }
 
-func (h *handler) writeWait(ctx context.Context, token string) time.Duration {
+func (h *handler) writeWait(ctx context.Context, token, client string) time.Duration {
 	if h.cfg.MaxWritesPerHour < 0 {
 		return 0
 	}
-	d, err := h.cfg.Limiter.Peek(ctx, h.writeWindow(), "t:"+token)
-	if err != nil {
-		return time.Hour
-	}
-	if !d.Allowed {
-		return d.RetryAfter
+	for _, counter := range h.writeCounters(token, client) {
+		d, err := h.cfg.Limiter.Peek(ctx, counter.window, counter.key)
+		if err != nil {
+			return time.Hour
+		}
+		if !d.Allowed {
+			return d.RetryAfter
+		}
 	}
 	return 0
 }
 
-func (h *handler) writeAdmit(ctx context.Context, token string) time.Duration {
+func (h *handler) writeAdmit(ctx context.Context, token, client string) time.Duration {
 	if h.cfg.MaxWritesPerHour < 0 {
 		return 0
 	}
-	d, err := h.cfg.Limiter.Record(ctx, h.writeWindow(), "t:"+token)
-	if err != nil {
-		return time.Hour
-	}
-	if !d.Allowed {
-		return d.RetryAfter
+	for _, counter := range h.writeCounters(token, client) {
+		d, err := h.cfg.Limiter.Record(ctx, counter.window, counter.key)
+		if err != nil {
+			return time.Hour
+		}
+		if !d.Allowed {
+			return d.RetryAfter
+		}
 	}
 	return 0
 }
 
-func (h *handler) writeWindow() securitylimit.Window {
-	return securitylimit.Window{Name: "subscription-writes", Limit: h.cfg.MaxWritesPerHour, Span: time.Hour}
+type writeCounter struct {
+	window securitylimit.Window
+	key    string
+}
+
+func (h *handler) writeCounters(token, client string) []writeCounter {
+	counters := make([]writeCounter, 0, 2)
+	if client != "" {
+		counters = append(counters, writeCounter{
+			window: securitylimit.Window{Name: "subscription-writes-client", Limit: h.cfg.MaxWritesPerHour, Span: time.Hour},
+			key:    tokenClientLimitKey(token, client),
+		})
+	}
+	counters = append(counters, writeCounter{
+		window: securitylimit.Window{Name: "subscription-writes", Limit: maxWritesPerTokenHour, Span: time.Hour},
+		key:    "t:" + token,
+	})
+	return counters
 }
 
 func tooManyWrites(w http.ResponseWriter, retry time.Duration) {
-	w.Header().Set("Retry-After", strconv.Itoa(int((retry+time.Second-1)/time.Second)))
+	w.Header().Set(subhdr.RetryAfter, strconv.Itoa(int((retry+time.Second-1)/time.Second)))
 	jsonError(w, http.StatusTooManyRequests, "too_many_requests", "")
 }
 
@@ -451,7 +510,7 @@ func tooManyWrites(w http.ResponseWriter, retry time.Duration) {
 // the fetch budget. page: the view carries the page's own data (the DNS of each server), which the answer of a DNS pick
 // needs; the checks of a call do without it.
 func (h *handler) identify(ctx context.Context, token string, page bool) (access.SubView, *tokenState, error) {
-	v, err := h.fetch(ctx, token, plugin.FormatURIList, access.DeviceHint{}, false, page) // the page asks, not an app
+	v, err := h.fetch(ctx, token, plugin.FormatURIList, access.DeviceHint{}, false, page, false) // the page asks, not an app
 	if err != nil {
 		return access.SubView{}, nil, err
 	}
@@ -564,10 +623,10 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 		status, b = http.StatusInternalServerError, []byte(`{"error":"internal"}`)
 	}
 	hd := w.Header()
-	hd["Content-Type"] = headerContentTypeJSON[:1:1]
-	hd["Cache-Control"] = headerCacheNoStore[:1:1]
-	hd["X-Content-Type-Options"] = headerNoSniff[:1:1]
-	hd["Referrer-Policy"] = headerNoReferrer[:1:1]
+	hd[subhdr.ContentType] = headerContentTypeJSON[:1:1]
+	hd[subhdr.CacheControl] = headerCacheNoStore[:1:1]
+	hd[subhdr.XContentTypeOptions] = headerNoSniff[:1:1]
+	hd[subhdr.ReferrerPolicy] = headerNoReferrer[:1:1]
 	w.WriteHeader(status)
 	w.Write(b)
 }

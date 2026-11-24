@@ -10,8 +10,10 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"google.golang.org/protobuf/proto"
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
+	"github.com/mistgate/mistgate/internal/panel/adminqr"
 	"github.com/mistgate/mistgate/internal/panel/store"
 	"github.com/mistgate/mistgate/internal/panel/vault"
 )
@@ -195,13 +197,17 @@ func TestRebindAuthenticator(t *testing.T) {
 	if err != nil || !strings.HasPrefix(b.Msg.TotpUri, "otpauth://totp/") || !strings.Contains(b.Msg.TotpUri, "ada") {
 		t.Fatalf("begin: %+v %v", b, err)
 	}
+	// the screen has no encoder: the code of the new secret comes with it, and is the code of its otpauth URI
+	if want := adminqr.Encode(b.Msg.TotpUri); b.Msg.TotpQr == nil || !proto.Equal(b.Msg.TotpQr, want) {
+		t.Fatalf("TotpQr = %v, want the code of %q", b.Msg.TotpQr, b.Msg.TotpUri)
+	}
 	newSecret := secretOf(t, b.Msg.TotpSecret)
 	if bytes.Equal(newSecret, oldSecret) {
 		t.Fatal("the same secret again")
 	}
 	// Nothing is stored before the code comes back: the old app still signs in.
 	stored, _ := st.PasswordByAdmin(context.Background(), adminID)
-	if opened, _ := s.vault.Open(stored.TOTPSecret, totpAAD(adminID)); !bytes.Equal(opened, oldSecret) {
+	if opened, _ := s.vault.Open(stored.TOTPSecret, TOTPSecretAAD(adminID)); !bytes.Equal(opened, oldSecret) {
 		t.Fatal("the secret changed before it was confirmed")
 	}
 
@@ -447,10 +453,10 @@ func TestResetLoginGivesAPasskeyAdminAPasswordLogin(t *testing.T) {
 	// The secret is sealed for that admin only.
 	cred, _ := st.PasswordByAdmin(ctx, helper.ID)
 	other, _ := vault.New(bytes.Repeat([]byte{7}, vault.KeySize))
-	if _, err := other.Open(cred.TOTPSecret, totpAAD(helper.ID)); err == nil {
+	if _, err := other.Open(cred.TOTPSecret, TOTPSecretAAD(helper.ID)); err == nil {
 		t.Error("the secret opens with another master key")
 	}
-	if _, err := s.vault.Open(cred.TOTPSecret, totpAAD(admin.ID)); err == nil {
+	if _, err := s.vault.Open(cred.TOTPSecret, TOTPSecretAAD(admin.ID)); err == nil {
 		t.Error("the secret opens as another admin's")
 	}
 }
@@ -460,7 +466,7 @@ func TestListAuditByKind(t *testing.T) {
 	s, st, _ := newTestService(t)
 	octx, _ := ownerCtx(t, s, st)
 	for _, r := range [][2]string{
-		{"login", "fail"}, {"password_change", "ok"}, {"page_unlock_lockout", "locked"}, {"user_delete", "ok"}, {"inbound_add", "ok"},
+		{"login", "fail"}, {"password_change", "ok"}, {"page_unlock_lockout", "locked"}, {"user_delete", "ok"}, {"user_link_rotate", "ok"}, {"inbound_add", "ok"},
 		{"preset_default", "ok"}, {"node.awg_prepare", "ok"}, {"call", "ok"}, {"mcp_plan", "ok"}, {"security_update", "rejected"},
 		{"backup_settings_update", "ok"}, {"backup_create", "ok"}, {"backup_storage_test", "ok"}, {"panel_update", "ok"}, {"node_update_schedule", "ok"},
 		{"node_update_schedule_cancel", "ok"}, {"node_dns_options", "ok"}, {"page_dns_choice", "ok"}, {"user_dns_choices_reset", "ok"},
@@ -485,7 +491,7 @@ func TestListAuditByKind(t *testing.T) {
 	if got := list(adminv1.AuditKind_AUDIT_KIND_SIGN_IN); got != "login password_change page_unlock_lockout" {
 		t.Errorf("sign-in: %s", got)
 	}
-	if got := list(adminv1.AuditKind_AUDIT_KIND_CHANGES); got != "user_delete inbound_add preset_default node.awg_prepare security_update "+
+	if got := list(adminv1.AuditKind_AUDIT_KIND_CHANGES); got != "user_delete user_link_rotate inbound_add preset_default node.awg_prepare security_update "+
 		"backup_settings_update backup_create backup_storage_test panel_update node_update_schedule node_update_schedule_cancel node_dns_options page_dns_choice user_dns_choices_reset link_dns_options page_link_dns_choice" {
 		t.Errorf("changes: %s", got)
 	}
@@ -511,5 +517,50 @@ func TestRandomPassword(t *testing.T) {
 			t.Fatalf("repeated %q", p)
 		}
 		seen[p] = true
+	}
+}
+
+// The filters an agent sets (hours, failed_only, action and actor substrings) run in the query and combine with kind.
+func TestListAuditServerSideFilters(t *testing.T) {
+	s, st, _ := newTestService(t)
+	octx, _ := ownerCtx(t, s, st)
+	add := func(at time.Time, actor, action, result string) {
+		t.Helper()
+		if err := st.Audit(context.Background(), at, store.AuditEntry{Actor: actor, Action: action, Result: result}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add(s.now().Add(-72*time.Hour), "mcp:tok_a", "user_create", "ok")
+	add(s.now().Add(-2*time.Hour), "mcp:tok_a", "user_disable", "fail")
+	add(s.now().Add(-time.Hour), "mcp:tok_b", "node_restart", "fail")
+	add(s.now().Add(-time.Minute), "mcp:tok_b", "user_delete", "ok")
+	list := func(req *adminv1.ListAuditRequest) string {
+		t.Helper()
+		r, err := s.ListAudit(octx, connect.NewRequest(req))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for i := len(r.Msg.Entries) - 1; i >= 0; i-- {
+			out = append(out, r.Msg.Entries[i].Action)
+		}
+		return strings.Join(out, " ")
+	}
+	if got := list(&adminv1.ListAuditRequest{Hours: 24, ActionContains: "user_"}); got != "user_disable user_delete" {
+		t.Errorf("hours + action: %s", got)
+	}
+	if got := list(&adminv1.ListAuditRequest{FailedOnly: true, ActorContains: "tok_b"}); got != "node_restart" {
+		t.Errorf("failed + actor: %s", got)
+	}
+	if got := list(&adminv1.ListAuditRequest{FailedOnly: true, Kind: adminv1.AuditKind_AUDIT_KIND_CHANGES}); got != "user_disable" {
+		t.Errorf("failed + kind: %s", got)
+	}
+	// a page is full of matching rows: a page of one with a filter is the newest match, with a cursor to the next
+	r, err := s.ListAudit(octx, connect.NewRequest(&adminv1.ListAuditRequest{FailedOnly: true, PageSize: 1}))
+	if err != nil || len(r.Msg.Entries) != 1 || r.Msg.Entries[0].Action != "node_restart" || r.Msg.NextBeforeId == 0 {
+		t.Fatalf("page: %+v %v", r, err)
+	}
+	if _, err := s.ListAudit(octx, connect.NewRequest(&adminv1.ListAuditRequest{ActorContains: strings.Repeat("x", 101)})); codeOf(err) != connect.CodeInvalidArgument {
+		t.Errorf("long filter: %v", err)
 	}
 }

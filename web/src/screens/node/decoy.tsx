@@ -1,21 +1,26 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Link } from "@tanstack/react-router";
 import { useId, useRef, useState, type ReactNode } from "react";
 import { EditionNotice } from "@/components/edition-notice";
-import { SectionLabel } from "@/components/ui/bits";
-import { Button } from "@/components/ui/button";
+import { Button, buttonClass } from "@/components/ui/button";
 import { Notice } from "@/components/ui/notice";
-import { kindTextClass, StatusDot, type StatusKind } from "@/components/ui/status";
+import type { StatusKind } from "@/components/ui/status";
 import { Role } from "@/gen/mistgate/admin/v1/auth_pb";
 import type { Node as NodeMsg } from "@/gen/mistgate/admin/v1/node_pb";
 import { useT, type T } from "@/i18n";
 import type { MessageKey } from "@/i18n/en";
-import { nodes as nodesApi } from "@/lib/api";
-import { asDecoyMode, decoyModes, isDecoyReason, maxBundleBytes, shortHash, type DecoyMode, type DecoyReason } from "@/lib/decoy";
+import { decoySites, nodes as nodesApi } from "@/lib/api";
+import { asDecoyMode, decoyModes, isDecoyReason, maxBundleBytes, type DecoyMode, type DecoyReason } from "@/lib/decoy";
+import { assignPreviewQuery, builtinId, decoyErrorText, deliveryHint, deliveryOf, nameFromFile, panelDirId, sitesQuery, uploadError } from "@/lib/decoysites";
 import { useEdition } from "@/lib/edition";
-import { errorText } from "@/lib/errors";
-import { useFmt } from "@/lib/format";
+import { cx } from "@/lib/cx";
 import type { Plain } from "@/lib/plain";
 import { meQuery } from "@/lib/session";
+import { LibraryPicker } from "@/screens/decoys/picker";
+import { Msg } from "@/screens/decoys/parts";
+import { Glyph } from "@/screens/overview-parts";
+import { Spin } from "./parts";
+import { SvCard, SvHead, SvOpt } from "./server-parts";
 
 type Node = Plain<NodeMsg>;
 
@@ -38,6 +43,9 @@ const reasonKind: Record<DecoyReason, StatusKind> = {
   panel_invalid: "warn",
   unavailable_in_edition: "off",
 };
+
+/** The tone of a reason code (the Nodes page's bulk rows read it too); one the page does not know is amber. */
+export const decoyReasonKind = (code: string): StatusKind => (isDecoyReason(code) ? reasonKind[code] : "warn");
 
 /**
  * The three-way choice with one line under each. The caller says which ones are off and why (`panelNote` / `ownNote`) and
@@ -91,149 +99,171 @@ export function DecoyModeChoice({
   );
 }
 
-/** "Decoy site" of a node: which site the node shows to strangers, the own archive, and what the node has really applied. Everyone sees it, only the owner changes it (as the API). */
+/** What a scene of /dev-kit puts the card in at the start (the node's own data says the rest). Never set by the product. */
+export const cardDemo: { current?: { mode?: DecoyMode; site?: string; problem?: string } } = {};
+
+/**
+ * "Decoy site" of a node (the board's section Server -> Decoy site): the three ways to show a site to strangers. For "Own site" the
+ * site is chosen in the library (the picker of the Decoy sites page) and goes to the node through AssignDecoySite, after a dry run
+ * that shows what it warns about. An archive dropped on the zone is the quick way: it becomes a site of the library and stands on
+ * this node at once. The bar under the choice says what the node has really done (the delivery words of the library). Everyone sees
+ * it, only the owner changes it (as the API).
+ */
 export function DecoyCard({ node }: { node: Node }) {
+  const demo = cardDemo.current; // the scenes of /dev-kit start the card in a state a click would bring it to
   const t = useT();
-  const fmt = useFmt();
   const qc = useQueryClient();
   const owner = useQuery(meQuery).data?.admin?.role === Role.OWNER;
   const edition = useEdition();
   const saved = asDecoyMode(node.decoyMode);
-  const [mode, setMode] = useState<DecoyMode>(saved);
-  const [file, setFile] = useState<File | null>(null);
-  const [problem, setProblem] = useState("");
+  const savedSite = saved === "own" ? node.decoySiteId : "";
+  const [mode, setMode] = useState<DecoyMode>(demo?.mode ?? saved);
+  const [site, setSite] = useState(demo?.site ?? savedSite);
+  const [problem, setProblem] = useState(demo?.problem ?? "");
+  const [over, setOver] = useState(false);
   const picker = useRef<HTMLInputElement>(null);
 
   // the node changed from elsewhere (another admin, the panel): the choice follows what is saved
-  const [seenSaved, setSeenSaved] = useState(saved);
-  if (seenSaved !== saved) {
-    setSeenSaved(saved);
+  const [seenSaved, setSeenSaved] = useState(`${saved}/${savedSite}`);
+  if (seenSaved !== `${saved}/${savedSite}`) {
+    setSeenSaved(`${saved}/${savedSite}`);
     setMode(saved);
+    setSite(savedSite);
   }
 
   const ownOff = edition.off("decoy_own") || !node.decoyOwnAvailable;
-  const hasBundle = node.decoyBundleSha256 !== "";
-  const needsFile = mode === "own" && !file && !hasBundle;
-  const dirty = mode !== saved || (mode === "own" && file !== null);
+  const needsSite = mode === "own" && !site;
+  const dirty = mode !== saved || (mode === "own" && site !== savedSite);
+  // what putting the site on this node would warn about, asked before it is done (the panel decides it, the card only shows it)
+  const dry = useQuery({ ...assignPreviewQuery(site, [node.id]), enabled: owner && mode === "own" && !!site && dirty && !ownOff });
 
-  const apply = useMutation({
-    mutationFn: async () =>
-      mode === "own" && file
-        ? nodesApi.uploadNodeDecoy({ nodeId: node.id, bundleArchive: new Uint8Array(await file.arrayBuffer()) })
-        : nodesApi.setNodeDecoyMode({ nodeId: node.id, mode }),
-    onSuccess: () => {
-      setFile(null);
-      setProblem("");
-      void qc.invalidateQueries({ queryKey: ["node", node.id] });
-      void qc.invalidateQueries({ queryKey: ["nodes"] });
-    },
-    onError: (e) => setProblem(errorText(e, t)),
-  });
-
-  function pick(f: File | undefined) {
-    if (!f) return;
-    if (f.size > maxBundleBytes) {
-      // never sent: the panel would refuse it anyway
-      setFile(null);
-      setProblem(t("decoy.own.tooBig", { name: f.name, size: Math.ceil((f.size / 1048576) * 10) / 10 }));
-      return;
-    }
+  const refresh = () => {
     setProblem("");
-    setFile(f);
+    for (const k of ["node", "nodes", "decoy-sites", "decoy-site"]) void qc.invalidateQueries({ queryKey: [k] });
+  };
+  const apply = useMutation({
+    mutationFn: async () => (mode === "own" ? decoySites.assignDecoySite({ siteId: site, nodeIds: [node.id], panel: false, dryRun: false }) : nodesApi.setNodeDecoyMode({ nodeId: node.id, mode })),
+    onSuccess: refresh,
+    onError: (e) => setProblem(decoyErrorText(e, t)),
+  });
+  // an archive dropped here: a site of the library first, then the site of this node
+  const drop = useMutation({
+    mutationFn: async (f: File) => {
+      const taken = (await qc.fetchQuery({ ...sitesQuery, staleTime: 0 })).sites.map((s) => s.name);
+      const made = await decoySites.createDecoySite({ name: nameFromFile(f.name, taken), bundleArchive: new Uint8Array(await f.arrayBuffer()), state: "ready", source: "upload" });
+      return decoySites.assignDecoySite({ siteId: made.site!.id, nodeIds: [node.id], panel: false, dryRun: false });
+    },
+    onSuccess: refresh,
+    onError: (e) => {
+      const u = uploadError(e, t);
+      setProblem(u.text ? `${u.title}. ${u.text}` : u.title);
+    },
+  });
+  const busy = apply.isPending || drop.isPending;
+
+  function take(f: File | undefined) {
+    if (!f) return;
+    if (f.size > maxBundleBytes) return setProblem(t("decoy.own.tooBig", { name: f.name, size: Math.ceil((f.size / 1048576) * 10) / 10 }));
+    setProblem("");
+    drop.mutate(f);
   }
 
-  const ownExtra = (
-    <div className="flex flex-col gap-2 rounded-field border border-dashed border-line px-3.5 py-3">
-      <SectionLabel as="span">{t("decoy.own.label")}</SectionLabel>
-      <div className="flex flex-wrap items-center gap-2">
-        <input
-          ref={picker}
-          type="file"
-          hidden
-          aria-label={t("decoy.own.label")}
-          accept=".zip,.tar,.tgz,.gz,application/zip,application/x-tar,application/gzip"
-          onChange={(e) => {
-            pick(e.target.files?.[0]);
-            e.target.value = ""; // the same file can be picked again after a refusal
-          }}
-        />
-        <Button variant="secondary" size="md" disabled={!owner || ownOff} onClick={() => picker.current?.click()}>
-          <span>{file || hasBundle ? t("decoy.own.change") : t("decoy.own.choose")}</span>
-        </Button>
-        <span className="min-w-0 font-mono text-xs break-all text-muted">{file ? `${file.name} · ${fmt.bytes(file.size, 1024)}` : t("decoy.own.none")}</span>
-      </div>
-      <span className="text-xs leading-snug text-pretty text-muted">{t("decoy.own.hint")}</span>
-      <span className="text-xs leading-snug text-muted">
-        {hasBundle ? t("decoy.own.uploaded", { hash: shortHash(node.decoyBundleSha256) }) : t("decoy.own.notUploaded")}
-      </span>
-    </div>
-  );
+  const live = node.decoyAgentMode && node.decoyReasonCode === "" ? asDecoyMode(node.decoyAgentMode) : undefined;
+  const off = (m: DecoyMode) => !owner || busy || (m === "panel" && !node.decoyPanelAvailable && saved !== "panel") || (m === "own" && ownOff);
+  const d = deliveryOf({ reasonCode: node.decoyReasonCode, supported: node.decoySupported });
+  const settled = !busy && !needsSite && !dirty;
+  const bar = busy ? t("np.sv.site.sending") : needsSite ? t("decoy.lib.pick") : dirty ? t("np.sv.site.pending") : d.kind === "ok" ? t("decoy.state.ok") : deliveryHint(t, d) || t(d.word);
+  const barKind = settled && d.kind === "ok" ? "ok" : settled && decoyReasonKind(node.decoyReasonCode) === "off" ? "off" : "";
+  // the site this choice shows, to be opened on the Decoy sites page
+  const open = mode === "builtin" ? builtinId : mode === "panel" ? panelDirId : site;
+  const warnings = dry.data?.warnings ?? [];
+  const shared = warnings.find((w) => w.code === "shared_domains");
 
   return (
-    <section className="flex flex-col gap-3 rounded-card-lg border border-line bg-panel p-4">
-      <SectionLabel as="h2" icon="mask" tone="lavender">
-        {t("decoy.title")}
-      </SectionLabel>
-      <p className="text-[13px] leading-snug text-pretty text-muted">{t("decoy.intro")}</p>
-      <DecoyModeChoice
-        label={t("decoy.title")}
-        value={mode}
-        onChange={(m) => {
-          setMode(m);
-          setProblem("");
-        }}
-        disabled={!owner || apply.isPending}
-        panelOff={!node.decoyPanelAvailable && saved !== "panel"}
-        panelNote={!node.decoyPanelAvailable ? t("decoy.panelNone") : undefined}
-        ownOff={ownOff}
-        ownExtra={ownExtra}
-      />
+    <SvCard aria-label={t("decoy.title")}>
+      <SvHead title={t("decoy.title")} hint={t("decoy.intro")} />
+      <div role="radiogroup" aria-label={t("decoy.title")} className="sv-opts">
+        {decoyModes.map((m) => (
+          <SvOpt key={m} on={mode === m} disabled={off(m)} title={t(`decoy.mode.${m}`)} mark={live === m ? t("np.sv.site.live") : undefined} onPick={() => (setMode(m), setProblem(""))}>
+            <span>{t(`decoy.mode.${m}Hint`)}</span>
+            {m === "panel" && !node.decoyPanelAvailable && <span className="w">{t("decoy.panelNone")}</span>}
+          </SvOpt>
+        ))}
+      </div>
+      {mode === "own" && (
+        <LibraryPicker value={site} onChange={(id) => (setSite(id), setProblem(""))} disabled={!owner || ownOff || busy}>
+          <div
+            role="button"
+            tabIndex={0}
+            aria-label={t("decoy.own.label")}
+            aria-busy={drop.isPending}
+            className={cx("sv-drop", over && "over", (!owner || ownOff || busy) && "pointer-events-none opacity-60")}
+            onClick={() => picker.current?.click()}
+            onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), picker.current?.click())}
+            onDragOver={(e) => (e.preventDefault(), setOver(true))}
+            onDragLeave={() => setOver(false)}
+            onDrop={(e) => {
+              e.preventDefault();
+              setOver(false);
+              if (owner && !ownOff && !busy) take(e.dataTransfer.files[0]);
+            }}
+          >
+            <input
+              ref={picker}
+              type="file"
+              hidden
+              aria-label={t("decoy.own.label")}
+              accept=".zip,.tar,.tgz,.gz,application/zip,application/x-tar,application/gzip"
+              onChange={(e) => {
+                take(e.target.files?.[0]);
+                e.target.value = ""; // the same file can be picked again after a refusal
+              }}
+            />
+            <Glyph d="M12 16V5M7 9l5-5 5 5M5 19h14" size={24} stroke={1.5} />
+            <b>{t("decoy.lib.drop")}</b>
+            <span>{t("decoy.lib.dropText")}</span>
+          </div>
+        </LibraryPicker>
+      )}
       <EditionNotice feature="decoy_own" />
-      {!owner && <p className="text-xs text-muted">{t("decoy.ownerOnly")}</p>}
-      {problem && <Notice tone="danger">{problem}</Notice>}
-      {owner && (
-        <div className="flex flex-wrap items-center justify-end gap-3">
-          {needsFile && <span className="text-xs text-muted">{t("decoy.own.needFile")}</span>}
-          <Button variant="primary" size="md" disabled={!dirty || needsFile || apply.isPending || (mode === "own" && ownOff)} onClick={() => apply.mutate()}>
-            {mode === "own" && file ? t("decoy.upload") : t("decoy.apply")}
-          </Button>
+      {(problem || warnings.length > 0) && (
+        <div className="sv-warns">
+          {problem && <Notice tone="danger">{problem}</Notice>}
+          {shared && (
+            <Msg kind="part" title={t("dz.as.shared")}>
+              <span>{t("dz.as.sharedText")}</span>
+              {shared.paths.length > 0 && (
+                <span className="dz-m" dir="ltr">
+                  {shared.paths.join(", ")}
+                </span>
+              )}
+            </Msg>
+          )}
+          {warnings
+            .filter((w) => w !== shared)
+            .map((w) => (
+              <Msg key={w.code} kind="part" title={t(`dz.ck.${w.code}` as MessageKey)}>
+                <span>{t("dz.as.warnText")}</span>
+              </Msg>
+            ))}
         </div>
       )}
-      <AppliedState node={node} />
-    </section>
-  );
-}
-
-/** What is configured against what the node reported (mode and the first digits of the hash), and why they differ. */
-function AppliedState({ node }: { node: Node }) {
-  const t = useT();
-  const mode = asDecoyMode(node.decoyMode);
-  const reason = node.decoyReasonCode;
-  const kind: StatusKind = reason === "" ? "ok" : isDecoyReason(reason) ? reasonKind[reason] : "warn";
-  const agent = node.decoyAgentMode ? t(`decoy.mode.${asDecoyMode(node.decoyAgentMode)}`) : t("decoy.state.noReport");
-  const row = (label: string, value: string, hash: string) => (
-    <div className="flex min-w-0 flex-col gap-0.5">
-      <span className="text-[11px] text-muted">{label}</span>
-      <span className="text-[13px] font-bold">{value}</span>
-      <span title={hash} className="font-mono text-[11px] break-all text-muted">
-        {hash ? shortHash(hash) : "—"}
-      </span>
-    </div>
-  );
-  return (
-    <div className="flex flex-col gap-2.5 border-t border-line pt-3">
-      <SectionLabel as="h3">{t("decoy.state.title")}</SectionLabel>
-      <div className="grid grid-cols-2 gap-3">
-        {row(t("decoy.state.configured"), t(`decoy.mode.${mode}`), mode === "own" ? node.decoyBundleSha256 : "")}
-        {row(t("decoy.state.reported"), agent, node.decoyAgentSha256)}
+      <div className={cx("sv-save on", barKind)}>
+        <span>{bar}</span>
+        {open && !edition.off("decoy_own") && (
+          <Link to="/decoys/$id" params={{ id: open }} className={cx(buttonClass("secondary", "md"), "dz-open")}>
+            {t("dz.pk.open")}
+          </Link>
+        )}
+        {owner ? (
+          <Button variant="primary" size="md" disabled={!dirty || needsSite || busy || dry.isFetching || (mode === "own" && ownOff)} onClick={() => apply.mutate()}>
+            {busy && <Spin />}
+            {t("decoy.apply")}
+          </Button>
+        ) : (
+          <span className="!ms-0 !text-muted">{t("decoy.ownerOnly")}</span>
+        )}
       </div>
-      <p className={`flex items-start gap-2 text-xs leading-snug text-pretty ${kindTextClass[kind]}`}>
-        <span className="mt-[3px]">
-          <StatusDot kind={kind} />
-        </span>
-        <span>{reason === "" ? t("decoy.state.ok") : reasonText(t, reason)}</span>
-      </p>
-      {!node.decoySupported && reason !== "agent_too_old" && <p className="text-xs leading-snug text-pretty text-muted">{t("decoy.unsupported")}</p>}
-    </div>
+    </SvCard>
   );
 }

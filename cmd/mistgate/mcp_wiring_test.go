@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -164,7 +165,7 @@ func TestMCPEndToEnd(t *testing.T) {
 		}
 		return n
 	}
-	if a, b, c := count(ro), count(op), count(ad); a != 27 || b != 45 || c != 84 {
+	if a, b, c := count(ro), count(op), count(ad); a != len(mcp.ToolNames(mcp.ProfileReadonly)) || b != len(mcp.ToolNames(mcp.ProfileOperator)) || c != len(mcp.ToolNames(mcp.ProfileAdmin)) {
 		t.Errorf("tools per profile: readonly %d, operator %d, admin %d", a, b, c)
 	}
 	// an operator token neither sees nor calls a fleet tool
@@ -179,6 +180,11 @@ func TestMCPEndToEnd(t *testing.T) {
 	// the kl!ck reports are off by default: a readonly token reads the switch and no nodes
 	if out := ok(ro, "klick_reports", map[string]any{}); !strings.Contains(out, `"enabled":false`) || !strings.Contains(out, `"nodes":[]`) {
 		t.Errorf("klick_reports: %s", out)
+	}
+	// the client catalogue on the real access module and the real token policy: a readonly token reads the four counts of an empty
+	// panel; the table itself is not an MCP tool
+	if out := ok(ro, "outdated_devices", map[string]any{}); !strings.Contains(out, `"total":0`) || !strings.Contains(out, `"state":"below_minimum"`) || !strings.Contains(out, `"devices":[]`) {
+		t.Errorf("outdated_devices: %s", out)
 	}
 	// relays on the real access module and the real token policy: a readonly token reads (none yet); the check and the changes
 	// are the admin profile's; no token reaches the procedures over /api
@@ -273,9 +279,12 @@ func TestMCPEndToEnd(t *testing.T) {
 			t.Errorf("%s is %s", u.Name, u.Status)
 		}
 	}
-	// the same chain, rejected
-	rej := decodeJSON[mcp.PlanOut](t, ok(op, "user_enable_plan", map[string]any{"user_ids": ids}))
-	ok(op, "user_enable_apply", map[string]any{"confirm_token": rej.ConfirmToken}) // enabling needs no owner
+	// Enabling three users is within the bulk threshold and their owner-approved disable spent no unattended budget.
+	rej := decodeJSON[mcp.PlanOut](t, ok(op, "user_enable_plan", map[string]any{"user_ids": ids[:3]}))
+	if rej.NeedsApproval {
+		t.Fatalf("enabling three users needs the owner: %+v", rej)
+	}
+	ok(op, "user_enable_apply", map[string]any{"confirm_token": rej.ConfirmToken})
 	dis2 := decodeJSON[mcp.PlanOut](t, ok(op, "user_disable_plan", map[string]any{"user_ids": ids}))
 	if code, body := rpc("owner", "", "ApprovalService", "Reject", `{"id":"`+dis2.PlanID+`"}`); code != 200 {
 		t.Fatalf("Reject: %d %s", code, body)
@@ -283,6 +292,47 @@ func TestMCPEndToEnd(t *testing.T) {
 	if out, isErr := tool(op, "user_disable_apply", map[string]any{"confirm_token": dis2.ConfirmToken}); !isErr || !strings.Contains(out, "rejected by the owner") {
 		t.Errorf("apply after a reject: %s", out)
 	}
+
+	// -- the hourly cap on what a token changes without the owner, on the real limiter and the real principal. Three disables
+	// of three users fit under ten units (the owner-approved four above spent none), the fourth asks for no more than three
+	// users and still waits for the owner, and the same token is refused whole over /api.
+	// A token of its own, so that the earlier calls do not eat into its request-rate burst.
+	_, capSecret := mkToken("capped", store.ProfileOperator)
+	capped, capRPC := session(capSecret), capSecret
+	for i := 1; i <= 3; i++ {
+		if i > 1 {
+			if code, body := rpc("owner", "", "UserService", "SetUsersEnabled", `{"user_ids":["`+ids[0]+`","`+ids[1]+`","`+ids[2]+`"],"enabled":true}`); code != 200 {
+				t.Fatalf("owner resetting users before disable %d: %d %s", i, code, body)
+			}
+		}
+		pl := decodeJSON[mcp.PlanOut](t, ok(capped, "user_disable_plan", map[string]any{"user_ids": ids[:3]}))
+		if pl.NeedsApproval {
+			t.Fatalf("disable plan %d of three users needs the owner: %+v", i, pl)
+		}
+		ok(capped, "user_disable_apply", map[string]any{"confirm_token": pl.ConfirmToken})
+	}
+	if code, body := rpc("owner", "", "UserService", "SetUsersEnabled", `{"user_ids":["`+ids[0]+`","`+ids[1]+`","`+ids[2]+`"],"enabled":true}`); code != 200 {
+		t.Fatalf("owner resetting users before over-limit plan: %d %s", code, body)
+	}
+	over := decodeJSON[mcp.PlanOut](t, ok(capped, "user_disable_plan", map[string]any{"user_ids": ids[:3]}))
+	if !over.NeedsApproval || len(over.Danger) != 1 || over.Danger[0] != "user_change_limit" {
+		t.Fatalf("the fourth disable plan of three users: %+v", over)
+	}
+	if code, body := rpc("", capRPC, "UserService", "SetUsersEnabled", `{"user_ids":["`+ids[0]+`","`+ids[1]+`"],"enabled":false}`); code != 429 ||
+		!strings.Contains(body, "token_user_change_limit") || !strings.Contains(body, "used=9") {
+		t.Errorf("a disable over /api past the cap: %d %s", code, body)
+	}
+	// An owner's session has no budget.
+	if code, body := rpc("owner", "", "UserService", "SetUsersEnabled", `{"user_ids":["`+ids[0]+`"],"enabled":false}`); code != 200 {
+		t.Errorf("an owner disabling a user: %d %s", code, body)
+	}
+	re := decodeJSON[mcp.PlanOut](t, ok(capped, "user_enable_plan", map[string]any{"user_ids": ids}))
+	// Enabling gives access back: it waits for the owner only because it names many people, never because of the
+	// token's hourly limit, even with that limit spent.
+	if re.NeedsApproval || len(re.Danger) != 0 {
+		t.Fatalf("enabling people with the user-change limit spent: %+v", re)
+	}
+	ok(capped, "user_enable_apply", map[string]any{"confirm_token": re.ConfirmToken})
 
 	// -- a fleet change through the owner's grant. The real UpdateService answers 400 "no release key" in this test build, which
 	// is its own answer: it was reached, past the allow-list, the role check and its step-up, only because the plan is approved.
@@ -340,6 +390,121 @@ func TestMCPEndToEnd(t *testing.T) {
 		t.Errorf("node_fix_plan: %v %s", isErr, out)
 	}
 	t.Logf("node_fix_plan on a node that never connected: %s", out)
+
+	// -- the library of decoy sites on the real services, the real token policy and the real fleet: a draft is saved by the token
+	// at once and is on no node; the panel itself refuses a draft call on a ready site; putting a site on a node and a new version
+	// of a site that stands on one wait for the owner and then reach the node.
+	// tokens of their own, so that the earlier calls do not eat into the request-rate burst
+	_, lopSecret := mkToken("libops", store.ProfileOperator)
+	_, ladSecret := mkToken("libboss", store.ProfileAdmin)
+	_, lroSecret := mkToken("libreader", store.ProfileReadonly)
+	lop, lad, lro := session(lopSecret), session(ladSecret), session(lroSecret)
+	const siteMarker = "Marker-DECOY-4417"
+	index := map[string]any{"path": "index.html", "content": "<title>Bakery</title><p>" + siteMarker}
+	if out, isErr := tool(lop, "decoy_site_draft_save", map[string]any{"name": "Bakery", "note": "a small neighbourhood bakery", "files": []any{index, map[string]any{"path": "404.html", "content": "<p>gone"}}}); isErr {
+		t.Fatalf("decoy_site_draft_save: %s", out)
+	} else if d := decodeJSON[mcp.DecoyDraftV](t, out); d.State != "draft" || d.Version != 1 || d.Files != 2 {
+		t.Fatalf("draft = %+v", d)
+	}
+	sites := decodeJSON[mcp.DecoySitesV](t, ok(lro, "decoy_sites_list", map[string]any{}))
+	if len(sites.Sites) != 1 || sites.Sites[0].State != "draft" || sites.Sites[0].Source != "mcp" || sites.Sites[0].MadeBy != "libops" || sites.Sites[0].NodeN != 0 {
+		t.Fatalf("decoy_sites_list: %+v", sites)
+	}
+	siteID := sites.Sites[0].ID
+	// no plan was made for the draft, and no token reaches the library over /api except to read
+	for _, p := range [][2]string{{"CreateDecoySite", `{}`}, {"AddDecoySiteVersion", `{}`}, {"DownloadDecoySite", `{}`}, {"AssignDecoySite", `{"siteId":"` + siteID + `","nodeIds":["x"],"dryRun":true}`}, {"DeleteDecoySite", `{}`}} {
+		for _, s := range []string{lopSecret, ladSecret} {
+			req, _ := http.NewRequest("POST", admin.URL+"/api/mistgate.decoysite.v1.DecoySiteService/"+p[0], strings.NewReader(p[1]))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+s)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != 403 {
+				t.Errorf("%s over /api with a token: %d", p[0], resp.StatusCode)
+			}
+		}
+	}
+	// the owner's plan puts the draft on de1 in one step; it waits for the owner
+	assign := decodeJSON[mcp.PlanOut](t, ok(lad, "decoy_site_assign_plan", map[string]any{"site_id": siteID, "nodes": []string{"de1"}, "mark_ready": true}))
+	if !assign.NeedsApproval {
+		t.Fatalf("assign plan: %+v", assign)
+	}
+	if out, isErr := tool(lad, "decoy_site_assign_apply", map[string]any{"confirm_token": assign.ConfirmToken}); !isErr || !strings.Contains(out, "waiting for the owner") {
+		t.Errorf("assign before the approval: %v %s", isErr, out)
+	}
+	if got := decodeJSON[mcp.DecoySiteGetV](t, ok(lro, "decoy_site_get", map[string]any{"site_id": siteID})); got.Site.State != "draft" || len(got.Nodes) != 0 {
+		t.Fatalf("the plan changed the site: %+v", got.Site)
+	}
+	if code, body := rpc("owner", "", "ApprovalService", "Approve", `{"id":"`+assign.PlanID+`"}`); code != 200 {
+		t.Fatalf("Approve: %d %s", code, body)
+	}
+	if ap := decodeJSON[mcp.ApplyOut](t, ok(lad, "decoy_site_assign_apply", map[string]any{"confirm_token": assign.ConfirmToken})); ap.Status != "applied" {
+		t.Fatalf("assign apply: %+v", ap)
+	}
+	on := decodeJSON[mcp.DecoySiteGetV](t, ok(lro, "decoy_site_get", map[string]any{"site_id": siteID}))
+	if on.Site.State != "ready" || len(on.Nodes) != 1 || on.Nodes[0].Node != "de1" {
+		t.Fatalf("after the assignment: %+v", on)
+	}
+	nodes, err := st.Nodes(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var de1 store.NodeRow
+	for _, n := range nodes {
+		if n.Name == "de1" {
+			de1 = n
+		}
+	}
+	if de1.DecoyMode != "own" || de1.DecoySiteID != siteID || de1.DecoyBundleHash == "" {
+		t.Fatalf("node de1 = mode %q site %q bundle %q", de1.DecoyMode, de1.DecoySiteID, de1.DecoyBundleHash)
+	}
+	// a ready site is not a draft: the panel refuses the draft tool whatever the tool does, and says what to do
+	if out, isErr := tool(lop, "decoy_site_draft_save", map[string]any{"site_id": siteID, "files": []any{index}}); !isErr || !strings.Contains(out, "decoy_site_not_draft") || !strings.Contains(out, "decoy_site_version_plan") {
+		t.Errorf("draft tool on a ready site: %v %s", isErr, out)
+	}
+	if out, isErr := tool(lop, "decoy_site_draft_save", map[string]any{"name": "Other", "note": "n", "files": []any{index}}); isErr {
+		t.Errorf("a second draft: %s", out)
+	}
+	// a new version of the site on the node: the operator's plan, the owner's approval, then the node's bundle changes
+	ver := decodeJSON[mcp.PlanOut](t, ok(lop, "decoy_site_version_plan", map[string]any{"site_id": siteID, "change_files": []any{map[string]any{"path": "menu.html", "content": "<p>menu"}}}))
+	if !ver.NeedsApproval || !strings.Contains(ver.Summary, "1 node") {
+		t.Fatalf("version plan: %+v", ver)
+	}
+	if code, body := rpc("owner", "", "ApprovalService", "Approve", `{"id":"`+ver.PlanID+`"}`); code != 200 {
+		t.Fatalf("Approve: %d %s", code, body)
+	}
+	if ap := decodeJSON[mcp.ApplyOut](t, ok(lop, "decoy_site_version_apply", map[string]any{"confirm_token": ver.ConfirmToken})); ap.Status != "applied" {
+		t.Fatalf("version apply: %+v", ap)
+	}
+	if after, err := st.Node(ctx, de1.ID); err != nil || after.DecoyBundleHash == de1.DecoyBundleHash || after.DecoyMode != "own" {
+		t.Fatalf("node de1 after the new version: %+v %v", after, err)
+	}
+	if got := decodeJSON[mcp.DecoySiteGetV](t, ok(lro, "decoy_site_get", map[string]any{"site_id": siteID})); got.Site.Version != 2 || len(got.Files) != 3 {
+		t.Fatalf("after the new version: %+v", got)
+	}
+	if file := decodeJSON[mcp.DecoyFileV](t, ok(lro, "decoy_site_file", map[string]any{"site_id": siteID, "path": "index.html"})); !strings.Contains(file.Text, siteMarker) {
+		t.Fatalf("decoy_site_file: %+v", file)
+	}
+	// the audit log names the site and the hash, never the text
+	decoyAudit, err := st.ListAudit(ctx, "", 0, 400)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoyRows int
+	for _, r := range decoyAudit {
+		if strings.HasPrefix(r.Action, "decoy_site.") || strings.HasPrefix(r.Action, "mcp_") {
+			decoyRows++
+		}
+		if strings.Contains(r.Params, siteMarker) || strings.Contains(r.Params, "menu</p>") {
+			t.Errorf("audit row %s carries the text of a site: %s", r.Action, r.Params)
+		}
+	}
+	if decoyRows == 0 {
+		t.Error("no audit rows for the library")
+	}
 
 	// -- the connection counters on the real services: a node that never connected does not send them, and a person nobody
 	// connected for has no rows; a readonly token reads both
@@ -412,6 +577,81 @@ func TestMCPEndToEnd(t *testing.T) {
 		t.Errorf("after the refused apply: %d %s", code, body)
 	}
 
+	// -- an own Mihomo template: the operator plans it (a helper's role: only the owner's approval of this plan lets the save change a
+	// template), the owner's card names it without the text, the real save checks and stores it, the readonly token reads it in windows, and no audit row holds the text.
+	const tplMarker = "# marker-template-text-4471"
+	tplText := "mixed-port: 7890\n" + tplMarker + "\nproxy-groups:\n  - name: Proxy\n    type: select\n    include-all-proxies: true\nrules:\n  - MATCH,Proxy\n"
+	tp := decodeJSON[mcp.PlanOut](t, ok(op2, "subscription_mihomo_template_set_plan", map[string]any{"name": "ROUTER", "yaml": tplText, "group_ids": []string{groupID}}))
+	if !tp.NeedsApproval || len(tp.Danger) != 1 || tp.Danger[0] != "user_page" {
+		t.Fatalf("subscription_mihomo_template_set_plan: %+v", tp)
+	}
+	if code, body := rpc("owner", "", "ApprovalService", "ListApprovals", `{}`); code != 200 || !strings.Contains(body, "ROUTER") || strings.Contains(body, "marker-template-text") {
+		t.Errorf("the owner's card for the template: %d %s", code, body)
+	}
+	if out, isErr := tool(op2, "subscription_mihomo_template_set_plan", map[string]any{"name": "ROUTER", "yaml": tplText + "# [redacted]\n"}); !isErr || !strings.Contains(out, "template_has_redaction_markers") {
+		t.Errorf("a text with a marker of the scrubber: %v %s", isErr, out)
+	}
+	if code, body := rpc("owner", "", "ApprovalService", "Approve", `{"id":"`+tp.PlanID+`"}`); code != 200 {
+		t.Fatalf("Approve: %d %s", code, body)
+	}
+	if ap := decodeJSON[mcp.ApplyOut](t, ok(op2, "subscription_mihomo_template_set_apply", map[string]any{"confirm_token": tp.ConfirmToken})); ap.Status != "applied" {
+		t.Errorf("subscription_mihomo_template_set_apply: %+v", ap)
+	}
+	if code, body := rpc("owner", "", "SubscriptionService", "GetSubscriptionSettings", `{}`); code != 200 || !strings.Contains(body, "marker-template-text") {
+		t.Errorf("the template was not saved: %d %s", code, body)
+	}
+	if out := ok(ro, "subscription_settings_get", map[string]any{}); !strings.Contains(out, `"mihomo_templates":[{"name":"ROUTER"`) || strings.Contains(out, "marker-template-text") {
+		t.Errorf("the list of templates: %s", out)
+	}
+	if out := ok(ro, "subscription_mihomo_template_get", map[string]any{"name": "router"}); !strings.Contains(out, "marker-template-text") || !strings.Contains(out, `"bytes":`+strconv.Itoa(len(tplText))) {
+		t.Errorf("the read of the template: %s", out)
+	}
+
+	// The templates are the owner's: the operator's other plans carry them as they are stored and apply without the owner's grant of this
+	// tool; the save over the API as a helper is refused in the subs tests (a token has no way to it but a plan).
+	tx := decodeJSON[mcp.PlanOut](t, ok(op2, "subscription_texts_set_plan", map[string]any{"announcement": "Maintenance tonight"}))
+	if code, body := rpc("owner", "", "ApprovalService", "Approve", `{"id":"`+tx.PlanID+`"}`); code != 200 {
+		t.Fatalf("Approve: %d %s", code, body)
+	}
+	if ap := decodeJSON[mcp.ApplyOut](t, ok(op2, "subscription_texts_set_apply", map[string]any{"confirm_token": tx.ConfirmToken})); ap.Status != "applied" {
+		t.Errorf("subscription_texts_set_apply with a template stored: %+v", ap)
+	}
+	if code, body := rpc("owner", "", "SubscriptionService", "GetSubscriptionSettings", `{}`); code != 200 || !strings.Contains(body, "Maintenance tonight") || !strings.Contains(body, "marker-template-text") {
+		t.Errorf("after the operator's text change: %d %s", code, body)
+	}
+
+	// The routing profiles of Happ and INCY are the owner's too, by the same rule: the operator plans, the apply waits for the owner,
+	// and the save passes only under the owner's approval of this tool's plan.
+	const routingMarker = "marker-routing-profile-5532"
+	routingText := `{"Name":"` + routingMarker + `","DirectSites":["domain:example.ru"]}`
+	rp := decodeJSON[mcp.PlanOut](t, ok(op2, "subscription_routing_set_plan", map[string]any{"name": routingMarker, "profile": routingText, "group_ids": []string{groupID}}))
+	if !rp.NeedsApproval {
+		t.Fatalf("subscription_routing_set_plan: %+v", rp)
+	}
+	if out, isErr := tool(op2, "subscription_routing_set_apply", map[string]any{"confirm_token": rp.ConfirmToken}); !isErr || !strings.Contains(out, "waiting for the owner") {
+		t.Errorf("routing apply before the approval: %v %s", isErr, out)
+	}
+	if code, body := rpc("owner", "", "ApprovalService", "Approve", `{"id":"`+rp.PlanID+`"}`); code != 200 {
+		t.Fatalf("Approve: %d %s", code, body)
+	}
+	if ap := decodeJSON[mcp.ApplyOut](t, ok(op2, "subscription_routing_set_apply", map[string]any{"confirm_token": rp.ConfirmToken})); ap.Status != "applied" {
+		t.Errorf("subscription_routing_set_apply: %+v", ap)
+	}
+	if code, body := rpc("owner", "", "SubscriptionService", "GetSubscriptionSettings", `{}`); code != 200 || !strings.Contains(body, routingMarker) {
+		t.Errorf("the routing profile was not saved: %d %s", code, body)
+	}
+	// another plan of the operator carries the stored profile unchanged
+	tx2 := decodeJSON[mcp.PlanOut](t, ok(op2, "subscription_texts_set_plan", map[string]any{"announcement": "Maintenance over"}))
+	if code, body := rpc("owner", "", "ApprovalService", "Approve", `{"id":"`+tx2.PlanID+`"}`); code != 200 {
+		t.Fatalf("Approve: %d %s", code, body)
+	}
+	if ap := decodeJSON[mcp.ApplyOut](t, ok(op2, "subscription_texts_set_apply", map[string]any{"confirm_token": tx2.ConfirmToken})); ap.Status != "applied" {
+		t.Errorf("subscription_texts_set_apply with a routing profile stored: %+v", ap)
+	}
+	if code, body := rpc("owner", "", "SubscriptionService", "GetSubscriptionSettings", `{}`); code != 200 || !strings.Contains(body, "Maintenance over") || !strings.Contains(body, routingMarker) {
+		t.Errorf("after the operator's text change: %d %s", code, body)
+	}
+
 	// -- the audit trail: the plan, the apply and the module's own rows carry the token as mcp:<id>
 	rows, err := st.ListAudit(ctx, "", 0, 200)
 	if err != nil {
@@ -422,6 +662,9 @@ func TestMCPEndToEnd(t *testing.T) {
 		seen[r.Source+"/"+r.Action+"/"+r.Actor] = true
 		if strings.Contains(r.Params, "cf_") || strings.Contains(r.Params, opSecret) || strings.Contains(r.Params, op2Secret) {
 			t.Errorf("audit row %s carries a secret: %s", r.Action, r.Params)
+		}
+		if strings.Contains(r.Params, "marker-template-text") {
+			t.Errorf("audit row %s carries the text of a template: %s", r.Action, r.Params)
 		}
 	}
 	for _, want := range []string{"mcp/mcp_plan/mcp:" + opID, "mcp/mcp_apply/mcp:" + opID, "mcp/mcp_apply/mcp:" + adID, "panel/approval_approve/adm_owner",
@@ -476,7 +719,7 @@ func TestMCPEndToEnd(t *testing.T) {
 		t.Fatalf("connect through mistgate mcp: %v (%s)", err, proxyErr.String())
 	}
 	defer ps.Close()
-	if n := count(ps); n != 27 {
+	if n := count(ps); n != 50 {
 		t.Errorf("tools through the proxy: %d", n)
 	}
 	if out := ok(ps, "fleet_status", map[string]any{}); !strings.Contains(out, `"nodes_total"`) {

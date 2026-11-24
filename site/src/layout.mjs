@@ -1,7 +1,7 @@
 // HTML templates and UI strings. No dependencies: plain template literals.
-import { SITE, GITHUB, pageUrl, editUrl } from "./urls.mjs";
+import { SITE, GITHUB, pageUrl, landingUrl, editUrl } from "./urls.mjs";
 import { icon, NAV } from "./icons.mjs";
-import { renderLanding } from "./landing.mjs";
+import { WEBSITE, ldScript } from "./jsonld.mjs";
 
 export const T = {
   en: {
@@ -11,7 +11,7 @@ export const T = {
     onPage: "On this page", prev: "Previous", next: "Next", edit: "Edit this page on GitHub", theme: "Switch theme", github: "Mistgate on GitHub", stars: "Mistgate on GitHub, {n} stars",
     language: "Language", copy: "Copy", copied: "Copied", table: "Table", plain: "Text", diagram: "Diagram", permalink: "Link to the section", pending: "This page is not written yet", roadmap: "Roadmap phases",
     license: "Released under AGPL-3.0", other: "Other",
-    inAdmin: "In the admin", sections: { overview: "Overview", nodes: "Nodes", users: "Users", profiles: "Profiles", subscriptions: "Subscriptions", health: "Health", reachability: "Reachability", updates: "Updates", integrations: "Integrations", settings: "Settings" },
+    inAdmin: "In the admin", sections: { overview: "Overview", nodes: "Nodes", users: "Users", profiles: "Profiles", subscriptions: "Subscriptions", health: "Health", reachability: "Reachability", updates: "Updates", ai: "AI", integrations: "Integrations", settings: "Settings" },
     notFound: "Page not found", notFoundText: "There is no such page. It may have moved or not been written yet.", toHome: "Go to the documentation",
   },
   ru: {
@@ -21,20 +21,49 @@ export const T = {
     onPage: "На этой странице", prev: "Назад", next: "Дальше", edit: "Править страницу на GitHub", theme: "Сменить тему", github: "Mistgate на GitHub", stars: "Mistgate на GitHub, звёзд: {n}",
     language: "Язык", copy: "Копировать", copied: "Скопировано", table: "Таблица", plain: "Текст", diagram: "Схема", permalink: "Ссылка на раздел", pending: "Эта страница ещё не написана", roadmap: "Этапы плана",
     license: "Лицензия AGPL-3.0", other: "Прочее",
-    inAdmin: "В админке", sections: { overview: "Обзор", nodes: "Ноды", users: "Пользователи", profiles: "Профили", subscriptions: "Подписки", health: "Здоровье", reachability: "Доступность", updates: "Обновления", integrations: "Интеграции", settings: "Настройки" },
+    inAdmin: "В админке", sections: { overview: "Обзор", nodes: "Ноды", users: "Пользователи", profiles: "Профили", subscriptions: "Подписки", health: "Здоровье", reachability: "Доступность", updates: "Обновления", ai: "ИИ", integrations: "Интеграции", settings: "Настройки" },
     notFound: "Страница не найдена", notFoundText: "Такой страницы нет. Возможно, она переехала или ещё не написана.", toHome: "К документации",
   },
   zh: {
-    hreflang: "zh-Hans", htmlLang: "zh-CN", ogLocale: "zh_CN", name: "简体中文", short: "中文", docs: "文档", home: "首页", siteTitle: "Mistgate 文档",
+    hreflang: "zh-Hans", htmlLang: "zh-Hans", ogLocale: "zh_CN", name: "简体中文", short: "中文", docs: "文档", home: "首页", siteTitle: "Mistgate 文档",
     skip: "跳到正文", menu: "菜单", closeMenu: "关闭菜单", navLabel: "文档", crumbs: "面包屑导航",
     search: "搜索文档", searchLabel: "搜索文档", searchEmpty: "没有找到结果。换个词试试。", searchClose: "关闭搜索", searchIn: "位于",
     onPage: "本页内容", prev: "上一页", next: "下一页", edit: "在 GitHub 上编辑此页", theme: "切换主题", github: "GitHub 上的 Mistgate", stars: "GitHub 上的 Mistgate，{n} 个星标",
     language: "语言", copy: "复制", copied: "已复制", table: "表格", plain: "文本", diagram: "示意图", permalink: "链接到此小节", pending: "此页尚未撰写", roadmap: "路线图阶段",
     license: "基于 AGPL-3.0 发布", other: "其他",
-    inAdmin: "在管理后台", inAdminSep: "：", sections: { overview: "概览", nodes: "节点", users: "用户", profiles: "协议配置", subscriptions: "订阅", health: "运行状况", reachability: "可达性", updates: "更新", integrations: "集成", settings: "设置" },
+    inAdmin: "在管理后台", inAdminSep: "：", sections: { overview: "概览", nodes: "节点", users: "用户", profiles: "协议配置", subscriptions: "订阅", health: "运行状况", reachability: "可达性", updates: "更新", ai: "AI", integrations: "集成", settings: "设置" },
     notFound: "页面不存在", notFoundText: "没有这个页面。它可能已移动，或尚未撰写。", toHome: "前往文档",
   },
+  // Persian, right to left; the words of the admin's glossary (web/src/i18n/fa.ts), in the README's formal «شما»
+  fa: {
+    hreflang: "fa", htmlLang: "fa", dir: "rtl", ogLocale: "fa_IR", name: "فارسی", short: "FA", docs: "مستندات", home: "صفحهٔ اصلی", siteTitle: "مستندات Mistgate",
+    skip: "رفتن به محتوا", menu: "منو", closeMenu: "بستن منو", navLabel: "مستندات", crumbs: "مسیر صفحه",
+    search: "جستجو در مستندات", searchLabel: "جستجو در مستندات", searchEmpty: "چیزی پیدا نشد. واژهٔ دیگری را امتحان کنید.", searchClose: "بستن جستجو", searchIn: "در صفحهٔ",
+    onPage: "در این صفحه", prev: "قبلی", next: "بعدی", edit: "ویرایش این صفحه در GitHub", theme: "تغییر تم", github: "Mistgate در GitHub", stars: "Mistgate در GitHub، {n} ستاره",
+    language: "زبان", copy: "کپی", copied: "کپی شد", table: "جدول", plain: "متن", diagram: "نمودار", permalink: "پیوند به این بخش", pending: "این صفحه هنوز نوشته نشده است", roadmap: "مرحله‌های نقشهٔ راه",
+    license: "منتشرشده با مجوز AGPL-3.0", other: "سایر صفحه‌ها", inEnglish: "این صفحه هنوز ترجمه نشده است و به انگلیسی باز می‌شود",
+    callouts: { note: "نکته", tip: "توصیه", warning: "هشدار", danger: "خطر" },
+    inAdmin: "در پنل مدیریت", sections: { overview: "نمای کلی", nodes: "نودها", users: "کاربران", profiles: "پروفایل‌ها", subscriptions: "اشتراک‌ها", health: "سلامت", reachability: "دسترس‌پذیری", updates: "به‌روزرسانی‌ها", ai: "هوش مصنوعی", integrations: "یکپارچه‌سازی‌ها", settings: "تنظیمات" },
+    notFound: "صفحه پیدا نشد", notFoundText: "چنین صفحه‌ای وجود ندارد. شاید جابه‌جا شده یا هنوز نوشته نشده باشد.", toHome: "رفتن به مستندات",
+  },
+  // Turkish; the words of the admin's glossary (web/src/i18n/tr.ts), in the README's formal «siz»
+  tr: {
+    hreflang: "tr", htmlLang: "tr", ogLocale: "tr_TR", name: "Türkçe", short: "TR", docs: "Belgeler", home: "Ana sayfa", siteTitle: "Mistgate belgeleri",
+    skip: "İçeriğe geç", menu: "Menü", closeMenu: "Menüyü kapat", navLabel: "Belgeler", crumbs: "Sayfa yolu",
+    search: "Belgelerde ara", searchLabel: "Belgelerde ara", searchEmpty: "Hiçbir şey bulunamadı. Başka bir sözcük deneyin.", searchClose: "Aramayı kapat", searchIn: "Sayfa:",
+    onPage: "Bu sayfada", prev: "Önceki", next: "Sonraki", edit: "Bu sayfayı GitHub'da düzenleyin", theme: "Temayı değiştir", github: "GitHub'da Mistgate", stars: "GitHub'da Mistgate, {n} yıldız",
+    language: "Dil", copy: "Kopyala", copied: "Kopyalandı", table: "Tablo", plain: "Metin", diagram: "Şema", permalink: "Bu bölümün bağlantısı", pending: "Bu sayfa henüz yazılmadı", roadmap: "Yol haritasının aşamaları",
+    license: "AGPL-3.0 lisansıyla yayımlanır", other: "Diğer sayfalar", inEnglish: "Bu sayfa henüz çevrilmedi, İngilizce açılır",
+    callouts: { note: "Not", tip: "İpucu", warning: "Uyarı", danger: "Tehlike" },
+    inAdmin: "Yönetim panelinde", sections: { overview: "Genel bakış", nodes: "Düğümler", users: "Kullanıcılar", profiles: "Profiller", subscriptions: "Abonelikler", health: "Sağlık", reachability: "Erişilebilirlik", updates: "Güncellemeler", ai: "Yapay zekâ", integrations: "Entegrasyonlar", settings: "Ayarlar" },
+    notFound: "Sayfa bulunamadı", notFoundText: "Böyle bir sayfa yok. Taşınmış ya da henüz yazılmamış olabilir.", toHome: "Belgelere git",
+  },
 };
+
+/** The quiet mark after the name of a page a language has not translated yet: the link opens the English page. */
+export const enMark = (t) => `<span class="en-mark" title="${esc(t.inEnglish)}"><span aria-hidden="true">EN</span><span class="sr">${esc(t.inEnglish)}</span></span>`;
+/** A page name in a sidebar or a list: the English title of an untranslated page is marked as English. */
+export const pageName = (t, p) => `<span${p.titleLang ? ` lang="${p.titleLang}" dir="ltr"` : ""}>${esc(p.title)}</span>${p.en ? enMark(t) : ""}`;
 
 const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
@@ -54,9 +83,9 @@ export const PAGE_SECTION = {
   "guide/profiles": "profiles", "guide/hysteria2": "profiles", "guide/amneziawg": "profiles",
   "guide/subscriptions": "subscriptions", "guide/client-apps": "subscriptions", "guide/user-page": "subscriptions", "guide/dns": "subscriptions",
   "operations/health": "health", "operations/troubleshooting": "health",
-  "operations/reachability": "reachability",
+  "operations/reachability": "reachability", "operations/probes": "reachability",
   "operations/updates": "updates", "operations/releases": "updates",
-  "getting-started/ai-agents": "integrations", "operations/telegram-alerts": "integrations", "reference/api": "integrations", "reference/mcp": "integrations",
+  "guide/assistant": "ai", "getting-started/ai-agents": "ai", "reference/api": "ai", "reference/mcp": "ai", "operations/telegram-alerts": "integrations",
   "getting-started/install-panel": "settings", "guide/decoy-site": "settings", "operations/backups": "settings", "operations/security": "settings", "operations/panel-watcher": "settings",
 };
 // pages that wear a section's colour but describe no screen of the admin: no "In the admin" label on them
@@ -78,10 +107,14 @@ function githubButton(t, stars) {
   return `<a class="ib gh" href="${GITHUB}" rel="noopener" aria-label="${esc(stars ? t.stars.replace("{n}", stars) : t.github)}" data-stars-label="${esc(t.stars)}">${GH}<span class="gh__stars"${stars ? "" : " hidden"}><span class="gh__n">${stars ? formatStars(stars) : ""}</span>${icon("star", 14)}</span></a>`;
 }
 
-function head({ lang, t, title, description, canonical, alternates, assets, noindex, home }) {
-  const fonts = (lang === "ru" ? ["onest-cyrillic", "onest-latin"] : ["onest-latin"]).map((f) => `<link rel="preload" href="/fonts/${f}.woff2" as="font" type="font/woff2" crossorigin>`).join("\n");
+// the font files a page needs at once: Turkish letters (ş ğ İ) are in latin-ext, Persian ones in Vazirmatn
+const PRELOAD = { ru: ["onest-cyrillic", "onest-latin"], fa: ["vazirmatn-arabic", "onest-latin"], tr: ["onest-latin", "onest-latin-ext"] };
+
+function head({ lang, t, title, seoTitle, description, canonical, alternates, assets, noindex, home, ld }) {
+  const fonts = (PRELOAD[lang] ?? ["onest-latin"]).map((f) => `<link rel="preload" href="/fonts/${f}.woff2" as="font" type="font/woff2" crossorigin>`).join("\n");
   const alts = alternates.map((a) => `<link rel="alternate" hreflang="${a.lang}" href="${SITE}${a.url}">`).join("\n");
-  const fullTitle = home ? title : `${title} — ${t.siteTitle}`;
+  // seoTitle (front matter): the whole <title>, worded for the search result; the page keeps its own title in the sidebar, the crumbs and the h1
+  const fullTitle = seoTitle ?? (home ? title : `${title} — ${t.siteTitle}`);
   return `<meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(fullTitle)}</title>
@@ -101,7 +134,7 @@ ${assets.og ? `<meta property="og:image" content="${SITE}${assets.og}">\n<meta n
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 ${assets.favicon32 ? '<link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png">\n<link rel="apple-touch-icon" href="/apple-touch-icon.png">' : ""}
 ${fonts}
-<script>${THEME_INIT}</script>
+${ld ? ldScript(ld) + "\n" : ""}<script>${THEME_INIT}</script>
 <link rel="stylesheet" href="${assets.css}">
 <script src="${assets.js}" defer></script>`;
 }
@@ -121,8 +154,8 @@ export function langMenu({ lang, t, langLinks }) {
 
 function header({ lang, t, langLinks, stars }) {
   return `<header class="top"><div class="top__in">
-<a class="ib menu-btn" href="#nav" data-menu aria-controls="nav" aria-label="${esc(t.menu)}">${icon("menu", 20)}</a>
-<a class="brand" href="${pageUrl(lang, "index")}" aria-label="Mistgate — ${esc(t.docs)}"><img src="/mistgate-badge.svg" width="32" height="32" alt="">${wordmark}</a>
+<a class="ib menu-btn" href="#nav" data-menu aria-controls="nav" aria-label="${esc(t.menu)}">${icon("menu", 18)}</a>
+<a class="brand" href="${landingUrl(lang)}" aria-label="Mistgate — ${esc(t.docs)}"><img src="/mistgate-badge.svg" width="32" height="32" alt="">${wordmark}</a>
 <span class="chip tag">${esc(t.docs)}</span>
 <span class="grow"></span>
 <button class="search-btn js-only" type="button" data-search-open aria-label="${esc(t.search)}" aria-keyshortcuts="Control+K Meta+K /">${icon("search", 16)}<span class="search-btn__t">${esc(t.search)}</span><span class="kbds"><kbd data-mod>Ctrl</kbd><kbd>K</kbd></span></button>
@@ -133,14 +166,14 @@ ${githubButton(t, stars)}
 }
 
 function sidebar({ lang, t, nav, current }) {
-  const link = (url, text, key) => {
-    const st = pageStyle(key);
-    return `<a class="nav-link" href="${url}"${key === current ? ' aria-current="page"' : ""}><span class="nav-ico"${st.tone ? ` data-tone="${st.tone}"` : ""}>${icon(st.icon, 16)}</span><span>${esc(text)}</span></a>`;
+  const link = (p) => {
+    const st = pageStyle(p.key);
+    return `<a class="nav-link" href="${p.url}"${p.en ? ' hreflang="en"' : ""}${p.key === current ? ' aria-current="page"' : ""}><span class="nav-ico"${st.tone ? ` data-tone="${st.tone}"` : ""}>${icon(st.icon, 16)}</span>${pageName(t, p)}</a>`;
   };
-  const groups = nav.map((g) => `<div class="grp"><div class="grp__label">${esc(g.title)}</div>${g.items.map((i) => link(i.url, i.title, i.key)).join("")}</div>`).join("");
+  const groups = nav.map((g) => `<div class="grp"><div class="grp__label">${esc(g.title)}</div>${g.items.map(link).join("")}</div>`).join("");
   return `<nav class="side" id="nav" aria-label="${esc(t.navLabel)}">
-<div class="side__head"><a class="brand" href="${pageUrl(lang, "index")}" aria-label="Mistgate — ${esc(t.docs)}"><img src="/mistgate-badge.svg" width="28" height="28" alt="">${wordmark}</a><a class="ib" href="#content" data-menu-close aria-label="${esc(t.closeMenu)}">${icon("x", 18)}</a></div>
-<div class="side__scroll"><div class="grp">${link(pageUrl(lang, "index"), t.home, "index")}</div>${groups}
+<div class="side__head"><a class="brand" href="${landingUrl(lang)}" aria-label="Mistgate — ${esc(t.docs)}"><img src="/mistgate-badge.svg" width="28" height="28" alt="">${wordmark}</a><a class="ib" href="#content" data-menu-close aria-label="${esc(t.closeMenu)}">${icon("x", 18)}</a></div>
+<div class="side__scroll"><div class="grp">${link({ url: pageUrl(lang, "index"), title: t.home, key: "index" })}</div>${groups}
 <div class="side__tools"><button class="ib js-only" type="button" data-theme-toggle aria-label="${esc(t.theme)}"><span class="theme-ico theme-ico--sun">${icon("sun", 18)}</span><span class="theme-ico theme-ico--moon">${icon("moon", 18)}</span></button><a class="ib" href="${GITHUB}" aria-label="${esc(t.github)}" rel="noopener">${GH}</a></div></div>
 </nav><a class="backdrop" href="#content" data-menu-close tabindex="-1" aria-hidden="true"></a>`;
 }
@@ -164,24 +197,31 @@ function searchDialog(t, lang) {
 
 const bodyData = (t) => esc(JSON.stringify({ copy: t.copy, copied: t.copied, inn: t.searchIn }));
 
+/** schema.org of a docs page: the article, and the breadcrumb of the visible one (the section links to its first page of this language). */
+function docLd({ lang, t, page, nav, crumbGroup, isHome }) {
+  const url = SITE + page.url, group = crumbGroup && nav.find((g) => g.title === crumbGroup)?.items.find((x) => !x.en);
+  const crumbs = [[t.docs, pageUrl(lang, "index")], ...(group ? [[crumbGroup, group.url]] : []), [page.title, page.url]];
+  return [
+    { "@type": "TechArticle", headline: page.title, description: page.description, inLanguage: t.htmlLang, url, mainEntityOfPage: url, dateModified: page.date, isPartOf: { "@type": "WebSite", name: WEBSITE.name, url: WEBSITE.url } },
+    ...(isHome ? [] : [{ "@type": "BreadcrumbList", itemListElement: crumbs.map(([name, u], i) => ({ "@type": "ListItem", position: i + 1, name, item: SITE + u })) }]),
+  ];
+}
+
 export function renderDoc(ctx) {
   const { lang, t, page, nav, assets, langLinks, alternates, prev, next, crumbGroup, stars } = ctx;
   const isHome = page.key === "index";
   const st = pageStyle(page.key);
   const toc = page.headings.filter((h) => h.level <= 3 && h.toc !== false);
-  const showToc = !isHome && toc.length >= 2;
-  const home = isHome ? renderLanding({ lang, t, nav, langNames: (langLinks ?? []).map((l) => T[l.lang].name), section: (key) => (NOT_IN_ADMIN.has(key) ? "start" : PAGE_SECTION[key] ?? null) }) : null;
+  const showToc = toc.length >= 2;
   const crumbs = isHome ? "" : `<nav class="crumbs" aria-label="${esc(t.crumbs)}"><a href="${pageUrl(lang, "index")}">${esc(t.docs)}</a>${crumbGroup ? `<span aria-hidden="true">/</span><span>${esc(crumbGroup)}</span>` : ""}<span aria-hidden="true">/</span><span aria-current="page">${esc(page.title)}</span></nav>`;
-  const hero = isHome
-    ? home.hero
-    : `<header class="doc-head">${crumbs}${st.inAdmin ? `<p class="eyebrow"><span class="id-chip" data-tone="${st.tone}">${icon(st.icon, 13)}</span><span>${esc(t.inAdmin)}${t.inAdminSep ?? ": "}${esc(t.sections[st.section])}</span></p>` : ""}<h1 class="doc-h1">${esc(page.title)}</h1><p class="doc-lead">${esc(page.description)}</p></header>`;
+  const hero = `<header class="doc-head">${crumbs}${st.inAdmin ? `<p class="eyebrow"><span class="id-chip" data-tone="${st.tone}">${icon(st.icon, 14)}</span><span>${esc(t.inAdmin)}${t.inAdminSep ?? ": "}${esc(t.sections[st.section])}</span></p>` : ""}<h1 class="doc-h1">${esc(page.title)}</h1><p class="doc-lead">${esc(page.description)}</p></header>`;
   const inlineToc = showToc ? `<details class="toc-inline"><summary>${esc(t.onPage)}</summary>${tocHtml(toc)}</details>` : "";
-  const pn = (x, dir) => x ? `<a class="pn pn--${dir}" href="${x.url}" rel="${dir}"><span class="label">${dir === "prev" ? icon("back", 12) : ""}${esc(t[dir])}${dir === "next" ? icon("chevronRight", 12) : ""}</span><span class="pn__t">${esc(x.title)}</span></a>` : "<span></span>";
+  const pn = (x, dir) => x ? `<a class="pn pn--${dir}" href="${x.url}" rel="${dir}"><span class="label">${dir === "prev" ? icon("back", 12) : ""}${esc(t[dir])}${dir === "next" ? icon("chevronRight", 12) : ""}</span><span class="pn__t">${pageName(t, x)}</span></a>` : "<span></span>";
   const edit = `<p class="edit"><a href="${editUrl(lang, page.key)}" rel="noopener">${icon("externalLink", 14)}${esc(t.edit)}</a></p>`;
   return `<!doctype html>
-<html lang="${t.htmlLang}">
+<html lang="${t.htmlLang}"${t.dir ? ` dir="${t.dir}"` : ""}>
 <head>
-${head({ lang, t, title: page.title, description: isHome ? home.description : page.description, canonical: page.url, alternates, assets, home: isHome })}
+${head({ lang, t, title: page.title, seoTitle: page.seoTitle, description: page.description, canonical: page.url, alternates, assets, home: isHome, ld: docLd({ lang, t, page, nav, crumbGroup, isHome }) })}
 </head>
 <body class="mg" data-t="${bodyData(t)}"${st.tone ? ` data-tone="${st.tone}"` : ""}>
 <a class="skip" href="#content">${esc(t.skip)}</a>
@@ -189,11 +229,13 @@ ${header({ lang, t, langLinks, stars })}
 <div class="shell">
 ${sidebar({ lang, t, nav, current: page.key })}
 <main class="main" id="content" tabindex="-1">
-<article class="doc${isHome ? " doc--home" : ""}">
+<article class="doc">
 ${hero}
 ${inlineToc}
-${isHome ? `<div class="home">${home.body}</div>` : `<div class="prose">\n${page.html}\n</div>`}
-${isHome ? "" : edit}
+<div class="prose">
+${page.html}
+</div>
+${edit}
 ${isHome ? "" : `<nav class="pns" aria-label="${esc(t.docs)}">${pn(prev, "prev")}${pn(next, "next")}</nav>`}
 </article>
 </main>
@@ -222,8 +264,8 @@ ${head({ lang: "en", t, title: t.notFound, description: t.notFoundText, canonica
 <p class="nf__code">404</p>
 <h1 class="doc-h1">${esc(t.notFound)}</h1>
 <p class="doc-lead">${esc(t.notFoundText)}</p>
-${others.map((l) => `<p class="doc-lead" lang="${T[l].htmlLang}">${esc(T[l].notFoundText)}</p>`).join("")}
-<div class="hero__cta"><a class="btn btn--primary" href="/">${esc(t.toHome)}${icon("chevronRight", 14)}</a>${others.map((l) => `<a class="btn btn--secondary" href="${pageUrl(l, "index")}" lang="${T[l].htmlLang}">${esc(T[l].toHome)}</a>`).join("")}</div>
+${others.map((l) => `<p class="doc-lead" lang="${T[l].htmlLang}"${T[l].dir ? ` dir="${T[l].dir}"` : ""}>${esc(T[l].notFoundText)}</p>`).join("")}
+<div class="hero__cta"><a class="btn btn--primary" href="${pageUrl("en", "index")}">${esc(t.toHome)}${icon("chevronRight", 14)}</a>${others.map((l) => `<a class="btn btn--secondary" href="${pageUrl(l, "index")}" lang="${T[l].htmlLang}"${T[l].dir ? ` dir="${T[l].dir}"` : ""}>${esc(T[l].toHome)}</a>`).join("")}</div>
 </main>
 ${footer({ lang: "en", t })}
 </body>

@@ -8,8 +8,8 @@ import (
 
 // The country check asks a source of probes inside a country how a node looks from there. The check itself (which nodes,
 // how many probes, the verdict, the alert) lives in country.go and knows nothing about any one service: a CountrySource is
-// anything that can take the targets of a round and report, per probe, what it saw. Globalping (internal/panel/globalping)
-// is the first; a block list or a probe inside the country can feed the same verdicts later.
+// anything that can take the targets of a round and report, per probe, what it saw. Globalping (internal/panel/globalping) is
+// the one that is measured this way; the other sources store rows that the check reads, and countryreach.Sources says what each is.
 
 // CountryConfig is what the owner chose.
 type CountryConfig struct {
@@ -18,7 +18,8 @@ type CountryConfig struct {
 	Country string
 	// Interval between rounds, at least ten minutes.
 	Interval time.Duration
-	// IPv6: also measure the nodes with working IPv6 by their IPv6 address, in rounds of their own (CountryRound.Family 6).
+	// IPv6: also measure nodes with working IPv6 when their IPv6 entry is on or IPv4 is blocked (including TCP-only) or partial,
+	// in separate rounds (CountryRound.Family 6).
 	IPv6 bool
 }
 

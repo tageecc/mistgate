@@ -14,5 +14,13 @@ new record that supersedes the old one, not by editing history.
 | [0007](0007-event-driven-agent-session.md) | The agent session is an event-driven core; on the edge a hibernating Durable Object drives it | Accepted |
 | [0008](0008-ssh-installs-in-a-second-worker.md) | SSH installs on the edge run in a second Worker script, in one Durable Object | Accepted |
 | [0009](0009-edge-six-scripts-behind-a-js-front.md) | Edge: six scripts behind a JS front (supplements 0008) | Accepted |
+| [0010](0010-mtproto.md) | MTProto proxy: a clean-room core, Fake TLS only, a real site for everyone else | Accepted |
+| [0011](0011-release-channels.md) | Release channels: stable, testing and dev, told apart by the tag | Accepted |
+| [0012](0012-backup-before-panel-update.md) | A backup to download before the panel updates itself | Accepted |
+| [0013](0013-restore-from-a-backup.md) | Restore from a backup: in the panel, and on a new server | Accepted |
+| [0014](0014-assistant.md) | The assistant: a cloud model that runs the panel through its own MCP tools | Accepted |
+| [0015](0015-moving-target-transport.md) | A moving target: a dialect of its own for every server, rotated by the panel | Proposed |
+| [0016](0016-ways-graph.md) | The ways as a graph: a node's entries, relays and exits in a node editor | Proposed |
+| [0017](0017-agent-operable-fleet.md) | An agent-operable fleet: what agents read, run, decide and change, and how it is tested | Proposed |
 
 The plan they serve: [`../cloudflare-edition/README.md`](../cloudflare-edition/README.md).

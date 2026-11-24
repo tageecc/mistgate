@@ -50,8 +50,10 @@ mistgate serve --listen :443 --acme-domain panel.example.com
 | `--agent-listen` | `MISTGATE_AGENT_LISTEN` | none (`127.0.0.1:8082` with `--dev`) | A separate TLS listener for the node agents. Without it agents use the public listener with the secret TLS name, which needs TLS on it (`--tls-cert` or `--acme-domain`). |
 | `--agent-addr` | `MISTGATE_AGENT_ADDR` | `--agent-listen` when it names a host, else the public URL's host and port (443 when none) | The `host:port` agents dial; it goes into the install command. |
 | `--decoy-dir` | `MISTGATE_DECOY_DIR` | the built-in page | A directory with your own decoy site. `404.html` and `429.html` in it replace the built-in error pages. |
-| `--trusted-proxy` | `MISTGATE_TRUSTED_PROXY` (comma-separated) | none | CIDR or IP of a reverse proxy whose `X-Forwarded-For` and `Forwarded` headers are believed. Repeatable. Without it the TCP peer is the client. |
+| `--trusted-proxy` | `MISTGATE_TRUSTED_PROXY` (comma-separated) | none | CIDR or IP of a reverse proxy whose `X-Forwarded-For` header is believed. The proxy must set or overwrite that header; one that only writes `Forwarded` is not supported. Repeatable. Without it the TCP peer is the client. |
 | `--update-service` | `MISTGATE_UPDATE_SERVICE` | `mistgate.service` (none with `--dev`) | The panel's own systemd unit, which the panel updater stops and starts again around the binary swap. Used when the panel runs as root; a panel running as another user starts the fixed root helper unit, whose command line names the unit itself. |
+| `--log-level` | `MISTGATE_LOG_LEVEL` | `info` | The panel log level at start: `debug`, `info`, `warn` or `error`. The owner can change it while the panel runs (Settings → System); a restart returns to this value. |
+| `--log-format` | `MISTGATE_LOG_FORMAT` | `text` | `text` or `json`: the format of the log on stderr. |
 | `--source-url` | `MISTGATE_SOURCE_URL` | `https://github.com/Mistgate/mistgate` | Where the source code of this build is published, linked next to the version in the admin (AGPL-3.0 section 13). A fork points it at its own repository; an empty value hides the link. |
 | `--dev` | `MISTGATE_DEV` (`1`, `true`, `yes`, `on`) | off | Development mode, see below. |
 
@@ -245,6 +247,8 @@ Prints `mistgate <version>`, then `built <time>` when the binary was built with 
 | `run` | Runs the agent in the foreground. |
 | `cleanup-net` | Removes the agent's tunnel interfaces, WARP routes and nftables tables. |
 | `awg prepare-kernel` | Installs the AmneziaWG kernel module. |
+| `awg fix-source` | Repairs a module source that does not build on some kernels. |
+| `host enable-security-updates` | Turns on automatic security updates (Debian and Ubuntu). |
 | `version` | Prints the version, the build time and the release key fingerprint. |
 
 `enroll` and `run` take `--state-dir`; give them the same directory. Exit codes: 0 success, 1 an error, 2 bad usage, 78 from `run` when the node is not enrolled (systemd does not restart the agent then).
@@ -309,7 +313,9 @@ It exits with 78 when the state directory holds no identity, and with 0 when the
 
 ### mistgate-node cleanup-net
 
-Takes no arguments. Removes the tunnel interfaces of the agent, its tunnel nftables table and, when present, the WARP device, routes, rules and table. It needs no state and no panel. The unit runs it after every stop; the agent creates everything again when it starts.
+Removes the tunnel interfaces of the agent, its tunnel nftables table and, when present, the WARP device, routes, rules and table. It needs no state and no panel. The unit runs it after every stop; the agent creates everything again when it starts.
+
+The IPv6 addresses the agent holds for the [IPv6 entry](../guide/nodes.md#ipv6-entry) stay through a stop, a restart and an update. `--ipv6-addresses` also removes them, only those the agent added (named in `ipv6-owned.json` in the state directory, `--state-dir`), never the host's own; use it for a hand clean of the server.
 
 ### mistgate-node awg prepare-kernel
 
@@ -328,6 +334,21 @@ mistgate-node awg prepare-kernel --yes    # runs it
 | `--timeout` | `45m` | Hard limit of the run. |
 
 It installs packages with apt (non-interactive, waiting up to 30 minutes for another package manager's lock). Supported: Debian and Ubuntu, not a container, without Secure Boot, with systemd. See [AmneziaWG](../guide/amneziawg.md).
+
+### mistgate-node awg fix-source
+
+Repairs the AmneziaWG module's source when it is a file known to break the build on some kernels. Linux only, as root.
+
+```sh
+mistgate-node awg fix-source --check    # reports, changes nothing
+mistgate-node awg fix-source            # repairs
+```
+
+It looks at `/usr/src/amneziawg-*/compat/compat.h`. A known-bad file is replaced (through a temporary file and a rename) only when the result is exactly the expected file; a good file is reported as `ok`; any other file is left as it is and reported with the first 12 characters of its sha256. The exit code is 1 when a file still needs the repair or is not known, else 0. The update job and `awg prepare-kernel` do this themselves; see [a kernel update fails in the module build](../operations/troubleshooting.md#a-kernel-update-fails-in-the-amneziawg-module-build).
+
+### mistgate-node host enable-security-updates
+
+Turns on automatic security updates. Linux only, as root. It installs `unattended-upgrades` if needed and enables the APT periodic settings and the apt-daily timers; it installs no upgrades and does not reboot. Without `--yes` it only describes the changes. `--status-file` writes progress to a file (the agent uses it when the doctor's fix **Turn on security updates** runs the command) and `--timeout` limits the run (default `20m`). See [Fixes](../operations/health.md#fixes).
 
 ### mistgate-node version
 

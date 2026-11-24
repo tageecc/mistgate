@@ -8,6 +8,7 @@ import (
 
 	"github.com/mistgate/mistgate/gen/mistgate/admin/v1/adminv1connect"
 	"github.com/mistgate/mistgate/internal/panel/store"
+	"github.com/mistgate/mistgate/internal/reqid"
 )
 
 // publicProcedures are the only admin API paths reachable without a session. The list
@@ -39,6 +40,13 @@ func ClientIPFrom(ctx context.Context) netip.Addr {
 
 // ClientIP is the client address for a request under the trusted-proxy rules.
 func (s *Service) ClientIP(r *http.Request) netip.Addr {
+	if len(s.trust.prefixes) == 0 && len(r.Header.Values("X-Forwarded-For")) > 0 {
+		if peer := parseNode(r.RemoteAddr); peer.IsValid() && (peer.IsPrivate() || peer.IsLoopback()) {
+			if untrustedForwardedWarning.CompareAndSwap(false, true) {
+				s.log.Warn("ignoring X-Forwarded-For from a private peer because no trusted proxy is configured", "code", "untrusted_forwarded_header_ignored")
+			}
+		}
+	}
 	return s.trust.ClientIP(r.RemoteAddr, r.Header)
 }
 
@@ -75,6 +83,15 @@ func AdminFrom(ctx context.Context) (store.Admin, bool) {
 	return a, ok
 }
 
+// ActorID returns the stable identifier to store in an audit row.
+func ActorID(ctx context.Context) string {
+	a, ok := AdminFrom(ctx)
+	if !ok {
+		return "anonymous"
+	}
+	return a.ID
+}
+
 // ActorLabel names the caller of an admin RPC for an event the admin reads ("who pressed it"): the admin's display
 // name, else the id (an API token is "token:<id>"), "" when the call has no admin.
 func ActorLabel(ctx context.Context) string {
@@ -99,6 +116,10 @@ func ActorLabel(ctx context.Context) string {
 func (s *Service) RequireSession(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r = s.WithClientIP(r)
+		if assistant, ok := assistantIdentityFrom(r.Context()); ok {
+			s.serveAssistant(w, r, next, assistant)
+			return
+		}
 		if publicProcedures[r.URL.Path] {
 			next.ServeHTTP(w, r)
 			return
@@ -107,7 +128,7 @@ func (s *Service) RequireSession(next http.Handler) http.Handler {
 			s.serveToken(w, r, next)
 			return
 		}
-		sess, admin, err := s.resolveSession(r.Context(), sessionToken(r.Header))
+		sess, admin, err := s.resolveSession(r.Context(), s.sessionToken(r.Header))
 		if err != nil {
 			writeJSONError(w, http.StatusUnauthorized, unauthenticatedBody)
 			return
@@ -117,6 +138,7 @@ func (s *Service) RequireSession(next http.Handler) http.Handler {
 			writeJSONError(w, http.StatusForbidden, forbiddenBody)
 			return
 		}
+		reqid.MarkAuthed(r.Context())
 		ctx := context.WithValue(r.Context(), adminKey{}, admin)
 		ctx = context.WithValue(ctx, sessionKey{}, sess)
 		next.ServeHTTP(w, r.WithContext(ctx))

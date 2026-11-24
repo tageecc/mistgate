@@ -11,7 +11,7 @@ import (
 )
 
 // The Mihomo core is the judge of the profile: `mihomo -t` parses every field of every proxy and of the dns section.
-// The test needs the binary (Linux; scripts/e2e/m3.sh builds v1.19.32 once into ~/.cache/mistgate-tests/) and is skipped without
+// The test needs the binary (Linux; scripts/e2e/m3.sh builds v1.19.33 once into ~/.cache/mistgate-tests/) and is skipped without
 // it: set MIHOMO_BIN to use another one.
 //
 //	wsl -d Ubuntu -u root -- bash -c 'cd <repo> && go test ./internal/panel/subs -run MihomoCore -v'
@@ -22,9 +22,9 @@ func mihomoBin(t *testing.T) string {
 		return p
 	}
 	home, _ := os.UserHomeDir()
-	p := filepath.Join(home, ".cache", "mistgate-tests", "mihomo-v1.19.32")
+	p := filepath.Join(home, ".cache", "mistgate-tests", "mihomo-v1.19.33")
 	if _, err := os.Stat(p); err != nil {
-		t.Skip("no mihomo binary: set MIHOMO_BIN or build v1.19.32 into ~/.cache/mistgate-tests/mihomo-v1.19.32")
+		t.Skip("no mihomo binary: set MIHOMO_BIN or build v1.19.33 into ~/.cache/mistgate-tests/mihomo-v1.19.33")
 	}
 	return p
 }
@@ -67,6 +67,8 @@ func TestMihomoCoreAcceptsTheProfiles(t *testing.T) {
 		{"no dns section", "Example VPN", nil},
 		{"russia split, plain", "Example VPN", ruSplit()},
 		{"china: country lists as rule providers", "Example VPN", cnSplit()},
+		{"block ads: the ad list as the first rule", "Example VPN", adsDocPresets[0].preset},
+		{"block ads next to the country lists", "Example VPN", adsDocPresets[1].preset},
 		{"a title with a space, unicode and a percent", "Моя сеть 50%", ruSplit()},
 		{"DoH", "Example", &dns.Preset{Name: "doh", Transport: dns.KindDoH, Servers: []dns.Server{{Variant: "adguard/default"}, {Variant: "cloudflare/standard"}}}},
 		{"DoT", "Example", &dns.Preset{Name: "dot", Transport: dns.KindDoT, Servers: []dns.Server{{Variant: "quad9/standard"}}}},
@@ -78,7 +80,7 @@ func TestMihomoCoreAcceptsTheProfiles(t *testing.T) {
 		{"no plain server (the system resolver for the nodes)", "Example", &dns.Preset{Name: "mullvad", Transport: dns.KindPlain, Servers: []dns.Server{{Variant: "mullvad/standard"}}}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			b, err := mihomoProfile{title: c.title, lines: all, names: names, preset: c.preset}.build()
+			b, err := mihomoProfile{title: c.title, lines: all, names: names, preset: c.preset, autoSelect: true}.build()
 			if err != nil {
 				t.Fatal(err)
 			}

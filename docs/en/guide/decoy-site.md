@@ -3,6 +3,8 @@ title: Your own decoy site
 description: Why to replace the built-in decoy page with a small site of your own, what a good one looks like, how to install it with --decoy-dir, and a ready prompt that has an AI agent invent a unique site.
 ---
 
+![The From a template window: a country, a kind, the preview of the new site and the Another variant button](../../images/readme/decoys-dark-en.webp)
+
 The public address of the panel shows a decoy site to everyone who is not the admin, a subscription client or a node agent. This page is about replacing the built-in page with a small site of your own, so that the address looks like any other small site. The flag and the serving rules are in [Install the panel](../getting-started/install-panel.md#5-the-decoy-site); [Security](../operations/security.md#the-decoy-site-and-the-hidden-admin) explains how the decoy hides the admin.
 
 ## Why your own
@@ -11,7 +13,7 @@ Without `--decoy-dir` the panel shows a built-in "Coming soon" page. Every insta
 
 ## Nodes: three options
 
-Every node serves a decoy site to anyone who is not a client: the Hysteria2 masquerade (HTTP/3 and the TCP site) and the VLESS REALITY site in `self` mode. Choose which site each node shows, on the node's **Server** tab or for several nodes at once on the Nodes page (select the nodes, then set the decoy site):
+Every node serves a decoy site to anyone who is not a client: the Hysteria2 masquerade (HTTP/3 and the TCP site), the VLESS REALITY site in `self` mode, and the site that strangers meet on the port of an [MTProto](mtproto.md) profile that uses the node's own name. (An MTProto profile that names another site shows that real site instead, not yours.) Choose which site each node shows, on the node's **Server** tab or for several nodes at once on the Nodes page (select the nodes, then set the decoy site):
 
 - **Built-in** keeps the fixed Mistgate page. Every installation ships the same page, so it is recognisable. Nodes that existed before the upgrade stay on it until you change them.
 - **Panel's site** copies the panel's `--decoy-dir` bundle to the node. Use it for one domain with subdomains: the subdomains are linked anyway (Certificate Transparency logs list them), and one company's site on its regional hosts looks natural. New nodes default to this option when the panel has a usable decoy directory.
@@ -34,14 +36,58 @@ The panel stores each bundle by its SHA-256 and sends a node only its own bundle
 
 A node whose agent is too old (it predates this feature) keeps the built-in page, and the panel shows "agent too old": update the node, then choose its site. The edge edition does not store Own bundles, so Own is unavailable there. Every change is recorded in the audit log.
 
-An AI agent connected over [MCP](../reference/mcp.md) can set a node's site with `node_decoy_plan` and `node_decoy_apply`; the owner approves each change. The agent prompt in [AI agents](../getting-started/ai-agents.md) tells it never to repeat the subject or look of the sites made for other nodes.
+An AI agent connected over [MCP](../reference/mcp.md) can set a node's site with `node_decoy_plan` and `node_decoy_apply`; the owner approves each change. An own site goes in one of two ways, and exactly one of them is given:
+
+- **`bundle_base64`**: a ZIP or TAR archive, as above.
+- **`files`**: a list of text files, `{path, content}`, and for a small image or icon `{path, content_base64}`. This is for an agent that cannot make an archive, such as a model with no file tools. The panel packs the list itself into the same canonical archive (paths sorted, fixed times and modes), so the same files always have the same SHA-256 and a node that already has the site is not sent it again. The archive then goes through exactly the checks of an upload; only a few are made first: at most 64 files, a path of at most 200 bytes, no two paths that differ only in case (`Index.html` next to `index.html`), `index.html` at the top, 2 MiB in all.
+
+The plan lists every file with its size, the total and the SHA-256 of the bundle; it never shows the contents, and they reach neither the audit log nor the saved chat history. The agent prompt in [AI agents](../getting-started/ai-agents.md) tells it never to repeat the subject or look of the sites made for other nodes.
+
+The built-in [assistant](assistant.md) can make the site itself: ask it in the chat ("make a decoy site for the node alpha"). It writes a few small pages and a style sheet, and shows a **Proposed change** card with the list of files; you approve it as any other change. A model's answer is length-capped, so a site made this way stays small, about 20 KB in all, which is enough for the three to five pages described below.
+
+## A site from a template
+
+![Five sites of five kinds made by the generator, passing by](../../images/readme/decoys-sites-dark-en.webp)
+
+The quickest way to a site of your own: the panel builds it from a built-in template. On the **Decoy sites** page press **+ Site**, choose **From a template**, then one of ten kinds: a service status page, a file transfer page, a sign-in page, a personal blog, a portfolio, a small-business site, project documentation, a personal card, a club or society, an open-source project page.
+
+The panel shows the home page of the site it built. **Another variant** builds a different site of the same kind; nothing reaches the library until you press **Create the site**. The new site is no different from an uploaded archive: it is ready at once, has several pages and its own `404.html`, and can be opened, renamed, downloaded and put on a node or on the panel. Its card says "Template · kind", and its note holds the name of the kind and of the country.
+
+**Country.** At the top of the window pick the country the site is for. The site is written in that country's language and takes its cities and streets, the form of its addresses and postcodes, its dates and money (dollars, pounds, euros, francs, roubles, zlotys, kronor, lira, tenge) and its common names. So a node in Germany should show a German site and a node in Britain a British one: put each site on a node of its own country. The window starts with the country where most of your nodes that show the built-in or the panel's own page stand (the first of the list when there are none), and a kind that has no texts in the language of the chosen country is not offered. Ready now, each with all ten kinds: the United States, the United Kingdom, Ireland, Germany, Austria, Switzerland, the Netherlands, France, Sweden, Finland, Estonia, Latvia, Lithuania, Poland, Turkey, Russia and Kazakhstan. The card of a site made this way says "Template · kind", and its note says "Template · kind · country". More languages and countries arrive with the releases, as data files, and appear in the list by themselves.
+
+**Telephone numbers.** A site shows a telephone number only where a range of numbers is set aside for made-up ones, and only for the cities that have one: every city of the United States (`(212) 555-01XX` style numbers) and of France, 14 of the 24 cities of the United Kingdom (the ranges that Ofcom has reserved for drama: London 020 7946 0XXX, Manchester 0161 496 0XXX and so on), the five large German cities (Berlin, Hamburg, Munich, Cologne, Frankfurt) and four Swedish ones (Stockholm, Gothenburg, Malmö, Kiruna). The number matches the city of the site's address, and nothing real can ring. Everywhere else (the other German, British and Swedish cities, Austria, Switzerland, Ireland, Russia, Kazakhstan, the Netherlands, Poland, Turkey, Finland and the Baltic states) the site has no telephone and shows a "Write to us" form instead. Like the sign-in form, it sends nothing: after a short pause it says that the message was not sent and to try later. There is no e-mail address on these sites either.
+
+Each kind has a design of its own, with its own header, footer, grid and components, not one frame with other words in it. Each has three variants of the first screen, three sets of fonts and six or seven colour sets (the personal blog, the small business, the file transfer page and the portfolio are light, the personal card, the club, the sign-in page and the open-source page are dark, and the documentation and the status page follow the visitor's light or dark setting). Every site also draws its sizes, corners and spacing within the character of its kind, so two sites of one kind differ in more than the name and the text. Every site has inner pages, a menu that folds into a button on a narrow screen (it needs no script) and a `404.html` in the site's own style; the documentation, the status page and the open-source page have a 404 page of a design of their own. The pages of each kind, without `404.html` (a range is what one site draws):
+
+| Kind | Pages |
+|:--|:--|
+| **Status page** | home with the state of 4 to 6 components, history, about, and one page for each of 8 to 12 incidents |
+| **File transfer** | home, how it works, limits and questions, privacy, terms |
+| **Sign-in page** | home with the sign-in form, help, privacy, terms |
+| **Personal blog** | home, about, archive, terms, and 8 to 12 notes, each on its own page |
+| **Portfolio** | home, work, about, contact, and one page for each of 7 to 9 works |
+| **Small business** | home, services with prices in the country's money, about, contact |
+| **Documentation** | home, install, usage, configuration, recipes, troubleshooting, questions, terms |
+| **Personal card** | home, about, projects, now |
+| **Club** | home, programme, how to join, news |
+| **Open source** | home, changelog, install, roadmap, and one page for each of 6 to 8 releases |
+
+A site without photos is under 600 KB.
+
+**Photos.** Sites of some kinds (a small business, a blog, a club, a photographer's portfolio, the portrait on a personal card, and the cover picture of the sign-in and file pages) can show real photographs instead of drawn pictures. For that the panel needs your own free API key from one of two services, **Pixabay** or **Pexels**; the Photos row of the window has a switch between them. Pixabay is the easier one: it gives a key at once. Sign in at pixabay.com and open [its API page](https://pixabay.com/api/docs/): the key is shown there. Pexels is not issuing new keys at the moment; a Pexels key you already have works as before. Choose the service, press **Add key** (once a key is set, the button says **Change key**), paste the key, and the window says "With photos". With one key the panel uses that service; with both, the one the switch shows (the service whose key you added last, until you pick). The panel downloads the photos while it builds the site, shrinks them and keeps them inside the site's own files, so a visitor's browser loads nothing from outside, and no credit line goes onto the site: the line "Photos provided by Pixabay" (or Pexels) with a link, which both services ask for, is in the window, where the search runs. The searches ask for things and places, not for people. A photo is never enlarged: Pixabay gives pictures up to 1280 px wide, and a place on a page that its picture is too small for keeps its drawn picture. When the chosen service does not answer, does not accept the key, or its limit is used up (Pixabay: 100 requests a minute, Pexels: 200 an hour), the panel does not turn to the other one: the site is built with drawn pictures and the window says why and which service. The panel keeps search results in memory (Pixabay's terms ask for 24 hours, Pexels' are kept an hour), so another variant of a site often costs no search; one site costs at most three searches and eight files. What you see before **Create the site** is what is saved, for 15 minutes after the preview. A key is kept sealed, is never shown again and is not written to the log; **Remove** forgets it. A documentation page, a status page and an open-source page never get photos.
+
+What to know:
+
+- **Every node needs a site of its own.** A site is built afresh on every press: two sites of the same kind differ in name, look, texts, file names and 404 page. So press **From a template** separately for each node and do not put one site on several nodes: two identical sites link the nodes together just as one built-in page does. If you still put one site on nodes of different domains, the panel warns you.
+- **The forms send nothing.** The sign-in form always answers "wrong username or password", the file transfer page refuses once a file is picked, and the "Write to us" form says that the message was not sent; what is typed and the file that is chosen stay in the visitor's browser and go nowhere: no form has an address to send to, and the small script of the page makes no request. The library's check *There are scripts or forms* looks only for a `<script>` or `<form>` tag in a page and for `.js` files, not at what they do, so it fires on these sites: always on the sign-in and file transfer pages, and on a small business, a portfolio and a club where the site has no telephone number and shows the "Write to us" form. For a template that is by design, not a fault.
+- **Templates grow with the releases.** New kinds appear in the list after the panel is updated; sites that already exist do not change.
 
 ## What a good decoy looks like
 
 - **A few static pages**, three to five, on a plausible and boring topic that fits the domain name: a small local business or a hobby project. A home page, an "about" page, a page with services or prices, a contact page with an address and opening hours.
 - **Text written for this site.** Do not copy a template or text found elsewhere: a search engine can find copied text, and then the site stands out. No "lorem ipsum", no "under construction".
 - **Everything local and small.** No external scripts, fonts, CDNs, analytics, maps, embeds or social buttons. The whole site is well under 2 MiB; a handful of pages with one style sheet is a few tens of kilobytes.
-- **Nothing that needs a backend.** No forms, no logins, no contact form, no shop. Give an email address instead.
+- **Nothing that needs a backend.** No shop, no login, no form meant to send something: a form that posts to a server that is not there gives the site away, and a `<script>` or `<form>` in a page (or any `.js` file) makes the library's check *There are scripts or forms* warn; it is a warning, the site still saves. Give an email address instead. The sites from a [template](#a-site-from-a-template) are the exception: their forms and script never send anything.
 - **Light images.** Small local SVG drawings or optimised files, each a few tens of kilobytes at most.
 - **A realistic `404.html`** in the same style as the site. The panel answers every unknown path with it, so a visitor who guesses a wrong address sees what a small site would show. Add a `429.html` the same way if you like.
 - **`robots.txt` only if you want one.** Without it the panel serves the built-in file that turns away known AI crawlers.

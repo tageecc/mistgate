@@ -1,3 +1,5 @@
+//go:build !js
+
 package mcp
 
 import (
@@ -7,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"connectrpc.com/connect"
 
@@ -17,15 +20,19 @@ import (
 // that make a check fail. It keeps the real panel's rule that a relay is switched on only after a passing leg check, and that
 // a failing path check switches it off again.
 type relayFixture struct {
-	mu       sync.Mutex
-	relays   []*adminv1.Relay
-	cands    []*adminv1.RelayCandidate
-	agentOld bool
-	legFail  string // a leg check fails with this code
-	pathFail string // the path check after switching on (or moving) fails with this code
-	order    []string
-	creates  []*adminv1.CreateRelayRequest
-	updates  []*adminv1.UpdateRelayRequest
+	mu               sync.Mutex
+	relays           []*adminv1.Relay
+	cands            []*adminv1.RelayCandidate
+	agentOld         bool
+	legFail          string // a leg check fails with this code
+	pathFail         string // the path check after switching on (or moving) fails with this code
+	legUnverifiable  bool
+	pathUnverifiable bool
+	order            []string
+	creates          []*adminv1.CreateRelayRequest
+	updates          []*adminv1.UpdateRelayRequest
+	checks           []*adminv1.CheckRelayRequest
+	reverseReach     *adminv1.RelayStage // what the check answers as reverse_reach
 }
 
 func newRelayFixture() relayFixture {
@@ -45,6 +52,18 @@ func newRelayFixture() relayFixture {
 				Id: "rly_2", InboundId: "inb_2", ExitNodeId: nodeA, ExitNodeName: "de1", ProfileId: "prf_2", ProfileName: "Web", Protocol: "vless",
 				ViaNodeId: nodeB, ViaNodeName: "nl1", Network: "tcp", Port: 8444, ExitPort: 443, State: adminv1.InboundState_INBOUND_STATE_PENDING,
 				ExitLive: true, AgentSupported: true, CreatedUnix: 1790840500,
+			},
+			{
+				Id: "rly_3", InboundId: "inb_3", ExitNodeId: nodeA, ExitNodeName: "de1", ProfileId: "prf_3", ProfileName: "Telegram", Protocol: "mtproto",
+				ViaNodeId: nodeB, ViaNodeName: "nl1", Network: "tcp", Port: 57893, ExitPort: 443, Enabled: true,
+				State: adminv1.InboundState_INBOUND_STATE_ACTIVE, ExitLive: true, AgentSupported: true, CreatedUnix: 1790841200,
+				Check: &adminv1.RelayCheck{AtUnix: 1790841200, Network: "tcp", Port: 57893, Ok: true,
+					Leg: &adminv1.RelayStage{Status: "skipped", Code: "unverifiable"}, Path: &adminv1.RelayStage{Status: "skipped", Code: "unverifiable"}},
+			},
+			{
+				Id: "rly_4", InboundId: "inb_4", ExitNodeId: nodeA, ExitNodeName: "de1", ProfileId: "prf_4", ProfileName: "Telegram off", Protocol: "mtproto",
+				ViaNodeId: nodeB, ViaNodeName: "nl1", Network: "tcp", Port: 57894, ExitPort: 443, State: adminv1.InboundState_INBOUND_STATE_PENDING,
+				ExitLive: true, AgentSupported: true, CreatedUnix: 1790841300,
 			},
 		},
 		cands: []*adminv1.RelayCandidate{
@@ -101,16 +120,24 @@ func (w *world) CheckRelay(_ context.Context, r *connect.Request[adminv1.CheckRe
 		return nil, relayCoded(connect.CodeNotFound, "relay not found")
 	}
 	f.log("check")
+	f.checks = append(f.checks, r.Msg)
 	leg := &adminv1.RelayStage{Status: "ok", SenderName: x.GetViaNodeName(), AtUnix: 1790842000}
 	if f.legFail != "" {
 		leg = &adminv1.RelayStage{Status: "fail", Code: f.legFail, SenderName: x.GetViaNodeName(), AtUnix: 1790842000}
+	} else if f.legUnverifiable {
+		leg = &adminv1.RelayStage{Status: "skipped", Code: "unverifiable", SenderName: x.GetViaNodeName(), AtUnix: 1790842000}
 	}
 	path := &adminv1.RelayStage{Status: "skipped", Code: "off"}
 	if x.GetEnabled() {
-		path = &adminv1.RelayStage{Status: "ok", SenderName: "panel", AtUnix: 1790842000}
+		if f.pathUnverifiable {
+			path = &adminv1.RelayStage{Status: "skipped", Code: "unverifiable", AtUnix: 1790842000}
+		} else {
+			path = &adminv1.RelayStage{Status: "ok", SenderName: "panel", AtUnix: 1790842000}
+		}
 	}
-	x.Check = &adminv1.RelayCheck{AtUnix: 1790842000, Network: x.GetNetwork(), Port: x.GetPort(), To: canaryAddr + ":443", Leg: leg, Path: path,
-		Ok: leg.Status == "ok", Verified: leg.Status == "ok" && path.Status == "ok"}
+	x.Check = &adminv1.RelayCheck{AtUnix: 1790842000, Network: x.GetNetwork(), Port: x.GetPort(), To: canaryAddr + ":443", Leg: leg, Path: path, ReverseReach: f.reverseReach,
+		Ok:       (leg.Status == "ok" || (leg.Status == "skipped" && leg.GetCode() == "unverifiable")) && path.Status != "fail",
+		Verified: leg.Status == "ok" && path.Status == "ok"}
 	return connect.NewResponse(&adminv1.CheckRelayResponse{Relay: x}), nil
 }
 
@@ -149,7 +176,7 @@ func (w *world) UpdateRelay(_ context.Context, r *connect.Request[adminv1.Update
 	}
 	f.updates = append(f.updates, r.Msg)
 	if r.Msg.Enabled != nil && *r.Msg.Enabled && !x.GetEnabled() {
-		if c := x.GetCheck(); c == nil || c.GetLeg().GetStatus() != "ok" {
+		if c := x.GetCheck(); c == nil || (c.GetLeg().GetStatus() != "ok" && !(c.GetLeg().GetStatus() == "skipped" && c.GetLeg().GetCode() == "unverifiable")) {
 			return nil, relayCoded(connect.CodeFailedPrecondition, "relay_unchecked")
 		}
 		f.log("update:on")
@@ -157,6 +184,11 @@ func (w *world) UpdateRelay(_ context.Context, r *connect.Request[adminv1.Update
 			return nil, relayCoded(connect.CodeFailedPrecondition, "relay_check_failed: code="+f.pathFail+"&stage=path")
 		}
 		x.Enabled, x.State = true, adminv1.InboundState_INBOUND_STATE_ACTIVE
+		if f.pathUnverifiable && x.Check != nil {
+			x.Check.Path = &adminv1.RelayStage{Status: "skipped", Code: "unverifiable", AtUnix: 1790842000}
+			x.Check.Ok = true
+			x.Check.Verified = false
+		}
 	}
 	if r.Msg.Enabled != nil && !*r.Msg.Enabled {
 		f.log("update:off")
@@ -189,26 +221,46 @@ func (w *world) DeleteRelay(_ context.Context, r *connect.Request[adminv1.Delete
 // ---------------------------------------------------------------------------------------------------------------------
 
 type relayStageResult struct {
-	Status string `json:"status"`
-	Code   string `json:"code"`
-	Sender string `json:"sender"`
+	Status      string  `json:"status"`
+	Code        string  `json:"code"`
+	Sender      string  `json:"sender"`
+	AtUnix      int64   `json:"at_unix"`
+	MB          uint32  `json:"mb"`
+	MbitS       float64 `json:"mbit_s"`
+	Bytes       uint64  `json:"bytes"`
+	ConnectMS   uint32  `json:"connect_ms"`
+	FirstByteMS uint32  `json:"first_byte_ms"`
+	DurationMS  uint32  `json:"duration_ms"`
 }
 
 type relayResult struct {
-	ID            string `json:"id"`
-	EntryNode     string `json:"entry_node"`
-	ExitNode      string `json:"exit_node"`
+	ID             string `json:"id"`
+	Protocol       string `json:"protocol"`
+	EntryNode      string `json:"entry_node"`
+	ExitNode       string `json:"exit_node"`
+	Mode           string `json:"mode"`
+	ActiveMode     string `json:"active_mode"`
+	ModeReason     string `json:"mode_reason"`
+	ReverseBlocked string `json:"reverse_blocked"`
+	Bridge         *struct {
+		Connected bool   `json:"connected"`
+		Conns     uint32 `json:"conns"`
+		RTTMS     uint32 `json:"rtt_ms"`
+	} `json:"bridge"`
 	Port          uint32 `json:"port"`
 	ExitPort      uint32 `json:"exit_port"`
 	Enabled       bool   `json:"enabled"`
 	State         string `json:"state"`
 	LastErrorCode string `json:"last_error_code"`
 	Check         *struct {
-		OK       bool              `json:"ok"`
-		Verified bool              `json:"verified"`
-		Stage    string            `json:"failed_stage"`
-		Leg      *relayStageResult `json:"leg"`
-		Path     *relayStageResult `json:"path"`
+		OK           bool              `json:"ok"`
+		Verified     bool              `json:"verified"`
+		Stage        string            `json:"failed_stage"`
+		Leg          *relayStageResult `json:"leg"`
+		Path         *relayStageResult `json:"path"`
+		ReverseReach *relayStageResult `json:"reverse_reach"`
+		ReverseSpeed *relayStageResult `json:"reverse_speed"`
+		Bridge       *relayStageResult `json:"bridge"`
 	} `json:"last_check"`
 }
 
@@ -229,7 +281,7 @@ func TestRelayReadsNameNoAddress(t *testing.T) {
 		t.Errorf("relays_list carries a node's error detail or target: %s", out)
 	}
 	v := decode[struct{ Relays []relayResult }](t, out)
-	if len(v.Relays) != 2 {
+	if len(v.Relays) != 4 {
 		t.Fatalf("relays: %s", out)
 	}
 	r := v.Relays[0]
@@ -237,16 +289,26 @@ func TestRelayReadsNameNoAddress(t *testing.T) {
 		r.LastErrorCode != "refused" || r.Check == nil || !r.Check.Verified || r.Check.Leg.Status != "ok" || r.Check.Path.Sender != "panel" {
 		t.Errorf("relay: %+v", r)
 	}
-	if v.Relays[1].Check != nil || v.Relays[1].State != "pending" {
+	if v.Relays[1].Check != nil || v.Relays[1].State != "pending" || v.Relays[1].Enabled {
 		t.Errorf("a relay never checked: %+v", v.Relays[1])
 	}
+	if r := v.Relays[2]; r.ID != "rly_3" || r.Protocol != "mtproto" || !r.Enabled || r.Check == nil || !r.Check.OK || r.Check.Verified ||
+		r.Check.Leg.Status != "skipped" || r.Check.Leg.Code != "unverifiable" {
+		t.Errorf("unverifiable MTProto relay: %+v", r)
+	}
+	if r := v.Relays[3]; r.ID != "rly_4" || r.Protocol != "mtproto" || r.Enabled || r.State != "pending" {
+		t.Errorf("switched-off MTProto relay: %+v", r)
+	}
 	for _, node := range []string{"nl1", nodeA} {
-		if got := decode[struct{ Relays []relayResult }](t, mustOK(t, s, "relays_list", map[string]any{"node": node})); len(got.Relays) != 2 {
+		if got := decode[struct{ Relays []relayResult }](t, mustOK(t, s, "relays_list", map[string]any{"node": node})); len(got.Relays) != 4 {
 			t.Errorf("relays of %s: %+v", node, got)
 		}
 	}
 	if got := mustFail(t, s, "relays_list", map[string]any{"node": "missing"}); !strings.Contains(got, "node not found") {
 		t.Errorf("unknown node: %q", got)
+	}
+	if got := mustFail(t, s, "relays_list", map[string]any{"offset": -1}); !strings.Contains(got, "must not be negative") {
+		t.Errorf("negative page offset: %q", got)
 	}
 
 	out = mustOK(t, s, "relay_candidates", map[string]any{"node": "nl1"})
@@ -289,6 +351,94 @@ func TestRelayReadsNameNoAddress(t *testing.T) {
 	}
 }
 
+func TestRelayListShowsModeBridgeAndBridgeStage(t *testing.T) {
+	e := newTestEnv(t)
+	r := e.w.relay.find("rly_1")
+	r.Mode, r.ActiveMode, r.ModeReason = "auto", "reverse", "leg_failed"
+	r.Bridge = &adminv1.RelayBridge{Connected: true, Conns: 2, RttMs: 34}
+	r.Check.Bridge = &adminv1.RelayStage{Status: "ok", SenderName: "de1", AtUnix: 1790842000}
+	_, secret := e.token(ProfileReadonly)
+	out := mustOK(t, e.session(secret), "relays_list", map[string]any{})
+	rv := decode[struct {
+		Relays []relayResult `json:"relays"`
+	}](t, out).Relays[0]
+	if rv.Mode != "auto" || rv.ActiveMode != "reverse" || rv.ModeReason != "leg_failed" || rv.Bridge == nil ||
+		!rv.Bridge.Connected || rv.Bridge.Conns != 2 || rv.Bridge.RTTMS != 34 || rv.Check == nil || rv.Check.Bridge == nil || rv.Check.Bridge.Status != "ok" {
+		t.Fatalf("relay view omitted reverse state: %+v", rv)
+	}
+}
+
+func TestRelayListShowsBridgeStageBeforeTheFirstFullCheck(t *testing.T) {
+	r := &adminv1.Relay{Check: &adminv1.RelayCheck{Bridge: &adminv1.RelayStage{Status: "fail", Code: "disconnected", AtUnix: 1790842000}}}
+	v := relayView(r)
+	if v.Check == nil || v.Check.Bridge == nil || v.Check.Bridge.Status != "fail" || v.Check.Bridge.Code != "disconnected" {
+		t.Fatalf("stage-only bridge check was hidden: %+v", v)
+	}
+	if text := relayCheckText(r); !strings.Contains(text, "bridge fail (disconnected)") {
+		t.Fatalf("stage-only bridge check text = %q", text)
+	}
+}
+
+func TestRelayPlanReportsReverseModeFacts(t *testing.T) {
+	t.Run("stale exit reach hint", func(t *testing.T) {
+		e := newTestEnv(t)
+		e.w.relay.cands[1].ExitReachesEntry = &adminv1.RelayReachHint{Verdict: "reach", Source: "exit_probe", AtUnix: time.Now().Add(-16 * time.Minute).Unix()}
+		_, secret := e.token(ProfileAdmin)
+		p := planOf(t, e.session(secret), "relay", map[string]any{"action": "create", "node": "nl1", "inbound_id": "inb_3", "mode": "reverse"})
+		if factOf(t, p, "mode").Value != "reverse" || !strings.HasPrefix(factOf(t, p, "reverse_reach").Value, "stale") {
+			t.Fatalf("reverse create facts: %+v", p.Facts)
+		}
+	})
+	t.Run("UDP cannot use the bridge", func(t *testing.T) {
+		e := newTestEnv(t)
+		e.w.relay.cands[3].ReverseBlocked = "udp" // the panel's word for it, from the candidate list
+		_, secret := e.token(ProfileAdmin)
+		p := planOf(t, e.session(secret), "relay", map[string]any{"action": "create", "node": "nl1", "inbound_id": "inb_5", "mode": "reverse"})
+		if factOf(t, p, "mode").Value != "reverse" || !strings.Contains(factOf(t, p, "reverse_bridge").Value, "UDP cannot use the bridge") {
+			t.Fatalf("UDP reverse facts: %+v", p.Facts)
+		}
+	})
+	t.Run("an old agent and stale stage", func(t *testing.T) {
+		e := newTestEnv(t)
+		r := e.w.relay.find("rly_2")
+		r.ReverseBlocked = "entry_agent_old"
+		r.Check = &adminv1.RelayCheck{ReverseReach: &adminv1.RelayStage{Status: "ok", AtUnix: time.Now().Add(-16 * time.Minute).Unix()}}
+		_, secret := e.token(ProfileAdmin)
+		p := planOf(t, e.session(secret), "relay", map[string]any{"action": "enable", "relay_id": "rly_2", "mode": "reverse"})
+		if !strings.Contains(factOf(t, p, "reverse_bridge").Value, "entry's agent is too old") {
+			t.Fatalf("reverse enable facts: %+v", p.Facts)
+		}
+		for _, f := range p.Facts {
+			if f.Key == "reverse_reach" {
+				t.Fatalf("a bridge that cannot be had was given a reach: %+v", p.Facts)
+			}
+		}
+	})
+}
+
+func TestRelayListPagesContinueWithoutDroppingRelays(t *testing.T) {
+	e := newTestEnv(t)
+	_, secret := e.token(ProfileReadonly)
+	s := e.session(secret)
+	type page struct {
+		Relays     []relayResult `json:"relays"`
+		Offset     int           `json:"offset"`
+		Limit      int           `json:"limit"`
+		Total      int           `json:"total"`
+		NextOffset int           `json:"next_offset"`
+		Truncated  bool          `json:"truncated"`
+	}
+	first := decode[page](t, mustOK(t, s, "relays_list", map[string]any{"limit": 2}))
+	if len(first.Relays) != 2 || first.Offset != 0 || first.Limit != 2 || first.Total != 4 || first.NextOffset != 2 || !first.Truncated {
+		t.Fatalf("first page: %+v", first)
+	}
+	last := decode[page](t, mustOK(t, s, "relays_list", map[string]any{"offset": first.NextOffset, "limit": first.Limit}))
+	if len(last.Relays) != 2 || last.Offset != 2 || last.Total != 4 || last.Truncated || last.NextOffset != 0 ||
+		last.Relays[0].Protocol != "mtproto" || last.Relays[1].Enabled {
+		t.Fatalf("last page: %+v", last)
+	}
+}
+
 func TestRelayCheckIsAnAdminReadWithoutAPlan(t *testing.T) {
 	e := newTestEnv(t)
 	for _, p := range []Profile{ProfileReadonly, ProfileOperator} {
@@ -322,6 +472,50 @@ func TestRelayCheckIsAnAdminReadWithoutAPlan(t *testing.T) {
 	}
 	if got := mustFail(t, s, "relay_check", map[string]any{"relay_id": "rly_missing"}); !strings.Contains(got, "not_found") {
 		t.Errorf("unknown relay: %q", got)
+	}
+}
+
+func TestRelayCheckShowsTheReverseStagesAndAsksForThemOnlyWhenToldTo(t *testing.T) {
+	e := newTestEnv(t)
+	e.w.relay.legFail = "timeout"
+	e.w.relay.reverseReach = &adminv1.RelayStage{Status: "ok", SenderName: "de1", Verdict: "ours", AtUnix: 1790842001}
+	_, secret := e.token(ProfileAdmin)
+	s := e.session(secret)
+	out := mustOK(t, s, "relay_check", map[string]any{"relay_id": "rly_2"})
+	noCanary(t, "relay_check", out)
+	r := decode[relayResult](t, out)
+	if r.Check == nil || r.Check.ReverseReach == nil || r.Check.ReverseReach.Status != "ok" || r.Check.ReverseReach.Sender != "de1" ||
+		r.Check.ReverseReach.AtUnix != 1790842001 || r.Check.ReverseSpeed != nil {
+		t.Fatalf("relay_check reverse stages = %+v", r.Check)
+	}
+	mustOK(t, s, "relay_check", map[string]any{"relay_id": "rly_2", "reverse_reach": true})
+	f := &e.w.relay
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.checks) != 2 || f.checks[0].GetReverseReach() || f.checks[0].GetReverseSpeed() || !f.checks[1].GetReverseReach() || f.checks[1].GetReverseSpeed() {
+		t.Fatalf("check requests = %+v; want the speed proof never asked for through MCP (path_speed has its own plan)", f.checks)
+	}
+}
+
+func TestRelayCandidatesShowWhetherTheExitReachesTheEntry(t *testing.T) {
+	e := newTestEnv(t)
+	e.w.relay.cands[0].ExitReachesEntry = &adminv1.RelayReachHint{Verdict: "reach", Source: "exit_probe", AtUnix: 1790842001}
+	_, secret := e.token(ProfileReadonly)
+	out := mustOK(t, e.session(secret), "relay_candidates", map[string]any{"node": "nl1"})
+	noCanary(t, "relay_candidates", out)
+	got := decode[struct {
+		Candidates []struct {
+			InboundID   string `json:"inbound_id"`
+			ExitReaches *struct {
+				Verdict string `json:"verdict"`
+				Source  string `json:"source"`
+				AtUnix  int64  `json:"at_unix"`
+			} `json:"exit_reaches_entry"`
+		} `json:"candidates"`
+	}](t, out)
+	if len(got.Candidates) < 2 || got.Candidates[0].ExitReaches == nil || got.Candidates[0].ExitReaches.Verdict != "reach" ||
+		got.Candidates[0].ExitReaches.Source != "exit_probe" || got.Candidates[0].ExitReaches.AtUnix != 1790842001 || got.Candidates[1].ExitReaches != nil {
+		t.Fatalf("candidates = %+v", got.Candidates)
 	}
 }
 
@@ -394,6 +588,53 @@ func TestRelayCreateWaitsForTheOwnerThenChecksAndSwitchesOn(t *testing.T) {
 	}
 }
 
+func TestAWGRelayPlanExplainsPerEntryKeysAndDisguisePort(t *testing.T) {
+	e := newTestEnv(t)
+	e.w.relay.cands = append(e.w.relay.cands, &adminv1.RelayCandidate{
+		InboundId: "inb_awg", NodeId: nodeA, NodeName: "de1", ProfileId: "prf_awg", ProfileName: "AWG",
+		Protocol: "awg", Network: "udp", Port: 51820,
+	})
+	_, secret := e.token(ProfileAdmin)
+	p := planOf(t, e.session(secret), "relay", map[string]any{"action": "create", "node": "nl1", "inbound_id": "inb_awg"})
+	if fact := factOf(t, p, "entry_port"); !strings.Contains(fact.Value, "profile's disguise port") {
+		t.Errorf("entry_port = %+v, want disguise-port selection", fact)
+	}
+	if fact := factOf(t, p, "awg_path_keys"); fact.Value != "People allowed to use both nodes get their own AmneziaWG relay key. AmneziaVPN users must download and import the new config; apps using a subscription link get it on refresh." {
+		t.Errorf("awg_path_keys = %+v", fact)
+	}
+}
+
+func TestRelayCreatePlanWarnsWhenEntryAndExitShareACountry(t *testing.T) {
+	for _, tc := range []struct {
+		name, exit, entry string
+		warns             bool
+	}{
+		{"same country, any case", "DE", "de", true},
+		{"other country", "DE", "NL", false},
+		{"no exit country", "", "NL", false},
+		{"no countries at all", "", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newTestEnv(t)
+			e.w.nodePatches[nodeA] = &adminv1.UpdateNodeRequest{CountryCode: &tc.exit}
+			e.w.nodePatches[nodeB] = &adminv1.UpdateNodeRequest{CountryCode: &tc.entry}
+			_, secret := e.token(ProfileAdmin)
+			s := e.session(secret)
+
+			p := planOf(t, s, "relay", map[string]any{"action": "create", "node": "nl1", "inbound_id": "inb_3"})
+			warned := false
+			for _, f := range p.Facts {
+				if f.Key == "warning" && f.Value == "entry and exit are in the same country" {
+					warned = true
+				}
+			}
+			if warned != tc.warns {
+				t.Fatalf("same-country warning = %v, want %v: %+v", warned, tc.warns, p.Facts)
+			}
+		})
+	}
+}
+
 func TestRelayCreateThatFailsAChecksStaysOff(t *testing.T) {
 	for _, tc := range []struct {
 		name            string
@@ -428,6 +669,29 @@ func TestRelayCreateThatFailsAChecksStaysOff(t *testing.T) {
 				t.Errorf("stored plan: %+v", st)
 			}
 		})
+	}
+}
+
+func TestRelayCreateCanBeEnabledWhenBothStagesAreUnverifiable(t *testing.T) {
+	e := newTestEnv(t)
+	e.w.relay.legUnverifiable = true
+	e.w.relay.pathUnverifiable = true
+	_, secret := e.token(ProfileAdmin)
+	s := e.session(secret)
+	p := planOf(t, s, "relay", map[string]any{"action": "create", "node": "nl1", "inbound_id": "inb_3"})
+	if err := e.plans.decide(p.PlanID, true); err != nil {
+		t.Fatal(err)
+	}
+	ap := applyOf(t, s, "relay", p.ConfirmToken)
+	if ap.Status != StatusApplied || !e.w.relay.find("rly_new").GetEnabled() {
+		t.Fatalf("unverifiable relay was not enabled: %+v", ap)
+	}
+	check := e.w.relay.find("rly_new").GetCheck()
+	if check == nil || !check.GetOk() || check.GetVerified() || check.GetLeg().GetStatus() != "skipped" || check.GetPath().GetCode() != "unverifiable" {
+		t.Fatalf("unverifiable check: %+v", check)
+	}
+	if got := relayCalls(e); !slices.Equal(got, []string{"create", "check", "update:on"}) {
+		t.Fatalf("calls: %v", got)
 	}
 }
 
@@ -507,6 +771,9 @@ func TestRelayChangesOfAnExistingRelay(t *testing.T) {
 	p = run(map[string]any{"action": "port", "relay_id": "rly_1", "port": 9000})
 	if f := factOf(t, p, "entry_port"); f.Value != "8443 -> 9000" {
 		t.Errorf("entry_port: %+v", f)
+	}
+	if f := factOf(t, p, "server"); !strings.Contains(f.Value, "443") {
+		t.Errorf("the relay server fact was overwritten: %+v", f)
 	}
 	if !strings.Contains(factOf(t, p, "effect").Value, "switched off") {
 		t.Errorf("effect: %q", factOf(t, p, "effect").Value)

@@ -1,0 +1,530 @@
+package update
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"connectrpc.com/connect"
+
+	agentv1 "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/gen/mistgate/agent/v1/agentv1connect"
+)
+
+type rb2Svc struct {
+	agentv1connect.UnimplementedAgentServiceHandler
+	s         *Service
+	node      string
+	ret       chan error
+	returned  chan rb2Return
+	firstSend chan rb2FirstSend
+}
+
+type rb2Return struct {
+	offset uint64
+	err    error
+	// The old handler can return while the test is still draining the resumed stream.
+	returnedAt time.Time
+}
+
+// The old write deadline can expire during the large resumed transfer, so capture overlap at its first send.
+type rb2FirstSend struct {
+	offset uint64
+	zombie bool
+}
+
+// rb2Svc adapts the update service to the Connect handler used by these transport regressions.
+func (a rb2Svc) FetchUpdate(ctx context.Context, req *connect.Request[agentv1.FetchUpdateRequest], stream *connect.ServerStream[agentv1.FetchUpdateResponse]) error {
+	reportedFirstSend := false
+	err := a.s.ServeWithWriteDeadline(ctx, a.node, req.Msg.Name, req.Msg.Offset, WriteDeadlineFromContext(ctx), func(chunk []byte, total uint64) error {
+		if req.Msg.Offset != 0 && !reportedFirstSend {
+			reportedFirstSend = true
+			a.s.bmu.Lock()
+			zombie := a.s.zombieTotal == 1 && a.s.zombies[a.node] == 1
+			a.s.bmu.Unlock()
+			a.firstSend <- rb2FirstSend{offset: req.Msg.Offset, zombie: zombie}
+		}
+		return stream.Send(&agentv1.FetchUpdateResponse{Data: chunk, TotalSize: total})
+	})
+	select {
+	case a.ret <- err:
+	default:
+	}
+	select {
+	case a.returned <- rb2Return{offset: req.Msg.Offset, err: err, returnedAt: time.Now()}:
+	default:
+	}
+	return err
+}
+
+type rb2Server struct {
+	srv      *httptest.Server
+	in, out  atomic.Int32
+	newConns atomic.Int32
+	svc      rb2Svc
+}
+
+// newRB2Server wires the update stream with the agent listener's production timeouts.
+func newRB2Server(t *testing.T, s *Service, h2 bool, ln net.Listener, h2conf *http.HTTP2Config) *rb2Server {
+	r := &rb2Server{svc: rb2Svc{
+		s: s, node: "nod_de1", ret: make(chan error, 64), returned: make(chan rb2Return, 64), firstSend: make(chan rb2FirstSend, 64),
+	}}
+	path, rpc := agentv1connect.NewAgentServiceHandler(r.svc)
+	mux := http.NewServeMux()
+	mux.Handle(path, rpc)
+	mux.HandleFunc("/slow", func(w http.ResponseWriter, req *http.Request) {
+		rc := http.NewResponseController(w)
+		_ = rc.SetWriteDeadline(time.Time{})
+		for i := 0; i < 8; i++ {
+			if _, err := w.Write([]byte("x")); err != nil {
+				return
+			}
+			_ = rc.Flush()
+			time.Sleep(200 * time.Millisecond)
+		}
+	})
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		r.in.Add(1)
+		defer r.out.Add(1)
+		if req.URL.Path != "/slow" {
+			rc := http.NewResponseController(w)
+			_ = rc.SetReadDeadline(time.Time{})
+			_ = rc.SetWriteDeadline(time.Time{})
+			req = req.WithContext(WithWriteDeadline(req.Context(), rc.SetWriteDeadline))
+		}
+		mux.ServeHTTP(w, req)
+	}))
+	srv.Config.ReadTimeout, srv.Config.WriteTimeout, srv.Config.IdleTimeout = 30*time.Second, 60*time.Second, 2*time.Minute
+	srv.Config.ConnState = func(_ net.Conn, st http.ConnState) {
+		if st == http.StateNew {
+			r.newConns.Add(1)
+		}
+	}
+	srv.Config.HTTP2 = h2conf
+	if ln != nil {
+		srv.Listener.Close()
+		srv.Listener = ln
+	}
+	srv.EnableHTTP2 = h2
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	r.srv = srv
+	return r
+}
+
+func (r *rb2Server) client() agentv1connect.AgentServiceClient {
+	return agentv1connect.NewAgentServiceClient(r.srv.Client(), r.srv.URL)
+}
+
+func (r *rb2Server) freshClient(t *testing.T) agentv1connect.AgentServiceClient {
+	t.Helper()
+	base, ok := r.srv.Client().Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("httptest client transport has type %T, want *http.Transport", r.srv.Client().Transport)
+	}
+	transport := base.Clone()
+	transport.DisableKeepAlives = true
+	t.Cleanup(transport.CloseIdleConnections)
+	return agentv1connect.NewAgentServiceClient(&http.Client{Transport: transport}, r.srv.URL)
+}
+
+func rb2Wait(ch <-chan error, d time.Duration) (error, bool) {
+	select {
+	case err := <-ch:
+		return err, true
+	case <-time.After(d):
+		return nil, false
+	}
+}
+
+const rb2Name = "mistgate-node-linux-amd64"
+
+// A fresh connection resumes a blackholed stream while its old handler is still inside the blocked write.
+func TestBundleHTTP2StallThenResetRepeated(t *testing.T) {
+	for _, h2 := range []bool{true, false} {
+		name := "http1"
+		if h2 {
+			name = "h2"
+		}
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			want := randBytes(24 << 20)
+			e.bundle("1.0", 10, map[string][]byte{rb2Name: want})
+			e.s.sendTimeout = 2 * time.Second
+			var h2conf *http.HTTP2Config
+			if h2 {
+				// HTTP/2 applies its deadline at the connection writer, which releases a blackholed stream's blocked send.
+				h2conf = &http.HTTP2Config{WriteByteTimeout: e.s.sendTimeout}
+			}
+			inner, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			ln := &blackholeLn{Listener: inner, holdTimeout: true}
+			r := newRB2Server(t, e.s, h2, ln, h2conf)
+			for round := 0; round < 6; round++ {
+				firstCtx, cancelFirst := context.WithCancel(context.Background())
+				first, err := r.freshClient(t).FetchUpdate(firstCtx,
+					connect.NewRequest(&agentv1.FetchUpdateRequest{Name: rb2Name}))
+				if err != nil {
+					cancelFirst()
+					t.Fatal(err)
+				}
+				t.Cleanup(func() {
+					cancelFirst()
+					_ = first.Close()
+				})
+				if !first.Receive() {
+					cancelFirst()
+					_ = first.Close()
+					t.Fatalf("round %d: initial download had no first chunk: %v", round, first.Err())
+				}
+				prefix := append([]byte(nil), first.Msg().Data...)
+				if len(prefix) == 0 || len(prefix) >= len(want) {
+					cancelFirst()
+					_ = first.Close()
+					t.Fatalf("round %d: first chunk length %d, want a non-empty prefix of %d bytes", round, len(prefix), len(want))
+				}
+				blocked := ln.hole()
+				if blocked == nil {
+					cancelFirst()
+					t.Fatalf("round %d: no accepted connection to blackhole", round)
+				}
+				select {
+				case <-blocked.blocked:
+				case <-time.After(5 * time.Second):
+					cancelFirst()
+					_ = first.Close()
+					t.Fatalf("round %d: the first connection did not block in a write", round)
+				}
+				if deadline := blocked.deadline.Load(); deadline == 0 {
+					cancelFirst()
+					t.Fatalf("round %d: the blocked connection has no write timeout", round)
+				}
+				e.s.bmu.Lock()
+				live := e.s.serves == 1 && e.s.servingNodes["nod_de1"] != nil
+				e.s.bmu.Unlock()
+				if !live {
+					t.Fatalf("round %d: blackholed Serve returned before the resume", round)
+				}
+
+				beforeResume := r.newConns.Load()
+				resumeOffset := uint64(len(prefix))
+				handoverAt := time.Now()
+				resumed, err := r.freshClient(t).FetchUpdate(context.Background(),
+					connect.NewRequest(&agentv1.FetchUpdateRequest{Name: rb2Name, Offset: resumeOffset}))
+				if err != nil {
+					t.Fatalf("round %d: resume on a fresh connection: %v", round, err)
+				}
+				suffix := make([]byte, 0, len(want)-len(prefix))
+				if !resumed.Receive() {
+					t.Fatalf("round %d: resumed stream had no first chunk: %v", round, resumed.Err())
+				}
+				firstSend := <-r.svc.firstSend
+				if firstSend.offset != resumeOffset || !firstSend.zombie {
+					t.Fatalf("round %d: resumed first send offset=%d, old zombie=%v", round, firstSend.offset, firstSend.zombie)
+				}
+				// The overlap is recorded: the old connection's write timeout may land now.
+				close(blocked.timeout)
+				suffix = append(suffix, resumed.Msg().Data...)
+				for resumed.Receive() {
+					suffix = append(suffix, resumed.Msg().Data...)
+				}
+				if resumed.Err() != nil || !bytes.Equal(append(prefix, suffix...), want) {
+					t.Fatalf("round %d: resumed stream error=%v, combined bytes=%d, want %d", round, resumed.Err(), len(prefix)+len(suffix), len(want))
+				}
+				if r.newConns.Load() <= beforeResume {
+					t.Fatalf("round %d: resume did not use a fresh connection", round)
+				}
+				newReturned, oldReturned := false, false
+				for !newReturned || !oldReturned {
+					select {
+					case result := <-r.svc.returned:
+						switch result.offset {
+						case resumeOffset:
+							if result.err != nil {
+								t.Fatalf("round %d: resumed Serve returned %v, want nil", round, result.err)
+							}
+							newReturned = true
+						case 0:
+							if result.err == nil {
+								t.Fatalf("round %d: superseded Serve returned nil, want its blocked write to fail", round)
+							}
+							if took := result.returnedAt.Sub(handoverAt); took > e.s.sendTimeout+stallSlack {
+								t.Fatalf("round %d: superseded Serve returned after %s, want within the send timeout", round, took)
+							}
+							oldReturned = true
+						default:
+							t.Fatalf("round %d: unexpected returned offset %d", round, result.offset)
+						}
+					case <-time.After(e.s.sendTimeout + stallSlack):
+						t.Fatalf("round %d: both Serve calls did not return within %s", round, e.s.sendTimeout+stallSlack)
+					}
+				}
+				cancelFirst()
+				_ = first.Close()
+				assertServeSlotsZero(t, e.s)
+			}
+			t.Logf("6 blackhole hand-overs: live slots and zombies cleared, handlers entered=%d returned=%d, conns=%d", r.in.Load(), r.out.Load(), r.newConns.Load())
+		})
+	}
+}
+
+// Another stream on the same HTTP/2 connection: a stalled download's deadline must not touch it, and a finished
+// download must not leave a deadline behind.
+func TestBundleHTTP2OtherStreamsOnSameConnection(t *testing.T) {
+	e := newEnv(t)
+	e.bundle("1.0", 10, map[string][]byte{rb2Name: randBytes(24 << 20), "mistgate-node-linux-arm64": randBytes(300 << 10)})
+	e.s.sendTimeout = 300 * time.Millisecond
+	r := newRB2Server(t, e.s, true, nil, nil)
+	hc := r.srv.Client()
+	cl := r.client()
+
+	st, err := cl.FetchUpdate(context.Background(), connect.NewRequest(&agentv1.FetchUpdateRequest{Name: "mistgate-node-linux-arm64"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for st.Receive() {
+		n += len(st.Msg().Data)
+	}
+	if st.Err() != nil || n != 300<<10 {
+		t.Fatalf("small download: %d bytes, %v", n, st.Err())
+	}
+	<-r.svc.ret
+
+	slowDone := make(chan error, 1)
+	go func() {
+		resp, err := hc.Get(r.srv.URL + "/slow")
+		if err != nil {
+			slowDone <- err
+			return
+		}
+		defer resp.Body.Close()
+		b, err := io.ReadAll(resp.Body)
+		if err == nil && len(b) != 8 {
+			err = errors.New("short body")
+		}
+		slowDone <- err
+	}()
+	sctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stalled, err := cl.FetchUpdate(sctx, connect.NewRequest(&agentv1.FetchUpdateRequest{Name: rb2Name}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = stalled
+	if serveErr, ok := rb2Wait(r.svc.ret, 10*time.Second); !ok || !errors.Is(serveErr, os.ErrDeadlineExceeded) {
+		t.Fatalf("stalled download: %v %v", serveErr, ok)
+	}
+	if err, ok := rb2Wait(slowDone, 10*time.Second); !ok || err != nil {
+		t.Fatalf("the other stream on the same connection: %v (finished=%v)", err, ok)
+	}
+	t.Logf("the /slow stream (1.6 s, gaps of 200 ms > deadline 300 ms after a finished download) survived the stalled stream's reset; TCP connections opened: %d", r.newConns.Load())
+}
+
+// A slow but live reader: the whole download takes many times the stall timeout, each chunk takes less.
+func TestBundleHTTP2SlowReaderThatKeepsMakingProgress(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		pause time.Duration
+	}{{"progress-before-timeout", 250 * time.Millisecond}} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			data := randBytes(6 << 20)
+			e.bundle("1.0", 10, map[string][]byte{rb2Name: data})
+			e.s.sendTimeout = 400 * time.Millisecond
+			r := newRB2Server(t, e.s, true, nil, nil)
+			start := time.Now()
+			st, err := r.client().FetchUpdate(context.Background(), connect.NewRequest(&agentv1.FetchUpdateRequest{Name: rb2Name}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := 0
+			for st.Receive() {
+				got += len(st.Msg().Data)
+				time.Sleep(tc.pause)
+			}
+			serveErr, _ := rb2Wait(r.svc.ret, 5*time.Second)
+			t.Logf("pause %s per 256 KiB message: received %d of %d in %s; client err=%v; serve err=%v",
+				tc.pause, got, len(data), time.Since(start).Round(time.Millisecond), st.Err(), serveErr)
+			if got != len(data) || serveErr != nil {
+				t.Errorf("a live reader was cut: received %d of %d, server error %v", got, len(data), serveErr)
+			}
+			if time.Since(start) <= e.s.sendTimeout {
+				t.Errorf("download took %s, want longer than one no-progress timeout", time.Since(start))
+			}
+		})
+	}
+}
+
+// blackholeConn: once the flag is set, writes block until the conn is closed or its write deadline passes,
+// the way a TCP send buffer to a vanished peer behaves.
+type blackholeLn struct {
+	net.Listener
+	// holdTimeout gives each connection a gate: a passed write deadline fails the blocked write only after the test
+	// closes it. The resume then always meets the old handler inside its write, however slow the machine is.
+	holdTimeout bool
+	mu          sync.Mutex
+	conns       []*blackholeConn
+}
+
+func (l *blackholeLn) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	bc := &blackholeConn{Conn: c, blocked: make(chan struct{}), closed: make(chan struct{})}
+	if l.holdTimeout {
+		bc.timeout = make(chan struct{})
+	}
+	l.mu.Lock()
+	l.conns = append(l.conns, bc)
+	l.mu.Unlock()
+	return bc, nil
+}
+
+func (l *blackholeLn) hole() *blackholeConn {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, c := range l.conns {
+		c.hole.Store(true)
+	}
+	if len(l.conns) == 0 {
+		return nil
+	}
+	return l.conns[len(l.conns)-1]
+}
+
+type blackholeConn struct {
+	net.Conn
+	hole        atomic.Bool
+	writeFailed atomic.Bool
+	deadline    atomic.Int64
+	once        sync.Once
+	blockOnce   sync.Once
+	blocked     chan struct{}
+	closed      chan struct{}
+	timeout     chan struct{} // nil: the deadline applies as soon as it passes
+}
+
+func (c *blackholeConn) timeoutHeld() bool {
+	if c.timeout == nil {
+		return false
+	}
+	select {
+	case <-c.timeout:
+		return false
+	default:
+		return true
+	}
+}
+
+func (c *blackholeConn) Write(b []byte) (int, error) {
+	if !c.hole.Load() {
+		return c.Conn.Write(b)
+	}
+	c.blockOnce.Do(func() { close(c.blocked) })
+	if c.writeFailed.Load() {
+		return 0, net.ErrClosed
+	}
+	for {
+		if d := c.deadline.Load(); d != 0 && time.Now().UnixNano() > d && !c.timeoutHeld() {
+			// The timeout makes this simulated TCP path terminal so TLS can finish closing the connection.
+			c.writeFailed.Store(true)
+			return 0, os.ErrDeadlineExceeded
+		}
+		select {
+		case <-c.closed:
+			return 0, net.ErrClosed
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
+func (c *blackholeConn) SetWriteDeadline(t time.Time) error {
+	if t.IsZero() {
+		c.deadline.Store(0)
+	} else {
+		c.deadline.Store(t.UnixNano())
+	}
+	return c.Conn.SetWriteDeadline(t)
+}
+
+func (c *blackholeConn) SetDeadline(t time.Time) error {
+	_ = c.SetWriteDeadline(t)
+	return c.Conn.SetDeadline(t)
+}
+
+func (c *blackholeConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return c.Conn.Close()
+}
+
+// A vanished TCP peer makes no write progress; HTTP/2 WriteByteTimeout must release its node's download slot.
+func TestBundleHTTP2BlackholedPeerReleasesNodeSlot(t *testing.T) {
+	e := newEnv(t)
+	e.bundle("1.0", 10, map[string][]byte{rb2Name: randBytes(24 << 20)})
+	inner, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln := &blackholeLn{Listener: inner}
+	done := make(chan error, 1)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		controller := http.NewResponseController(w)
+		err := e.s.Serve(req.Context(), "nod_de1", rb2Name, 0, func(chunk []byte, _ uint64) error {
+			if _, err := w.Write(chunk); err != nil {
+				return err
+			}
+			return controller.Flush()
+		})
+		done <- err
+	}))
+	server.Config.HTTP2 = &http.HTTP2Config{WriteByteTimeout: 500 * time.Millisecond}
+	server.EnableHTTP2 = true
+	server.Listener.Close()
+	server.Listener = ln
+	server.StartTLS()
+	t.Cleanup(server.Close)
+	resp, err := server.Client().Get(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.CopyN(io.Discard, resp.Body, 64<<10); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	readerDone := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(io.Discard, resp.Body)
+		readerDone <- err
+	}()
+	ln.hole()
+	if serveErr, returned := rb2Wait(done, 4*time.Second); !returned || serveErr == nil {
+		t.Fatalf("blackholed HTTP/2 handler returned=%v err=%v proto=%s, want a write failure within the configured timeout", returned, serveErr, resp.Proto)
+	}
+	var sink chunkSink
+	if err := e.s.Serve(e.ctx, "nod_de1", rb2Name, 0, sink.send); err != nil {
+		t.Fatalf("the blackholed stream kept the node's update slot: %v", err)
+	}
+	resp.Body.Close()
+	select {
+	case <-readerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("HTTP/2 reader did not finish after the server closed the blackholed connection")
+	}
+}
+
+// stallSlack is the scheduling allowance on top of the send timeout. The bound under test is the send timeout itself;
+// a second was not enough on a machine running other builds (the test failed about once in a few full runs).
+const stallSlack = 5 * time.Second

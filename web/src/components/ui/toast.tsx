@@ -1,7 +1,7 @@
 import { Toast } from "@base-ui/react/toast";
 import { createContext, use, useMemo, type ReactNode } from "react";
 import { useT } from "@/i18n";
-import { cx } from "@/lib/cx";
+import { useEffectsEnabled } from "@/lib/effects";
 import { Icon } from "./icons";
 
 type Notify = ((message: string, options?: { undo?: () => void; ms?: number }) => void) & { error: (message: string) => void };
@@ -19,8 +19,8 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     <Toast.Provider limit={2} timeout={3400}>
       <Bridge>{children}</Bridge>
       <Toast.Portal>
-        {/* bottom centre; on the phone it sits above the floating dock */}
-        <Toast.Viewport className="pointer-events-none fixed inset-x-0 bottom-[88px] z-40 flex flex-col items-center gap-2 px-4 md:bottom-5">
+        {/* bottom centre of the page beside the menu; on the phone it sits above the floating dock, on a desktop above the Nodes page's bulk bar (index.css) */}
+        <Toast.Viewport data-toast-viewport className="pointer-events-none fixed inset-x-0 bottom-[104px] z-40 flex flex-col items-center gap-2 px-4 md:bottom-6 md:ps-[calc(var(--menu-w)+16px)]">
           <Current />
         </Toast.Viewport>
       </Toast.Portal>
@@ -52,6 +52,7 @@ function Bridge({ children }: { children: ReactNode }) {
 
 function Current() {
   const t = useT();
+  const halo = useEffectsEnabled();
   const { toasts } = Toast.useToastManager();
   return ["error", "note"].map((slot) => {
     const toast = toasts.find((x) => x.id === slot);
@@ -62,17 +63,22 @@ function Current() {
         // a refilled slot is a new element, so the new message pops in again
         key={`${slot}${toast.updateKey}`}
         toast={toast}
-        className="pointer-events-auto flex max-w-full items-center rounded-field bg-fg px-3.5 py-[11px] text-xs leading-snug text-canvas shadow-(--shadow-toast) animate-[mg-ui-in_0.35s_cubic-bezier(0.2,0.9,0.3,1.3)_both] md:max-w-[480px]"
+        className="pointer-events-auto relative isolate flex min-h-11 max-w-full items-center rounded-xl bg-fg py-2 ps-4 pe-2 text-sm leading-5 font-medium text-canvas shadow-(--shadow-toast) animate-[mg-up_0.3s_var(--e)_both] md:max-w-[480px]"
       >
-        <Toast.Content className="flex items-center gap-2.5">
-          <span aria-hidden className={cx("grid size-5 flex-none place-items-center rounded-full", error ? "bg-danger" : "bg-accent")}>
-            {error ? <span className="text-[13px] leading-none font-extrabold text-[#0c0c0e]">!</span> : <span className="-mt-0.5 h-2 w-1 rotate-45 border-r-2 border-b-2 border-[#0c0c0e]" />}
-          </span>
-          <Toast.Description className="min-w-0" />
-          <Toast.Action className="ml-1 flex-none font-extrabold underline" />
+        {/* a halo of accent dots under the toast: part of the effects, off with them */}
+        {halo && <span aria-hidden className="toast-halo" />}
+        <Toast.Content className="flex items-center gap-4">
+          {/* a note is plain words, as drawn; only an error carries a red mark in front, so it is not mistaken for a note */}
           {error && (
-            <Toast.Close aria-label={t("common.close")} className="-mr-1.5 grid size-6 flex-none place-items-center rounded-full opacity-60 transition-opacity hover:opacity-100">
-              <Icon name="x" size={12} />
+            <span aria-hidden className="tone-bad grid size-5 flex-none place-items-center rounded-full bg-(--c) text-[13px] leading-none font-medium text-(--c-ink)">
+              !
+            </span>
+          )}
+          <Toast.Description className="min-w-0" />
+          <Toast.Action className="flex h-7 flex-none items-center rounded-ctl bg-[color-mix(in_srgb,var(--bg)_8%,transparent)] px-2.5 text-[13px] font-medium transition-colors duration-150 hover:bg-[color-mix(in_srgb,var(--bg)_14%,transparent)] [:root[data-theme=light]_&]:bg-white/14 [:root[data-theme=light]_&]:hover:bg-white/14" />
+          {error && (
+            <Toast.Close aria-label={t("common.close")} className="-me-0.5 grid size-7 flex-none place-items-center rounded-ctl opacity-60 transition-opacity hover:opacity-100">
+              <Icon name="x" size={14} />
             </Toast.Close>
           )}
         </Toast.Content>

@@ -112,15 +112,21 @@ func tcpEcho(t *testing.T) string {
 
 func startTCPDestinationPair(t *testing.T, serve func(string, net.Conn)) string {
 	t.Helper()
-	a, err := net.Listen("tcp", "127.0.0.2:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := strconv.Itoa(a.Addr().(*net.TCPAddr).Port)
-	b, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", port))
-	if err != nil {
+	// The port the kernel hands out at 127.0.0.2 can be held at 127.0.0.1 by another test's socket: then take another.
+	var a, b net.Listener
+	for attempt := 1; ; attempt++ {
+		var err error
+		if a, err = net.Listen("tcp", "127.0.0.2:0"); err != nil {
+			t.Fatal(err)
+		}
+		port := strconv.Itoa(a.Addr().(*net.TCPAddr).Port)
+		if b, err = net.Listen("tcp", net.JoinHostPort("127.0.0.1", port)); err == nil {
+			break
+		}
 		_ = a.Close()
-		t.Fatal(err)
+		if attempt == 20 {
+			t.Fatal(err)
+		}
 	}
 	t.Cleanup(func() {
 		_ = a.Close()
@@ -408,7 +414,7 @@ func exchange(conn net.Conn, payload []byte) error {
 	return nil
 }
 
-// payload starts with a byte the sniffer recognises as neither HTTP nor TLS, so only 3 bytes are "put back".
+// payload starts with a byte the sniffer recognises as neither HTTP nor TLS; what the sniffer reads is "put back" and still counted.
 func payload(n int) []byte {
 	b := make([]byte, n)
 	b[0], b[1], b[2] = 0x01, 0x02, 0x03
@@ -439,7 +445,12 @@ func sessionsOf(c engine.Collected, credID string) int {
 
 func eventually(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(8 * time.Second)
+	eventuallyWithin(t, what, 8*time.Second, cond)
+}
+
+func eventuallyWithin(t *testing.T, what string, wait time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(wait)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return
@@ -540,7 +551,7 @@ func TestEndToEnd(t *testing.T) {
 	}
 	col := r.collect()
 	up, down := trafficOf(col, a.CredID)
-	if down != 5000 || up < 5000-3 || up > 5000 { // the sniffer's 3 "put back" bytes bypass the traffic callback
+	if down != 5000 || up != 5000 { // the sniffer's "put back" bytes are counted too (third_party/hysteria-core/MISTGATE.md)
 		t.Fatalf("traffic up=%d down=%d, want ~5000/5000", up, down)
 	}
 	if n := sessionsOf(col, a.CredID); n != 1 {
@@ -1096,25 +1107,26 @@ func TestApplyValidationAndLifecycle(t *testing.T) {
 	}
 	r.e.Remove(ctx, r.spec.ID)
 
-	// Bad credentials are rejected as a whole and change nothing.
+	// Bad credentials are skipped individually while the inbound keeps running.
 	for name, c := range map[string]plugin.UserCred{
 		"no data":    {CredID: "crd_x"},
 		"short hash": {CredID: "crd_x", Data: json.RawMessage(`{"auth_sha256":"abcd"}`)},
 		"not hex":    {CredID: "crd_x", Data: json.RawMessage(`{"auth_sha256":"` + strings.Repeat("zz", 32) + `"}`)},
 		"no id":      func() plugin.UserCred { c := cred("x"); c.CredID = ""; return c }(),
 	} {
-		if _, err := r.e.Apply(ctx, r.spec, []plugin.UserCred{c}); err == nil {
-			t.Errorf("credential %s must be rejected", name)
+		report, err := r.e.Apply(ctx, r.spec, []plugin.UserCred{c})
+		if err != nil || report.CredCount != 0 || len(report.Warnings) != 1 {
+			t.Errorf("credential %s: report=%+v err=%v; want it skipped with a warning", name, report, err)
 		}
 	}
 	dup := cred("d")
 	dup2 := cred("d")
 	dup2.CredID = "crd_d2"
-	if _, err := r.e.Apply(ctx, r.spec, []plugin.UserCred{dup, dup2}); err == nil {
-		t.Error("two credentials with one token must be rejected")
+	if report, err := r.e.Apply(ctx, r.spec, []plugin.UserCred{dup, dup2}); err != nil || report.CredCount != 1 || len(report.Warnings) != 1 {
+		t.Errorf("duplicate token: report=%+v err=%v; want first credential applied and later one skipped", report, err)
 	}
-	if _, err := r.e.Apply(ctx, r.spec, []plugin.UserCred{dup, dup}); err == nil {
-		t.Error("duplicate credential id must be rejected")
+	if report, err := r.e.Apply(ctx, r.spec, []plugin.UserCred{dup, dup}); err != nil || report.CredCount != 1 || len(report.Warnings) != 1 {
+		t.Errorf("duplicate credential id: report=%+v err=%v; want one credential applied and duplicate skipped", report, err)
 	}
 	r.e.Remove(ctx, r.spec.ID)
 
@@ -1170,6 +1182,40 @@ func TestApplyValidationAndLifecycle(t *testing.T) {
 	}
 	if _, err := r.e.Apply(ctx, r.spec, nil); err == nil {
 		t.Fatal("Apply after Close must fail")
+	}
+}
+
+func TestApplySkipsBadCredentialAndStillRevokesOthers(t *testing.T) {
+	r := newRig(t, "")
+	kept, revoked := cred("a"), cred("revoked")
+	r.apply(kept, revoked)
+
+	bad := cred("broken")
+	bad.Data = json.RawMessage(`{`)
+	report, err := r.e.Apply(context.Background(), r.spec, []plugin.UserCred{kept, bad})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.CredCount != 1 || len(report.Warnings) != 1 || !strings.Contains(report.Warnings[0], "broken") {
+		t.Fatalf("apply report = %+v", report)
+	}
+	observed := r.e.Observed()
+	if len(observed) != 1 || len(observed[0].Creds) != 1 || observed[0].Creds[0].CredID != kept.CredID {
+		t.Fatalf("observed credentials = %+v", observed)
+	}
+
+	duplicate := cred("z")
+	duplicate.Data = append([]byte(nil), kept.Data...)
+	report, err = r.e.Apply(context.Background(), r.spec, []plugin.UserCred{duplicate, kept})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.CredCount != 1 || len(report.Warnings) != 1 || !strings.Contains(report.Warnings[0], "crd_a and crd_z share one token") {
+		t.Fatalf("duplicate token report = %+v", report)
+	}
+	observed = r.e.Observed()
+	if len(observed) != 1 || len(observed[0].Creds) != 1 || observed[0].Creds[0].CredID != kept.CredID {
+		t.Fatalf("duplicate token winner = %+v; want %s", observed, kept.CredID)
 	}
 }
 

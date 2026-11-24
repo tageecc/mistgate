@@ -132,6 +132,7 @@ const (
 	AuditSource_AUDIT_SOURCE_BOT         AuditSource = 2
 	AuditSource_AUDIT_SOURCE_MCP         AuditSource = 3
 	AuditSource_AUDIT_SOURCE_API         AuditSource = 4
+	AuditSource_AUDIT_SOURCE_ASSISTANT   AuditSource = 5
 )
 
 // Enum value maps for AuditSource.
@@ -142,6 +143,7 @@ var (
 		2: "AUDIT_SOURCE_BOT",
 		3: "AUDIT_SOURCE_MCP",
 		4: "AUDIT_SOURCE_API",
+		5: "AUDIT_SOURCE_ASSISTANT",
 	}
 	AuditSource_value = map[string]int32{
 		"AUDIT_SOURCE_UNSPECIFIED": 0,
@@ -149,6 +151,7 @@ var (
 		"AUDIT_SOURCE_BOT":         2,
 		"AUDIT_SOURCE_MCP":         3,
 		"AUDIT_SOURCE_API":         4,
+		"AUDIT_SOURCE_ASSISTANT":   5,
 	}
 )
 
@@ -485,8 +488,10 @@ type BeginSetupResponse struct {
 	// PASSKEY: PublicKeyCredentialCreationOptionsJSON.
 	OptionsJson string `protobuf:"bytes,2,opt,name=options_json,json=optionsJson,proto3" json:"options_json,omitempty"`
 	// PASSWORD: otpauth://totp/... for the QR code, and the same secret in base32 for typing in.
-	TotpUri       string `protobuf:"bytes,3,opt,name=totp_uri,json=totpUri,proto3" json:"totp_uri,omitempty"`
-	TotpSecret    string `protobuf:"bytes,4,opt,name=totp_secret,json=totpSecret,proto3" json:"totp_secret,omitempty"`
+	TotpUri    string `protobuf:"bytes,3,opt,name=totp_uri,json=totpUri,proto3" json:"totp_uri,omitempty"`
+	TotpSecret string `protobuf:"bytes,4,opt,name=totp_secret,json=totpSecret,proto3" json:"totp_secret,omitempty"`
+	// PASSWORD: totp_uri as a QR code to draw; absent for PASSKEY. Setup has no session yet, so it cannot ask EncodeQr.
+	TotpQr        *QrCode `protobuf:"bytes,5,opt,name=totp_qr,json=totpQr,proto3" json:"totp_qr,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -547,6 +552,13 @@ func (x *BeginSetupResponse) GetTotpSecret() string {
 		return x.TotpSecret
 	}
 	return ""
+}
+
+func (x *BeginSetupResponse) GetTotpQr() *QrCode {
+	if x != nil {
+		return x.TotpQr
+	}
+	return nil
 }
 
 type FinishSetupRequest struct {
@@ -2073,8 +2085,10 @@ type BeginTotpEnrollmentResponse struct {
 	// Binds Begin to Finish for this session; the server keeps the ceremony for 5 minutes.
 	CeremonyId string `protobuf:"bytes,1,opt,name=ceremony_id,json=ceremonyId,proto3" json:"ceremony_id,omitempty"`
 	// otpauth://totp/... for the QR code, and the same secret in base32 for typing in.
-	TotpUri       string `protobuf:"bytes,2,opt,name=totp_uri,json=totpUri,proto3" json:"totp_uri,omitempty"`
-	TotpSecret    string `protobuf:"bytes,3,opt,name=totp_secret,json=totpSecret,proto3" json:"totp_secret,omitempty"`
+	TotpUri    string `protobuf:"bytes,2,opt,name=totp_uri,json=totpUri,proto3" json:"totp_uri,omitempty"`
+	TotpSecret string `protobuf:"bytes,3,opt,name=totp_secret,json=totpSecret,proto3" json:"totp_secret,omitempty"`
+	// totp_uri as a QR code to draw.
+	TotpQr        *QrCode `protobuf:"bytes,4,opt,name=totp_qr,json=totpQr,proto3" json:"totp_qr,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2128,6 +2142,13 @@ func (x *BeginTotpEnrollmentResponse) GetTotpSecret() string {
 		return x.TotpSecret
 	}
 	return ""
+}
+
+func (x *BeginTotpEnrollmentResponse) GetTotpQr() *QrCode {
+	if x != nil {
+		return x.TotpQr
+	}
+	return nil
 }
 
 type FinishTotpEnrollmentRequest struct {
@@ -2686,9 +2707,17 @@ type ListAuditRequest struct {
 	// Default 50, at most 200.
 	PageSize uint32 `protobuf:"varint,3,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
 	// Only one kind of action; unspecified = all. Combines with source.
-	Kind          AuditKind `protobuf:"varint,4,opt,name=kind,proto3,enum=mistgate.admin.v1.AuditKind" json:"kind,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Kind AuditKind `protobuf:"varint,4,opt,name=kind,proto3,enum=mistgate.admin.v1.AuditKind" json:"kind,omitempty"`
+	// Only entries of the last hours (1..8760); 0 = any age. Combines with every other filter.
+	Hours uint32 `protobuf:"varint,5,opt,name=hours,proto3" json:"hours,omitempty"`
+	// Only rows whose result is not "ok" (what AUDIT_KIND_FAILURES does), also together with another kind.
+	FailedOnly bool `protobuf:"varint,6,opt,name=failed_only,json=failedOnly,proto3" json:"failed_only,omitempty"`
+	// Literal substrings (at most 100 characters, ASCII case-insensitive): the action contains action_contains; the actor's
+	// id or name contains actor_contains. "" = any. Applied in the query, before the page is cut.
+	ActionContains string `protobuf:"bytes,7,opt,name=action_contains,json=actionContains,proto3" json:"action_contains,omitempty"`
+	ActorContains  string `protobuf:"bytes,8,opt,name=actor_contains,json=actorContains,proto3" json:"actor_contains,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ListAuditRequest) Reset() {
@@ -2747,6 +2776,34 @@ func (x *ListAuditRequest) GetKind() AuditKind {
 		return x.Kind
 	}
 	return AuditKind_AUDIT_KIND_UNSPECIFIED
+}
+
+func (x *ListAuditRequest) GetHours() uint32 {
+	if x != nil {
+		return x.Hours
+	}
+	return 0
+}
+
+func (x *ListAuditRequest) GetFailedOnly() bool {
+	if x != nil {
+		return x.FailedOnly
+	}
+	return false
+}
+
+func (x *ListAuditRequest) GetActionContains() string {
+	if x != nil {
+		return x.ActionContains
+	}
+	return ""
+}
+
+func (x *ListAuditRequest) GetActorContains() string {
+	if x != nil {
+		return x.ActorContains
+	}
+	return ""
 }
 
 type ListAuditResponse struct {
@@ -3245,7 +3302,7 @@ var File_mistgate_admin_v1_auth_proto protoreflect.FileDescriptor
 
 const file_mistgate_admin_v1_auth_proto_rawDesc = "" +
 	"\n" +
-	"\x1cmistgate/admin/v1/auth.proto\x12\x11mistgate.admin.v1\"\x15\n" +
+	"\x1cmistgate/admin/v1/auth.proto\x12\x11mistgate.admin.v1\x1a\x1emistgate/admin/v1/common.proto\"\x15\n" +
 	"\x13GetLoginInfoRequest\"\xc4\x02\n" +
 	"\x14GetLoginInfoResponse\x12\x1d\n" +
 	"\n" +
@@ -3267,14 +3324,15 @@ const file_mistgate_admin_v1_auth_proto_rawDesc = "" +
 	"\x06method\x18\x03 \x01(\x0e2\x1e.mistgate.admin.v1.SetupMethodR\x06method\x12\x14\n" +
 	"\x05login\x18\x04 \x01(\tR\x05login\x12\x1a\n" +
 	"\bpassword\x18\x05 \x01(\tR\bpassword\x12'\n" +
-	"\x0fturnstile_token\x18\x06 \x01(\tR\x0eturnstileToken\"\x94\x01\n" +
+	"\x0fturnstile_token\x18\x06 \x01(\tR\x0eturnstileToken\"\xc8\x01\n" +
 	"\x12BeginSetupResponse\x12\x1f\n" +
 	"\vceremony_id\x18\x01 \x01(\tR\n" +
 	"ceremonyId\x12!\n" +
 	"\foptions_json\x18\x02 \x01(\tR\voptionsJson\x12\x19\n" +
 	"\btotp_uri\x18\x03 \x01(\tR\atotpUri\x12\x1f\n" +
 	"\vtotp_secret\x18\x04 \x01(\tR\n" +
-	"totpSecret\"\xc5\x01\n" +
+	"totpSecret\x122\n" +
+	"\atotp_qr\x18\x05 \x01(\v2\x19.mistgate.admin.v1.QrCodeR\x06totpQr\"\xc5\x01\n" +
 	"\x12FinishSetupRequest\x12\x1f\n" +
 	"\vsetup_token\x18\x01 \x01(\tR\n" +
 	"setupToken\x12\x1f\n" +
@@ -3368,13 +3426,14 @@ const file_mistgate_admin_v1_auth_proto_rawDesc = "" +
 	"\x0eended_sessions\x18\x01 \x01(\rR\rendedSessions\"N\n" +
 	"\x1aBeginTotpEnrollmentRequest\x12\x14\n" +
 	"\x05login\x18\x01 \x01(\tR\x05login\x12\x1a\n" +
-	"\bpassword\x18\x02 \x01(\tR\bpassword\"z\n" +
+	"\bpassword\x18\x02 \x01(\tR\bpassword\"\xae\x01\n" +
 	"\x1bBeginTotpEnrollmentResponse\x12\x1f\n" +
 	"\vceremony_id\x18\x01 \x01(\tR\n" +
 	"ceremonyId\x12\x19\n" +
 	"\btotp_uri\x18\x02 \x01(\tR\atotpUri\x12\x1f\n" +
 	"\vtotp_secret\x18\x03 \x01(\tR\n" +
-	"totpSecret\"[\n" +
+	"totpSecret\x122\n" +
+	"\atotp_qr\x18\x04 \x01(\v2\x19.mistgate.admin.v1.QrCodeR\x06totpQr\"[\n" +
 	"\x1bFinishTotpEnrollmentRequest\x12\x1f\n" +
 	"\vceremony_id\x18\x01 \x01(\tR\n" +
 	"ceremonyId\x12\x1b\n" +
@@ -3411,12 +3470,17 @@ const file_mistgate_admin_v1_auth_proto_rawDesc = "" +
 	"\vparams_json\x18\a \x01(\tR\n" +
 	"paramsJson\x12\x16\n" +
 	"\x06result\x18\b \x01(\tR\x06result\x12\x0e\n" +
-	"\x02ip\x18\t \x01(\tR\x02ip\"\xba\x01\n" +
+	"\x02ip\x18\t \x01(\tR\x02ip\"\xc1\x02\n" +
 	"\x10ListAuditRequest\x126\n" +
 	"\x06source\x18\x01 \x01(\x0e2\x1e.mistgate.admin.v1.AuditSourceR\x06source\x12\x1f\n" +
 	"\tbefore_id\x18\x02 \x01(\x03B\x020\x02R\bbeforeId\x12\x1b\n" +
 	"\tpage_size\x18\x03 \x01(\rR\bpageSize\x120\n" +
-	"\x04kind\x18\x04 \x01(\x0e2\x1c.mistgate.admin.v1.AuditKindR\x04kind\"v\n" +
+	"\x04kind\x18\x04 \x01(\x0e2\x1c.mistgate.admin.v1.AuditKindR\x04kind\x12\x14\n" +
+	"\x05hours\x18\x05 \x01(\rR\x05hours\x12\x1f\n" +
+	"\vfailed_only\x18\x06 \x01(\bR\n" +
+	"failedOnly\x12'\n" +
+	"\x0faction_contains\x18\a \x01(\tR\x0eactionContains\x12%\n" +
+	"\x0eactor_contains\x18\b \x01(\tR\ractorContains\"v\n" +
 	"\x11ListAuditResponse\x127\n" +
 	"\aentries\x18\x01 \x03(\v2\x1d.mistgate.admin.v1.AuditEntryR\aentries\x12(\n" +
 	"\x0enext_before_id\x18\x02 \x01(\x03B\x020\x02R\fnextBeforeId\"\x1c\n" +
@@ -3458,13 +3522,14 @@ const file_mistgate_admin_v1_auth_proto_rawDesc = "" +
 	"\n" +
 	"ROLE_OWNER\x10\x01\x12\x0f\n" +
 	"\vROLE_HELPER\x10\x02\x12\x11\n" +
-	"\rROLE_READONLY\x10\x03*\x85\x01\n" +
+	"\rROLE_READONLY\x10\x03*\xa1\x01\n" +
 	"\vAuditSource\x12\x1c\n" +
 	"\x18AUDIT_SOURCE_UNSPECIFIED\x10\x00\x12\x16\n" +
 	"\x12AUDIT_SOURCE_PANEL\x10\x01\x12\x14\n" +
 	"\x10AUDIT_SOURCE_BOT\x10\x02\x12\x14\n" +
 	"\x10AUDIT_SOURCE_MCP\x10\x03\x12\x14\n" +
-	"\x10AUDIT_SOURCE_API\x10\x04*p\n" +
+	"\x10AUDIT_SOURCE_API\x10\x04\x12\x1a\n" +
+	"\x16AUDIT_SOURCE_ASSISTANT\x10\x05*p\n" +
 	"\tAuditKind\x12\x1a\n" +
 	"\x16AUDIT_KIND_UNSPECIFIED\x10\x00\x12\x16\n" +
 	"\x12AUDIT_KIND_SIGN_IN\x10\x01\x12\x16\n" +
@@ -3573,74 +3638,77 @@ var file_mistgate_admin_v1_auth_proto_goTypes = []any{
 	(*BeginStepUpResponse)(nil),            // 55: mistgate.admin.v1.BeginStepUpResponse
 	(*FinishStepUpRequest)(nil),            // 56: mistgate.admin.v1.FinishStepUpRequest
 	(*FinishStepUpResponse)(nil),           // 57: mistgate.admin.v1.FinishStepUpResponse
+	(*QrCode)(nil),                         // 58: mistgate.admin.v1.QrCode
 }
 var file_mistgate_admin_v1_auth_proto_depIdxs = []int32{
 	0,  // 0: mistgate.admin.v1.BeginSetupRequest.method:type_name -> mistgate.admin.v1.SetupMethod
-	22, // 1: mistgate.admin.v1.FinishSetupResponse.admin:type_name -> mistgate.admin.v1.Admin
-	22, // 2: mistgate.admin.v1.FinishLoginResponse.admin:type_name -> mistgate.admin.v1.Admin
-	22, // 3: mistgate.admin.v1.PasswordLoginResponse.admin:type_name -> mistgate.admin.v1.Admin
-	22, // 4: mistgate.admin.v1.MeResponse.admin:type_name -> mistgate.admin.v1.Admin
-	1,  // 5: mistgate.admin.v1.Admin.role:type_name -> mistgate.admin.v1.Role
-	23, // 6: mistgate.admin.v1.ListPasskeysResponse.passkeys:type_name -> mistgate.admin.v1.Passkey
-	23, // 7: mistgate.admin.v1.FinishAddPasskeyResponse.passkey:type_name -> mistgate.admin.v1.Passkey
-	40, // 8: mistgate.admin.v1.ListSessionsResponse.sessions:type_name -> mistgate.admin.v1.AdminSession
-	2,  // 9: mistgate.admin.v1.AuditEntry.source:type_name -> mistgate.admin.v1.AuditSource
-	2,  // 10: mistgate.admin.v1.ListAuditRequest.source:type_name -> mistgate.admin.v1.AuditSource
-	3,  // 11: mistgate.admin.v1.ListAuditRequest.kind:type_name -> mistgate.admin.v1.AuditKind
-	47, // 12: mistgate.admin.v1.ListAuditResponse.entries:type_name -> mistgate.admin.v1.AuditEntry
-	4,  // 13: mistgate.admin.v1.AuthService.GetLoginInfo:input_type -> mistgate.admin.v1.GetLoginInfoRequest
-	6,  // 14: mistgate.admin.v1.AuthService.BeginSetup:input_type -> mistgate.admin.v1.BeginSetupRequest
-	8,  // 15: mistgate.admin.v1.AuthService.FinishSetup:input_type -> mistgate.admin.v1.FinishSetupRequest
-	10, // 16: mistgate.admin.v1.AuthService.BeginLogin:input_type -> mistgate.admin.v1.BeginLoginRequest
-	12, // 17: mistgate.admin.v1.AuthService.FinishLogin:input_type -> mistgate.admin.v1.FinishLoginRequest
-	14, // 18: mistgate.admin.v1.AuthService.PasswordLogin:input_type -> mistgate.admin.v1.PasswordLoginRequest
-	18, // 19: mistgate.admin.v1.AuthService.Logout:input_type -> mistgate.admin.v1.LogoutRequest
-	20, // 20: mistgate.admin.v1.AuthService.Me:input_type -> mistgate.admin.v1.MeRequest
-	24, // 21: mistgate.admin.v1.AuthService.ListPasskeys:input_type -> mistgate.admin.v1.ListPasskeysRequest
-	26, // 22: mistgate.admin.v1.AuthService.BeginAddPasskey:input_type -> mistgate.admin.v1.BeginAddPasskeyRequest
-	28, // 23: mistgate.admin.v1.AuthService.FinishAddPasskey:input_type -> mistgate.admin.v1.FinishAddPasskeyRequest
-	30, // 24: mistgate.admin.v1.AuthService.RemovePasskey:input_type -> mistgate.admin.v1.RemovePasskeyRequest
-	32, // 25: mistgate.admin.v1.AuthService.GetPasswordLogin:input_type -> mistgate.admin.v1.GetPasswordLoginRequest
-	34, // 26: mistgate.admin.v1.AuthService.ChangePassword:input_type -> mistgate.admin.v1.ChangePasswordRequest
-	36, // 27: mistgate.admin.v1.AuthService.BeginTotpEnrollment:input_type -> mistgate.admin.v1.BeginTotpEnrollmentRequest
-	38, // 28: mistgate.admin.v1.AuthService.FinishTotpEnrollment:input_type -> mistgate.admin.v1.FinishTotpEnrollmentRequest
-	41, // 29: mistgate.admin.v1.AuthService.ListSessions:input_type -> mistgate.admin.v1.ListSessionsRequest
-	43, // 30: mistgate.admin.v1.AuthService.EndSession:input_type -> mistgate.admin.v1.EndSessionRequest
-	45, // 31: mistgate.admin.v1.AuthService.EndOtherSessions:input_type -> mistgate.admin.v1.EndOtherSessionsRequest
-	48, // 32: mistgate.admin.v1.AuthService.ListAudit:input_type -> mistgate.admin.v1.ListAuditRequest
-	50, // 33: mistgate.admin.v1.AuthService.GetSecuritySettings:input_type -> mistgate.admin.v1.GetSecuritySettingsRequest
-	52, // 34: mistgate.admin.v1.AuthService.UpdateSecuritySettings:input_type -> mistgate.admin.v1.UpdateSecuritySettingsRequest
-	54, // 35: mistgate.admin.v1.AuthService.BeginStepUp:input_type -> mistgate.admin.v1.BeginStepUpRequest
-	56, // 36: mistgate.admin.v1.AuthService.FinishStepUp:input_type -> mistgate.admin.v1.FinishStepUpRequest
-	5,  // 37: mistgate.admin.v1.AuthService.GetLoginInfo:output_type -> mistgate.admin.v1.GetLoginInfoResponse
-	7,  // 38: mistgate.admin.v1.AuthService.BeginSetup:output_type -> mistgate.admin.v1.BeginSetupResponse
-	9,  // 39: mistgate.admin.v1.AuthService.FinishSetup:output_type -> mistgate.admin.v1.FinishSetupResponse
-	11, // 40: mistgate.admin.v1.AuthService.BeginLogin:output_type -> mistgate.admin.v1.BeginLoginResponse
-	13, // 41: mistgate.admin.v1.AuthService.FinishLogin:output_type -> mistgate.admin.v1.FinishLoginResponse
-	15, // 42: mistgate.admin.v1.AuthService.PasswordLogin:output_type -> mistgate.admin.v1.PasswordLoginResponse
-	19, // 43: mistgate.admin.v1.AuthService.Logout:output_type -> mistgate.admin.v1.LogoutResponse
-	21, // 44: mistgate.admin.v1.AuthService.Me:output_type -> mistgate.admin.v1.MeResponse
-	25, // 45: mistgate.admin.v1.AuthService.ListPasskeys:output_type -> mistgate.admin.v1.ListPasskeysResponse
-	27, // 46: mistgate.admin.v1.AuthService.BeginAddPasskey:output_type -> mistgate.admin.v1.BeginAddPasskeyResponse
-	29, // 47: mistgate.admin.v1.AuthService.FinishAddPasskey:output_type -> mistgate.admin.v1.FinishAddPasskeyResponse
-	31, // 48: mistgate.admin.v1.AuthService.RemovePasskey:output_type -> mistgate.admin.v1.RemovePasskeyResponse
-	33, // 49: mistgate.admin.v1.AuthService.GetPasswordLogin:output_type -> mistgate.admin.v1.GetPasswordLoginResponse
-	35, // 50: mistgate.admin.v1.AuthService.ChangePassword:output_type -> mistgate.admin.v1.ChangePasswordResponse
-	37, // 51: mistgate.admin.v1.AuthService.BeginTotpEnrollment:output_type -> mistgate.admin.v1.BeginTotpEnrollmentResponse
-	39, // 52: mistgate.admin.v1.AuthService.FinishTotpEnrollment:output_type -> mistgate.admin.v1.FinishTotpEnrollmentResponse
-	42, // 53: mistgate.admin.v1.AuthService.ListSessions:output_type -> mistgate.admin.v1.ListSessionsResponse
-	44, // 54: mistgate.admin.v1.AuthService.EndSession:output_type -> mistgate.admin.v1.EndSessionResponse
-	46, // 55: mistgate.admin.v1.AuthService.EndOtherSessions:output_type -> mistgate.admin.v1.EndOtherSessionsResponse
-	49, // 56: mistgate.admin.v1.AuthService.ListAudit:output_type -> mistgate.admin.v1.ListAuditResponse
-	51, // 57: mistgate.admin.v1.AuthService.GetSecuritySettings:output_type -> mistgate.admin.v1.GetSecuritySettingsResponse
-	53, // 58: mistgate.admin.v1.AuthService.UpdateSecuritySettings:output_type -> mistgate.admin.v1.UpdateSecuritySettingsResponse
-	55, // 59: mistgate.admin.v1.AuthService.BeginStepUp:output_type -> mistgate.admin.v1.BeginStepUpResponse
-	57, // 60: mistgate.admin.v1.AuthService.FinishStepUp:output_type -> mistgate.admin.v1.FinishStepUpResponse
-	37, // [37:61] is the sub-list for method output_type
-	13, // [13:37] is the sub-list for method input_type
-	13, // [13:13] is the sub-list for extension type_name
-	13, // [13:13] is the sub-list for extension extendee
-	0,  // [0:13] is the sub-list for field type_name
+	58, // 1: mistgate.admin.v1.BeginSetupResponse.totp_qr:type_name -> mistgate.admin.v1.QrCode
+	22, // 2: mistgate.admin.v1.FinishSetupResponse.admin:type_name -> mistgate.admin.v1.Admin
+	22, // 3: mistgate.admin.v1.FinishLoginResponse.admin:type_name -> mistgate.admin.v1.Admin
+	22, // 4: mistgate.admin.v1.PasswordLoginResponse.admin:type_name -> mistgate.admin.v1.Admin
+	22, // 5: mistgate.admin.v1.MeResponse.admin:type_name -> mistgate.admin.v1.Admin
+	1,  // 6: mistgate.admin.v1.Admin.role:type_name -> mistgate.admin.v1.Role
+	23, // 7: mistgate.admin.v1.ListPasskeysResponse.passkeys:type_name -> mistgate.admin.v1.Passkey
+	23, // 8: mistgate.admin.v1.FinishAddPasskeyResponse.passkey:type_name -> mistgate.admin.v1.Passkey
+	58, // 9: mistgate.admin.v1.BeginTotpEnrollmentResponse.totp_qr:type_name -> mistgate.admin.v1.QrCode
+	40, // 10: mistgate.admin.v1.ListSessionsResponse.sessions:type_name -> mistgate.admin.v1.AdminSession
+	2,  // 11: mistgate.admin.v1.AuditEntry.source:type_name -> mistgate.admin.v1.AuditSource
+	2,  // 12: mistgate.admin.v1.ListAuditRequest.source:type_name -> mistgate.admin.v1.AuditSource
+	3,  // 13: mistgate.admin.v1.ListAuditRequest.kind:type_name -> mistgate.admin.v1.AuditKind
+	47, // 14: mistgate.admin.v1.ListAuditResponse.entries:type_name -> mistgate.admin.v1.AuditEntry
+	4,  // 15: mistgate.admin.v1.AuthService.GetLoginInfo:input_type -> mistgate.admin.v1.GetLoginInfoRequest
+	6,  // 16: mistgate.admin.v1.AuthService.BeginSetup:input_type -> mistgate.admin.v1.BeginSetupRequest
+	8,  // 17: mistgate.admin.v1.AuthService.FinishSetup:input_type -> mistgate.admin.v1.FinishSetupRequest
+	10, // 18: mistgate.admin.v1.AuthService.BeginLogin:input_type -> mistgate.admin.v1.BeginLoginRequest
+	12, // 19: mistgate.admin.v1.AuthService.FinishLogin:input_type -> mistgate.admin.v1.FinishLoginRequest
+	14, // 20: mistgate.admin.v1.AuthService.PasswordLogin:input_type -> mistgate.admin.v1.PasswordLoginRequest
+	18, // 21: mistgate.admin.v1.AuthService.Logout:input_type -> mistgate.admin.v1.LogoutRequest
+	20, // 22: mistgate.admin.v1.AuthService.Me:input_type -> mistgate.admin.v1.MeRequest
+	24, // 23: mistgate.admin.v1.AuthService.ListPasskeys:input_type -> mistgate.admin.v1.ListPasskeysRequest
+	26, // 24: mistgate.admin.v1.AuthService.BeginAddPasskey:input_type -> mistgate.admin.v1.BeginAddPasskeyRequest
+	28, // 25: mistgate.admin.v1.AuthService.FinishAddPasskey:input_type -> mistgate.admin.v1.FinishAddPasskeyRequest
+	30, // 26: mistgate.admin.v1.AuthService.RemovePasskey:input_type -> mistgate.admin.v1.RemovePasskeyRequest
+	32, // 27: mistgate.admin.v1.AuthService.GetPasswordLogin:input_type -> mistgate.admin.v1.GetPasswordLoginRequest
+	34, // 28: mistgate.admin.v1.AuthService.ChangePassword:input_type -> mistgate.admin.v1.ChangePasswordRequest
+	36, // 29: mistgate.admin.v1.AuthService.BeginTotpEnrollment:input_type -> mistgate.admin.v1.BeginTotpEnrollmentRequest
+	38, // 30: mistgate.admin.v1.AuthService.FinishTotpEnrollment:input_type -> mistgate.admin.v1.FinishTotpEnrollmentRequest
+	41, // 31: mistgate.admin.v1.AuthService.ListSessions:input_type -> mistgate.admin.v1.ListSessionsRequest
+	43, // 32: mistgate.admin.v1.AuthService.EndSession:input_type -> mistgate.admin.v1.EndSessionRequest
+	45, // 33: mistgate.admin.v1.AuthService.EndOtherSessions:input_type -> mistgate.admin.v1.EndOtherSessionsRequest
+	48, // 34: mistgate.admin.v1.AuthService.ListAudit:input_type -> mistgate.admin.v1.ListAuditRequest
+	50, // 35: mistgate.admin.v1.AuthService.GetSecuritySettings:input_type -> mistgate.admin.v1.GetSecuritySettingsRequest
+	52, // 36: mistgate.admin.v1.AuthService.UpdateSecuritySettings:input_type -> mistgate.admin.v1.UpdateSecuritySettingsRequest
+	54, // 37: mistgate.admin.v1.AuthService.BeginStepUp:input_type -> mistgate.admin.v1.BeginStepUpRequest
+	56, // 38: mistgate.admin.v1.AuthService.FinishStepUp:input_type -> mistgate.admin.v1.FinishStepUpRequest
+	5,  // 39: mistgate.admin.v1.AuthService.GetLoginInfo:output_type -> mistgate.admin.v1.GetLoginInfoResponse
+	7,  // 40: mistgate.admin.v1.AuthService.BeginSetup:output_type -> mistgate.admin.v1.BeginSetupResponse
+	9,  // 41: mistgate.admin.v1.AuthService.FinishSetup:output_type -> mistgate.admin.v1.FinishSetupResponse
+	11, // 42: mistgate.admin.v1.AuthService.BeginLogin:output_type -> mistgate.admin.v1.BeginLoginResponse
+	13, // 43: mistgate.admin.v1.AuthService.FinishLogin:output_type -> mistgate.admin.v1.FinishLoginResponse
+	15, // 44: mistgate.admin.v1.AuthService.PasswordLogin:output_type -> mistgate.admin.v1.PasswordLoginResponse
+	19, // 45: mistgate.admin.v1.AuthService.Logout:output_type -> mistgate.admin.v1.LogoutResponse
+	21, // 46: mistgate.admin.v1.AuthService.Me:output_type -> mistgate.admin.v1.MeResponse
+	25, // 47: mistgate.admin.v1.AuthService.ListPasskeys:output_type -> mistgate.admin.v1.ListPasskeysResponse
+	27, // 48: mistgate.admin.v1.AuthService.BeginAddPasskey:output_type -> mistgate.admin.v1.BeginAddPasskeyResponse
+	29, // 49: mistgate.admin.v1.AuthService.FinishAddPasskey:output_type -> mistgate.admin.v1.FinishAddPasskeyResponse
+	31, // 50: mistgate.admin.v1.AuthService.RemovePasskey:output_type -> mistgate.admin.v1.RemovePasskeyResponse
+	33, // 51: mistgate.admin.v1.AuthService.GetPasswordLogin:output_type -> mistgate.admin.v1.GetPasswordLoginResponse
+	35, // 52: mistgate.admin.v1.AuthService.ChangePassword:output_type -> mistgate.admin.v1.ChangePasswordResponse
+	37, // 53: mistgate.admin.v1.AuthService.BeginTotpEnrollment:output_type -> mistgate.admin.v1.BeginTotpEnrollmentResponse
+	39, // 54: mistgate.admin.v1.AuthService.FinishTotpEnrollment:output_type -> mistgate.admin.v1.FinishTotpEnrollmentResponse
+	42, // 55: mistgate.admin.v1.AuthService.ListSessions:output_type -> mistgate.admin.v1.ListSessionsResponse
+	44, // 56: mistgate.admin.v1.AuthService.EndSession:output_type -> mistgate.admin.v1.EndSessionResponse
+	46, // 57: mistgate.admin.v1.AuthService.EndOtherSessions:output_type -> mistgate.admin.v1.EndOtherSessionsResponse
+	49, // 58: mistgate.admin.v1.AuthService.ListAudit:output_type -> mistgate.admin.v1.ListAuditResponse
+	51, // 59: mistgate.admin.v1.AuthService.GetSecuritySettings:output_type -> mistgate.admin.v1.GetSecuritySettingsResponse
+	53, // 60: mistgate.admin.v1.AuthService.UpdateSecuritySettings:output_type -> mistgate.admin.v1.UpdateSecuritySettingsResponse
+	55, // 61: mistgate.admin.v1.AuthService.BeginStepUp:output_type -> mistgate.admin.v1.BeginStepUpResponse
+	57, // 62: mistgate.admin.v1.AuthService.FinishStepUp:output_type -> mistgate.admin.v1.FinishStepUpResponse
+	39, // [39:63] is the sub-list for method output_type
+	15, // [15:39] is the sub-list for method input_type
+	15, // [15:15] is the sub-list for extension type_name
+	15, // [15:15] is the sub-list for extension extendee
+	0,  // [0:15] is the sub-list for field type_name
 }
 
 func init() { file_mistgate_admin_v1_auth_proto_init() }
@@ -3648,6 +3716,7 @@ func file_mistgate_admin_v1_auth_proto_init() {
 	if File_mistgate_admin_v1_auth_proto != nil {
 		return
 	}
+	file_mistgate_admin_v1_common_proto_init()
 	file_mistgate_admin_v1_auth_proto_msgTypes[17].OneofWrappers = []any{}
 	file_mistgate_admin_v1_auth_proto_msgTypes[48].OneofWrappers = []any{}
 	type x struct{}

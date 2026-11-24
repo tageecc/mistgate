@@ -3,14 +3,16 @@ title: Add a node
 description: Choose between the SSH installation and the manual install, enroll a server with a one-time command, watch it come online, and remove it cleanly later.
 ---
 
+![A New node window: the server's address, then the login, the checks and the install steps one after another until the node is connected](../../images/readme/addnode-dark-en.webp)
+
 A node joins the fleet when its agent gets a certificate from the panel, installs itself as a systemd service and connects. **Nodes → Add node** offers two ways:
 
 | Way | What you do | When to pick it |
 |:--|:--|:--|
-| **Install automatically over SSH** | Enter the server's address, confirm its SSH host key, type the password; the panel does the rest. | The usual way. Described in [Install a node over SSH](ssh-install.md). |
-| **Get a manual install command** | Copy the agent to the server and run a one-time command as root. | The panel cannot reach the server over SSH (on the Cloudflare edition: the address is Cloudflare's or proxied by it, the network is private, or SSH is open only to your own IP), the server allows only key login, or you want to run the commands yourself. Described on this page. |
+| **Over SSH** | Enter the server's address, confirm its SSH host key, log in with the panel's key or a password; the panel does the rest. | The usual way. Described in [Install a node over SSH](ssh-install.md). |
+| **By command** | Copy the agent to the server and run a one-time command as root. | The panel cannot reach the server over SSH (on the Cloudflare edition: the address is Cloudflare's or proxied by it, the network is private, or SSH is open only to your own IP), or you want to run the commands yourself. Described on this page. |
 
-An AI agent can also start an SSH installation through MCP; you approve it and type the password on the approval screen: see the [AI agent guide](ai-agents.md). This page also explains how to remove a node. If the dialog opens directly on the name, country and address fields, the panel predates the SSH installation: update it first (see [panel updates](../operations/updates.md)).
+An AI agent can also start an SSH installation through MCP; you approve it and choose the panel key or type the password on the approval screen: see the [AI agent guide](ai-agents.md). This page also explains how to remove a node. If the dialog opens directly on the name, country and address fields, the panel predates the SSH installation: update it first (see [panel updates](../operations/updates.md)).
 
 ## Before a manual install
 
@@ -20,17 +22,19 @@ An AI agent can also start an SSH installation through MCP; you approve it and t
 
 ## 1. Choose manual installation
 
-In **Nodes → Add node**, choose **Get a manual install command**. The same window opens from the **Add node** tile on the Overview, the command palette and the end of the setup wizard. If you already created a pending manual node, retire it before using the same name in the SSH wizard, or choose another unused name.
+In **Nodes → Add node**, choose **By command**. The same window opens from the **Add node** tile on the Overview, the command palette and the end of the setup wizard. If you already created a pending manual node, retire it before using the same name in the SSH wizard, or choose another unused name.
 
 | Field | What to enter |
 |:--|:--|
 | Name | a–z, 0–9 and dash, 2 to 24 characters, for example `de1`. Names are unique among live nodes and active SSH installs; retiring a node releases its name while keeping its history. |
-| Country | Optional. It matters for DNS: on nodes in Russia the doctor checks gosuslugi.ru and offers Yandex DNS. |
+| Country | Optional. It matters for DNS: on nodes in Russia the doctor checks gosuslugi.ru and offers Yandex DNS; on nodes in China it checks www.baidu.com and offers AliDNS and DNSPod. |
 | Address | A domain or an IP, without `https://` and without a port. Clients connect to it, and it goes into every subscription. A Let's Encrypt certificate for Hysteria2 needs a domain whose A record points at the server. |
 
 When the address is an IP, the window says so before you go on: Hysteria2 on that node then needs a domain with an A record or the self-signed (pinned) certificate, which you pick when you add the profile. AmneziaWG works on an IP as it is.
 
-Press **Create install command**. The node appears in the list as "Waiting for install", and the window shows three steps.
+From the second node on the window also asks **Who gets this node**: **Everyone** (every group, and groups made later), **Some groups** (only the ones you tick) or **Nobody yet** (check the node first: no group gets it, so it is in no subscription). The choice starts at the one you made last time, and at **Nobody yet** before that. The first node of a panel is not asked: it goes to every group, so a new panel works at once, and the window says so. You can change it later on the node's page: see [Who gets a node](../guide/nodes.md#the-nodes-list).
+
+Press **Get install command**. The node appears in the list as "Waiting for install", and the window shows three steps.
 
 ## 2. Put the agent on the server
 
@@ -80,7 +84,7 @@ started; follow it with: journalctl -u mistgate-node -f
 
 `install`:
 
-1. Checks that it runs as root and that the state directory holds an identity.
+1. Checks that it runs as root, that the state directory holds an identity and that the server has the `nft` command. It installs no package itself: without `nft` it changes nothing, says so, names the command to run (on Debian and Ubuntu `apt-get install -y nftables`; Debian 13 cloud images come without it) and ends with exit status 3.
 2. Copies itself to `/usr/local/bin/mistgate-node`. The file in `/root` is no longer needed.
 3. Writes the hardened unit `/etc/systemd/system/mistgate-node.service`, sized to the server's memory, then runs `systemctl daemon-reload`, `enable` and `restart`.
 
@@ -156,7 +160,7 @@ systemctl restart systemd-journald
 
 If you applied the doctor's resolver fix on that node, remove `/etc/systemd/resolved.conf.d/90-mistgate.conf` and restart systemd-resolved, or put `/etc/resolv.conf` back from `/etc/resolv.conf.mistgate.bak` (when `/etc/resolv.conf.mistgate.bak.link` exists, the original was a symlink to the path written in it).
 
-`mistgate-node cleanup-net` can be run at any time. It removes the AmneziaWG and WARP interfaces, the WARP routes and rules and their nftables tables; the agent creates them again when it starts.
+`mistgate-node cleanup-net` can be run at any time. It removes the AmneziaWG and WARP interfaces, the WARP routes and rules and their nftables tables; the agent creates them again when it starts. It leaves the IPv6 addresses that the agent added to the server (the node's own addresses, named in `ipv6-owned.json` in the state directory) alone, so a restart or an update does not drop them; `mistgate-node cleanup-net --ipv6-addresses` removes those too, and never an address the host had. Retiring a node removes them as well.
 
 ## When enrollment fails
 
@@ -171,7 +175,8 @@ If you applied the doctor's resolver fix on that node, remove `/etc/systemd/reso
 | A timeout or `connection refused` | The panel is down, a firewall blocks TCP 443 to the panel, or the address in the command is wrong. | Check the panel and its firewall; test with `curl -I https://panel.example.com/` from the node. |
 | `already enrolled; use --force to replace the identity` | The state directory already holds an identity. | Add `--force` after `enroll`, or remove `/var/lib/mistgate-node` first. |
 | `install: must run as root` | Not root. | Run the command as root. |
+| `install: nft is not installed on this server` (exit status 3) | The `nftables` package is missing, as on cloud images of Debian 13. Nothing was changed. | Run the command the message names (`apt-get install -y nftables`), then run `install` again. |
 | `holds no identity: run mistgate-node enroll first` | `enroll` failed, or `install` got another `--state-dir`. | Run `enroll` again with the same state directory. |
-| The admin answers **Create install command** with "panel address is not configured" | The panel knows no address for agents: setup ran without `--public-url` and `serve` has no `--agent-addr`. | Restart the panel with `--agent-addr panel.example.com:443`. |
+| The admin answers **Get install command** with "panel address is not configured" | The panel knows no address for agents: setup ran without `--public-url` and `serve` has no `--agent-addr`. | Restart the panel with `--agent-addr panel.example.com:443`. |
 
 More symptoms and fixes are in [Troubleshooting](../operations/troubleshooting.md). Day-to-day node settings are in [Nodes](../guide/nodes.md).

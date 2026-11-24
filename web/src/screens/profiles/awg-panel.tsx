@@ -11,7 +11,7 @@ import { Notice } from "@/components/ui/notice";
 import { Switch } from "@/components/ui/switch";
 import { useToast } from "@/components/ui/toast";
 import { awg as awgApi } from "@/lib/api";
-import { asVersion, changedCount, minClients, versions, type AwgVersion, type ConfImport } from "@/lib/awg";
+import { asVersion, changedCount, minClientLabel, minClients, versions, type AwgVersion, type ConfImport } from "@/lib/awg";
 import { cx } from "@/lib/cx";
 import { errorText } from "@/lib/errors";
 import { useTx, type Tx } from "@/screens/users/t";
@@ -43,7 +43,7 @@ export function handTyped(prev: Settings, next: Settings): Settings {
 export type AwgAdvice = { warnings: readonly FieldError[]; score?: ObfuscationScore };
 
 const card =
-  "flex min-w-0 flex-col items-start gap-1 rounded-card border border-line bg-canvas px-3 py-2.5 text-left transition-colors duration-200 data-checked:border-accent-line data-checked:bg-accent-soft data-disabled:opacity-60";
+  "flex min-w-0 flex-col items-start gap-1 rounded-card border border-line bg-canvas px-3 py-2.5 text-start transition-colors duration-200 data-checked:border-accent-line data-checked:bg-accent-soft data-disabled:opacity-60";
 
 /** What a look is: the web and file-transfer traffic it copies, the calls, name lookups, and so on. All one tone, the disguise's. */
 const presetIcons: Record<string, IconName> = {
@@ -92,7 +92,7 @@ function ScoreReasons({ score, t }: { score: ObfuscationScore; t: Tx }) {
       <span className="font-bold">{t("awg.score.base", { n: score.base, tier })}</span>
       {score.items.map((i) => (
         <span key={i.code + i.pointer} className="flex gap-2">
-          <b className={cx("w-7 flex-none text-right font-mono", i.delta > 0 ? "text-accent-text" : "text-warn-text")}>{i.delta > 0 ? `+${i.delta}` : `−${-i.delta}`}</b>
+          <b className={cx("w-7 flex-none text-end font-mono", i.delta > 0 ? "text-accent-text" : "text-warn-text")}>{i.delta > 0 ? `+${i.delta}` : `−${-i.delta}`}</b>
           <span>{t.opt(`awg.score.${i.code}`, i.params) ?? i.code}</span>
         </span>
       ))}
@@ -181,11 +181,11 @@ function DomainField({ value, pool, busy, t, onCommit }: { value: string; pool: 
 }
 
 /**
- * The AmneziaWG part of the profile editor: version cards, mimicry cards, the warnings and the score of the current
- * numbers (the server's preview) and the oldest client that understands the chosen version. Everything else is the
- * schema form. Picking a look fetches only the signature packets (not critical); the big button replaces the whole block.
+ * What the AmneziaWG form does with the panel (the mimicry cards, the generator and the .conf import), apart from how it is drawn: the cards of the
+ * wizard (AwgPanel) and the board's rows of the profile page (awg-settings.tsx) take the same calls and the same rules. Picking a look fetches only
+ * the signature packets (not critical); "generate" replaces the whole block.
  */
-export function AwgPanel({ settings, onChange, advice }: { settings: Settings; onChange: (next: Settings) => void; advice?: AwgAdvice }) {
+export function useAwgBlock(settings: Settings, onChange: (next: Settings) => void) {
   const t = useTx();
   const toast = useToast();
   const meta = useQuery(presetsQuery);
@@ -194,7 +194,6 @@ export function AwgPanel({ settings, onChange, advice }: { settings: Settings; o
   const preset = typeof ob.preset === "string" && ob.preset ? ob.preset : "dns";
   const domain = typeof ob.domain === "string" ? ob.domain : "";
   const [busy, setBusy] = useState(false);
-  const [showScore, setShowScore] = useState(false);
   // what the last "new values" did; stays until the next pick
   const [note, setNote] = useState<{ n: number } | null>(null);
   // an answer arrives after the owner may have typed on: it goes onto what the form holds then
@@ -262,10 +261,20 @@ export function AwgPanel({ settings, onChange, advice }: { settings: Settings; o
     if (v !== version) void generate(asVersion(v));
   };
   const shown = presets.filter((p) => p.versions.length === 0 || p.versions.includes(version));
+  return { meta, version, ob, preset, domain, busy, note, presets, shown, current, varies: current?.variesPerDevice ?? true, perDevice: ob.per_device_signature === true, generate, signature, importConf, pickVersion };
+}
+
+/**
+ * The AmneziaWG part of the new-profile wizard: version cards, mimicry cards, the warnings and the score of the current numbers (the server's
+ * preview) and the oldest client that understands the chosen version. Everything else is the schema form. (The profile page draws the same
+ * choices as the board's rows: awg-settings.tsx.)
+ */
+export function AwgPanel({ settings, onChange, advice }: { settings: Settings; onChange: (next: Settings) => void; advice?: AwgAdvice }) {
+  const t = useTx();
+  const { meta, version, ob, preset, domain, busy, note, shown, current, varies, perDevice, generate, signature, importConf, pickVersion } = useAwgBlock(settings, onChange);
+  const [showScore, setShowScore] = useState(false);
   const warnings = advice?.warnings ?? [];
   const score = advice?.score;
-  const varies = current?.variesPerDevice ?? true;
-  const perDevice = ob.per_device_signature === true;
 
   return (
     <>
@@ -291,7 +300,7 @@ export function AwgPanel({ settings, onChange, advice }: { settings: Settings; o
           <div className="flex flex-wrap gap-1.5">
             {minClients[version].map((c) => (
               <Chip key={c.app} mono>
-                {c.app} {c.min}+
+                {minClientLabel(c.app, c.min, t("awg.clients.only20"))}
               </Chip>
             ))}
           </div>

@@ -54,9 +54,9 @@ func (s *source) Name() string     { return "globalping" }
 func (s *source) HourlyLimit() int { return s.limit }
 
 func (s *source) Measure(ctx context.Context, r health.CountryRound) (health.CountryObserved, error) {
-	tctx, done, err := s.svc.track(ctx, s.gen)
-	if err != nil {
-		return health.CountryObserved{}, err
+	tctx, done, ok := s.svc.guard.Track(ctx, s.gen, 0)
+	if !ok {
+		return health.CountryObserved{}, errSwitchedOff
 	}
 	defer done()
 	obs, err := s.measure(tctx, r)
@@ -361,4 +361,53 @@ func countValid(m measurement) int {
 		}
 	}
 	return n
+}
+
+// ErrDisabled: Globalping is switched off, so a one-off measurement is not made either.
+var ErrDisabled = errors.New("globalping: switched off")
+
+// ProbeTCP6 is the last resort of the IPv6 check of a node (fleet.Config.GlobalpingTCP6): one TCP ping of a port of an IPv6 address
+// from two probes anywhere. It says how many probes gave an answer and how many of those connected. An IPv6 literal takes no
+// ipVersion; the API picks only probes that have IPv6 and answers 422 when it has none, which is an error here. It costs two
+// tests of the hourly budget and honours the owner's switch (not the IPv6 round's own toggle: this is a request, not a schedule).
+func (s *Service) ProbeTCP6(ctx context.Context, addr string, port uint16) (answered, connected int, err error) {
+	st, err := s.load(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	if !st.Enabled {
+		return 0, 0, ErrDisabled
+	}
+	gen := s.guard.Generation()
+	src := &source{svc: s, c: s.client(s.token(st)), poll: s.cfg.PollDelay, gen: gen}
+	tctx, done, ok := s.guard.Track(ctx, gen, 0)
+	if !ok {
+		return 0, 0, errSwitchedOff
+	}
+	defer done()
+	tctx, cancel := context.WithTimeout(tctx, 40*time.Second)
+	defer cancel()
+	c, err := src.create(tctx, measurementRequest{Type: "ping", Target: addr, Locations: []location{{Magic: "world", Limit: 2}},
+		MeasurementOptions: pingOptions{Protocol: "TCP", Port: port, Packets: pingPackets}})
+	if err != nil {
+		return 0, 0, err
+	}
+	finished, err := src.pollAll(tctx, []string{c.ID})
+	m, ok := finished[c.ID]
+	if !ok {
+		if err == nil {
+			err = errors.New("globalping: the measurement did not finish")
+		}
+		return 0, 0, err
+	}
+	for _, it := range m.Results {
+		a, reached, _ := pingResult(it.Result)
+		if a {
+			answered++
+		}
+		if reached {
+			connected++
+		}
+	}
+	return answered, connected, nil
 }

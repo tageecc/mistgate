@@ -6,17 +6,24 @@ import "mistgate/admin/v1/common.proto";
 import "mistgate/admin/v1/profile.proto";
 
 // Users screen, create-user modal, user detail. Product rules:
-//  - Every user gets BOTH apps by default. Two toggles (Happ, Amnezia), at least one on.
+//  - Every user gets Happ and Amnezia by default; Telegram and the official TrustTunnel app are opt-in.
+//    At least one of Happ and Amnezia stays on (the user table constraint); Telegram and TrustTunnel are
+//    independent, additive switches.
 //  - Node selection per user: all nodes (automatic, includes nodes added later) or an explicit list.
 //  - Group, quota (+ reset period), term, device limit, optional speed limit.
 //  - "Via" = the apps the user really used recently (derived from traffic/sessions of the last 7 days),
 //    independent of the toggles.
 //
 // EFFECTIVE ACCESS (what the panel turns into desired state for a node):
+//   groups(U) = {U.group} + U.extra_groups: the main group and the extra groups of the person
 //   for every inbound I (profile P on node N) and every non-revoked device credential C of user U:
-//     U.status == ACTIVE  AND  P in U.group.profiles  AND  (U.all_nodes OR N in U.nodes)
+//     U.status == ACTIVE  AND  some group G of groups(U) holds P (P in G.profiles) and gets N (N not in
+//     G.disabled_node_ids): the same G for both  AND  (U.all_nodes OR N in U.nodes)
 //     AND  some enabled app of U consumes P.protocol (Protocol.Clients)  AND  I is enabled  ->  C goes to N.
+//   A relay twin of I through the entry node E needs the same G to get E as well.
 //   Changing any of these changes desired state and is pushed to the nodes at once.
+// The MAIN group (User.group_id) alone decides what is not access: the DNS preset, the Mihomo template, the response
+// headers, the colour and the sort by group. An extra group only adds access, and is never the main group.
 //
 // STATUS (precedence disabled > expired > limited > active; maintained by the access module):
 //   DISABLED  admin switch. EXPIRED  expires_at passed. LIMITED  used_bytes >= quota_bytes.
@@ -44,6 +51,21 @@ service UserService {
   rpc DeleteUsers(DeleteUsersRequest) returns (DeleteUsersResponse);
   // "Link & QR". The QR is rendered by the SPA from the URL. rotate = issue a new token (old link dies).
   rpc GetSubscriptionLink(GetSubscriptionLinkRequest) returns (GetSubscriptionLinkResponse);
+  // The Telegram proxy of one person: whether they hold a key and the tg://proxy links of their MTProto inbounds, one per
+  // node and profile. A read: it makes no device and no key and records no fetch. No links when Telegram is off, the
+  // person has no key, or no MTProto profile runs for them.
+  rpc GetTelegramLinks(GetTelegramLinksRequest) returns (GetTelegramLinksResponse);
+  // Makes the person's Telegram key if they have none (the same answer when they have one). Telegram has to be on for them.
+  // The key is a device of the person (DEVICE_KIND_TELEGRAM_KEY, listed with their devices) but it does NOT count against
+  // their device limit, so this never fails for want of room. Turning Telegram on in CreateUser or UpdateUser makes the key
+  // the same way.
+  rpc IssueTelegramKey(IssueTelegramKeyRequest) returns (IssueTelegramKeyResponse);
+  // Gives the key a new secret: every link made before stops working, the new links are in the answer. NOT_FOUND "key"
+  // when the person has none.
+  rpc RotateTelegramKey(RotateTelegramKeyRequest) returns (RotateTelegramKeyResponse);
+  // Revokes the key and frees its place among the devices; the nodes drop the secret with the next desired state. Telegram
+  // stays on. Turning Telegram off or removing the key device (RevokeDevice) does the same.
+  rpc RevokeTelegramKey(RevokeTelegramKeyRequest) returns (RevokeTelegramKeyResponse);
   // What the nodes saw of this person's connections over the last hours, per device, node and protocol (agent.proto
   // LinkCounters): connects, refusals, early drops, handshakes that do not complete, time online. Counts only, no
   // address. A read like GetUser: every role and API tokens (the MCP tool user_connection).
@@ -89,6 +111,19 @@ message DeviceConnection {
   uint32 loss_permille = 21;
   uint32 rtt_samples = 22;
   uint64 pkts_sent = 23 [jstype = JS_NUMBER];
+  // The per-key counters of agents that list "links/3" (InboundConnections in node.proto says what they mean): VLESS
+  // tcp_stalls and tcp_stalls_16k, AmneziaWG (userspace backend) initiations, responses and responses_unmatched.
+  uint32 tcp_stalls = 24;
+  uint32 tcp_stalls_16k = 25;
+  uint32 initiations = 26;
+  uint32 responses = 27;
+  uint32 responses_unmatched = 28;
+  // Which of these five this row's protocol, transport, AWG backend or agent does not count: their zero means nothing.
+  repeated string unsupported = 29;
+  // The connections of this row went through a relay: the entry node's country ("RU") and id. Empty: the direct path.
+  string via_country = 30;
+  // See via_country.
+  string via_node_id = 31;
 }
 
 message GetUserConnectionResponse {
@@ -98,6 +133,10 @@ message GetUserConnectionResponse {
   repeated DeviceConnection rows = 3;
   // Nodes the person can use whose agent does not send connection counters: nothing from them is in rows.
   repeated string nodes_without_counters = 4;
+  // The person's devices that sent ClientHellos over VLESS REALITY in the window (agents with "vless-hello-kex/1"), counted on the
+  // nodes: how many offered the post-quantum key exchange and how many a classic one (HelloKexDevice says what each means). Each
+  // device once, however many nodes it used, by device id; a device of a node whose agent does not count is missing.
+  repeated HelloKexDevice hello_kex = 5;
 }
 
 enum UserStatus {
@@ -130,6 +169,8 @@ enum UserFilter {
   USER_FILTER_OVER_QUOTA = 3;
   // More live devices than device_limit (a limit of 0 is never over).
   USER_FILTER_OVER_DEVICE_LIMIT = 4;
+  // The Telegram toggle is on (apps.telegram): the people of the Telegram proxy, whatever their key or the MTProto profiles.
+  USER_FILTER_TELEGRAM = 5;
 }
 
 enum UserSort {
@@ -153,6 +194,16 @@ enum UserSort {
 message AppToggles {
   bool happ = 1;
   bool amnezia = 2;
+  // Telegram clients receive tg://proxy links for the MTProto profiles of the user's groups.
+  bool telegram = 3;
+  // The Mistgate app (the desktop client, one key per device). It rides on the subscription link, so it works only while
+  // happ is on as well. Absent in a request = leave it as it is (a new person: on); a response always carries it. Off: the
+  // person's enrolment is refused (app_disabled) and the devices they already enrolled get no servers (their keys are kept
+  // and work again when it is switched on).
+  optional bool mistgate = 4;
+  // The official TrustTunnel apps receive tt:// links for the user's TrustTunnel inbounds. This is independent of Mistgate,
+  // Happ and Amnezia; absent in an update = leave the existing value as it is.
+  optional bool trust_tunnel = 5;
 }
 
 message NodeSelection {
@@ -200,7 +251,7 @@ message User {
   string effective_dns_preset_name = 24;
   DnsSource dns_source = 25;
   // What the user's page offers, by app, as the subscription decides it: the app is switched on and the group gives
-  // it something on a node the user may use (an enabled, pending or running inbound on an enrolled node). Both false =
+  // it something on an enabled group node the user may use (an enabled, pending or running inbound on an enrolled node). Both false =
   // the person gets nothing yet. The status does not cut them (a disabled user's page shows the status instead).
   bool access_happ = 26;
   bool access_amnezia = 27;
@@ -210,6 +261,22 @@ message User {
   string group_color = 29;
   // The DEVICE limit: no single device of the person goes faster than this. 0 = no separate device limit.
   uint64 device_speed_limit_bps = 30 [jstype = JS_NUMBER];
+  // The Telegram toggle and at least one usable MTProto inbound for the person.
+  bool access_telegram = 31;
+  // A Telegram key was issued to the person: a live DEVICE_KIND_TELEGRAM_KEY device. The links need the key, the toggle and
+  // a usable MTProto inbound (access_telegram). Not called "key": a token-reachable response has no field that looks like a secret.
+  bool telegram_issued = 32;
+  // Devices currently idle and omitted from devices_used; their rows and credentials remain.
+  uint32 devices_idle = 33;
+  // The extra groups of the person (they only add access; group_id is the main group), ordered by name. The three lists run
+  // in step: the id, the name and the colour (Group.color, "" = none picked) of each, so a chip needs no second request.
+  repeated string extra_group_ids = 34;
+  repeated string extra_group_names = 35;
+  repeated string extra_group_colors = 36;
+  // The person's page password was removed: their page opens on the link alone (see PagePasswordAction). It says nothing about
+  // the instance-wide switch (SubscriptionSettings.user_page.require_page_password), which, when off, opens every page. Not a
+  // secret: the password itself is never part of a User.
+  bool page_open = 37;
 }
 
 enum DnsSource {
@@ -221,8 +288,9 @@ enum DnsSource {
 
 message ListUsersRequest {
   UserFilter filter = 1;
-  // Case-insensitive substring of name or group name.
+  // Case-insensitive substring of name or group name (the main group's).
   string query = 2;
+  // In the group: people that have it as their main group or as an extra one, each person once.
   string group_id = 3;
   // Default 50, max 200. The selected sort value uses `descending`; ties use name ascending, then id ascending.
   // Name order supports keyset paging with page_token. Other orders use offset paging; page_token with any other
@@ -244,13 +312,15 @@ message UserCounts {
   uint32 expiring = 3;
   uint32 over_quota = 4;
   // Live, non-revoked devices in use for users matching query/group_id, regardless of filter or page. All apps on
-  // one implicit subscription-fetch device count once; each AmneziaWG key counts as one device.
+  // one implicit subscription-fetch device count once; each AmneziaWG or TrustTunnel key counts as one device.
   uint32 devices_used = 5;
   // Matching devices whose Device.online value is true, regardless of filter or page. Subscription devices are
   // online while their user is online; AmneziaWG devices are online after a handshake within the 3-minute window.
   uint32 devices_online = 6;
   // People with more live devices than their device_limit, counted like devices_used.
   uint32 over_device_limit = 7;
+  // People with the Telegram toggle on, for the same query and group_id (the chip of USER_FILTER_TELEGRAM).
+  uint32 telegram = 8;
 }
 
 message ListUsersResponse {
@@ -287,7 +357,7 @@ message Device {
   // Last handshake of the peer on any node; 0 = never connected.
   int64 last_handshake_unix = 13 [jstype = JS_NUMBER];
   // What the device is: an app on the subscription link (its own HWID), the one place the apps without a HWID share, or an
-  // AmneziaVPN key.
+  // AmneziaVPN or TrustTunnel key.
   DeviceKind kind = 14;
   // The OS version and the app ("Happ/3.4.2") the device last fetched with; empty when it never said.
   string os_version = 15;
@@ -302,6 +372,19 @@ message Device {
   // The first 6 hex characters of the device's hash, to tell two phones of one model apart. Empty for the shared device
   // and for keys.
   string fingerprint = 20;
+  // The device is connected through the Mistgate app's own API (it holds a device key): the servers arrive in the app, not by
+  // the subscription link. Never the key itself.
+  bool enrolled = 21;
+  // With enrolled: the user's link was changed since the device connected, so it waits to reconnect on its own (the app
+  // gets link_changed and enrols again at its next sync).
+  bool enrol_link_stale = 22;
+  // The device has no connection or subscription fetch within the configured idle period; its credentials remain valid.
+  bool idle = 23;
+  // When it crossed the idle threshold (last node connection, else last fetch/sync, else creation time); 0 when not idle.
+  int64 idle_since_unix = 24 [jstype = JS_NUMBER];
+  // When the nodes last counted a connection of the device (a session they saw, or the newest hour with connections or online time
+  // in the connection counters); 0 = none counted. For a link device last_seen_unix is its last subscription fetch, not this.
+  int64 last_online_unix = 25 [jstype = JS_NUMBER];
 }
 
 enum DeviceKind {
@@ -310,8 +393,10 @@ enum DeviceKind {
   DEVICE_KIND_LINK = 1;
   // The place shared by every app that sends no HWID.
   DEVICE_KIND_LINK_SHARED = 2;
-  // An AmneziaVPN key (DeviceService.CreateAwgDevice).
+  // An AmneziaVPN or TrustTunnel key.
   DEVICE_KIND_KEY = 3;
+  // The person's Telegram proxy key (UserService.IssueTelegramKey): one secret for every MTProto link of the person.
+  DEVICE_KIND_TELEGRAM_KEY = 4;
 }
 
 message DayTraffic {
@@ -411,6 +496,19 @@ message CreateUserResponse {
   string page_password = 3;
 }
 
+// What UpdateUserRequest.page_password_action does to the page password of one person. The password is computed from the link and a
+// small number, so it is never stored or sent here: the owner reads it with GetSubscriptionLink (closed to tokens).
+enum PagePasswordAction {
+  PAGE_PASSWORD_ACTION_UNSPECIFIED = 0;
+  // A new password for the same link (the number it is computed with goes up by one): the cookies of the old one stop working at
+  // once, the subscription and the apps are not touched. FAILED_PRECONDITION "page_password_removed" while the password is removed.
+  PAGE_PASSWORD_ACTION_CHANGE = 1;
+  // The person's page opens on the link alone, with no question. A repeat does nothing.
+  PAGE_PASSWORD_ACTION_REMOVE = 2;
+  // The password is asked again, and it is a new one (the old one does not come back). A repeat does nothing.
+  PAGE_PASSWORD_ACTION_RESTORE = 3;
+}
+
 message UpdateUserRequest {
   string user_id = 1;
   optional string name = 2;
@@ -432,12 +530,25 @@ message UpdateUserRequest {
   optional string subscription_name = 13;
   // The device limit (User.device_speed_limit_bps). 0 = remove the limit.
   optional uint64 device_speed_limit_bps = 14 [jstype = JS_NUMBER];
+  // The extra groups change by these two lists, not by a full set, so two changes made at once do not undo each other and a
+  // repeat does nothing. Ids; each must exist (NOT_FOUND "group"). INVALID_ARGUMENT "group_in_both" for an id in both lists,
+  // "main_group" for remove_group_ids with the person's main group (as it is after this request), "too_many_groups" when the
+  // person would be in more than 16 groups in all (the main one counted). An id of add_group_ids that is the main group (after
+  // this request) is skipped. group_id = B with add_group_ids = [A] makes B the main group and keeps A as an extra group;
+  // without A there the old main group is left. The new main group leaves the extra groups. Changing the groups is one change
+  // of the person for a token's user-change limit, like a change of the main group.
+  repeated string add_group_ids = 15;
+  repeated string remove_group_ids = 16;
+  // Change, remove or restore the person's page password. Counts as one change of the person for a token's user-change limit. The
+  // response never carries the password; the owner reads the new one with GetSubscriptionLink.
+  PagePasswordAction page_password_action = 17;
 }
 
 message UpdateUserResponse {
   // The user after the update; with dry_run, as it is now.
   User user = 1;
-  // What a new group does to the user's profiles; unset when the group stays.
+  // What the new set of groups (a new main group, added or removed extra groups) does to the person's profiles and nodes; unset
+  // when they get the same profiles on the same nodes.
   AccessImpact impact = 2;
 }
 
@@ -446,8 +557,14 @@ message UpdateUserResponse {
 message AccessImpact {
   repeated ImpactProfile lost = 1;
   repeated ImpactProfile gained = 2;
-  // People touched: the user, or the group's users.
+  // People touched: the user, or the group's users (main and extra members).
   uint32 users = 3;
+  // Nodes where the person gets something after the change and got nothing before (the node comes), and the reverse (the node
+  // goes), judged by pairs (profile, node) on the enabled inbounds within the person's own node choice, so a group with the
+  // same profiles but other nodes shows as a change too. Ordered by id. Only UpdateUser fills them; a group update leaves them
+  // empty.
+  repeated string gained_node_ids = 4;
+  repeated string lost_node_ids = 5;
 }
 
 message ImpactProfile {
@@ -518,7 +635,60 @@ message GetSubscriptionLinkRequest {
 message GetSubscriptionLinkResponse {
   // https://<subscription domain>/<secret prefix>/<token>. The token is shown only here and to the user.
   string url = 1;
-  // The password of the user's page for this link (xxxx-xxxx), derived from the token: a new link is a new password.
-  // Empty when the instance does not ask for one. Like the link, never shown to agents.
+  // The password of the user's page for this link (xxxx-xxxx), derived from the token and the password's number: a new link is a
+  // new password, and so is a change of the password (UpdateUser page_password_action). Empty when the instance does not ask for one
+  // or this person's password was removed (User.page_open). Like the link, never shown to agents.
   string page_password = 2;
+}
+
+message GetTelegramLinksRequest {
+  string user_id = 1;
+}
+
+// One tg://proxy link of a person. The secret is in the URL: the UI must treat it like a password.
+message TelegramProxyLink {
+  string node_id = 1;
+  string node_name = 2;
+  string profile_id = 3;
+  string profile_name = 4;
+  string url = 5;
+  // A twin of the node's link: its IPv6 entry, or a relay of an entry node whose country code is `via`. Both false: the link
+  // to the node itself. The owner sees node_name and profile_name; the person's page never does.
+  bool ipv6 = 6;
+  bool relay = 7;
+  string via = 8;
+}
+
+message GetTelegramLinksResponse {
+  repeated TelegramProxyLink links = 1;
+  // The person holds a Telegram key. False: links is empty, whatever MTProto profiles run.
+  bool has_key = 2;
+  // The key's device (RevokeDevice removes it too); empty without a key.
+  string key_device_id = 3;
+  // When the key was issued or last rotated; 0 without a key.
+  int64 key_issued_unix = 4 [jstype = JS_NUMBER];
+}
+
+message IssueTelegramKeyRequest {
+  string user_id = 1;
+}
+
+message IssueTelegramKeyResponse {
+  GetTelegramLinksResponse proxy = 1;
+}
+
+message RotateTelegramKeyRequest {
+  string user_id = 1;
+}
+
+message RotateTelegramKeyResponse {
+  GetTelegramLinksResponse proxy = 1;
+}
+
+message RevokeTelegramKeyRequest {
+  string user_id = 1;
+}
+
+message RevokeTelegramKeyResponse {
+  GetTelegramLinksResponse proxy = 1;
 }

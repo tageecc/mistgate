@@ -1,3 +1,5 @@
+//go:build !js
+
 package mcp
 
 import (
@@ -47,7 +49,7 @@ func TestSubscriptionSettingsGet(t *testing.T) {
 	_, secret := e.token(ProfileReadonly)
 	out := mustOK(t, e.session(secret), "subscription_settings_get", map[string]any{})
 	v := decode[SubsSettingsV](t, out)
-	if v.EffectiveTitle != "Example VPN" || v.ServerNameTemplate != subsettings.DefaultNameTemplate || !v.UserPage.PagePassword || !v.UserPage.DeviceSelfService {
+	if v.EffectiveTitle != "Example VPN" || v.ServerNameTemplate != subsettings.DefaultNameTemplate || !v.UserPage.PagePassword || !v.UserPage.DeviceSelfService || !v.LinkAutoSelect || v.DeviceIdleAfterDays != 30 {
 		t.Errorf("page settings: %+v", v)
 	}
 	ios := v.Apps["ios"]
@@ -60,6 +62,43 @@ func TestSubscriptionSettingsGet(t *testing.T) {
 	// the last wall still applies: a query string reads [redacted]
 	if !strings.Contains(out, "play.google.com/store/apps/details?[redacted]") {
 		t.Errorf("the Play link was not scrubbed: %s", out)
+	}
+}
+
+func TestSubscriptionDeviceIdlePlanApplyAndBounds(t *testing.T) {
+	e := newTestEnv(t)
+	_, secret := e.token(ProfileOperator)
+	s := e.session(secret)
+	plan := decode[PlanOut](t, mustOK(t, s, "subscription_link_limits_set_plan", map[string]any{"device_idle_after_days": 0}))
+	if !plan.NeedsApproval || factIn(t, storedFacts(t, e), "device_idle_after_days").Value != "30 -> 0" {
+		t.Fatalf("idle setting plan = %+v, facts %+v", plan, storedFacts(t, e))
+	}
+	if err := e.plans.decide(plan.PlanID, true); err != nil {
+		t.Fatal(err)
+	}
+	apply := decode[ApplyOut](t, mustOK(t, s, "subscription_link_limits_set_apply", map[string]any{"confirm_token": plan.ConfirmToken}))
+	if apply.Status != StatusApplied || e.w.subs.GetDeviceIdleAfterDays() != 0 {
+		t.Fatalf("idle setting apply = %+v, stored days = %d", apply, e.w.subs.GetDeviceIdleAfterDays())
+	}
+	for _, days := range []uint32{6, 366} {
+		mustFail(t, s, "subscription_link_limits_set_plan", map[string]any{"device_idle_after_days": days})
+	}
+}
+
+func TestSubscriptionLinkAutoSelectPlan(t *testing.T) {
+	e := newTestEnv(t)
+	_, secret := e.token(ProfileOperator)
+	s := e.session(secret)
+	plan := decode[PlanOut](t, mustOK(t, s, "subscription_link_limits_set_plan", map[string]any{"link_auto_select": false}))
+	if !plan.NeedsApproval || factIn(t, storedFacts(t, e), "link_auto_select").Value != "true -> false" {
+		t.Fatalf("plan did not describe the automatic server selection change: %+v", plan)
+	}
+	if err := e.plans.decide(plan.PlanID, true); err != nil {
+		t.Fatal(err)
+	}
+	apply := decode[ApplyOut](t, mustOK(t, s, "subscription_link_limits_set_apply", map[string]any{"confirm_token": plan.ConfirmToken}))
+	if apply.Status != StatusApplied || e.w.subs.GetLinkAutoSelect() || e.plans.only().OutcomeCode != "subscription_link_limits_updated" {
+		t.Fatalf("apply = %+v, settings = %v, outcome = %s", apply, e.w.subs.GetLinkAutoSelect(), e.plans.only().OutcomeCode)
 	}
 }
 

@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"log/slog"
+	"os"
 	"sync"
 
 	pb "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/internal/node/agent"
 	"github.com/mistgate/mistgate/internal/node/awg"
 	"github.com/mistgate/mistgate/internal/node/engine"
 	"github.com/mistgate/mistgate/internal/plugin"
@@ -25,6 +27,10 @@ import (
 type awgEngine struct {
 	env  engine.Env
 	mode func() string // NodeSettings.awg_backend as the agent holds it ("" = auto)
+	// peers counts the AmneziaWG devices of the node, for the memory ceiling of the userspace fallback (nil = none known).
+	peers func() int
+	// moduleLoaded says the kernel module is there now (/sys/module/amneziawg); a field so tests can say yes.
+	moduleLoaded func() bool
 
 	mu    sync.Mutex
 	eng   *awg.Engine
@@ -35,7 +41,12 @@ func newAwgEngine(env engine.Env, mode func() string) *awgEngine {
 	if env.Log == nil {
 		env.Log = slog.Default()
 	}
-	return &awgEngine{env: env, mode: mode}
+	return &awgEngine{env: env, mode: mode, moduleLoaded: awgModuleLoaded}
+}
+
+func awgModuleLoaded() bool {
+	_, err := os.Stat("/sys/module/amneziawg")
+	return err == nil
 }
 
 // normMode maps the setting to one of the three modes; anything else is "auto" (a panel from the future must not
@@ -54,7 +65,7 @@ func (l *awgEngine) get() *awg.Engine {
 	defer l.mu.Unlock()
 	if l.eng == nil {
 		m := normMode(l.mode())
-		e, err := awg.NewWithOptions(l.env, awg.Options{Backend: m})
+		e, err := awg.NewWithOptions(l.env, awg.Options{Backend: m, Peers: l.peers})
 		if err != nil { // only a bad mode, which normMode excludes; keep the agent alive anyway
 			l.env.Log.Error("awg engine", "err", err)
 			e, _ = awg.NewWithOptions(l.env, awg.Options{Backend: "auto"})
@@ -85,6 +96,56 @@ func (l *awgEngine) NodeSettings(ctx context.Context, st *pb.NodeSettings) bool 
 	}
 	l.eng, l.built = nil, ""
 	return true
+}
+
+// ReprobeKernel implements agent.AwgModuleReprober: the engine runs on the userspace fallback of a "kernel" setting and the
+// module is loaded now (someone built it). It is the ONLY way back besides an agent start: nothing probes the module by
+// itself while people are connected (decision D4), and an engine that is not on the fallback is never touched. A candidate
+// engine only probes (a genetlink lookup; interfaces and ports appear at Apply, which the agent does after this returns),
+// so it never competes with the serving engine. The serving engine is dropped (its interfaces go) only when the candidate
+// really got the kernel backend, which the agent then applies every awg inbound on; otherwise it keeps serving.
+func (l *awgEngine) ReprobeKernel(ctx context.Context) (bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.eng == nil || l.built == "userspace" || !l.moduleLoaded() {
+		return false, nil
+	}
+	// on the fallback, or with no backend at all (no module and userspace did not fit): both wait for the module
+	if st := l.eng.BackendStatus(); st.Available && !st.Fallback {
+		return false, nil
+	}
+	candidateEnv := l.env
+	candidateEnv.Event = nil // no second "fallback" event for a probe
+	candidate, err := awg.NewWithOptions(candidateEnv, awg.Options{Backend: "auto", Peers: l.peers})
+	if err != nil {
+		return false, err
+	}
+	if st := candidate.BackendStatus(); !st.Available || st.Name != "kernel" {
+		_ = candidate.Close(ctx)
+		return false, nil
+	}
+	l.env.Log.Info("the kernel module is usable now, the engine is rebuilt on it")
+	err = l.eng.Close(ctx)
+	l.eng = candidate // l.built stays "kernel": the setting did not change
+	return true, err
+}
+
+var _ agent.AWGKernelDebugEngine = (*awgEngine)(nil)
+
+// KernelDebugInfo implements agent.AWGKernelDebugEngine: an engine never built serves no AWG, so there is nothing to read.
+func (l *awgEngine) KernelDebugInfo() (bool, []awg.KernelDebugInterface) {
+	if e := l.peek(); e != nil {
+		return e.KernelDebugInfo()
+	}
+	return false, nil
+}
+
+// WatchKernelUnknownPeers implements agent.AWGKernelDebugEngine.
+func (l *awgEngine) WatchKernelUnknownPeers(fn func(string)) (bool, func()) {
+	if e := l.peek(); e != nil {
+		return e.WatchKernelUnknownPeers(fn)
+	}
+	return false, func() {}
 }
 
 // BackendStatus is the doctor's view (the agent asserts this method).

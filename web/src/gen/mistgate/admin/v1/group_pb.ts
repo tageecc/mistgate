@@ -4,6 +4,8 @@
 
 import type { GenFile, GenMessage, GenService } from "@bufbuild/protobuf/codegenv2";
 import { fileDesc, messageDesc, serviceDesc } from "@bufbuild/protobuf/codegenv2";
+import type { NodeShareMode } from "./common_pb";
+import { file_mistgate_admin_v1_common } from "./common_pb";
 import type { AccessImpact } from "./user_pb";
 import { file_mistgate_admin_v1_user } from "./user_pb";
 import type { Message } from "@bufbuild/protobuf";
@@ -12,7 +14,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file mistgate/admin/v1/group.proto.
  */
 export const file_mistgate_admin_v1_group: GenFile = /*@__PURE__*/
-  fileDesc("Ch1taXN0Z2F0ZS9hZG1pbi92MS9ncm91cC5wcm90bxIRbWlzdGdhdGUuYWRtaW4udjEimwEKBUdyb3VwEgoKAmlkGAEgASgJEgwKBG5hbWUYAiABKAkSEwoLcHJvZmlsZV9pZHMYAyADKAkSEgoKdXNlcl9jb3VudBgEIAEoDRIVCg1kbnNfcHJlc2V0X2lkGAUgASgJEhIKCmhhcHBfbm9kZXMYBiABKA0SFQoNYW1uZXppYV9ub2RlcxgHIAEoDRINCgVjb2xvchgIIAEoCSITChFMaXN0R3JvdXBzUmVxdWVzdCI+ChJMaXN0R3JvdXBzUmVzcG9uc2USKAoGZ3JvdXBzGAEgAygLMhgubWlzdGdhdGUuYWRtaW4udjEuR3JvdXAiXQoSQ3JlYXRlR3JvdXBSZXF1ZXN0EgwKBG5hbWUYASABKAkSEwoLcHJvZmlsZV9pZHMYAiADKAkSFQoNZG5zX3ByZXNldF9pZBgDIAEoCRINCgVjb2xvchgEIAEoCSI+ChNDcmVhdGVHcm91cFJlc3BvbnNlEicKBWdyb3VwGAEgASgLMhgubWlzdGdhdGUuYWRtaW4udjEuR3JvdXAi6AEKElVwZGF0ZUdyb3VwUmVxdWVzdBIQCghncm91cF9pZBgBIAEoCRIRCgRuYW1lGAIgASgJSACIAQESNwoLcHJvZmlsZV9pZHMYAyABKAsyHS5taXN0Z2F0ZS5hZG1pbi52MS5Qcm9maWxlSWRzSAGIAQESGgoNZG5zX3ByZXNldF9pZBgEIAEoCUgCiAEBEg8KB2RyeV9ydW4YBSABKAgSEgoFY29sb3IYBiABKAlIA4gBAUIHCgVfbmFtZUIOCgxfcHJvZmlsZV9pZHNCEAoOX2Ruc19wcmVzZXRfaWRCCAoGX2NvbG9yIhwKClByb2ZpbGVJZHMSDgoGdmFsdWVzGAEgAygJIm8KE1VwZGF0ZUdyb3VwUmVzcG9uc2USJwoFZ3JvdXAYASABKAsyGC5taXN0Z2F0ZS5hZG1pbi52MS5Hcm91cBIvCgZpbXBhY3QYAiABKAsyHy5taXN0Z2F0ZS5hZG1pbi52MS5BY2Nlc3NJbXBhY3QiPQoSRGVsZXRlR3JvdXBSZXF1ZXN0EhAKCGdyb3VwX2lkGAEgASgJEhUKDW1vdmVfdXNlcnNfdG8YAiABKAkiFQoTRGVsZXRlR3JvdXBSZXNwb25zZTKDAwoMR3JvdXBTZXJ2aWNlElkKCkxpc3RHcm91cHMSJC5taXN0Z2F0ZS5hZG1pbi52MS5MaXN0R3JvdXBzUmVxdWVzdBolLm1pc3RnYXRlLmFkbWluLnYxLkxpc3RHcm91cHNSZXNwb25zZRJcCgtDcmVhdGVHcm91cBIlLm1pc3RnYXRlLmFkbWluLnYxLkNyZWF0ZUdyb3VwUmVxdWVzdBomLm1pc3RnYXRlLmFkbWluLnYxLkNyZWF0ZUdyb3VwUmVzcG9uc2USXAoLVXBkYXRlR3JvdXASJS5taXN0Z2F0ZS5hZG1pbi52MS5VcGRhdGVHcm91cFJlcXVlc3QaJi5taXN0Z2F0ZS5hZG1pbi52MS5VcGRhdGVHcm91cFJlc3BvbnNlElwKC0RlbGV0ZUdyb3VwEiUubWlzdGdhdGUuYWRtaW4udjEuRGVsZXRlR3JvdXBSZXF1ZXN0GiYubWlzdGdhdGUuYWRtaW4udjEuRGVsZXRlR3JvdXBSZXNwb25zZULFAQoVY29tLm1pc3RnYXRlLmFkbWluLnYxQgpHcm91cFByb3RvUAFaOmdpdGh1Yi5jb20vbWlzdGdhdGUvbWlzdGdhdGUvZ2VuL21pc3RnYXRlL2FkbWluL3YxO2FkbWludjGiAgNNQViqAhFNaXN0Z2F0ZS5BZG1pbi5WMcoCEU1pc3RnYXRlXEFkbWluXFYx4gIdTWlzdGdhdGVcQWRtaW5cVjFcR1BCTWV0YWRhdGHqAhNNaXN0Z2F0ZTo6QWRtaW46OlYxYgZwcm90bzM", [file_mistgate_admin_v1_user]);
+  fileDesc("Ch1taXN0Z2F0ZS9hZG1pbi92MS9ncm91cC5wcm90bxIRbWlzdGdhdGUuYWRtaW4udjEi6AEKBUdyb3VwEgoKAmlkGAEgASgJEgwKBG5hbWUYAiABKAkSEwoLcHJvZmlsZV9pZHMYAyADKAkSEgoKdXNlcl9jb3VudBgEIAEoDRIVCg1kbnNfcHJlc2V0X2lkGAUgASgJEhIKCmhhcHBfbm9kZXMYBiABKA0SFQoNYW1uZXppYV9ub2RlcxgHIAEoDRINCgVjb2xvchgIIAEoCRIZChFkaXNhYmxlZF9ub2RlX2lkcxgJIAMoCRIWCg50ZWxlZ3JhbV9ub2RlcxgKIAEoDRIYChBleHRyYV91c2VyX2NvdW50GAsgASgNIhMKEUxpc3RHcm91cHNSZXF1ZXN0Ij4KEkxpc3RHcm91cHNSZXNwb25zZRIoCgZncm91cHMYASADKAsyGC5taXN0Z2F0ZS5hZG1pbi52MS5Hcm91cCJ4ChJDcmVhdGVHcm91cFJlcXVlc3QSDAoEbmFtZRgBIAEoCRITCgtwcm9maWxlX2lkcxgCIAMoCRIVCg1kbnNfcHJlc2V0X2lkGAMgASgJEg0KBWNvbG9yGAQgASgJEhkKEWRpc2FibGVkX25vZGVfaWRzGAUgAygJIj4KE0NyZWF0ZUdyb3VwUmVzcG9uc2USJwoFZ3JvdXAYASABKAsyGC5taXN0Z2F0ZS5hZG1pbi52MS5Hcm91cCK6AgoSVXBkYXRlR3JvdXBSZXF1ZXN0EhAKCGdyb3VwX2lkGAEgASgJEhEKBG5hbWUYAiABKAlIAIgBARI3Cgtwcm9maWxlX2lkcxgDIAEoCzIdLm1pc3RnYXRlLmFkbWluLnYxLlByb2ZpbGVJZHNIAYgBARIaCg1kbnNfcHJlc2V0X2lkGAQgASgJSAKIAQESDwoHZHJ5X3J1bhgFIAEoCBISCgVjb2xvchgGIAEoCUgDiAEBEjoKEWRpc2FibGVkX25vZGVfaWRzGAcgASgLMhoubWlzdGdhdGUuYWRtaW4udjEuTm9kZUlkc0gEiAEBQgcKBV9uYW1lQg4KDF9wcm9maWxlX2lkc0IQCg5fZG5zX3ByZXNldF9pZEIICgZfY29sb3JCFAoSX2Rpc2FibGVkX25vZGVfaWRzIhwKClByb2ZpbGVJZHMSDgoGdmFsdWVzGAEgAygJIhkKB05vZGVJZHMSDgoGdmFsdWVzGAEgAygJIm8KE1VwZGF0ZUdyb3VwUmVzcG9uc2USJwoFZ3JvdXAYASABKAsyGC5taXN0Z2F0ZS5hZG1pbi52MS5Hcm91cBIvCgZpbXBhY3QYAiABKAsyHy5taXN0Z2F0ZS5hZG1pbi52MS5BY2Nlc3NJbXBhY3QiPQoSRGVsZXRlR3JvdXBSZXF1ZXN0EhAKCGdyb3VwX2lkGAEgASgJEhUKDW1vdmVfdXNlcnNfdG8YAiABKAkiFQoTRGVsZXRlR3JvdXBSZXNwb25zZSJ8ChVTZXROb2RlU2hhcmluZ1JlcXVlc3QSDwoHbm9kZV9pZBgBIAEoCRIuCgRtb2RlGAIgASgOMiAubWlzdGdhdGUuYWRtaW4udjEuTm9kZVNoYXJlTW9kZRIRCglncm91cF9pZHMYAyADKAkSDwoHZHJ5X3J1bhgEIAEoCCKfAQoWU2V0Tm9kZVNoYXJpbmdSZXNwb25zZRIuCgRtb2RlGAEgASgOMiAubWlzdGdhdGUuYWRtaW4udjEuTm9kZVNoYXJlTW9kZRIRCglncm91cF9pZHMYAiADKAkSGAoQcGVvcGxlX3JlY2VpdmluZxgDIAEoDRITCgtwZW9wbGVfZ2FpbhgEIAEoDRITCgtwZW9wbGVfbG9zZRgFIAEoDTLqAwoMR3JvdXBTZXJ2aWNlElkKCkxpc3RHcm91cHMSJC5taXN0Z2F0ZS5hZG1pbi52MS5MaXN0R3JvdXBzUmVxdWVzdBolLm1pc3RnYXRlLmFkbWluLnYxLkxpc3RHcm91cHNSZXNwb25zZRJcCgtDcmVhdGVHcm91cBIlLm1pc3RnYXRlLmFkbWluLnYxLkNyZWF0ZUdyb3VwUmVxdWVzdBomLm1pc3RnYXRlLmFkbWluLnYxLkNyZWF0ZUdyb3VwUmVzcG9uc2USXAoLVXBkYXRlR3JvdXASJS5taXN0Z2F0ZS5hZG1pbi52MS5VcGRhdGVHcm91cFJlcXVlc3QaJi5taXN0Z2F0ZS5hZG1pbi52MS5VcGRhdGVHcm91cFJlc3BvbnNlElwKC0RlbGV0ZUdyb3VwEiUubWlzdGdhdGUuYWRtaW4udjEuRGVsZXRlR3JvdXBSZXF1ZXN0GiYubWlzdGdhdGUuYWRtaW4udjEuRGVsZXRlR3JvdXBSZXNwb25zZRJlCg5TZXROb2RlU2hhcmluZxIoLm1pc3RnYXRlLmFkbWluLnYxLlNldE5vZGVTaGFyaW5nUmVxdWVzdBopLm1pc3RnYXRlLmFkbWluLnYxLlNldE5vZGVTaGFyaW5nUmVzcG9uc2VCxQEKFWNvbS5taXN0Z2F0ZS5hZG1pbi52MUIKR3JvdXBQcm90b1ABWjpnaXRodWIuY29tL21pc3RnYXRlL21pc3RnYXRlL2dlbi9taXN0Z2F0ZS9hZG1pbi92MTthZG1pbnYxogIDTUFYqgIRTWlzdGdhdGUuQWRtaW4uVjHKAhFNaXN0Z2F0ZVxBZG1pblxWMeICHU1pc3RnYXRlXEFkbWluXFYxXEdQQk1ldGFkYXRh6gITTWlzdGdhdGU6OkFkbWluOjpWMWIGcHJvdG8z", [file_mistgate_admin_v1_common, file_mistgate_admin_v1_user]);
 
 /**
  * @generated from message mistgate.admin.v1.Group
@@ -34,6 +36,9 @@ export type Group = Message<"mistgate.admin.v1.Group"> & {
   profileIds: string[];
 
   /**
+   * People that have this group as their main group. The ones that have it as an extra group are in extra_user_count; the two
+   * together are the people the group gives access to.
+   *
    * @generated from field: uint32 user_count = 4;
    */
   userCount: number;
@@ -66,6 +71,29 @@ export type Group = Message<"mistgate.admin.v1.Group"> & {
    * @generated from field: string color = 8;
    */
   color: string;
+
+  /**
+   * Nodes that are disabled for users in this group. Empty = every node is available, including future nodes. A node the
+   * owner holds back (Node.sharing) is here while the group was not given it. Changing it with UpdateGroup follows the rule
+   * at UpdateGroupRequest.disabled_node_ids.
+   *
+   * @generated from field: repeated string disabled_node_ids = 9;
+   */
+  disabledNodeIds: string[];
+
+  /**
+   * Nodes where the group's MTProto profiles give a Telegram proxy right now (same rule as happ_nodes and amnezia_nodes).
+   *
+   * @generated from field: uint32 telegram_nodes = 10;
+   */
+  telegramNodes: number;
+
+  /**
+   * People that have this group as an extra group (a person is in one of the two counts, never both).
+   *
+   * @generated from field: uint32 extra_user_count = 11;
+   */
+  extraUserCount: number;
 };
 
 /**
@@ -130,6 +158,11 @@ export type CreateGroupRequest = Message<"mistgate.admin.v1.CreateGroupRequest">
    * @generated from field: string color = 4;
    */
   color: string;
+
+  /**
+   * @generated from field: repeated string disabled_node_ids = 5;
+   */
+  disabledNodeIds: string[];
 };
 
 /**
@@ -197,6 +230,16 @@ export type UpdateGroupRequest = Message<"mistgate.admin.v1.UpdateGroupRequest">
    * @generated from field: optional string color = 6;
    */
   color?: string | undefined;
+
+  /**
+   * Presence = replace the group's disabled node set. A node that is held back (Node.sharing mode LISTED or NONE) and that
+   * the group was not given cannot be switched on here: FAILED_PRECONDITION "node_held: node=<id>", so a form that was
+   * loaded before the node was made cannot hand it out by saving. Give it from the node's side (SetNodeSharing). Switching
+   * such a node off for a group that was given it works.
+   *
+   * @generated from field: optional mistgate.admin.v1.NodeIds disabled_node_ids = 7;
+   */
+  disabledNodeIds?: NodeIds | undefined;
 };
 
 /**
@@ -224,6 +267,23 @@ export const ProfileIdsSchema: GenMessage<ProfileIds> = /*@__PURE__*/
   messageDesc(file_mistgate_admin_v1_group, 6);
 
 /**
+ * @generated from message mistgate.admin.v1.NodeIds
+ */
+export type NodeIds = Message<"mistgate.admin.v1.NodeIds"> & {
+  /**
+   * @generated from field: repeated string values = 1;
+   */
+  values: string[];
+};
+
+/**
+ * Describes the message mistgate.admin.v1.NodeIds.
+ * Use `create(NodeIdsSchema)` to create a new message.
+ */
+export const NodeIdsSchema: GenMessage<NodeIds> = /*@__PURE__*/
+  messageDesc(file_mistgate_admin_v1_group, 7);
+
+/**
  * @generated from message mistgate.admin.v1.UpdateGroupResponse
  */
 export type UpdateGroupResponse = Message<"mistgate.admin.v1.UpdateGroupResponse"> & {
@@ -235,7 +295,8 @@ export type UpdateGroupResponse = Message<"mistgate.admin.v1.UpdateGroupResponse
   group?: Group | undefined;
 
   /**
-   * What the new profile set does to the group's users; unset when the set stays.
+   * What the new profile set does to the group's users (main and extra members; a person whose other group holds the same
+   * profile loses less than this says); unset when the set stays.
    *
    * @generated from field: mistgate.admin.v1.AccessImpact impact = 2;
    */
@@ -247,7 +308,7 @@ export type UpdateGroupResponse = Message<"mistgate.admin.v1.UpdateGroupResponse
  * Use `create(UpdateGroupResponseSchema)` to create a new message.
  */
 export const UpdateGroupResponseSchema: GenMessage<UpdateGroupResponse> = /*@__PURE__*/
-  messageDesc(file_mistgate_admin_v1_group, 7);
+  messageDesc(file_mistgate_admin_v1_group, 8);
 
 /**
  * @generated from message mistgate.admin.v1.DeleteGroupRequest
@@ -259,8 +320,9 @@ export type DeleteGroupRequest = Message<"mistgate.admin.v1.DeleteGroupRequest">
   groupId: string;
 
   /**
-   * The group's users move here first, in the same transaction. Empty: refused with FAILED_PRECONDITION
-   * "group_not_empty: users=N" while users belong to the group.
+   * The people that have the group as their main group move here first, in the same transaction (one that had the target as an
+   * extra group keeps it as the main one). Empty: refused with FAILED_PRECONDITION "group_not_empty: users=N" while people have
+   * it as their main group. The extra members need no target: they leave the group.
    *
    * @generated from field: string move_users_to = 2;
    */
@@ -272,7 +334,7 @@ export type DeleteGroupRequest = Message<"mistgate.admin.v1.DeleteGroupRequest">
  * Use `create(DeleteGroupRequestSchema)` to create a new message.
  */
 export const DeleteGroupRequestSchema: GenMessage<DeleteGroupRequest> = /*@__PURE__*/
-  messageDesc(file_mistgate_admin_v1_group, 8);
+  messageDesc(file_mistgate_admin_v1_group, 9);
 
 /**
  * @generated from message mistgate.admin.v1.DeleteGroupResponse
@@ -285,10 +347,94 @@ export type DeleteGroupResponse = Message<"mistgate.admin.v1.DeleteGroupResponse
  * Use `create(DeleteGroupResponseSchema)` to create a new message.
  */
 export const DeleteGroupResponseSchema: GenMessage<DeleteGroupResponse> = /*@__PURE__*/
-  messageDesc(file_mistgate_admin_v1_group, 9);
+  messageDesc(file_mistgate_admin_v1_group, 10);
 
 /**
- * Access groups (a group is a set of profiles). The users screen has a
+ * @generated from message mistgate.admin.v1.SetNodeSharingRequest
+ */
+export type SetNodeSharingRequest = Message<"mistgate.admin.v1.SetNodeSharingRequest"> & {
+  /**
+   * @generated from field: string node_id = 1;
+   */
+  nodeId: string;
+
+  /**
+   * ALL, LISTED or NONE (UNSPECIFIED is INVALID_ARGUMENT).
+   *
+   * @generated from field: mistgate.admin.v1.NodeShareMode mode = 2;
+   */
+  mode: NodeShareMode;
+
+  /**
+   * LISTED: the groups that receive the node, at least one. Empty for ALL and NONE.
+   *
+   * @generated from field: repeated string group_ids = 3;
+   */
+  groupIds: string[];
+
+  /**
+   * Say what would change; nothing is written and the nodes hear nothing.
+   *
+   * @generated from field: bool dry_run = 4;
+   */
+  dryRun: boolean;
+};
+
+/**
+ * Describes the message mistgate.admin.v1.SetNodeSharingRequest.
+ * Use `create(SetNodeSharingRequestSchema)` to create a new message.
+ */
+export const SetNodeSharingRequestSchema: GenMessage<SetNodeSharingRequest> = /*@__PURE__*/
+  messageDesc(file_mistgate_admin_v1_group, 11);
+
+/**
+ * @generated from message mistgate.admin.v1.SetNodeSharingResponse
+ */
+export type SetNodeSharingResponse = Message<"mistgate.admin.v1.SetNodeSharingResponse"> & {
+  /**
+   * The mode after the change; with dry_run, as it would be.
+   *
+   * @generated from field: mistgate.admin.v1.NodeShareMode mode = 1;
+   */
+  mode: NodeShareMode;
+
+  /**
+   * The groups that receive the node after the change, by id.
+   *
+   * @generated from field: repeated string group_ids = 2;
+   */
+  groupIds: string[];
+
+  /**
+   * Active people of those groups who see the node: those who use every node or picked this one.
+   *
+   * @generated from field: uint32 people_receiving = 3;
+   */
+  peopleReceiving: number;
+
+  /**
+   * People who start to receive the node and people who stop (active people, counted as people_receiving), for the
+   * confirmation window. A person in a group that receives it before and after is in neither.
+   *
+   * @generated from field: uint32 people_gain = 4;
+   */
+  peopleGain: number;
+
+  /**
+   * @generated from field: uint32 people_lose = 5;
+   */
+  peopleLose: number;
+};
+
+/**
+ * Describes the message mistgate.admin.v1.SetNodeSharingResponse.
+ * Use `create(SetNodeSharingResponseSchema)` to create a new message.
+ */
+export const SetNodeSharingResponseSchema: GenMessage<SetNodeSharingResponse> = /*@__PURE__*/
+  messageDesc(file_mistgate_admin_v1_group, 12);
+
+/**
+ * Access groups (a group is a set of profiles, with optional nodes disabled for its users). The users screen has a
  * "Groups" tab for them; the create-user form and the user card pick one, and the profile page adds a profile to them.
  *
  * @generated from service mistgate.admin.v1.GroupService
@@ -319,7 +465,8 @@ export const GroupService: GenService<{
     output: typeof UpdateGroupResponseSchema;
   },
   /**
-   * FAILED_PRECONDITION while users still belong to it, unless move_users_to names where they go.
+   * FAILED_PRECONDITION while people have it as their MAIN group, unless move_users_to names where they go. People that have it
+   * as an extra group just leave it (they keep their main group and lose what this group gave them).
    *
    * @generated from rpc mistgate.admin.v1.GroupService.DeleteGroup
    */
@@ -327,6 +474,24 @@ export const GroupService: GenService<{
     methodKind: "unary";
     input: typeof DeleteGroupRequestSchema;
     output: typeof DeleteGroupResponseSchema;
+  },
+  /**
+   * Hands a node out as asked, in one transaction: ALL clears every group's switch for the node and lets groups made later
+   * have it, LISTED gives it to the listed groups only (groups made later do not get it), NONE to no group. The groups' own
+   * disabled lists change with it (Group.disabled_node_ids), so the group pages show the new state. dry_run says what would
+   * change without writing; asked with the node's current mode and groups, it says how many people get the node now. The
+   * mode of every node and how many groups receive it are in Node.sharing, and which ones in Group.disabled_node_ids.
+   * Same rights as UpdateGroup (owner and helper; for a token, approved with the plan); the people who gain or lose the
+   * node count against the token's user-change limit like a group update does. Audited as node_sharing_set. NOT_FOUND
+   * for a node or group that does not exist, FAILED_PRECONDITION "node_retired" for a retired node, INVALID_ARGUMENT for
+   * group_ids with ALL or NONE and for LISTED with none.
+   *
+   * @generated from rpc mistgate.admin.v1.GroupService.SetNodeSharing
+   */
+  setNodeSharing: {
+    methodKind: "unary";
+    input: typeof SetNodeSharingRequestSchema;
+    output: typeof SetNodeSharingResponseSchema;
   },
 }> = /*@__PURE__*/
   serviceDesc(file_mistgate_admin_v1_group, 0);

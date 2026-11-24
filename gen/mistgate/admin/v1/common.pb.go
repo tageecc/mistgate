@@ -100,6 +100,10 @@ const (
 	App_APP_HAPP App = 1
 	// AmneziaVPN / AmneziaWG apps.
 	App_APP_AMNEZIA App = 2
+	// Telegram clients: MTProto proxy links (tg://proxy).
+	App_APP_TELEGRAM App = 3
+	// Official TrustTunnel apps: one tt:// key per person.
+	App_APP_TRUST_TUNNEL App = 4
 )
 
 // Enum value maps for App.
@@ -108,11 +112,15 @@ var (
 		0: "APP_UNSPECIFIED",
 		1: "APP_HAPP",
 		2: "APP_AMNEZIA",
+		3: "APP_TELEGRAM",
+		4: "APP_TRUST_TUNNEL",
 	}
 	App_value = map[string]int32{
-		"APP_UNSPECIFIED": 0,
-		"APP_HAPP":        1,
-		"APP_AMNEZIA":     2,
+		"APP_UNSPECIFIED":  0,
+		"APP_HAPP":         1,
+		"APP_AMNEZIA":      2,
+		"APP_TELEGRAM":     3,
+		"APP_TRUST_TUNNEL": 4,
 	}
 )
 
@@ -322,11 +330,74 @@ func (WarpSource) EnumDescriptor() ([]byte, []int) {
 	return file_mistgate_admin_v1_common_proto_rawDescGZIP(), []int{4}
 }
 
+// How a node is handed out to groups. A group receives every node that is not on its disabled list (Group.disabled_node_ids).
+// A node the owner holds back is on that list of every group that was not given it, and a group made later starts with it
+// there too; so the mode is read off the node: ALL when nothing is held back, LISTED while some group receives it, NONE when
+// no group does. Set with GroupService.SetNodeSharing, or at the node's creation (CreateEnrollmentRequest.sharing,
+// StartNodeProvisionRequest.sharing); read in Node.sharing and, per group, in Group.disabled_node_ids.
+type NodeShareMode int32
+
+const (
+	// Only in a request that makes a node: the panel decides. The first node of the panel that is not retired goes to every group
+	// (ALL), each later one to no group (NONE). Never in a response.
+	NodeShareMode_NODE_SHARE_MODE_UNSPECIFIED NodeShareMode = 0
+	// Every group, groups made later too. A group can still turn the node off for itself (UpdateGroup.disabled_node_ids).
+	NodeShareMode_NODE_SHARE_MODE_ALL NodeShareMode = 1
+	// Only the listed groups; a group made later does not get the node.
+	NodeShareMode_NODE_SHARE_MODE_LISTED NodeShareMode = 2
+	// No group, and no group made later, until the owner gives the node to one. A legitimate state: nothing alerts on it.
+	NodeShareMode_NODE_SHARE_MODE_NONE NodeShareMode = 3
+)
+
+// Enum value maps for NodeShareMode.
+var (
+	NodeShareMode_name = map[int32]string{
+		0: "NODE_SHARE_MODE_UNSPECIFIED",
+		1: "NODE_SHARE_MODE_ALL",
+		2: "NODE_SHARE_MODE_LISTED",
+		3: "NODE_SHARE_MODE_NONE",
+	}
+	NodeShareMode_value = map[string]int32{
+		"NODE_SHARE_MODE_UNSPECIFIED": 0,
+		"NODE_SHARE_MODE_ALL":         1,
+		"NODE_SHARE_MODE_LISTED":      2,
+		"NODE_SHARE_MODE_NONE":        3,
+	}
+)
+
+func (x NodeShareMode) Enum() *NodeShareMode {
+	p := new(NodeShareMode)
+	*p = x
+	return p
+}
+
+func (x NodeShareMode) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (NodeShareMode) Descriptor() protoreflect.EnumDescriptor {
+	return file_mistgate_admin_v1_common_proto_enumTypes[5].Descriptor()
+}
+
+func (NodeShareMode) Type() protoreflect.EnumType {
+	return &file_mistgate_admin_v1_common_proto_enumTypes[5]
+}
+
+func (x NodeShareMode) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use NodeShareMode.Descriptor instead.
+func (NodeShareMode) EnumDescriptor() ([]byte, []int) {
+	return file_mistgate_admin_v1_common_proto_rawDescGZIP(), []int{5}
+}
+
 // Why a status is what it is. The UI localizes `code`; `params` fill the placeholders.
 // Codes: agent_silent {minutes}, host_blip {minutes}, enrollment_pending {expires_in_minutes, expires_unix},
 // enrollment_expired (PENDING without a usable install command), inbound_failed {inbound, error, profile, failed,
 // total} (failed of the node's total enabled profiles do not run), state_drift, clock_skew {seconds}, no_profiles
-// (ONLINE, nothing else wrong, but no enabled profile: nobody gets the node).
+// (ONLINE, nothing else wrong, but no enabled profile: nobody gets the node), inbound_no_way_in {profile, node, reason}
+// (hiding the direct server leaves no usable IPv6 twin, CDN host or relay; reason is "awg", "acme_ip" or "no_usable_relay").
 // The health checks add no_traffic {failed, total} (status NO_TRAFFIC: agent on, synthetic
 // checks failing) and doctor_fail {check} (status stays ONLINE, reason shows the worst FAIL of the doctor).
 type StatusReason struct {
@@ -463,7 +534,17 @@ type Inbound struct {
 	// The configured server-name override, or empty when the profile/node default is used.
 	TlsServerNameOverride string `protobuf:"bytes,16,opt,name=tls_server_name_override,json=tlsServerNameOverride,proto3" json:"tls_server_name_override,omitempty"`
 	// Whether this inbound is enabled in the desired state.
-	Enabled       bool `protobuf:"varint,17,opt,name=enabled,proto3" json:"enabled,omitempty"`
+	Enabled bool `protobuf:"varint,17,opt,name=enabled,proto3" json:"enabled,omitempty"`
+	// Whether the server at the node's own address is included in subscriptions. The inbound keeps running when false.
+	DirectInSubscriptions bool `protobuf:"varint,18,opt,name=direct_in_subscriptions,json=directInSubscriptions,proto3" json:"direct_in_subscriptions,omitempty"`
+	// Whether clients reach this inbound through its CDN host instead of the node's address.
+	Cdn bool `protobuf:"varint,19,opt,name=cdn,proto3" json:"cdn,omitempty"`
+	// Protocol "vless", REALITY only: the target this node shows instead of the profile's, as "host:port" ("" = the profile's own; the
+	// host is also the one name REALITY accepts here, so it is the tls_server_name of this inbound).
+	RealityTargetOverride string `protobuf:"bytes,20,opt,name=reality_target_override,json=realityTargetOverride,proto3" json:"reality_target_override,omitempty"`
+	// The target REALITY forwards strangers to as this inbound has it built: "self" (the node's own site), "host:port", or "" for an
+	// inbound that is not VLESS REALITY. The edit window and the neighbour card say what strangers see now and after a change.
+	RealityTarget string `protobuf:"bytes,21,opt,name=reality_target,json=realityTarget,proto3" json:"reality_target,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -615,6 +696,34 @@ func (x *Inbound) GetEnabled() bool {
 		return x.Enabled
 	}
 	return false
+}
+
+func (x *Inbound) GetDirectInSubscriptions() bool {
+	if x != nil {
+		return x.DirectInSubscriptions
+	}
+	return false
+}
+
+func (x *Inbound) GetCdn() bool {
+	if x != nil {
+		return x.Cdn
+	}
+	return false
+}
+
+func (x *Inbound) GetRealityTargetOverride() string {
+	if x != nil {
+		return x.RealityTargetOverride
+	}
+	return ""
+}
+
+func (x *Inbound) GetRealityTarget() string {
+	if x != nil {
+		return x.RealityTarget
+	}
+	return ""
 }
 
 // AmneziaWG interface state of one inbound (agent.v1.AwgHealth).
@@ -827,9 +936,23 @@ type PortCheck struct {
 	// "panel" or the name of the node that sent.
 	Sender string `protobuf:"bytes,8,opt,name=sender,proto3" json:"sender,omitempty"`
 	// verdict "": node_offline | agent_too_old | no_sender | busy | inconclusive | same_host | no_route | failed.
-	Reason        string `protobuf:"bytes,9,opt,name=reason,proto3" json:"reason,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Reason string `protobuf:"bytes,9,opt,name=reason,proto3" json:"reason,omitempty"`
+	// The first sender's verdict before comparison with a confirmation sender.
+	SenderVerdict string `protobuf:"bytes,10,opt,name=sender_verdict,json=senderVerdict,proto3" json:"sender_verdict,omitempty"`
+	// "panel" or the name of the confirmation node; empty when there was no confirmation run.
+	ConfirmSender string `protobuf:"bytes,11,opt,name=confirm_sender,json=confirmSender,proto3" json:"confirm_sender,omitempty"`
+	// Packets sent by the confirmation sender for this port; 0 when there was no confirmation run.
+	ConfirmSent uint32 `protobuf:"varint,12,opt,name=confirm_sent,json=confirmSent,proto3" json:"confirm_sent,omitempty"`
+	// Packets counted by the target from the confirmation sender; 0 when there was no confirmation run.
+	ConfirmGot uint32 `protobuf:"varint,13,opt,name=confirm_got,json=confirmGot,proto3" json:"confirm_got,omitempty"`
+	// The confirmation sender's verdict after the relative-loss rule; empty when there was no confirmation run.
+	ConfirmVerdict string `protobuf:"bytes,14,opt,name=confirm_verdict,json=confirmVerdict,proto3" json:"confirm_verdict,omitempty"`
+	// "node" when both runs found loss, "path" when only one did, or empty when unconfirmed or both were clean.
+	Blame string `protobuf:"bytes,15,opt,name=blame,proto3" json:"blame,omitempty"`
+	// Unix time of the latest successful panel protocol probe through an enabled inbound on this port; 0 if its latest result failed or none is stored.
+	ProtocolOkUnix int64 `protobuf:"varint,16,opt,name=protocol_ok_unix,json=protocolOkUnix,proto3" json:"protocol_ok_unix,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *PortCheck) Reset() {
@@ -923,6 +1046,55 @@ func (x *PortCheck) GetReason() string {
 		return x.Reason
 	}
 	return ""
+}
+
+func (x *PortCheck) GetSenderVerdict() string {
+	if x != nil {
+		return x.SenderVerdict
+	}
+	return ""
+}
+
+func (x *PortCheck) GetConfirmSender() string {
+	if x != nil {
+		return x.ConfirmSender
+	}
+	return ""
+}
+
+func (x *PortCheck) GetConfirmSent() uint32 {
+	if x != nil {
+		return x.ConfirmSent
+	}
+	return 0
+}
+
+func (x *PortCheck) GetConfirmGot() uint32 {
+	if x != nil {
+		return x.ConfirmGot
+	}
+	return 0
+}
+
+func (x *PortCheck) GetConfirmVerdict() string {
+	if x != nil {
+		return x.ConfirmVerdict
+	}
+	return ""
+}
+
+func (x *PortCheck) GetBlame() string {
+	if x != nil {
+		return x.Blame
+	}
+	return ""
+}
+
+func (x *PortCheck) GetProtocolOkUnix() int64 {
+	if x != nil {
+		return x.ProtocolOkUnix
+	}
+	return 0
 }
 
 // One TCP port of a node in the port check (design/vless.md section 7.4): does a connection reach Mistgate itself.
@@ -1059,8 +1231,36 @@ type LinkHour struct {
 	LossPermille  uint32 `protobuf:"varint,16,opt,name=loss_permille,json=lossPermille,proto3" json:"loss_permille,omitempty"`
 	RttSamples    uint32 `protobuf:"varint,17,opt,name=rtt_samples,json=rttSamples,proto3" json:"rtt_samples,omitempty"`
 	PktsSent      uint64 `protobuf:"varint,18,opt,name=pkts_sent,json=pktsSent,proto3" json:"pkts_sent,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// Agents that list "links/3" (see InboundConnections); device rows carry only the per-key ones (tcp_stalls,
+	// tcp_stalls_16k, initiations, responses, responses_unmatched).
+	HsUnfinished       uint32 `protobuf:"varint,19,opt,name=hs_unfinished,json=hsUnfinished,proto3" json:"hs_unfinished,omitempty"`
+	TlsAlertsSent      uint32 `protobuf:"varint,20,opt,name=tls_alerts_sent,json=tlsAlertsSent,proto3" json:"tls_alerts_sent,omitempty"`
+	TlsAlertsRecv      uint32 `protobuf:"varint,21,opt,name=tls_alerts_recv,json=tlsAlertsRecv,proto3" json:"tls_alerts_recv,omitempty"`
+	TlsCertRefused     uint32 `protobuf:"varint,22,opt,name=tls_cert_refused,json=tlsCertRefused,proto3" json:"tls_cert_refused,omitempty"`
+	RealityFallback    uint32 `protobuf:"varint,23,opt,name=reality_fallback,json=realityFallback,proto3" json:"reality_fallback,omitempty"`
+	AuthFailed         uint32 `protobuf:"varint,24,opt,name=auth_failed,json=authFailed,proto3" json:"auth_failed,omitempty"`
+	TcpStalls          uint32 `protobuf:"varint,25,opt,name=tcp_stalls,json=tcpStalls,proto3" json:"tcp_stalls,omitempty"`
+	TcpStalls_16K      uint32 `protobuf:"varint,26,opt,name=tcp_stalls_16k,json=tcpStalls16k,proto3" json:"tcp_stalls_16k,omitempty"`
+	Initiations        uint32 `protobuf:"varint,27,opt,name=initiations,proto3" json:"initiations,omitempty"`
+	Responses          uint32 `protobuf:"varint,28,opt,name=responses,proto3" json:"responses,omitempty"`
+	ResponsesUnmatched uint32 `protobuf:"varint,29,opt,name=responses_unmatched,json=responsesUnmatched,proto3" json:"responses_unmatched,omitempty"`
+	// TrustTunnel agents with "trusttunnel-refusals/1", inbound rows (see InboundConnections).
+	TunnelBlocked         uint32 `protobuf:"varint,30,opt,name=tunnel_blocked,json=tunnelBlocked,proto3" json:"tunnel_blocked,omitempty"`
+	TunnelNoIpv4          uint32 `protobuf:"varint,31,opt,name=tunnel_no_ipv4,json=tunnelNoIpv4,proto3" json:"tunnel_no_ipv4,omitempty"`
+	TunnelConnRefused     uint32 `protobuf:"varint,32,opt,name=tunnel_conn_refused,json=tunnelConnRefused,proto3" json:"tunnel_conn_refused,omitempty"`
+	TunnelConnUnreachable uint32 `protobuf:"varint,33,opt,name=tunnel_conn_unreachable,json=tunnelConnUnreachable,proto3" json:"tunnel_conn_unreachable,omitempty"`
+	TunnelConnDns         uint32 `protobuf:"varint,34,opt,name=tunnel_conn_dns,json=tunnelConnDns,proto3" json:"tunnel_conn_dns,omitempty"`
+	TunnelConnOther       uint32 `protobuf:"varint,35,opt,name=tunnel_conn_other,json=tunnelConnOther,proto3" json:"tunnel_conn_other,omitempty"`
+	TunnelTimeout         uint32 `protobuf:"varint,36,opt,name=tunnel_timeout,json=tunnelTimeout,proto3" json:"tunnel_timeout,omitempty"`
+	TunnelOtherDeadlines  uint32 `protobuf:"varint,37,opt,name=tunnel_other_deadlines,json=tunnelOtherDeadlines,proto3" json:"tunnel_other_deadlines,omitempty"`
+	TunnelOtherAuthority  uint32 `protobuf:"varint,38,opt,name=tunnel_other_authority,json=tunnelOtherAuthority,proto3" json:"tunnel_other_authority,omitempty"`
+	TunnelOtherIcmp       uint32 `protobuf:"varint,39,opt,name=tunnel_other_icmp,json=tunnelOtherIcmp,proto3" json:"tunnel_other_icmp,omitempty"`
+	TunnelOtherDial       uint32 `protobuf:"varint,40,opt,name=tunnel_other_dial,json=tunnelOtherDial,proto3" json:"tunnel_other_dial,omitempty"`
+	TunnelStreamClosed    uint32 `protobuf:"varint,41,opt,name=tunnel_stream_closed,json=tunnelStreamClosed,proto3" json:"tunnel_stream_closed,omitempty"`
+	TunnelStreamCredGone  uint32 `protobuf:"varint,42,opt,name=tunnel_stream_cred_gone,json=tunnelStreamCredGone,proto3" json:"tunnel_stream_cred_gone,omitempty"`
+	TunnelStreamConnLimit uint32 `protobuf:"varint,43,opt,name=tunnel_stream_conn_limit,json=tunnelStreamConnLimit,proto3" json:"tunnel_stream_conn_limit,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *LinkHour) Reset() {
@@ -1219,6 +1419,414 @@ func (x *LinkHour) GetPktsSent() uint64 {
 	return 0
 }
 
+func (x *LinkHour) GetHsUnfinished() uint32 {
+	if x != nil {
+		return x.HsUnfinished
+	}
+	return 0
+}
+
+func (x *LinkHour) GetTlsAlertsSent() uint32 {
+	if x != nil {
+		return x.TlsAlertsSent
+	}
+	return 0
+}
+
+func (x *LinkHour) GetTlsAlertsRecv() uint32 {
+	if x != nil {
+		return x.TlsAlertsRecv
+	}
+	return 0
+}
+
+func (x *LinkHour) GetTlsCertRefused() uint32 {
+	if x != nil {
+		return x.TlsCertRefused
+	}
+	return 0
+}
+
+func (x *LinkHour) GetRealityFallback() uint32 {
+	if x != nil {
+		return x.RealityFallback
+	}
+	return 0
+}
+
+func (x *LinkHour) GetAuthFailed() uint32 {
+	if x != nil {
+		return x.AuthFailed
+	}
+	return 0
+}
+
+func (x *LinkHour) GetTcpStalls() uint32 {
+	if x != nil {
+		return x.TcpStalls
+	}
+	return 0
+}
+
+func (x *LinkHour) GetTcpStalls_16K() uint32 {
+	if x != nil {
+		return x.TcpStalls_16K
+	}
+	return 0
+}
+
+func (x *LinkHour) GetInitiations() uint32 {
+	if x != nil {
+		return x.Initiations
+	}
+	return 0
+}
+
+func (x *LinkHour) GetResponses() uint32 {
+	if x != nil {
+		return x.Responses
+	}
+	return 0
+}
+
+func (x *LinkHour) GetResponsesUnmatched() uint32 {
+	if x != nil {
+		return x.ResponsesUnmatched
+	}
+	return 0
+}
+
+func (x *LinkHour) GetTunnelBlocked() uint32 {
+	if x != nil {
+		return x.TunnelBlocked
+	}
+	return 0
+}
+
+func (x *LinkHour) GetTunnelNoIpv4() uint32 {
+	if x != nil {
+		return x.TunnelNoIpv4
+	}
+	return 0
+}
+
+func (x *LinkHour) GetTunnelConnRefused() uint32 {
+	if x != nil {
+		return x.TunnelConnRefused
+	}
+	return 0
+}
+
+func (x *LinkHour) GetTunnelConnUnreachable() uint32 {
+	if x != nil {
+		return x.TunnelConnUnreachable
+	}
+	return 0
+}
+
+func (x *LinkHour) GetTunnelConnDns() uint32 {
+	if x != nil {
+		return x.TunnelConnDns
+	}
+	return 0
+}
+
+func (x *LinkHour) GetTunnelConnOther() uint32 {
+	if x != nil {
+		return x.TunnelConnOther
+	}
+	return 0
+}
+
+func (x *LinkHour) GetTunnelTimeout() uint32 {
+	if x != nil {
+		return x.TunnelTimeout
+	}
+	return 0
+}
+
+func (x *LinkHour) GetTunnelOtherDeadlines() uint32 {
+	if x != nil {
+		return x.TunnelOtherDeadlines
+	}
+	return 0
+}
+
+func (x *LinkHour) GetTunnelOtherAuthority() uint32 {
+	if x != nil {
+		return x.TunnelOtherAuthority
+	}
+	return 0
+}
+
+func (x *LinkHour) GetTunnelOtherIcmp() uint32 {
+	if x != nil {
+		return x.TunnelOtherIcmp
+	}
+	return 0
+}
+
+func (x *LinkHour) GetTunnelOtherDial() uint32 {
+	if x != nil {
+		return x.TunnelOtherDial
+	}
+	return 0
+}
+
+func (x *LinkHour) GetTunnelStreamClosed() uint32 {
+	if x != nil {
+		return x.TunnelStreamClosed
+	}
+	return 0
+}
+
+func (x *LinkHour) GetTunnelStreamCredGone() uint32 {
+	if x != nil {
+		return x.TunnelStreamCredGone
+	}
+	return 0
+}
+
+func (x *LinkHour) GetTunnelStreamConnLimit() uint32 {
+	if x != nil {
+		return x.TunnelStreamConnLimit
+	}
+	return 0
+}
+
+// One device's ClientHello counts over the window (GetFleetConnectionsResponse.hello_kex_classic, GetUserConnectionResponse.hello_kex).
+// A device is pq in a window when every hello counted had an X25519MLKEM768 key share before any X25519 share (the condition a
+// strict REALITY library demands), classic when one lacked it: that library turns the device away. unknown ones could not be read
+// (cut short, spread over several records, malformed). Counted by the nodes on the current core, per connection.
+type HelloKexDevice struct {
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	DeviceId string                 `protobuf:"bytes,1,opt,name=device_id,json=deviceId,proto3" json:"device_id,omitempty"`
+	UserId   string                 `protobuf:"bytes,2,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
+	UserName string                 `protobuf:"bytes,3,opt,name=user_name,json=userName,proto3" json:"user_name,omitempty"`
+	// The device as the panel knows it now (the app and platform of its last subscription fetch).
+	Client       string `protobuf:"bytes,4,opt,name=client,proto3" json:"client,omitempty"`
+	Platform     string `protobuf:"bytes,5,opt,name=platform,proto3" json:"platform,omitempty"`
+	HelloPq      uint32 `protobuf:"varint,6,opt,name=hello_pq,json=helloPq,proto3" json:"hello_pq,omitempty"`
+	HelloClassic uint32 `protobuf:"varint,7,opt,name=hello_classic,json=helloClassic,proto3" json:"hello_classic,omitempty"`
+	HelloUnknown uint32 `protobuf:"varint,8,opt,name=hello_unknown,json=helloUnknown,proto3" json:"hello_unknown,omitempty"`
+	// Start of the newest hour with a hello counter.
+	LastHourUnix  int64 `protobuf:"varint,9,opt,name=last_hour_unix,json=lastHourUnix,proto3" json:"last_hour_unix,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *HelloKexDevice) Reset() {
+	*x = HelloKexDevice{}
+	mi := &file_mistgate_admin_v1_common_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HelloKexDevice) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HelloKexDevice) ProtoMessage() {}
+
+func (x *HelloKexDevice) ProtoReflect() protoreflect.Message {
+	mi := &file_mistgate_admin_v1_common_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HelloKexDevice.ProtoReflect.Descriptor instead.
+func (*HelloKexDevice) Descriptor() ([]byte, []int) {
+	return file_mistgate_admin_v1_common_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *HelloKexDevice) GetDeviceId() string {
+	if x != nil {
+		return x.DeviceId
+	}
+	return ""
+}
+
+func (x *HelloKexDevice) GetUserId() string {
+	if x != nil {
+		return x.UserId
+	}
+	return ""
+}
+
+func (x *HelloKexDevice) GetUserName() string {
+	if x != nil {
+		return x.UserName
+	}
+	return ""
+}
+
+func (x *HelloKexDevice) GetClient() string {
+	if x != nil {
+		return x.Client
+	}
+	return ""
+}
+
+func (x *HelloKexDevice) GetPlatform() string {
+	if x != nil {
+		return x.Platform
+	}
+	return ""
+}
+
+func (x *HelloKexDevice) GetHelloPq() uint32 {
+	if x != nil {
+		return x.HelloPq
+	}
+	return 0
+}
+
+func (x *HelloKexDevice) GetHelloClassic() uint32 {
+	if x != nil {
+		return x.HelloClassic
+	}
+	return 0
+}
+
+func (x *HelloKexDevice) GetHelloUnknown() uint32 {
+	if x != nil {
+		return x.HelloUnknown
+	}
+	return 0
+}
+
+func (x *HelloKexDevice) GetLastHourUnix() int64 {
+	if x != nil {
+		return x.LastHourUnix
+	}
+	return 0
+}
+
+// A share asked for: the mode, and for LISTED the groups that receive the node (at least one; empty for ALL and NONE).
+type NodeSharing struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Mode          NodeShareMode          `protobuf:"varint,1,opt,name=mode,proto3,enum=mistgate.admin.v1.NodeShareMode" json:"mode,omitempty"`
+	GroupIds      []string               `protobuf:"bytes,2,rep,name=group_ids,json=groupIds,proto3" json:"group_ids,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *NodeSharing) Reset() {
+	*x = NodeSharing{}
+	mi := &file_mistgate_admin_v1_common_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NodeSharing) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NodeSharing) ProtoMessage() {}
+
+func (x *NodeSharing) ProtoReflect() protoreflect.Message {
+	mi := &file_mistgate_admin_v1_common_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NodeSharing.ProtoReflect.Descriptor instead.
+func (*NodeSharing) Descriptor() ([]byte, []int) {
+	return file_mistgate_admin_v1_common_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *NodeSharing) GetMode() NodeShareMode {
+	if x != nil {
+		return x.Mode
+	}
+	return NodeShareMode_NODE_SHARE_MODE_UNSPECIFIED
+}
+
+func (x *NodeSharing) GetGroupIds() []string {
+	if x != nil {
+		return x.GroupIds
+	}
+	return nil
+}
+
+// A QR code the panel draws itself: the server encodes (internal/qr) and says which modules are dark, the page makes the
+// shapes. The same data as the person's page gets (subs page_qr), so both draw the one code with the logo in the middle.
+type QrCode struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Modules a side, 4*version+17.
+	N uint32 `protobuf:"varint,1,opt,name=n,proto3" json:"n,omitempty"`
+	// n*n modules row by row, eight to a byte, the first in the high bit, 1 = dark; the last byte is padded with zeros.
+	Bits []byte `protobuf:"bytes,2,opt,name=bits,proto3" json:"bits,omitempty"`
+	// Side, in modules, of the clear square in the middle for the logo; 0: no logo (the code is too small to spare the error
+	// correction). A multiple of 0.5.
+	Window        float64 `protobuf:"fixed64,3,opt,name=window,proto3" json:"window,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *QrCode) Reset() {
+	*x = QrCode{}
+	mi := &file_mistgate_admin_v1_common_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *QrCode) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*QrCode) ProtoMessage() {}
+
+func (x *QrCode) ProtoReflect() protoreflect.Message {
+	mi := &file_mistgate_admin_v1_common_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use QrCode.ProtoReflect.Descriptor instead.
+func (*QrCode) Descriptor() ([]byte, []int) {
+	return file_mistgate_admin_v1_common_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *QrCode) GetN() uint32 {
+	if x != nil {
+		return x.N
+	}
+	return 0
+}
+
+func (x *QrCode) GetBits() []byte {
+	if x != nil {
+		return x.Bits
+	}
+	return nil
+}
+
+func (x *QrCode) GetWindow() float64 {
+	if x != nil {
+		return x.Window
+	}
+	return 0
+}
+
 var File_mistgate_admin_v1_common_proto protoreflect.FileDescriptor
 
 const file_mistgate_admin_v1_common_proto_rawDesc = "" +
@@ -1232,7 +1840,7 @@ const file_mistgate_admin_v1_common_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"A\n" +
 	"\rProtocolCount\x12\x1a\n" +
 	"\bprotocol\x18\x01 \x01(\tR\bprotocol\x12\x14\n" +
-	"\x05users\x18\x02 \x01(\rR\x05users\"\xe1\x04\n" +
+	"\x05users\x18\x02 \x01(\rR\x05users\"\x8a\x06\n" +
 	"\aInbound\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1d\n" +
 	"\n" +
@@ -1253,7 +1861,11 @@ const file_mistgate_admin_v1_common_proto_rawDesc = "" +
 	"\x06egress\x18\x0e \x01(\tR\x06egress\x12#\n" +
 	"\rport_override\x18\x0f \x01(\rR\fportOverride\x127\n" +
 	"\x18tls_server_name_override\x18\x10 \x01(\tR\x15tlsServerNameOverride\x12\x18\n" +
-	"\aenabled\x18\x11 \x01(\bR\aenabled\"\x8f\x03\n" +
+	"\aenabled\x18\x11 \x01(\bR\aenabled\x126\n" +
+	"\x17direct_in_subscriptions\x18\x12 \x01(\bR\x15directInSubscriptions\x12\x10\n" +
+	"\x03cdn\x18\x13 \x01(\bR\x03cdn\x126\n" +
+	"\x17reality_target_override\x18\x14 \x01(\tR\x15realityTargetOverride\x12%\n" +
+	"\x0ereality_target\x18\x15 \x01(\tR\rrealityTarget\"\x8f\x03\n" +
 	"\x10AwgInboundStatus\x12\x18\n" +
 	"\abackend\x18\x01 \x01(\tR\abackend\x12'\n" +
 	"\x0fbackend_version\x18\x02 \x01(\tR\x0ebackendVersion\x12\x19\n" +
@@ -1270,7 +1882,7 @@ const file_mistgate_admin_v1_common_proto_rawDesc = "" +
 	"\x05state\x18\x01 \x01(\x0e2\x1c.mistgate.admin.v1.WarpStateR\x05state\x125\n" +
 	"\x06source\x18\x02 \x01(\x0e2\x1d.mistgate.admin.v1.WarpSourceR\x06source\x12\x12\n" +
 	"\x04colo\x18\x03 \x01(\tR\x04colo\x12!\n" +
-	"\faccount_type\x18\x04 \x01(\tR\vaccountType\"\xee\x01\n" +
+	"\faccount_type\x18\x04 \x01(\tR\vaccountType\"\xed\x03\n" +
 	"\tPortCheck\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x12\n" +
 	"\x04port\x18\x02 \x01(\rR\x04port\x12\x18\n" +
@@ -1280,7 +1892,16 @@ const file_mistgate_admin_v1_common_proto_rawDesc = "" +
 	"\fchecked_unix\x18\x06 \x01(\x03B\x020\x02R\vcheckedUnix\x12\x1d\n" +
 	"\bbad_unix\x18\a \x01(\x03B\x020\x02R\abadUnix\x12\x16\n" +
 	"\x06sender\x18\b \x01(\tR\x06sender\x12\x16\n" +
-	"\x06reason\x18\t \x01(\tR\x06reason\"\xd1\x01\n" +
+	"\x06reason\x18\t \x01(\tR\x06reason\x12%\n" +
+	"\x0esender_verdict\x18\n" +
+	" \x01(\tR\rsenderVerdict\x12%\n" +
+	"\x0econfirm_sender\x18\v \x01(\tR\rconfirmSender\x12!\n" +
+	"\fconfirm_sent\x18\f \x01(\rR\vconfirmSent\x12\x1f\n" +
+	"\vconfirm_got\x18\r \x01(\rR\n" +
+	"confirmGot\x12'\n" +
+	"\x0fconfirm_verdict\x18\x0e \x01(\tR\x0econfirmVerdict\x12\x14\n" +
+	"\x05blame\x18\x0f \x01(\tR\x05blame\x12,\n" +
+	"\x10protocol_ok_unix\x18\x10 \x01(\x03B\x020\x02R\x0eprotocolOkUnix\"\xd1\x01\n" +
 	"\bTcpCheck\x12\x12\n" +
 	"\x04port\x18\x01 \x01(\rR\x04port\x12\x12\n" +
 	"\x04role\x18\x02 \x01(\tR\x04role\x12\x12\n" +
@@ -1289,7 +1910,7 @@ const file_mistgate_admin_v1_common_proto_rawDesc = "" +
 	"\averdict\x18\x05 \x01(\tR\averdict\x12\x16\n" +
 	"\x06reason\x18\x06 \x01(\tR\x06reason\x12\x16\n" +
 	"\x06sender\x18\a \x01(\tR\x06sender\x12%\n" +
-	"\fchecked_unix\x18\b \x01(\x03B\x020\x02R\vcheckedUnix\"\xaa\x04\n" +
+	"\fchecked_unix\x18\b \x01(\x03B\x020\x02R\vcheckedUnix\"\xe1\f\n" +
 	"\bLinkHour\x12*\n" +
 	"\x0fhour_start_unix\x18\x01 \x01(\x03B\x020\x02R\rhourStartUnix\x12\x1a\n" +
 	"\bconnects\x18\x02 \x01(\rR\bconnects\x12\x18\n" +
@@ -1312,7 +1933,51 @@ const file_mistgate_admin_v1_common_proto_rawDesc = "" +
 	"\rloss_permille\x18\x10 \x01(\rR\flossPermille\x12\x1f\n" +
 	"\vrtt_samples\x18\x11 \x01(\rR\n" +
 	"rttSamples\x12\x1f\n" +
-	"\tpkts_sent\x18\x12 \x01(\x04B\x020\x02R\bpktsSent*\xd5\x01\n" +
+	"\tpkts_sent\x18\x12 \x01(\x04B\x020\x02R\bpktsSent\x12#\n" +
+	"\rhs_unfinished\x18\x13 \x01(\rR\fhsUnfinished\x12&\n" +
+	"\x0ftls_alerts_sent\x18\x14 \x01(\rR\rtlsAlertsSent\x12&\n" +
+	"\x0ftls_alerts_recv\x18\x15 \x01(\rR\rtlsAlertsRecv\x12(\n" +
+	"\x10tls_cert_refused\x18\x16 \x01(\rR\x0etlsCertRefused\x12)\n" +
+	"\x10reality_fallback\x18\x17 \x01(\rR\x0frealityFallback\x12\x1f\n" +
+	"\vauth_failed\x18\x18 \x01(\rR\n" +
+	"authFailed\x12\x1d\n" +
+	"\n" +
+	"tcp_stalls\x18\x19 \x01(\rR\ttcpStalls\x12$\n" +
+	"\x0etcp_stalls_16k\x18\x1a \x01(\rR\ftcpStalls16k\x12 \n" +
+	"\vinitiations\x18\x1b \x01(\rR\vinitiations\x12\x1c\n" +
+	"\tresponses\x18\x1c \x01(\rR\tresponses\x12/\n" +
+	"\x13responses_unmatched\x18\x1d \x01(\rR\x12responsesUnmatched\x12%\n" +
+	"\x0etunnel_blocked\x18\x1e \x01(\rR\rtunnelBlocked\x12$\n" +
+	"\x0etunnel_no_ipv4\x18\x1f \x01(\rR\ftunnelNoIpv4\x12.\n" +
+	"\x13tunnel_conn_refused\x18  \x01(\rR\x11tunnelConnRefused\x126\n" +
+	"\x17tunnel_conn_unreachable\x18! \x01(\rR\x15tunnelConnUnreachable\x12&\n" +
+	"\x0ftunnel_conn_dns\x18\" \x01(\rR\rtunnelConnDns\x12*\n" +
+	"\x11tunnel_conn_other\x18# \x01(\rR\x0ftunnelConnOther\x12%\n" +
+	"\x0etunnel_timeout\x18$ \x01(\rR\rtunnelTimeout\x124\n" +
+	"\x16tunnel_other_deadlines\x18% \x01(\rR\x14tunnelOtherDeadlines\x124\n" +
+	"\x16tunnel_other_authority\x18& \x01(\rR\x14tunnelOtherAuthority\x12*\n" +
+	"\x11tunnel_other_icmp\x18' \x01(\rR\x0ftunnelOtherIcmp\x12*\n" +
+	"\x11tunnel_other_dial\x18( \x01(\rR\x0ftunnelOtherDial\x120\n" +
+	"\x14tunnel_stream_closed\x18) \x01(\rR\x12tunnelStreamClosed\x125\n" +
+	"\x17tunnel_stream_cred_gone\x18* \x01(\rR\x14tunnelStreamCredGone\x127\n" +
+	"\x18tunnel_stream_conn_limit\x18+ \x01(\rR\x15tunnelStreamConnLimit\"\xa6\x02\n" +
+	"\x0eHelloKexDevice\x12\x1b\n" +
+	"\tdevice_id\x18\x01 \x01(\tR\bdeviceId\x12\x17\n" +
+	"\auser_id\x18\x02 \x01(\tR\x06userId\x12\x1b\n" +
+	"\tuser_name\x18\x03 \x01(\tR\buserName\x12\x16\n" +
+	"\x06client\x18\x04 \x01(\tR\x06client\x12\x1a\n" +
+	"\bplatform\x18\x05 \x01(\tR\bplatform\x12\x19\n" +
+	"\bhello_pq\x18\x06 \x01(\rR\ahelloPq\x12#\n" +
+	"\rhello_classic\x18\a \x01(\rR\fhelloClassic\x12#\n" +
+	"\rhello_unknown\x18\b \x01(\rR\fhelloUnknown\x12(\n" +
+	"\x0elast_hour_unix\x18\t \x01(\x03B\x020\x02R\flastHourUnix\"`\n" +
+	"\vNodeSharing\x124\n" +
+	"\x04mode\x18\x01 \x01(\x0e2 .mistgate.admin.v1.NodeShareModeR\x04mode\x12\x1b\n" +
+	"\tgroup_ids\x18\x02 \x03(\tR\bgroupIds\"B\n" +
+	"\x06QrCode\x12\f\n" +
+	"\x01n\x18\x01 \x01(\rR\x01n\x12\x12\n" +
+	"\x04bits\x18\x02 \x01(\fR\x04bits\x12\x16\n" +
+	"\x06window\x18\x03 \x01(\x01R\x06window*\xd5\x01\n" +
 	"\n" +
 	"NodeStatus\x12\x1b\n" +
 	"\x17NODE_STATUS_UNSPECIFIED\x10\x00\x12\x17\n" +
@@ -1322,11 +1987,13 @@ const file_mistgate_admin_v1_common_proto_rawDesc = "" +
 	"\x10NODE_STATUS_BLIP\x10\x04\x12\x1a\n" +
 	"\x16NODE_STATUS_NO_TRAFFIC\x10\x05\x12\x18\n" +
 	"\x14NODE_STATUS_UPDATING\x10\x06\x12\x17\n" +
-	"\x13NODE_STATUS_RETIRED\x10\a*9\n" +
+	"\x13NODE_STATUS_RETIRED\x10\a*a\n" +
 	"\x03App\x12\x13\n" +
 	"\x0fAPP_UNSPECIFIED\x10\x00\x12\f\n" +
 	"\bAPP_HAPP\x10\x01\x12\x0f\n" +
-	"\vAPP_AMNEZIA\x10\x02*\x98\x01\n" +
+	"\vAPP_AMNEZIA\x10\x02\x12\x10\n" +
+	"\fAPP_TELEGRAM\x10\x03\x12\x14\n" +
+	"\x10APP_TRUST_TUNNEL\x10\x04*\x98\x01\n" +
 	"\fInboundState\x12\x1d\n" +
 	"\x19INBOUND_STATE_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15INBOUND_STATE_PENDING\x10\x01\x12\x18\n" +
@@ -1346,7 +2013,12 @@ const file_mistgate_admin_v1_common_proto_rawDesc = "" +
 	"WarpSource\x12\x1b\n" +
 	"\x17WARP_SOURCE_UNSPECIFIED\x10\x00\x12\x1a\n" +
 	"\x16WARP_SOURCE_REGISTERED\x10\x01\x12\x18\n" +
-	"\x14WARP_SOURCE_IMPORTED\x10\x02B\xc6\x01\n" +
+	"\x14WARP_SOURCE_IMPORTED\x10\x02*\x7f\n" +
+	"\rNodeShareMode\x12\x1f\n" +
+	"\x1bNODE_SHARE_MODE_UNSPECIFIED\x10\x00\x12\x17\n" +
+	"\x13NODE_SHARE_MODE_ALL\x10\x01\x12\x1a\n" +
+	"\x16NODE_SHARE_MODE_LISTED\x10\x02\x12\x18\n" +
+	"\x14NODE_SHARE_MODE_NONE\x10\x03B\xc6\x01\n" +
 	"\x15com.mistgate.admin.v1B\vCommonProtoP\x01Z:github.com/mistgate/mistgate/gen/mistgate/admin/v1;adminv1\xa2\x02\x03MAX\xaa\x02\x11Mistgate.Admin.V1\xca\x02\x11Mistgate\\Admin\\V1\xe2\x02\x1dMistgate\\Admin\\V1\\GPBMetadata\xea\x02\x13Mistgate::Admin::V1b\x06proto3"
 
 var (
@@ -1361,35 +2033,40 @@ func file_mistgate_admin_v1_common_proto_rawDescGZIP() []byte {
 	return file_mistgate_admin_v1_common_proto_rawDescData
 }
 
-var file_mistgate_admin_v1_common_proto_enumTypes = make([]protoimpl.EnumInfo, 5)
-var file_mistgate_admin_v1_common_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_mistgate_admin_v1_common_proto_enumTypes = make([]protoimpl.EnumInfo, 6)
+var file_mistgate_admin_v1_common_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_mistgate_admin_v1_common_proto_goTypes = []any{
 	(NodeStatus)(0),          // 0: mistgate.admin.v1.NodeStatus
 	(App)(0),                 // 1: mistgate.admin.v1.App
 	(InboundState)(0),        // 2: mistgate.admin.v1.InboundState
 	(WarpState)(0),           // 3: mistgate.admin.v1.WarpState
 	(WarpSource)(0),          // 4: mistgate.admin.v1.WarpSource
-	(*StatusReason)(nil),     // 5: mistgate.admin.v1.StatusReason
-	(*ProtocolCount)(nil),    // 6: mistgate.admin.v1.ProtocolCount
-	(*Inbound)(nil),          // 7: mistgate.admin.v1.Inbound
-	(*AwgInboundStatus)(nil), // 8: mistgate.admin.v1.AwgInboundStatus
-	(*WarpSummary)(nil),      // 9: mistgate.admin.v1.WarpSummary
-	(*PortCheck)(nil),        // 10: mistgate.admin.v1.PortCheck
-	(*TcpCheck)(nil),         // 11: mistgate.admin.v1.TcpCheck
-	(*LinkHour)(nil),         // 12: mistgate.admin.v1.LinkHour
-	nil,                      // 13: mistgate.admin.v1.StatusReason.ParamsEntry
+	(NodeShareMode)(0),       // 5: mistgate.admin.v1.NodeShareMode
+	(*StatusReason)(nil),     // 6: mistgate.admin.v1.StatusReason
+	(*ProtocolCount)(nil),    // 7: mistgate.admin.v1.ProtocolCount
+	(*Inbound)(nil),          // 8: mistgate.admin.v1.Inbound
+	(*AwgInboundStatus)(nil), // 9: mistgate.admin.v1.AwgInboundStatus
+	(*WarpSummary)(nil),      // 10: mistgate.admin.v1.WarpSummary
+	(*PortCheck)(nil),        // 11: mistgate.admin.v1.PortCheck
+	(*TcpCheck)(nil),         // 12: mistgate.admin.v1.TcpCheck
+	(*LinkHour)(nil),         // 13: mistgate.admin.v1.LinkHour
+	(*HelloKexDevice)(nil),   // 14: mistgate.admin.v1.HelloKexDevice
+	(*NodeSharing)(nil),      // 15: mistgate.admin.v1.NodeSharing
+	(*QrCode)(nil),           // 16: mistgate.admin.v1.QrCode
+	nil,                      // 17: mistgate.admin.v1.StatusReason.ParamsEntry
 }
 var file_mistgate_admin_v1_common_proto_depIdxs = []int32{
-	13, // 0: mistgate.admin.v1.StatusReason.params:type_name -> mistgate.admin.v1.StatusReason.ParamsEntry
+	17, // 0: mistgate.admin.v1.StatusReason.params:type_name -> mistgate.admin.v1.StatusReason.ParamsEntry
 	2,  // 1: mistgate.admin.v1.Inbound.state:type_name -> mistgate.admin.v1.InboundState
-	8,  // 2: mistgate.admin.v1.Inbound.awg:type_name -> mistgate.admin.v1.AwgInboundStatus
+	9,  // 2: mistgate.admin.v1.Inbound.awg:type_name -> mistgate.admin.v1.AwgInboundStatus
 	3,  // 3: mistgate.admin.v1.WarpSummary.state:type_name -> mistgate.admin.v1.WarpState
 	4,  // 4: mistgate.admin.v1.WarpSummary.source:type_name -> mistgate.admin.v1.WarpSource
-	5,  // [5:5] is the sub-list for method output_type
-	5,  // [5:5] is the sub-list for method input_type
-	5,  // [5:5] is the sub-list for extension type_name
-	5,  // [5:5] is the sub-list for extension extendee
-	0,  // [0:5] is the sub-list for field type_name
+	5,  // 5: mistgate.admin.v1.NodeSharing.mode:type_name -> mistgate.admin.v1.NodeShareMode
+	6,  // [6:6] is the sub-list for method output_type
+	6,  // [6:6] is the sub-list for method input_type
+	6,  // [6:6] is the sub-list for extension type_name
+	6,  // [6:6] is the sub-list for extension extendee
+	0,  // [0:6] is the sub-list for field type_name
 }
 
 func init() { file_mistgate_admin_v1_common_proto_init() }
@@ -1402,8 +2079,8 @@ func file_mistgate_admin_v1_common_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_mistgate_admin_v1_common_proto_rawDesc), len(file_mistgate_admin_v1_common_proto_rawDesc)),
-			NumEnums:      5,
-			NumMessages:   9,
+			NumEnums:      6,
+			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

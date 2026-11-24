@@ -4,9 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"path"
-	"regexp"
-	"strings"
 
+	"github.com/mistgate/mistgate/internal/node/awgprep"
 	"github.com/mistgate/mistgate/internal/node/unit"
 	"github.com/mistgate/mistgate/internal/node/update"
 )
@@ -20,12 +19,12 @@ const (
 	// Generation 3 is the L3 protocols: /dev/net/tun is reachable (PrivateDevices=no with exactly that
 	// device allowed), which the userspace AmneziaWG and WARP backends need, and ExecStopPost removes what a crashed
 	// agent leaves behind (the mgawg* and mgwarp interfaces, the tunnel and WARP nft tables, the WARP routes and rules).
-	// The unit refresh runs the installed binary from a transient systemd unit; the agent never writes through its sandbox.
+	// The resolver fix uses a transient systemd unit so existing generation-3 units do not need a refresh.
 )
 
 // safePath keeps anything that could break out of a unit-file line (spaces, quotes, newlines, %, $) out
 // of the paths we interpolate.
-var safePath = regexp.MustCompile(`^/[A-Za-z0-9_./-]*$`)
+func safePath(p string) bool { return awgprep.SafePath(p) }
 
 // renderUnit returns the hardened systemd unit. ramBytes sizes the memory limits (the memory budget:
 // GOMEMLIMIT about 60% of RAM, MemoryHigh a bit above it); 0 means unknown and assumes 1 GiB.
@@ -34,7 +33,7 @@ var safePath = regexp.MustCompile(`^/[A-Za-z0-9_./-]*$`)
 // (nftables, sysctl) and CAP_NET_BIND_SERVICE (TCP 443 for the masquerade and ACME). Root is deliberate:
 // the host baseline lives in root-owned /etc/sysctl.d and /etc/systemd/journald.conf.d, and a non-root
 // user could not write those or ask systemd to restart journald. ProtectSystem=strict makes everything
-// else read-only; only the state directory and those two drop-in directories are writable.
+// else read-only; only the state directory, the binary directory and the two host configuration directories are writable.
 // ProtectKernelTunables stays off on purpose: the fq + bbr baseline is applied through /proc/sys.
 //
 // Self-update (generation 2): the directory of the binary is writable (the agent puts <bin>.new and <bin>.prev next to
@@ -42,7 +41,7 @@ var safePath = regexp.MustCompile(`^/[A-Za-z0-9_./-]*$`)
 // updated build crashes three times in a row. Nothing else loosens.
 func renderUnit(bin, stateDir string, ramBytes uint64) (string, error) {
 	for _, p := range []string{bin, stateDir} {
-		if !safePath.MatchString(p) || strings.Contains(p, "..") {
+		if !safePath(p) {
 			return "", fmt.Errorf("unsafe path %q (absolute, letters, digits and _ . / - only)", p)
 		}
 	}

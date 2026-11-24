@@ -15,7 +15,7 @@ import {
   type DoctorItem as DoctorItemMsg,
   type NodeDoctor as NodeDoctorMsg,
 } from "@/gen/mistgate/admin/v1/health_pb";
-import type { T } from "@/i18n";
+import { dirOf, type T } from "@/i18n";
 import { en, type MessageKey } from "@/i18n/en";
 import { health } from "./api";
 import { itemParams } from "./doctor-detail";
@@ -23,8 +23,9 @@ import type { Fmt } from "./format";
 import { plain, type Plain } from "./plain";
 import { pollMs } from "./queries";
 import { protocolName } from "./series";
+import { osAlertReason, osAlertWhyKey } from "./os-run";
 import { meQuery } from "./session";
-import { lossPct, senderLabel } from "./port-check";
+import { lossPct, regionWord, senderLabel } from "./port-check";
 import { torrentEvidenceText } from "./torrent";
 import { pauseReasonText } from "./updates";
 
@@ -47,12 +48,16 @@ export const alertsQuery = queryOptions({
   refetchInterval: pollMs,
 });
 
+/** How often the checks are read while a country round asked by hand runs (a round takes up to a few minutes). */
+const runningPollMs = 3_000;
+
 /** Empty nodeId = every node (the Checks tab); a node id = only that node (the pills of its Overview). */
 export const checksQuery = (nodeId = "") =>
   queryOptions({
     queryKey: ["health", "checks", nodeId],
     queryFn: async ({ signal }) => plain(await health.getChecks({ nodeId }, { signal })),
-    refetchInterval: pollMs,
+    // a country round asked by hand is running: its result is picked up as soon as it is there
+    refetchInterval: (q) => (q.state.data?.countryNow?.some((c) => c.running) ? runningPollMs : pollMs),
   });
 
 /** The stored doctor reports, never a call to a node. Empty nodeId = the whole fleet. */
@@ -89,12 +94,6 @@ export function lookup(t: T, key: string, params: Params = {}): string | null {
 // ---------------------------------------------------------------------------------------------------
 // Alerts
 
-export function severityKind(s: AlertSeverity): StatusKind {
-  if (s === AlertSeverity.CRITICAL) return "bad";
-  if (s === AlertSeverity.WARNING) return "warn";
-  return "blip"; // info: grey-blue, never red
-}
-
 export const severityWord = (s: AlertSeverity): MessageKey =>
   s === AlertSeverity.CRITICAL ? "hl.sev.critical" : s === AlertSeverity.WARNING ? "hl.sev.warning" : "hl.sev.info";
 
@@ -109,6 +108,7 @@ export function alertTitle(t: T, a: Alert): string {
   if (a.kind === AlertKind.CHECK_FAILED && (a.subject === "panel_egress" || a.subject === "probe_path")) key += "." + a.subject;
   if (a.kind === AlertKind.NODE_DOWN && a.subject === "panel_link") key += ".panel_link"; // fleet-wide, no node to name
   if (a.kind === AlertKind.HOST_BLIP && a.subject === "flapping") key += ".flapping"; // the quiet blip records keep "Host blip"
+  if (a.kind === AlertKind.PATH_LOSSY && params.open) key += ".filtered"; // a filter on the way, not a lossy line (its why is .filtered too)
   if ((a.kind === AlertKind.DOCTOR_WARN || a.kind === AlertKind.DOCTOR_FAIL) && params.check) params.check_title = checkTitle(t, params.check);
   if (a.kind === AlertKind.COUNTRY_BLOCKED) {
     params.country = countryIn(t, params.country ?? "");
@@ -128,30 +128,60 @@ export function alertWhy(t: T, fmt: Fmt, a: Alert): string {
   const params: Params = doctor ? itemParams(t, fmt, a) : { ...a.params };
   // a paused rollout names the step error code of its node: say it in words, the short form of the pause
   if (a.kind === AlertKind.UPDATE_FAILED && a.params.reason) params.reason = pauseReasonText(t, a.params.reason);
+  // a stopped OS update names the step's error key (and the node's job code): say it in words
+  if (a.kind === AlertKind.OS_UPDATE_FAILED) params.reason = osAlertReason(t, a.params);
+  // a run whose trace failed has no colo ("exit ."): say so in a word
+  if (a.kind === AlertKind.WARP_REACH && !params.colo) params.colo = t("warp.reach.coloNone");
   if (a.kind === AlertKind.NODE_DOWN && a.params.minutes) params.duration = fmt.duration(Number(a.params.minutes) * 60);
   if (a.kind === AlertKind.ACCESS_ENDED && Number(a.params.since) > 0) params.date = fmt.stamp(Number(a.params.since));
   if (a.kind === AlertKind.USERS_IMPACTED) params.protocol = protocolName(a.subject);
+  // a scheduled task that keeps failing names its last reason as a code (tasks.proto RUN REASONS)
+  if (a.kind === AlertKind.SCHEDULED_TASK_FAILING && a.params.reason) params.reason = lookup(t, `task.reason.${a.params.reason}`) ?? a.params.reason;
   if (a.kind === AlertKind.TORRENT) return lookup(t, a.whyKey, torrentParams(t, params)) ?? "";
   if (a.kind === AlertKind.COUNTRY_BLOCKED) {
     // "RU" and "443, 8443" as the sentence needs them: "from Russia", "ports 443 and 8443"
     params.country = countryIn(t, a.params.country ?? "");
+    params.networks = networksShort(t, a.params.networks ?? "");
     const ports = (a.params.ports ?? "").split(",").map((p) => p.trim()).filter(Boolean);
     params.ports = ports.length ? t.n("cr.alert.ports", ports.length, { ports: listOf(fmt.locale, ports) }) : "";
-    // the server's key assumes Globalping's probes; the TSPU probe alone, and two sources that disagree, have their own
+    // the TSPU probe alone, and sources that disagree, have their own keys
     const sources = (a.params.sources ?? "").split(",");
+    // whose probes got nothing, "cheburcheck, Globalping and bsbord": the sources of the networks, else the alert's live ones
+    const dark = networkSources(alertNetworks(a.params.networks ?? "")).map((s) => s.value);
+    // in Persian each name is an isolate of its own, so the list keeps the right-to-left order of the sentence around it
+    const isolate = (s: string) => (dirOf(fmt.lang) === "rtl" ? `⁨${s}⁩` : s);
+    params.probes = listOf(fmt.locale, (dark.length ? dark : sources.filter((s) => s && s !== "tspu")).map((s) => isolate(sourceName(t, s))));
+    // people reach the node through relays (info): that sentence is the alert's own, whoever saw the block
+    // own probes alone: one narrow point, so only "some networks", worded as a hint
+    const probesAlone = sources.length > 0 && sources.every((s) => s === "probes");
     const own =
-      sources.includes("tspu") && !sources.includes("globalping")
-        ? "health.alert.country_blocked.why.tspu"
-        : a.params.confidence === "conflict"
-          ? `health.alert.country_blocked.why.conflict.${a.params.verdict ?? ""}`
-          : "";
+      a.params.why === "reached_through_relays"
+        ? ""
+        : probesAlone && (a.subject === "partial" || a.subject.endsWith("/partial"))
+          ? "health.alert.country_blocked.why.partial.probes"
+          : sources.includes("tspu") && !sources.includes("globalping")
+            ? "health.alert.country_blocked.why.tspu"
+            : a.params.confidence === "conflict"
+              ? `health.alert.country_blocked.why.conflict.${a.params.verdict ?? ""}`
+              : "";
     if (own && hasKey(own)) return t(own, params);
   }
   if (a.kind === AlertKind.PORT_LOSSY) {
     params.lost = String(lossPct(Number(a.params.sent), Number(a.params.got)));
     params.sender = senderLabel(t, a.params.sender ?? "");
+    // confirmed from a second sender (why.confirmed): its share too
+    params.confirm_lost = String(lossPct(Number(a.params.confirm_sent), Number(a.params.confirm_got)));
+    params.confirm_sender = senderLabel(t, a.params.confirm_sender ?? "");
   }
-  return lookup(t, a.whyKey, params) ?? "";
+  if (a.kind === AlertKind.PATH_LOSSY) {
+    // one value for "299/300", so a right-to-left sentence keeps it in one piece
+    params.lost = String(lossPct(Number(a.params.sent), Number(a.params.got)));
+    params.arrived = `${a.params.other_got ?? ""}/${a.params.sent ?? ""}`;
+    params.region = regionWord(t, a.params.region ?? "");
+    params.other_region = regionWord(t, a.params.other_region ?? "");
+  }
+  // a refused reboot with nothing installed, and a node lost during the check, have their own sentences
+  return lookup(t, a.kind === AlertKind.OS_UPDATE_FAILED ? osAlertWhyKey(a.whyKey, a.params) : a.whyKey, params) ?? "";
 }
 
 /** The sentence of a TORRENT alert: "N attempts", then the evidence of the last one and the ports, when the agent said so. */
@@ -245,6 +275,185 @@ export const peopleOrder = (alerts: readonly Alert[]): Alert[] => alerts.filter(
 /** Alerts that count for the badge and the strip: not muted, not info. */
 export function isLoud(a: Alert, now: number): boolean {
   return a.severity >= AlertSeverity.WARNING && a.mutedUntilUnix <= now;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Alert groups: the Alerts tab shows one card per problem and one history row per event
+
+/** Kinds that come one per profile of a node (the subject is the inbound): their alerts on one node read as one problem. */
+const perProfile = new Set<AlertKind>([AlertKind.PORT_LOSSY, AlertKind.CHECK_FAILED]);
+const opened = (a: Alert) => a.openedUnix || a.firstSeenUnix;
+/** What tells two alerts of a kind apart beyond the node: the subject, except for the per-profile kinds (and their fleet-wide forms keep it). */
+const sameKey = (a: Alert) => `${a.kind}|${a.titleKey}|${perProfile.has(a.kind) && a.nodeId ? "" : a.subject}`;
+
+/** Live alerts, in the server's order: the per-profile ones of one node and kind become one group, every other alert is its own. */
+export function groupAlerts(alerts: readonly Alert[]): Alert[][] {
+  const groups = new Map<string, Alert[]>();
+  for (const a of alerts) {
+    const k = a.nodeId && perProfile.has(a.kind) ? `${a.nodeId}|${sameKey(a)}` : a.id;
+    const g = groups.get(k);
+    if (g) g.push(a);
+    else groups.set(k, [a]);
+  }
+  return [...groups.values()];
+}
+
+/**
+ * Closed episodes (newest first) by event: the same kind and title opened within a minute of the group's first, on any node
+ * or profile. Overlap alone does not join them, so two long unrelated episodes stay apart.
+ */
+export function groupHistory(rows: readonly Alert[]): Alert[][] {
+  const out: Alert[][] = [];
+  const last = new Map<string, Alert[]>();
+  for (const h of rows) {
+    const k = sameKey(h);
+    const g = last.get(k);
+    if (g && Math.abs(opened(h) - opened(g[0]!)) <= 60) g.push(h);
+    else {
+      const next = [h];
+      out.push(next);
+      last.set(k, next);
+    }
+  }
+  return out;
+}
+
+/** The worst severity of a group. */
+export const groupSeverity = (g: readonly Alert[]) => g.reduce((s, a) => Math.max(s, a.severity), AlertSeverity.UNSPECIFIED) as AlertSeverity;
+
+/** A group's title: its alerts' own when they all say the same, else the count (ports that lose packets, profiles that fail). */
+export function groupTitle(t: T, g: readonly Alert[]): string {
+  const titles = new Set(g.map((a) => alertTitle(t, a)));
+  const a = g[0]!;
+  if (titles.size === 1) return alertTitle(t, a);
+  if (a.kind === AlertKind.PORT_LOSSY) return t.n("hl.alerts.group.port_lossy", new Set(g.map((x) => x.params.port)).size);
+  if (a.kind === AlertKind.CHECK_FAILED) return t.n("hl.alerts.group.check_failed", titles.size);
+  return alertTitle(t, a);
+}
+
+/** The number a folded card shows by its title: the loss of the ports (or of a lossy path), how many networks get nothing. Empty for the rest. */
+export function groupFact(t: T, g: readonly Alert[]): string {
+  const a = g[0]!;
+  if (a.kind === AlertKind.PORT_LOSSY) {
+    const lost = Math.max(...g.map((x) => lossPct(Number(x.params.sent), Number(x.params.got))));
+    return t(g.length > 1 ? "hl.alerts.fact.lossUpTo" : "hl.alerts.fact.loss", { lost });
+  }
+  // the worst port of the lossy sender's run; a filtered path names the ports that got through instead of "100 % lost"
+  if (a.kind === AlertKind.PATH_LOSSY)
+    return a.params.open ? t("hl.alerts.fact.filtered", { open: a.params.open }) : t("hl.alerts.fact.loss", { lost: lossPct(Number(a.params.sent), Number(a.params.got)) });
+  if (a.kind === AlertKind.COUNTRY_BLOCKED) {
+    const n = alertNetworks(a.params.networks ?? "").length;
+    return n > 1 ? t.n("hl.alerts.fact.nets", n) : "";
+  }
+  return "";
+}
+
+/**
+ * A network of a country alert that gets nothing from the node: the operator, its AS number and region when the source
+ * named them, and the source that saw it ("globalping" when the panel wrote none; "" for a network cut off at the end).
+ */
+export type AlertNet = { name: string; asn: string; region: string; source: string };
+
+/** The sources the panel writes after a network's region (health/country.go countryVantageName); Globalping's carry none. */
+const netSources = new Set(["tspu", "cheburcheck", "cheburcheck_own", "bsbord", "bsbord_tunnel", "bsbord_geo", "probes"]);
+
+/** s split at its commas outside brackets: "MTS (AS1, Sakha (Yakutia)), Tele2" is two parts. */
+function topLevel(s: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let from = 0;
+  for (let i = 0; i <= s.length; i++) {
+    if (s[i] === "(") depth++;
+    else if (s[i] === ")") depth = Math.max(0, depth - 1);
+    else if (i === s.length || (s[i] === "," && depth === 0)) {
+      parts.push(s.slice(from, i).trim());
+      from = i + 1;
+    }
+  }
+  return parts.filter(Boolean);
+}
+
+/**
+ * One network as the panel writes it: "MTS (AS30881, Республика Саха (Якутия), cheburcheck)", or a bare "MTS". Its last
+ * bracket at the outer level holds the details, so a region with brackets or commas stays whole. A network cut off at the end
+ * of a long list ("MTS (AS8359, Mosc…", an unclosed bracket) keeps its name and the details that arrived whole.
+ */
+function netOf(x: string): AlertNet {
+  const body = x.replace(/\s*…$/, "");
+  let depth = 0;
+  let open = -1;
+  for (let i = 0; i < body.length; i++) {
+    if (body[i] === "(" && depth++ === 0) open = i;
+    else if (body[i] === ")" && depth > 0) depth--;
+  }
+  const cut = body !== x || depth > 0;
+  if (open < 0 || (depth === 0 && !body.endsWith(")"))) return { name: x, asn: "", region: "", source: cut ? "" : "globalping" };
+  const inner = depth > 0 ? body.slice(open + 1) : body.slice(open + 1, -1);
+  const parts = topLevel(inner);
+  if (depth > 0 && !/,\s*$/.test(inner)) parts.pop(); // the part the cut went through
+  const source = netSources.has(parts.at(-1) ?? "") ? parts.pop()! : cut ? "" : "globalping";
+  const asn = /^AS\d+$/.test(parts[0] ?? "") ? parts.shift()!.slice(2) : "";
+  return { name: body.slice(0, open).trim() || inner, asn, region: parts.join(", "), source };
+}
+
+/** The networks of a country alert as the panel joins them ("MTS (AS8359, Moscow, bsbord), Tele2"), split at the commas outside brackets. */
+export function alertNetworks(s: string): AlertNet[] {
+  return topLevel(s)
+    .filter((x) => x !== "…")
+    .map(netOf);
+}
+
+/** The values by how often they come, the most first; equal counts keep their first order. */
+function byCount(values: readonly string[]): { value: string; n: number }[] {
+  const seen = new Map<string, number>();
+  for (const v of values) seen.set(v, (seen.get(v) ?? 0) + 1);
+  return [...seen].map(([value, n]) => ({ value, n })).sort((a, b) => b.n - a.n);
+}
+
+/** Whose probes the networks come from, the source with most of them first: cheburcheck 34, Globalping 2, bsbord 2. */
+export const networkSources = (nets: readonly AlertNet[]) =>
+  byCount(nets.map((n) => n.source).filter(Boolean)).sort((a, b) => b.n - a.n || sourceRank(a.value) - sourceRank(b.value));
+
+/**
+ * An operator of a country alert: how many of its networks get nothing, its AS numbers (the most used first), its regions by
+ * source. A group names its source (`marked`) when the operator's networks come from several sources, or from one that is not
+ * the list's main source, which the list says once above.
+ */
+export type AlertOperator = { name: string; n: number; asns: string[]; groups: { source: string; regions: string[]; marked: boolean }[] };
+
+/** The networks by operator, the one with most networks first: "Rostelecom" with its ten. */
+export function networksByOperator(nets: readonly AlertNet[], locale = "en"): AlertOperator[] {
+  const main = networkSources(nets)[0]?.value ?? "";
+  const cmp = (a: string, b: string) => a.localeCompare(b, locale);
+  const by = new Map<string, AlertNet[]>();
+  for (const n of nets) by.set(n.name, [...(by.get(n.name) ?? []), n]);
+  return [...by]
+    .map(([name, list]) => {
+      const sources = byCount(list.map((n) => n.source)).sort((a, b) => b.n - a.n || sourceRank(a.value) - sourceRank(b.value));
+      const several = sources.length > 1;
+      return {
+        name,
+        n: list.length,
+        asns: byCount(list.map((n) => n.asn).filter(Boolean)).map((a) => a.value),
+        groups: sources.map(({ value: source }) => ({
+          source,
+          regions: [...new Set(list.filter((n) => n.source === source && n.region).map((n) => n.region))].sort(cmp),
+          marked: source !== "" && (several || source !== main),
+        })),
+      };
+    })
+    .sort((a, b) => b.n - a.n || cmp(a.name, b.name));
+}
+
+/** More networks than a sentence holds: the list is cut to the three operators with most of them, "and N more" networks (the card lists them all). */
+export const NETS_INLINE = 4;
+export function networksShort(t: T, s: string): string {
+  const nets = alertNetworks(s);
+  if (nets.length <= NETS_INLINE) return s;
+  const top = networksByOperator(nets).slice(0, 3);
+  const rest = nets.length - top.reduce((n, o) => n + o.n, 0);
+  const names = top.map((o) => o.name).join(", ");
+  return rest > 0 ? t("hl.nets.short", { names, n: rest }) : names;
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -344,10 +553,10 @@ type CountryProbe = CountryCheck["probes"][number];
 export type Vantage = CountryCheck["vantages"][number];
 
 /** The live sources in the server's order (CountryCheck.sources); the breakdown, the tooltip and the summary keep it. */
-const sourceOrder = ["globalping", "tspu", "cheburcheck", "cheburcheck_own", "bsbord"];
+const sourceOrder = ["globalping", "tspu", "cheburcheck", "cheburcheck_own", "bsbord", "probes"];
 export const sourceRank = (s: string) => sourceOrder.indexOf(s) + 1 || sourceOrder.length + 1;
 /** The sources that are not Globalping, the TSPU probe or the lists: their rows name themselves in the tooltip. */
-const externalSources = ["cheburcheck", "cheburcheck_own", "bsbord"];
+const externalSources = ["cheburcheck", "cheburcheck_own", "bsbord", "probes"];
 
 /** A source by its name ("TSPU probe"); a source this page does not know stays its code. */
 export function sourceName(t: T, source: string): string {
@@ -360,6 +569,24 @@ export function vantageName(v: Pick<Vantage, "network" | "key" | "asn" | "region
   const tag = [v.asn ? `AS${v.asn}` : "", v.region].filter(Boolean).join(", ");
   const name = v.network || v.key || "?";
   return tag ? `${name} (${tag})` : name;
+}
+
+/** Why a point of an own probe is dark or unsure, in words; a code this page does not know says that the answer is not clear. */
+export function probeWhy(t: T, why: string): string {
+  const key = `pr.why.${why}`;
+  return why && hasKey(key) ? t(key) : t("pr.why.unknown");
+}
+
+/** Why a point of an own probe is dark or unsure, with the port of the target it comes from: "TLS is reset (443)". */
+export function probeReason(t: T, v: Pick<Vantage, "why" | "port">): string {
+  const why = probeWhy(t, v.why);
+  return v.why && v.port > 0 ? `${why} (${v.port})` : why;
+}
+
+/** The name of a point of an own probe, in the admin's words: "Operator · City — probe “name”"; a point with no probe name (none sent) is its network. */
+export function probePointName(t: T, v: Pick<Vantage, "network" | "key" | "probeName">): string {
+  const where = v.network || v.key || "?";
+  return v.probeName ? t("pr.vantage", { where, name: v.probeName }) : where;
 }
 
 /** A row with a Globalping round (it has probes, or a reason why it has none); a row of the TSPU probe or the lists alone has neither. */
@@ -412,12 +639,13 @@ export const ipv6Why = (t: T, c: Pick<CountryCheck, "reason" | "country">) => ca
 
 /**
  * The IPv6 side of a COUNTRY_BLOCKED alert: "alert" for the IPv6 alert itself (family=6), "open" for an IPv4 one whose node the
- * IPv6 rounds reach (ipv6=open). Null for anything else.
+ * IPv6 rounds reach (ipv6=open), "entry" for an IPv4 one whose node has its IPv6 entry on (ipv6=entry: people with IPv6 get
+ * through it). Null for anything else.
  */
-export function alertIpv6(a: Pick<Alert, "kind" | "params">): "alert" | "open" | null {
+export function alertIpv6(a: Pick<Alert, "kind" | "params">): "alert" | "open" | "entry" | null {
   if (a.kind !== AlertKind.COUNTRY_BLOCKED) return null;
   if (a.params.family === "6") return "alert";
-  return a.params.ipv6 === "open" ? "open" : null;
+  return a.params.ipv6 === "open" || a.params.ipv6 === "entry" ? a.params.ipv6 : null;
 }
 
 export type CountryLook = {
@@ -438,6 +666,11 @@ export type CountryLook = {
   alsoListed: boolean;
   /** The quiet line of a row, where a phone has no tooltip: who saw it, the lists, and when, or why there is no verdict. */
   line: string;
+  /**
+   * The same line in its pieces, the networks as the node page's row says them ("4 networks: A, B, C and D": a partial block's
+   * dark ones are under the row, not here), the last one the time; the row keeps the node of the probe and the time as units.
+   */
+  row: string[];
   /** Two live sources that disagree: what each said ("Globalping: reachable · probe: TCP blocked"); empty when they do not. */
   conflict: string;
   /** What each live source said on its own, with its reason and age: "bsbord: no data, the node has no TCP port to test · 3 h ago". */
@@ -466,7 +699,16 @@ export type CountryLook = {
    * white list, those without a clear answer; the operators Globalping had no probe for; each source's age. Null without a dark one.
    */
   breakdown: { dark: BreakdownNet[]; seen: BreakdownNet[]; white: BreakdownNet[]; unsure: BreakdownNet[]; noProbe: string; at: string } | null;
+  /**
+   * The points of the owner's own probes, each on its own line wherever there is room (and in the tooltip): "Operator · City —
+   * probe “dacha”: TLS is reset · 5 min ago". They are in the breakdown as well when it has a dark one; the row of a node
+   * shows this list only when there is no breakdown.
+   */
+  ownPoints: OwnPoint[];
 };
+
+/** One point of an own probe: its name without an address, what it saw, when. */
+export type OwnPoint = { key: string; kind: "ok" | "dark" | "unsure"; name: string; what: string; at: string };
 
 /** A network of the breakdown: "MTS" and "AS8359 · Novosibirsk · Globalping"; "×3" when several probes of a source share it. */
 export type BreakdownNet = { name: string; tag: string };
@@ -498,7 +740,11 @@ function breakdownNets(t: T, vs: readonly Vantage[], locale: string): BreakdownN
   const lines = new Map<string, { v: Vantage; net: BreakdownNet; n: number }>();
   for (const v of vs) {
     const kind = v.kind && hasKey(`cr.kind.${v.kind}`) ? t(`cr.kind.${v.kind}` as MessageKey) : "";
-    const net = { name: v.network || v.key || "?", tag: [v.asn ? `AS${v.asn}` : "", v.region, kind, sourceName(t, v.source)].filter(Boolean).join(" · ") };
+    // an own probe is named after itself (its name has the city in it) and says why its point is dark or unsure instead of its source
+    const net =
+      v.source === "probes"
+        ? { name: probePointName(t, v), tag: [v.asn ? `AS${v.asn}` : "", kind, v.state === "reach" ? "" : probeReason(t, v)].filter(Boolean).join(" · ") }
+        : { name: v.network || v.key || "?", tag: [v.asn ? `AS${v.asn}` : "", v.region, kind, sourceName(t, v.source)].filter(Boolean).join(" · ") };
     const k = `${net.name}|${net.tag}`;
     const seen = lines.get(k);
     if (seen) seen.n++;
@@ -552,9 +798,21 @@ export function countryLook(t: T, fmt: Fmt, c: CountryCheck): CountryLook {
   const partial = c.verdict === CountryVerdict.PARTIAL;
   const darkAll = c.vantages.filter((v) => v.state === "dark");
   const darkNamed = partial ? darkAll : [];
-  const dark = darkNamed.length ? t("cr.tip.dark", { networks: [...new Set(darkNamed.map(vantageName))].join(t("cr.tip.sep")) }) : "";
-  const darkNames = [...new Set(darkNamed.map((v) => v.network).filter(Boolean))].join(", ");
+  // the points of own probes are named after their probe, in the admin's words
+  const named = (v: Vantage) => (v.source === "probes" ? { ...v, network: probePointName(t, v) } : v);
+  const dark = darkNamed.length ? t("cr.tip.dark", { networks: [...new Set(darkNamed.map((v) => vantageName(named(v))))].join(t("cr.tip.sep")) }) : "";
+  const darkNames = [...new Set(darkNamed.map((v) => named(v).network).filter(Boolean))].join(", ");
   const of = (state: string) => breakdownNets(t, c.vantages.filter((v) => v.state === state), fmt.locale);
+  const ownPoints: OwnPoint[] = c.vantages
+    .filter((v) => v.source === "probes")
+    .map((v): OwnPoint => ({
+      key: v.key,
+      kind: v.state === "reach" ? "ok" : v.state === "dark" ? "dark" : "unsure",
+      name: probePointName(t, v),
+      what: v.state === "reach" ? t("pr.ok") : probeReason(t, v),
+      at: fmt.ago(v.atUnix),
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name, fmt.locale));
   // each source's age once: its vantages come from one row
   const ages = new Map<string, number>();
   for (const v of c.vantages) ages.set(v.source, Math.max(ages.get(v.source) ?? 0, v.atUnix));
@@ -562,7 +820,8 @@ export function countryLook(t: T, fmt: Fmt, c: CountryCheck): CountryLook {
     .sort(([a], [b]) => sourceRank(a) - sourceRank(b))
     .map(([s, at]) => t("cr.part.when", { source: sourceName(t, s), ago: fmt.ago(at) }))
     .join(" · ");
-  const networks = dark || (fromGp ? [...new Set(c.probes.filter((p) => p.valid && p.network).map((p) => p.network))].join(", ") : "");
+  const nets = fromGp ? [...new Set(c.probes.filter((p) => p.valid && p.network).map((p) => p.network))] : [];
+  const networks = dark || nets.join(", ");
   const ports = tspuPortsText(t, c.tspuPorts);
   const vantage = c.tspuVantageName || c.tspuVantageId;
   const ago = fmt.ago(c.atUnix);
@@ -574,7 +833,11 @@ export function countryLook(t: T, fmt: Fmt, c: CountryCheck): CountryLook {
     ? [t("cr.note.conflict"), conflict]
     : [icmp ? t("cr.icmpPasses") : "", networks, tspuOnly ? ports : "", fromTspu ? t("cr.line.probe", { node: vantage }) : ""];
   const lineOf = (...first: string[]) => [...first, cdn, ago].filter(Boolean).join(" · ");
-  const look = (kind: CountryLook["kind"], label: string, head: string, line: string): CountryLook => {
+  // the row of the node page: the networks counted and named (more than five: the first four and "and N more"), the lists, the time
+  const netsRow = nets.length ? t.n("cr.nets", nets.length, { list: nets.length > 5 ? t("hl.nets.short", { names: nets.slice(0, 4).join(", "), n: nets.length - 4 }) : listOf(fmt.locale, nets) }) : "";
+  const seenRow = conflict ? seen : [icmp ? t("cr.icmpPasses") : "", netsRow, tspuOnly ? ports : "", fromTspu ? t("cr.line.probe", { node: vantage }) : ""];
+  const rowOf = (...first: string[]) => [...first, cdn, ago].filter(Boolean);
+  const look = (kind: CountryLook["kind"], label: string, head: string, line: string, row: string[]): CountryLook => {
     const note = conflict ? t("cr.note.conflict") : icmp ? t("cr.icmpPasses") : partial ? darkNames : tspuOnly && kind !== "ok" ? t("tp.title") : "";
     return {
       kind,
@@ -585,6 +848,7 @@ export function countryLook(t: T, fmt: Fmt, c: CountryCheck): CountryLook {
       state: [head, conflict ? `${t("cr.tip.conflict")} · ${conflict}` : icmp ? "" : dark || note, listed && kind !== "listed" ? t("cr.line.listed") : ""].filter(Boolean).join(" · "),
       alsoListed: listed && kind !== "listed",
       line,
+      row,
       conflict,
       dark,
       noProbe: c.noProbe.length ? t("cr.tip.noProbe", { networks: c.noProbe.join(t("cr.tip.sep")) }) : "",
@@ -600,6 +864,7 @@ export function countryLook(t: T, fmt: Fmt, c: CountryCheck): CountryLook {
           }
         : null,
       probes: c.probes.map((p) => probeOf(t, p, partial)),
+      ownPoints,
       at: live ? t("cr.tip.at", { time: fmt.stamp(c.atUnix) }) : "",
       gpNone: live && !fromGp && fromTspu && c.reason ? t("cr.tip.gpNone", { reason: countryReason(t, c.reason) || c.reason }) : "",
       tspu: probed
@@ -632,19 +897,19 @@ export function countryLook(t: T, fmt: Fmt, c: CountryCheck): CountryLook {
   const inList = listed ? t("cr.line.listed") : "";
   switch (c.verdict) {
     case CountryVerdict.OK:
-      return look("ok", t("cr.v.ok"), t("cr.tip.ok", { country: countryIn(t, c.country) }), lineOf(...seen, inList));
+      return look("ok", t("cr.v.ok"), t("cr.tip.ok", { country: countryIn(t, c.country) }), lineOf(...seen, inList), rowOf(...seenRow, inList));
     case CountryVerdict.PARTIAL:
-      return look("partial", t("cr.v.partial"), t("cr.tip.partial", { country: countryIn(t, c.country) }), lineOf(...seen, inList));
+      return look("partial", t("cr.v.partial"), t("cr.tip.partial", { country: countryIn(t, c.country) }), lineOf(...seen, inList), rowOf(...seenRow, inList));
     case CountryVerdict.TCP_BLOCKED:
-      return look("warn", t("cr.v.tcp"), t(icmp ? "cr.tip.tcp" : "cr.tip.tcpOnly"), lineOf(...seen, inList));
+      return look("warn", t("cr.v.tcp"), t(icmp ? "cr.tip.tcp" : "cr.tip.tcpOnly"), lineOf(...seen, inList), rowOf(...seenRow, inList));
     case CountryVerdict.BLOCKED:
-      return look("bad", t("cr.v.blocked"), t("cr.tip.blocked"), lineOf(...seen, inList));
+      return look("bad", t("cr.v.blocked"), t("cr.tip.blocked"), lineOf(...seen, inList), rowOf(...seenRow, inList));
     case CountryVerdict.LISTED:
-      return look("listed", t("cr.v.listed"), t("cr.tip.listed"), lineOf(names.join(t("cr.tip.sep"))));
+      return look("listed", t("cr.v.listed"), t("cr.tip.listed"), lineOf(names.join(t("cr.tip.sep"))), rowOf(names.join(t("cr.tip.sep"))));
     default:
       // with neither a round nor a run the row is the lists' alone, and they do not hold the address
-      if (!live && !probed) return look("unknown", t("cr.v.unknown"), t("cr.tip.notListed"), lineOf(t("cr.line.notListed")));
-      return look("unknown", t("cr.v.unknown"), reason ? t("cr.tip.unknown", { reason }) : t("cr.tip.unknownBare"), lineOf(reason));
+      if (!live && !probed) return look("unknown", t("cr.v.unknown"), t("cr.tip.notListed"), lineOf(t("cr.line.notListed")), rowOf(t("cr.line.notListed")));
+      return look("unknown", t("cr.v.unknown"), reason ? t("cr.tip.unknown", { reason }) : t("cr.tip.unknownBare"), lineOf(reason), rowOf(reason));
   }
 }
 
@@ -783,6 +1048,8 @@ export function manualSteps(i: DoctorItem): ManualStep[] {
   switch (i.id) {
     case "time_sync":
       return [{ text: "hl.manual.time_sync", command: "timedatectl set-ntp true" }];
+    case "security_updates":
+      return [{ text: "hl.manual.security_updates", command: "apt-get install unattended-upgrades && dpkg-reconfigure -plow unattended-upgrades" }];
     case "port_conflicts": {
       const steps: ManualStep[] = [];
       const flags = p.network === "tcp" ? "-ltpn" : "-lupn";
@@ -794,10 +1061,14 @@ export function manualSteps(i: DoctorItem): ManualStep[] {
     }
     case "foreign_nft":
       return [{ text: "hl.manual.foreign_nft", command: "nft list ruleset" }];
+    case "nftables":
+      return [{ text: "hl.manual.nftables", command: "apt-get install -y nftables" }];
     case "dstate_tasks":
       return [{ text: "hl.manual.reboot" }];
     case "cert_expiry":
       return p.inbound_id ? [{ text: "hl.manual.cert", open: { tab: "profiles", label: "hl.alerts.openProfiles" } }] : [];
+    case "reality_target":
+      return [{ text: "hl.manual.reality_target", open: { tab: "profiles", label: "hl.alerts.openProfiles" } }];
   }
   return [];
 }

@@ -1,7 +1,13 @@
+//go:build !js
+
 package mcp
 
 import (
 	"context"
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -143,8 +149,8 @@ func TestProfileRegistryEntries(t *testing.T) {
 func TestConnectionDescriptionsExplainLimits(t *testing.T) {
 	want := map[string][]string{
 		"checks_results":    {"per-probe eyeball tag", "no_probe", "partial (some vantages are dark while others reach the node", "cheburcheck_own", "globalping ok with tspu tcp_blocked is partial/dc_only"},
-		"user_connection":   {"cannot distinguish a freeze", "first 60 seconds", "64 kib", "10-second", "idle tail", "freezes", "quiet", "accepted", "hellos_foreign", "inbound-only", "rtt_samples", "pkts_sent", "no unsupported list"},
-		"node_connections":  {"cannot distinguish a freeze", "first 60 seconds", "64 kib", "10-second", "resumed tls sessions", "freezes", "quiet", "accepted", "hellos_foreign", "rtt_samples", "pkts_sent", "their zero values mean nothing"},
+		"user_connection":   {"cannot distinguish a freeze", "first 60 seconds", "64 kib", "10-second", "idle tail", "freezes", "quiet", "accepted", "hellos_foreign", "inbound-only", "rtt_samples", "pkts_sent", "responses_unmatched", "whose zero means nothing"},
+		"node_connections":  {"cannot distinguish a freeze", "first 60 seconds", "64 kib", "10-second", "resumed tls sessions", "freezes", "quiet", "accepted", "hellos_foreign", "rtt_samples", "pkts_sent", "hs_unfinished", "tls_cert_refused", "tcp_stalls_16k", "kernel backend", "their zero values mean nothing"},
 		"fleet_connections": {"cannot distinguish a freeze", "first 60 seconds", "64 kib", "10-second", "resumed tls sessions", "freezes", "quiet", "accepted", "hellos_foreign", "rtt_samples", "pkts_sent", "unsupported zero counters mean nothing"},
 	}
 	for name, phrases := range want {
@@ -167,19 +173,43 @@ func TestConnectionDescriptionsExplainLimits(t *testing.T) {
 	}
 }
 
+var updateToolsByProfile = flag.Bool("update-tools-by-profile", false, "rewrite testdata/tools_by_profile.txt")
+
+// toolsByProfileFile is the tool list of every profile, one name a line under its profile's heading: a tool that appears or goes, or
+// moves to another profile, shows as a line of the diff instead of as a count that someone edits.
+func toolsByProfileFile() string {
+	var b strings.Builder
+	for _, p := range []Profile{ProfileReadonly, ProfileOperator, ProfileAdmin} {
+		fmt.Fprintf(&b, "[%s]\n", p)
+		for _, name := range ToolNames(p) {
+			b.WriteString(name + "\n")
+		}
+	}
+	return b.String()
+}
+
+// The tools each profile sees, as the golden file says, on the registry and on a running server.
 func TestToolsPerProfile(t *testing.T) {
+	path := filepath.Join("testdata", "tools_by_profile.txt")
+	want := toolsByProfileFile()
+	if *updateToolsByProfile {
+		if err := os.WriteFile(path, []byte(want), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	have, err := os.ReadFile(path)
+	if err != nil || strings.ReplaceAll(string(have), "\r\n", "\n") != want {
+		t.Fatalf("%s is out of date: a tool came or went. Refresh it with `go test ./internal/panel/mcp -run ToolsPerProfile -update-tools-by-profile` and read the diff", path)
+	}
 	e := newTestEnv(t)
-	want := map[Profile]int{ProfileReadonly: 27, ProfileOperator: 45, ProfileAdmin: 84}
 	got := map[Profile][]string{}
-	for p, n := range want {
+	for _, p := range []Profile{ProfileReadonly, ProfileOperator, ProfileAdmin} {
 		_, secret := e.token(p)
 		names := toolNames(t, e.session(secret))
 		got[p] = names
-		if len(names) != n {
-			t.Errorf("%s sees %d tools, want %d: %v", p, len(names), n, names)
-		}
-		if len(toolsFor(p)) != n {
-			t.Errorf("%s: registry says %d tools, want %d", p, len(toolsFor(p)), n)
+		if !slices.Equal(slices.Sorted(slices.Values(names)), ToolNames(p)) {
+			t.Errorf("%s: the server lists %d tools, the registry %d", p, len(names), len(ToolNames(p)))
 		}
 	}
 	for _, n := range got[ProfileReadonly] {
@@ -188,14 +218,17 @@ func TestToolsPerProfile(t *testing.T) {
 		}
 	}
 	for _, n := range got[ProfileOperator] {
-		if slices.Contains([]string{"audit_search", "node_fix_plan", "rollout_start_plan", "node_rollback_apply"}, n) {
+		if slices.Contains([]string{"audit_search", "node_fix_plan", "rollout_start_plan", "node_rollback_apply", "node_server_keys_add_plan", "node_server_keys_add_apply"}, n) {
 			t.Errorf("operator sees an admin tool: %s", n)
 		}
 	}
-	for _, n := range []string{"node_fix_plan", "node_fix_apply", "rollout_start_plan", "rollout_pause_plan", "rollout_resume_plan", "rollout_cancel_plan", "node_rollback_plan", "audit_search"} {
+	for _, n := range []string{"node_fix_plan", "node_fix_apply", "rollout_start_plan", "rollout_pause_plan", "rollout_resume_plan", "rollout_cancel_plan", "node_rollback_plan", "node_server_keys_add_plan", "node_server_keys_add_apply", "os_rollout_start_plan", "os_rollout_start_apply", "os_rollout_pause_plan", "os_rollout_pause_apply", "os_rollout_resume_plan", "os_rollout_resume_apply", "os_rollout_cancel_plan", "os_rollout_cancel_apply", "audit_search"} {
 		if !slices.Contains(got[ProfileAdmin], n) {
 			t.Errorf("admin lacks %s", n)
 		}
+	}
+	if !slices.Contains(got[ProfileReadonly], "os_updates_status") {
+		t.Error("readonly profile lacks stored OS update status")
 	}
 }
 
@@ -209,7 +242,10 @@ func TestProvisioningToolsKeepSecretsOutOfPlans(t *testing.T) {
 			t.Fatal(err)
 		}
 		if tool.Name == "node_install_plan" || tool.Name == "node_install_apply" ||
-			tool.Name == "node_server_password_rotate_plan" || tool.Name == "node_server_password_rotate_apply" {
+			tool.Name == "node_server_password_rotate_plan" || tool.Name == "node_server_password_rotate_apply" ||
+			tool.Name == "node_server_key_add_plan" || tool.Name == "node_server_key_add_apply" ||
+			tool.Name == "node_server_keys_add_plan" || tool.Name == "node_server_keys_add_apply" ||
+			tool.Name == "node_server_key_remove_plan" || tool.Name == "node_server_key_remove_apply" {
 			props, _ := tool.InputSchema.(map[string]any)["properties"].(map[string]any)
 			properties[tool.Name] = props
 		}
@@ -228,6 +264,16 @@ func TestProvisioningToolsKeepSecretsOutOfPlans(t *testing.T) {
 	if properties["node_server_password_rotate_apply"]["confirm_token"] == nil {
 		t.Fatal("password rotation still requires an owner-approved plan")
 	}
+	for _, name := range []string{"node_server_key_add_plan", "node_server_keys_add_plan", "node_server_key_remove_plan"} {
+		if properties[name]["private_key"] != nil || properties[name]["private_key_passphrase"] != nil {
+			t.Fatalf("private key appeared in MCP tool %s: %v", name, properties[name])
+		}
+	}
+	for _, name := range []string{"node_server_key_add_apply", "node_server_keys_add_apply", "node_server_key_remove_apply"} {
+		if len(properties[name]) != 1 || properties[name]["confirm_token"] == nil {
+			t.Fatalf("%s must take only confirm_token: %v", name, properties[name])
+		}
+	}
 }
 
 func TestProvisioningRevealIsNotAnMCPProcedure(t *testing.T) {
@@ -243,6 +289,24 @@ func TestProvisioningRevealIsNotAnMCPProcedure(t *testing.T) {
 				t.Fatalf("%s exposes the panel-only SSH password reveal procedure", td.name)
 			}
 		}
+	}
+}
+
+func TestNodeIPv6AddressIsHiddenFromThePlanInput(t *testing.T) {
+	e := newTestEnv(t)
+	_, secret := e.token(ProfileAdmin)
+	s := e.session(secret)
+	var properties map[string]any
+	for tool, err := range s.Tools(context.Background(), nil) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tool.Name == "node_ipv6_plan" {
+			properties, _ = tool.InputSchema.(map[string]any)["properties"].(map[string]any)
+		}
+	}
+	if properties == nil || properties["address"] != nil {
+		t.Fatalf("the agent can choose or see the stored address: %v", properties)
 	}
 }
 
@@ -286,5 +350,33 @@ func TestHiddenToolIsUnknown(t *testing.T) {
 	}
 	if n := len(e.w.log); n != 0 {
 		t.Errorf("hidden tools reached the API %d times", n)
+	}
+}
+
+// The owner's approved plan of a tool opens the procedures that tool calls and nothing else (auth's grants table). A procedure of
+// an apply tool that needs the owner's approval or a step-up and that the tool's grant does not list is refused (403) on a real
+// panel, however well the tool runs against the fakes; and a grant that names a procedure the tool never calls opens it for
+// nothing. The two lists meet here, because auth cannot import the tool registry.
+func TestToolGrantsMatchTheProceduresOfTheirTools(t *testing.T) {
+	tools := map[string]toolDef{}
+	for _, td := range registry {
+		if name, ok := strings.CutSuffix(td.name, "_apply"); ok {
+			tools[name] = td
+		}
+	}
+	for name, td := range tools {
+		for _, p := range td.procs {
+			access, _ := auth.TokenAccess(p)
+			if (access == auth.TokenAccessApproved || auth.NeedsStepUp(p)) && !auth.GrantAllows(name, p) {
+				t.Errorf("%s_apply calls %s, which needs the owner's approval, and the grant of %s does not list it", name, p, name)
+			}
+		}
+	}
+	for name, td := range tools {
+		for _, p := range auth.GrantedProcedures(name) {
+			if !slices.Contains(td.procs, p) {
+				t.Errorf("the grant of %s opens %s, which %s_apply does not list among its procedures", name, p, name)
+			}
+		}
 	}
 }

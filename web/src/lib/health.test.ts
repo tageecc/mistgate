@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { NodeStatus } from "@/gen/mistgate/admin/v1/common_pb";
 import { AlertKind, AlertSeverity, CheckStatus, CountryVerdict, DoctorStatus } from "@/gen/mistgate/admin/v1/health_pb";
@@ -24,7 +25,16 @@ import {
   fixErrorText,
   fixLabel,
   fleetIssues,
+  alertNetworks,
+  groupAlerts,
   groupDoctor,
+  groupFact,
+  groupHistory,
+  groupSeverity,
+  groupTitle,
+  networksByOperator,
+  networkSources,
+  networksShort,
   hasKey,
   isIssue,
   isLoud,
@@ -39,7 +49,6 @@ import {
   peopleOrder,
   resolutionWord,
   restartConsequence,
-  severityKind,
   type Alert,
   type CheckCell,
   type CountryCheck,
@@ -95,7 +104,7 @@ const item = (over: Partial<DoctorItem> = {}): DoctorItem => ({
   ...over,
 });
 
-const cell =(over: Partial<CheckCell> = {}): CheckCell => ({ deployed: true, inboundId: "inb_1", failStreak: 0, history: [], latencyHourMs: 0, responseHourMs: 0, connectHourMs: 0, udpSentHour: 0, udpLostHour: 0, nodeSentHour: 0, nodeLostHour: 0, ...over });
+const cell =(over: Partial<CheckCell> = {}): CheckCell => ({ deployed: true, inboundId: "inb_1", failStreak: 0, history: [], latencyHourMs: 0, responseHourMs: 0, connectHourMs: 0, udpSentHour: 0, udpLostHour: 0, nodeSentHour: 0, nodeLostHour: 0, daily: [], ...over });
 const at = (status: CheckStatus, latencyMs = 0, errorCode = "") => ({ status, atUnix: 1, latencyMs, exitIp: "", exitCountry: "", errorCode, errorDetail: "", connectMs: 0, responseMs: 0, udpSent: 0, udpLost: 0 });
 
 describe("lookup", () => {
@@ -166,12 +175,39 @@ describe("alerts", () => {
     // an inbound the panel could not name is still said, by its id
     expect(alertWhy(t, fmt, alert({ kind: AlertKind.CERT_EXPIRY, whyKey: "health.alert.cert_expiry.why.expired", params: { inbound_id: "inb_9", reason: "expired" } }))).toContain("“inb_9” has expired");
   });
+  it("reads a site that shows a block page through WARP in words, also when the trace gave no exit", () => {
+    const reach = (params: Record<string, string>) => alert({ kind: AlertKind.WARP_REACH, whyKey: "health.alert.warp_reach.why", params: { domain: "example.com", http_status: "403", streak: "3", ...params } });
+    expect(alertWhy(t, fmt, reach({ colo: "AMS" }))).toContain("answered with a block page (HTTP 403) at the Cloudflare exit AMS.");
+    const unnamed = alertWhy(tRu, fmtRu, reach({ colo: "" }));
+    expect(unnamed).toContain("на выходе Cloudflare (не определён).");
+    expect(unnamed).not.toMatch(/[{}]/);
+  });
   it("says how long a node has been down in the coarsest unit, and a paused rollout's reason once", () => {
     expect(alertWhy(t, fmt, alert({ kind: AlertKind.NODE_DOWN, whyKey: "health.alert.node_down.why", params: { minutes: "185" } }))).toContain("for 3 h and");
     const paused = alert({ kind: AlertKind.UPDATE_FAILED, whyKey: "health.alert.update_failed.why.gate_failed", params: { node: "de2", reason: "probe_failed" } });
     expect(alertWhy(t, fmt, paused)).toContain("de2 did not pass the check after updating: the client-eye check failed. Where possible");
     const unread = alert({ kind: AlertKind.UPDATE_FAILED, whyKey: "health.alert.update_failed.why.gate_failed", params: { node: "de2", reason: "inbounds_unreadable" } });
     expect(alertWhy(tRu, fmtRu, unread)).toContain("de2 не прошла проверку после обновления: панель не смогла прочитать профили ноды. Где получилось");
+  });
+  it("words the alert of a stopped OS update with the node's own reason, in both languages", () => {
+    const stopped = (why: string, params: Record<string, string>) => alert({ kind: AlertKind.OS_UPDATE_FAILED, whyKey: `health.alert.os_update_failed.why.${why}`, params: { node: "fi1", ...params } });
+    // the sentence already says "installed, not rebooted": the reason adds the node's own words, not the step's headline again
+    expect(alertWhy(t, fmt, stopped("reboot_held", { reason: "reboot_held", code: "boot_default_custom", mode: "security" }))).toMatch(
+      /^fi1: the updates are installed, but the server was not rebooted\. The boot menu \(GRUB\) is set to start a chosen or saved entry/,
+    );
+    // a reboot alone installed nothing: it does not say so, in either language
+    const only = stopped("reboot_held", { reason: "reboot_held", code: "too_soon", mode: "reboot_only" });
+    expect(alertWhy(t, fmt, only)).toBe(`fi1: the server was not rebooted, the node refused. ${en["os.job.err.too_soon"]} Fix that, then close the update.`);
+    expect(alertWhy(tRu, fmtRu, only)).toMatch(/^fi1: сервер не перезагружен, нода отказалась\. Сервер перезагружался меньше 10 минут назад/);
+    expect(alertWhy(t, fmt, only)).not.toMatch(/installed/);
+    // a node lost during the check does not "come back"
+    const lost = stopped("gate_failed", { reason: "node_lost", mode: "security" });
+    expect(alertWhy(t, fmt, lost)).toMatch(/^fi1 dropped off the network while the panel was checking it after the update\./);
+    expect(alertWhy(t, fmt, lost)).not.toContain("came back");
+    expect(alertWhy(tRu, fmtRu, lost)).toMatch(/^fi1 пропала из сети, пока панель проверяла её после обновления\./);
+    expect(alertWhy(t, fmt, stopped("step_failed", { reason: "job_failed", code: "install_failed", package: "nginx" }))).toContain("The update failed on the node. Installing the updates failed on nginx.");
+    expect(alertWhy(t, fmt, stopped("not_back", { reason: "not_back" }))).toContain("did not come back within 15 minutes");
+    expect(alertWhy(tRu, fmtRu, stopped("gate_failed", { reason: "probe_failed" }))).toContain("fi1 вернулась, но не прошла проверку после обновления: Нода вернулась, но проверка глазами клиента не прошла.");
   });
   it("says when access ended and names the protocol people dropped off", () => {
     const ended = alert({ kind: AlertKind.ACCESS_ENDED, whyKey: "health.alert.access_ended.why.expired", params: { user_name: "alice", since: "1700000000" } });
@@ -213,6 +249,39 @@ describe("alerts", () => {
     expect(alertWhy(t, fmt, lossy("de2"))).toMatch(/^The test packets to port 8443 of “hy2 · WARP” lost 37 % \(checked from de2\)\./);
     expect(alertWhy(tRu, fmtRu, lossy("panel"))).toMatch(/^Тестовые пакеты до порта 8443 профиля «hy2 · WARP» потерялись на 37 % \(проверка с панели\)\./);
   });
+  it("words a port_lossy alert confirmed from a second sender with both shares and both senders", () => {
+    const both = alert({ kind: AlertKind.PORT_LOSSY, subject: "inb_1", titleKey: "health.alert.port_lossy.title", whyKey: "health.alert.port_lossy.why.confirmed",
+      params: { profile: "TUIC · 2083", port: "2083", sent: "300", got: "241", sender: "msk1", confirm_sender: "panel", confirm_sent: "300", confirm_got: "238", checked_unix: "1790000000" } });
+    expect(alertWhy(t, fmt, both)).toMatch(/^The test packets to port 2083 of “TUIC · 2083” got lost from both sides: 20 % from msk1, 21 % from the panel, so this node’s port loses them\./);
+    expect(alertWhy(tRu, fmtRu, both)).toMatch(/^Тестовые пакеты до порта 2083 профиля «TUIC · 2083» терялись с обеих сторон: 20 % с msk1, 21 % с панели — значит, их теряет порт этой ноды\./);
+  });
+  it("words a path_lossy alert: whose packets get lost on the way to which node, and the sender that got through", () => {
+    const path = alert({ kind: AlertKind.PATH_LOSSY, nodeId: "nod_minsk1", nodeName: "minsk1", subject: "nod_nl1", titleKey: "health.alert.path_lossy.title", whyKey: "health.alert.path_lossy.why",
+      params: { node: "minsk1", target: "nl1", target_id: "nod_nl1", ports: "2053, 2083", sent: "300", got: "236", other: "de1", other_got: "299", region: "cis", other_region: "other", checked_unix: "1790000000" } });
+    expect(alertTitle(t, path)).toBe("Loses UDP on the way to nl1");
+    expect(alertWhy(t, fmt, path)).toMatch(/^UDP from minsk1 \(CIS\) to nl1 loses 21 % on ports 2053, 2083, while 299\/300 arrive from de1 \(outside the CIS\)\. The loss is on the way from minsk1, not on nl1: its ports are fine\./);
+    expect(alertWhy(tRu, fmtRu, path)).toMatch(/^UDP от minsk1 \(СНГ\) до nl1 теряет 21 % на портах 2053, 2083, а с de1 \(вне СНГ\) доходит 299\/300\. Потери на пути от minsk1, а не на nl1/);
+    expect(groupFact(tPlural, [path])).toBe("21 % lost");
+    // right to left: the count stays one left-to-right island, never "300/299"
+    const tFa = Object.assign((key: keyof typeof en, vars?: Record<string, string | number>) => fill(dictionaries.fa[key], vars, true), { n: () => "" }) as unknown as T;
+    expect(alertWhy(tFa, fmt, path)).toContain("⁨299/300⁩");
+    expect(alertWhy(tFa, fmt, path)).toContain("⁨minsk1⁩");
+  });
+  it("words a filtered path_lossy alert: a filter on the way to a node that is fine, the ports that got through, no share lost", () => {
+    const params = { node: "de1", target: "fi1", target_id: "nod_fi1", ports: "2053, 8443", open: "443", sent: "300", got: "0", other: "msk1", other_got: "300", region: "other", other_region: "cis", checked_unix: "1790000000" };
+    const filtered = alert({ kind: AlertKind.PATH_LOSSY, nodeId: "nod_de1", nodeName: "de1", subject: "nod_fi1", titleKey: "health.alert.path_lossy.title", whyKey: "health.alert.path_lossy.why.filtered", params });
+    expect(alertTitle(t, filtered)).toBe("UDP filtered on the way to fi1");
+    expect(alertTitle(tRu, filtered)).toBe("Фильтр UDP по пути к fi1");
+    expect(alertWhy(t, fmt, filtered)).toBe(
+      "UDP from de1 (outside the CIS) reaches fi1 only on 443; ports 2053, 8443 get nothing, while from msk1 (CIS) everything arrives. This is a filter on the way, often the hoster’s DDoS protection against data-centre traffic: fi1 itself is fine and people on home networks usually connect, but port checks (and a relay) from de1 cannot pass.",
+    );
+    expect(alertWhy(tRu, fmtRu, filtered)).toMatch(/^От de1 \(вне СНГ\) UDP доходит до fi1 только на 443; на порты 2053, 8443 — ничего, а с msk1 \(СНГ\) доходит всё\. Это фильтр по пути, часто защита хостера от DDoS из датацентров: сама fi1 в порядке/);
+    expect(groupFact(tPlural, [filtered])).toBe("only 443 gets through");
+    // without {open} it stays a lossy line
+    const lossy = { ...filtered, whyKey: "health.alert.path_lossy.why", params: { ...params, open: "", got: "206" } };
+    expect(alertTitle(t, lossy)).toBe("Loses UDP on the way to fi1");
+    expect(groupFact(tPlural, [lossy])).toBe("31 % lost");
+  });
   it("offers the mute choices up to the panel's week, «until morning» to the next 08:00", () => {
     const clock = (h: number, m = 0) => new Date(2026, 9, 1, h, m);
     const secs = (d: Date) => muteChoices(d).map((c) => c.seconds);
@@ -220,11 +289,6 @@ describe("alerts", () => {
     expect(secs(clock(6, 30))[1]).toBe(90 * 60); // before 08:00: this morning
     expect(secs(clock(8))[1]).toBe(24 * 3600); // at 08:00 sharp: tomorrow's
     expect(muteChoices(clock(12)).map((c) => c.key)).toEqual(["hl.mute.hour", "hl.mute.morning", "hl.mute.day", "hl.mute.week"]);
-  });
-  it("maps severity to the status kinds; info is never red", () => {
-    expect(severityKind(AlertSeverity.CRITICAL)).toBe("bad");
-    expect(severityKind(AlertSeverity.WARNING)).toBe("warn");
-    expect(severityKind(AlertSeverity.INFO)).toBe("blip");
   });
   it("counts an alert as loud only when it is a warning or worse and not muted", () => {
     expect(isLoud(alert(), 1000)).toBe(true);
@@ -405,11 +469,16 @@ describe("doctor", () => {
   });
   it("gives the steps by hand for the checks the panel cannot fix itself", () => {
     expect(manualSteps(item({ id: "time_sync", status: DoctorStatus.WARN }))).toEqual([{ text: "hl.manual.time_sync", command: "timedatectl set-ntp true" }]);
+    expect(manualSteps(item({ id: "security_updates", status: DoctorStatus.WARN }))).toEqual([{
+      text: "hl.manual.security_updates",
+      command: "apt-get install unattended-upgrades && dpkg-reconfigure -plow unattended-upgrades",
+    }]);
     const port = manualSteps(item({ id: "port_conflicts", status: DoctorStatus.FAIL, params: { network: "udp", port: "8443", inbound_id: "inb_1" } }));
     expect(port.map((s) => s.command)).toEqual(["ss -lupn 'sport = :8443'", undefined]);
     expect(port[1]!.open).toEqual({ tab: "profiles", label: "hl.manual.port_moveBtn" });
     expect(manualSteps(item({ id: "port_conflicts", status: DoctorStatus.FAIL, params: { network: "tcp", port: "443" } }))[0]!.command).toBe("ss -ltpn 'sport = :443'");
     expect(manualSteps(item({ id: "foreign_nft", status: DoctorStatus.WARN }))[0]!.command).toBe("nft list ruleset");
+    expect(manualSteps(item({ id: "nftables", status: DoctorStatus.WARN }))).toEqual([{ text: "hl.manual.nftables", command: "apt-get install -y nftables" }]);
     expect(manualSteps(item({ id: "dstate_tasks", status: DoctorStatus.FAIL }))).toEqual([{ text: "hl.manual.reboot" }]);
     expect(manualSteps(item({ id: "memory_pressure", status: DoctorStatus.WARN }))).toEqual([]);
   });
@@ -438,21 +507,24 @@ describe("fixErrorText", () => {
 
 // Every key the panel and the agent send has a sentence in both languages (agent.proto "CHECK IDS" and "FIX IDS").
 describe("the server's vocabulary is covered", () => {
-  const checks = ["disk_space", "journald_size", "dstate_tasks", "time_sync", "resolver", "ipv6", "foreign_vpn", "foreign_nft", "port_conflicts", "net_baseline", "cert_expiry", "memory_pressure", "cpu_softirq", "kernel_headers", "awg_backend", "warp_path", "unit_generation"];
-  const fixes = ["journald_vacuum", "apply_baseline", "restart_inbound", "set_resolver", "reconnect_warp", "refresh_unit", "allow_forwarding"];
+  const checks = ["disk_space", "journald_size", "dstate_tasks", "time_sync", "resolver", "ipv6", "foreign_vpn", "foreign_nft", "port_conflicts", "net_baseline", "cert_expiry", "memory_pressure", "cpu_softirq", "kernel_headers", "awg_backend", "warp_path", "unit_generation", "security_updates", "nftables", "cpu_steal", "conntrack_fill", "agent_fds", "reality_target"];
+  const fixes = ["journald_vacuum", "apply_baseline", "restart_inbound", "set_resolver", "reconnect_warp", "refresh_unit", "allow_forwarding", "enable_security_updates", "awg_module_repair", "install_nftables"];
   const errors = ["timeout", "auth", "tls", "refused", "http_status", "exit_unreachable", "client_unsupported", "node_offline", "inbound_not_active", "inbound_failed", "inbound_disabled", "inbound_pending"];
   const kinds = ["node_down", "host_blip", "no_traffic", "check_failed", "doctor_warn", "doctor_fail", "state_drift", "cert_expiry", "quota", "subscription_shared_suspect",
     "access_ended", "user_connection", "users_impacted", "country_blocked"];
   const whyNoTraffic = ["udp_blocked", "udp_all_blocked", "mixed", "auth", "tls", "refused", "exit_unreachable", "http_status", "unknown"];
-  const whyCheck = ["udp_blocked", "warp_path", "timeout", "auth", "tls", "refused", "exit_unreachable", "http_status", "unknown", "panel_egress", "probe_path", "via_cdn", "not_started"];
+  const whyCheck = ["udp_blocked", "panel_udp_path", "warp_path", "timeout", "auth", "tls", "refused", "exit_unreachable", "http_status", "unknown", "panel_egress", "probe_path", "via_cdn", "not_started"];
   const expected = [
     ...checks.flatMap((c) => [`doctor.${c}.title`, `health.doctor.${c}.why`]),
     "health.doctor.dstate_tasks.why.qxl_ttm",
-    ...["no_tun", "unit_outdated", "no_module", "docker_forward_drop"].map((h) => `health.doctor.awg_backend.why.${h}`),
+    ...["no_tun", "unit_outdated", "no_module", "docker_forward_drop", "fallback"].map((h) => `health.doctor.awg_backend.why.${h}`),
     ...["not_configured", "no_backend", "paused", "table_in_use", "rule_pref_in_use", "interface_in_use"].map((h) => `health.doctor.warp_path.why.${h}`),
     ...fixes.flatMap((f) => [`health.fix.${f}.label`, `health.fix.${f}.plan`]),
     "hl.fix.disruptiveWarp",
     "hl.fix.disruptiveUnit",
+    "hl.fix.securityUpdates",
+    "hl.fix.nftables",
+    "hl.fix.disruptiveAwg",
     ...errors.map((e) => `health.check.err.${e}`),
     ...kinds.map((k) => `health.alert.${k}.title`),
     "health.alert.check_failed.title.panel_egress",
@@ -478,6 +550,7 @@ describe("the server's vocabulary is covered", () => {
     "health.alert.country_blocked.why.tspu",
     "health.alert.country_blocked.why.conflict.tcp_blocked",
     "health.alert.country_blocked.why.conflict.blocked",
+    "health.alert.country_blocked.why.reached_through_relays",
     "health.alert.country_blocked.title.partial",
     "health.alert.country_blocked.why.partial",
     "hl.res.accepted",
@@ -488,6 +561,8 @@ describe("the server's vocabulary is covered", () => {
     "hl.fix.err.unsupported_host",
     "hl.fix.err.busy",
     "hl.fix.err.unit_refresh_invalid",
+    "hl.manual.security_updates",
+    "hl.manual.nftables",
     "node.reason.no_traffic",
     "node.reason.doctor_fail",
   ];
@@ -496,6 +571,13 @@ describe("the server's vocabulary is covered", () => {
       expect(hasKey(k), k).toBe(true);
       for (const lang of langs) expect(dictionaries[lang][k as keyof typeof ru], `${lang} ${k}`).toBeTruthy();
     }
+  });
+  it("words every error code a check can end with, in every language", () => {
+    // the codes the Go scan finds in internal/panel/health (error_codes_test.go pins the file); the update screens word the code of
+    // a profile that did not pass from these too
+    const codes = JSON.parse(readFileSync(`${process.cwd()}/../internal/panel/health/testdata/error_codes.json`, "utf8")) as string[];
+    expect(codes.length).toBeGreaterThan(8);
+    for (const c of codes) for (const lang of langs) expect((dictionaries[lang] as Record<string, string>)[`health.check.err.${c}`], `${lang} ${c}`).toBeTruthy();
   });
   it("has every placeholder of the why texts among the params the node or the panel sends", () => {
     const sent: Record<string, string[]> = {
@@ -513,9 +595,15 @@ describe("the server's vocabulary is covered", () => {
       memory_pressure: ["avail_pct", "swap_pct", "oom_kills", "psi_some", "psi_full", "oom_victims"],
       cpu_softirq: ["softirq_pct", "cpu_pct"],
       kernel_headers: ["kernel", "missing"],
-      awg_backend: ["backend", "version", "mode", "reason", "hint", "unit_gen"],
+      awg_backend: ["backend", "version", "mode", "reason", "hint", "unit_gen", "kernel"],
       warp_path: ["state", "backend", "colo", "hint", "error", "inbounds"],
       unit_generation: ["unit_gen", "current"],
+      security_updates: [],
+      nftables: ["reason"],
+      cpu_steal: ["steal_pct", "steal_max_pct", "samples"],
+      conntrack_fill: ["count", "max", "fill_pct"],
+      agent_fds: ["fds", "limit", "used_pct"],
+      reality_target: ["hint", "inbound_id", "inbounds", "target", "server_name", "days_left", "checked"],
     };
     // what itemParams makes from them (doctor-detail.ts): the profile names and the optional pieces of a sentence
     const derived = ["profile", "profiles", "profiles_part", "server_part", "via", "colo_part", "left"];
@@ -534,7 +622,7 @@ describe("the server's vocabulary is covered", () => {
       node_down: ["duration", "nodes", "total"],
       host_blip: ["count"],
       device_limit: ["user_name", "used", "limit"],
-      country_blocked: ["country", "networks", "ports"],
+      country_blocked: ["country", "networks", "ports", "probes"], // probes: the names of the networks' sources (alertWhy)
     };
     for (const [kind, params] of Object.entries(sent)) {
       for (const key of Object.keys(en).filter((k) => k.startsWith(`health.alert.${kind}.why`))) {
@@ -751,6 +839,9 @@ describe("reachability from a country", () => {
     dpiHop: 0,
     icmpOk: state === "reach",
     tcpOk: state === "reach",
+    why: "",
+    probeName: "",
+    port: 0,
     ...over,
   });
   const gpDark = (network: string, asn: string, region: string) => vantage("globalping", network, "dark", { key: `AS${asn}`, asn, region });
@@ -1123,25 +1214,189 @@ describe("reachability from a country", () => {
     const tcp = alert({ kind: AlertKind.COUNTRY_BLOCKED, whyKey: "health.alert.country_blocked.why.tcp_blocked", params: { ...params, verdict: "tcp_blocked" } });
     const gone = alert({ kind: AlertKind.COUNTRY_BLOCKED, whyKey: "health.alert.country_blocked.why.blocked", params: { ...params, verdict: "blocked" } });
     expect(alertWhy(tPlural, fmt, tcp)).toBe(
-      "The sources disagree: Globalping (probes inside Russia: Beeline, Rostelecom) and your probe node there see this node differently. One of them finds TCP to ports 443 and 8443 cut, so that is shown. Two checks in a row saw it. It closes after two clean checks.",
+      "The sources disagree: the probes of Globalping inside Russia (Beeline, Rostelecom) find TCP to ports 443 and 8443 cut, while other checks there see the node differently. The worse result is shown. Two checks in a row saw it. It closes after two clean checks.",
     );
     expect(alertWhy(tRuPlural, fmtRu, tcp)).toBe(
-      "Источники расходятся: Globalping (зонды внутри России: Beeline, Rostelecom) и твоя нода-зонд там видят ноду по-разному. Один из них видит, что TCP на порты 443 и 8443 режут, поэтому показано это. Так показали две проверки подряд. Алерт закроется после двух чистых проверок.",
+      "Источники расходятся: зонды Globalping внутри России (Beeline, Rostelecom) видят, что TCP на порты 443 и 8443 режут, а другие проверки там видят ноду иначе. Показан худший результат. Так показали две проверки подряд. Алерт закроется после двух чистых проверок.",
     );
     expect(alertWhy(tZhPlural, fmtZh, tcp)).toBe(
-      "各来源的结果不一致：Globalping（俄罗斯境内的探测点：Beeline, Rostelecom）和你在那里的探测节点看到的情况不同。其中一方发现 TCP 端口 443 和 8443 被封锁，因此显示这一结果。连续两次检测都是如此。连续两次正常后，告警会关闭。",
+      "各来源的结果不一致：俄罗斯境内的 Globalping 探测点（Beeline, Rostelecom）发现 TCP 端口 443 和 8443 被封锁，而那里的其他检测看到的情况不同。此处显示较差的结果。连续两次检测都是如此。连续两次正常后，告警会关闭。",
     );
     expect(alertWhy(tPlural, fmt, gone)).toBe(
-      "The sources disagree: Globalping’s probes inside Russia (Beeline, Rostelecom) cannot reach the node at all, no answer to ping, no TCP connection, while your probe node there sees it differently. The worse result is shown. Two checks in a row saw it. It closes after two clean checks.",
+      "The sources disagree: the probes of Globalping inside Russia (Beeline, Rostelecom) cannot reach the node at all, no answer to ping, no TCP connection, while other checks there see it differently. The worse result is shown. Two checks in a row saw it. It closes after two clean checks.",
     );
     expect(alertWhy(tRuPlural, fmtRu, gone)).toBe(
-      "Источники расходятся: зонды Globalping внутри России (Beeline, Rostelecom) совсем не достают до ноды, нет ответа ни на ping, ни по TCP, а твоя нода-зонд там видит иначе. Показан худший результат. Так показали две проверки подряд. Алерт закроется после двух чистых проверок.",
+      "Источники расходятся: зонды Globalping внутри России (Beeline, Rostelecom) совсем не достают до ноды, нет ответа ни на ping, ни по TCP, а другие проверки там видят иначе. Показан худший результат. Так показали две проверки подряд. Алерт закроется после двух чистых проверок.",
     );
     expect(alertWhy(tZhPlural, fmtZh, gone)).toBe(
-      "各来源的结果不一致：俄罗斯境内的 Globalping 探测点（Beeline, Rostelecom）完全无法到达节点，ping 和 TCP 都没有响应，而你在那里的探测节点看到的情况不同。此处显示较差的结果。连续两次检测都是如此。连续两次正常后，告警会关闭。",
+      "各来源的结果不一致：俄罗斯境内的 Globalping 探测点（Beeline, Rostelecom）完全无法到达节点，ping 和 TCP 都没有响应，而那里的其他检测看到的情况不同。此处显示较差的结果。连续两次检测都是如此。连续两次正常后，告警会关闭。",
     );
     // both sources that agree keep Globalping's words: its probes saw it
     const agree = alert({ kind: AlertKind.COUNTRY_BLOCKED, whyKey: "health.alert.country_blocked.why.tcp_blocked", params: { ...params, confidence: "eyeball", verdict: "tcp_blocked" } });
     expect(alertWhy(tPlural, fmt, agree)).toMatch(/^Probes inside Russia \(Beeline, Rostelecom\) reach the node’s address/);
+  });
+
+  it("words a country_blocked alert that people get around through relays by its own sentence, whoever saw the block", () => {
+    const base = { kind: AlertKind.COUNTRY_BLOCKED, severity: AlertSeverity.INFO, whyKey: "health.alert.country_blocked.why.reached_through_relays" };
+    const params = { node: "de1", country: "RU", why: "reached_through_relays", verdict: "tcp_blocked", networks: "", ports: "443" };
+    for (const extra of [{ sources: "globalping" }, { sources: "tspu" }, { sources: "globalping,tspu", confidence: "conflict" }] as Record<string, string>[]) {
+      const a = alert({ ...base, params: { ...params, ...extra } });
+      expect(alertWhy(tPlural, fmt, a)).toMatch(/^People reach this node through relays: every server of it they are given has a healthy relay, so the block in Russia/);
+      expect(alertWhy(tRuPlural, fmtRu, a)).toMatch(/^До ноды доходят через реле:/);
+      expect(alertWhy(tZhPlural, fmtZh, a)).toMatch(/^用户通过中继到达这个节点/);
+    }
+  });
+});
+
+describe("alert groups", () => {
+  const lossy = (id: string, nodeId: string, port: string, got: string, opened = 1000) =>
+    alert({ id, kind: AlertKind.PORT_LOSSY, nodeId, nodeName: nodeId.slice(4), subject: `inb_${id}`, titleKey: "health.alert.port_lossy.title", openedUnix: opened, params: { port, profile: `p${port}`, sent: "300", got } });
+
+  it("puts the per-profile alerts of one node and kind on one card, in the server's order; every other alert stays its own", () => {
+    const down = alert({ id: "down", kind: AlertKind.NODE_DOWN, nodeId: "nod_nl1", titleKey: "health.alert.node_down.title" });
+    const blip = alert({ id: "blip", kind: AlertKind.HOST_BLIP, nodeId: "nod_nl1", titleKey: "health.alert.host_blip.title" });
+    const panel = alert({ id: "egress", nodeId: "", subject: "panel_egress" });
+    const probe = alert({ id: "probe", nodeId: "", subject: "probe_path" });
+    const groups = groupAlerts([down, lossy("a", "nod_nl1", "2083", "207"), blip, lossy("b", "nod_msk1", "443", "243"), lossy("c", "nod_nl1", "4443", "276"), panel, probe]);
+    expect(groups.map((g) => g.map((a) => a.id))).toEqual([["down"], ["a", "c"], ["blip"], ["b"], ["egress"], ["probe"]]);
+  });
+
+  it("titles a card of several by what they share, else by the count, and shows the worst loss", () => {
+    const three = [lossy("a", "nod_nl1", "2083", "207"), lossy("b", "nod_nl1", "33183", "264"), lossy("c", "nod_nl1", "4443", "276")];
+    expect(groupTitle(tPlural, three)).toBe("UDP loses packets on 3 ports");
+    expect(groupTitle(tRuPlural, three)).toBe("UDP теряет пакеты на 3 портах");
+    expect(groupFact(tPlural, three)).toBe("up to 31 % lost");
+    expect(groupFact(tPlural, three.slice(0, 1))).toBe("31 % lost");
+    // two profiles on one port say the same title
+    const same = [lossy("d", "nod_msk1", "443", "243"), lossy("e", "nod_msk1", "443", "249")];
+    expect(groupTitle(tPlural, same)).toBe("UDP to port 443 loses packets");
+    const failing = [alert({ id: "x", params: { profile: "VLESS" } }), alert({ id: "y", params: { profile: "Trojan" } })];
+    expect(groupTitle(tPlural, failing)).toBe("2 profiles fail the client-eye check");
+    expect(groupTitle(tRuPlural, failing)).toBe("2 профиля не проходят проверку глазами клиента");
+    expect(groupSeverity([alert(), alert({ severity: AlertSeverity.CRITICAL }), alert({ severity: AlertSeverity.INFO })])).toBe(AlertSeverity.CRITICAL);
+  });
+
+  it("joins the closed episodes of one event: the same kind and title opened within a minute, across nodes and ports", () => {
+    const closed = (id: string, nodeName: string, opened: number, over: Partial<Alert> = {}) =>
+      alert({ id, nodeId: `nod_${nodeName}`, nodeName, openedUnix: opened, resolvedAtUnix: opened + 360, resolution: "cleared", params: { profile: "MTProto · 443" }, ...over });
+    const blip = (id: string, nodeName: string, opened: number) => closed(id, nodeName, opened, { kind: AlertKind.HOST_BLIP, titleKey: "health.alert.host_blip.title", subject: "agent" });
+    const rows = [
+      closed("a", "sg1", 5033),
+      closed("b", "nl1", 5021),
+      closed("c", "fi1", 5009),
+      blip("d", "fi1", 5000), // another kind in the same minute: its own row
+      closed("e", "de1", 5000),
+      closed("f", "de1", 4000), // the same check an hour earlier: another event
+      alert({ id: "g", kind: AlertKind.DOCTOR_WARN, subject: "disk_space", titleKey: "health.alert.doctor_warn.title", openedUnix: 3990 }),
+      alert({ id: "h", kind: AlertKind.DOCTOR_WARN, subject: "time_sync", titleKey: "health.alert.doctor_warn.title", openedUnix: 3990 }), // another check
+    ];
+    expect(groupHistory(rows).map((g) => g.map((a) => a.id))).toEqual([["a", "b", "c", "e"], ["d"], ["f"], ["g"], ["h"]]);
+  });
+
+  it("reads the networks of a country alert, by operator, and cuts a long list in the sentence", () => {
+    const list = "Beeline (AS8402, Moscow, cheburcheck), MTS (AS8359, Kazan, bsbord), MTS (AS8359, Moscow), Rostelecom (AS12389, Moscow), Tele2, MTS (AS8359, Novosibirsk)";
+    const nets = alertNetworks(list);
+    expect(nets).toEqual([
+      { name: "Beeline", asn: "8402", region: "Moscow", source: "cheburcheck" },
+      { name: "MTS", asn: "8359", region: "Kazan", source: "bsbord" },
+      { name: "MTS", asn: "8359", region: "Moscow", source: "globalping" },
+      { name: "Rostelecom", asn: "12389", region: "Moscow", source: "globalping" },
+      { name: "Tele2", asn: "", region: "", source: "globalping" },
+      { name: "MTS", asn: "8359", region: "Novosibirsk", source: "globalping" },
+    ]);
+    expect(networksByOperator(nets).map((o) => [o.name, o.n])).toEqual([["MTS", 3], ["Beeline", 1], ["Rostelecom", 1], ["Tele2", 1]]);
+    expect(networksShort(tPlural, list)).toBe("MTS, Beeline, Rostelecom and 1 more");
+    expect(networksShort(tRuPlural, list)).toBe("MTS, Beeline, Rostelecom и ещё 1");
+    // a short list stays as the server wrote it
+    expect(networksShort(tPlural, "MTS (AS8359, Novosibirsk), Tele2")).toBe("MTS (AS8359, Novosibirsk), Tele2");
+    const a = alert({ kind: AlertKind.COUNTRY_BLOCKED, subject: "partial", titleKey: "health.alert.country_blocked.title", whyKey: "health.alert.country_blocked.why.partial", params: { country: "RU", networks: list } });
+    expect(alertWhy(tPlural, fmt, a)).toMatch(/^Home or mobile probes on MTS, Beeline, Rostelecom and 1 more get no answer/);
+    expect(groupFact(tPlural, [a])).toBe("6 networks");
+  });
+
+  it("keeps a region with brackets or commas whole, and a network cut off at the end of the list", () => {
+    const list =
+      "MTS (AS30881, Республика Саха (Якутия), cheburcheck), MTS, Rostelecom (AS12389, Республика Саха (Якутия), cheburcheck), " +
+      "Svyaz (AS1, Moscow, Zelenograd, bsbord), A (B) (AS2, X (Y, Z)), ER-Telecom Holding";
+    expect(alertNetworks(list)).toEqual([
+      { name: "MTS", asn: "30881", region: "Республика Саха (Якутия)", source: "cheburcheck" },
+      { name: "MTS", asn: "", region: "", source: "globalping" }, // a full alert names Globalping's networks without details
+      { name: "Rostelecom", asn: "12389", region: "Республика Саха (Якутия)", source: "cheburcheck" },
+      { name: "Svyaz", asn: "1", region: "Moscow, Zelenograd", source: "bsbord" },
+      { name: "A (B)", asn: "2", region: "X (Y, Z)", source: "globalping" },
+      { name: "ER-Telecom Holding", asn: "", region: "", source: "globalping" },
+    ]);
+    // a long list cut short: the whole details stay, the half one goes, and its source is not guessed
+    expect(alertNetworks("Beeline (AS8402, Moscow), MTS (AS8359, Республика Саха (Яку…")).toEqual([
+      { name: "Beeline", asn: "8402", region: "Moscow", source: "globalping" },
+      { name: "MTS", asn: "8359", region: "", source: "" },
+    ]);
+    expect(alertNetworks("Beeline (AS8402, Moscow, cheburcheck), MTS (AS83")).toEqual([
+      { name: "Beeline", asn: "8402", region: "Moscow", source: "cheburcheck" },
+      { name: "MTS", asn: "", region: "", source: "" },
+    ]);
+    expect(alertNetworks("Beeline (AS8402, Moscow, cheburcheck), Rostel…")).toEqual([
+      { name: "Beeline", asn: "8402", region: "Moscow", source: "cheburcheck" },
+      { name: "Rostel…", asn: "", region: "", source: "" },
+    ]);
+    expect(alertNetworks("Beeline (AS8402, Moscow, cheburcheck), …").map((n) => n.name)).toEqual(["Beeline"]);
+    expect(alertNetworks("")).toEqual([]);
+  });
+
+  it("groups the networks by operator: AS numbers once, regions by source, a source named only where it says something", () => {
+    const cc = (op: string, asn: number, region: string) => `${op} (AS${asn}, ${region}, cheburcheck)`;
+    const list = [
+      cc("Rostelecom", 12389, "Пермский край"), cc("Rostelecom", 12389, "Республика Саха (Якутия)"), cc("Rostelecom", 42610, "Москва"), cc("Rostelecom", 12389, "Кировская область"),
+      cc("MTS", 8359, "Кировская область"), cc("MTS", 30881, "Республика Саха (Якутия)"), "MTS (AS8359, Москва, bsbord)", "MTS",
+      cc("TTK", 15774, "Республика Саха (Якутия)"), "Miranda (Крым, bsbord)", "ER-Telecom Holding", cc("Ufanet", 24955, "Республика Башкортостан"),
+    ].join(", ");
+    const nets = alertNetworks(list);
+    expect(networkSources(nets)).toEqual([{ value: "cheburcheck", n: 8 }, { value: "globalping", n: 2 }, { value: "bsbord", n: 2 }]);
+    const ops = networksByOperator(nets, "ru");
+    expect(ops.map((o) => o.name)).toEqual(["MTS", "Rostelecom", "ER-Telecom Holding", "Miranda", "TTK", "Ufanet"]);
+    expect(ops[0]).toEqual({
+      name: "MTS",
+      n: 4,
+      asns: ["8359", "30881"],
+      groups: [
+        { source: "cheburcheck", regions: ["Кировская область", "Республика Саха (Якутия)"], marked: true },
+        { source: "globalping", regions: [], marked: true },
+        { source: "bsbord", regions: ["Москва"], marked: true },
+      ],
+    });
+    // one source, the list's main one: nothing to say; regions in the alphabet of the page, each once
+    expect(ops[1]).toEqual({
+      name: "Rostelecom",
+      n: 4,
+      asns: ["12389", "42610"],
+      groups: [{ source: "cheburcheck", regions: ["Кировская область", "Москва", "Пермский край", "Республика Саха (Якутия)"], marked: false }],
+    });
+    // one source that is not the main one: named; a network without details has no region to show
+    expect(ops[2]!.groups).toEqual([{ source: "globalping", regions: [], marked: true }]);
+    expect(ops[3]!.groups).toEqual([{ source: "bsbord", regions: ["Крым"], marked: true }]);
+    expect(ops[4]!.groups).toEqual([{ source: "cheburcheck", regions: ["Республика Саха (Якутия)"], marked: false }]);
+    // the sentence names operators, never a region, and counts the networks it leaves out
+    expect(networksShort(tPlural, list)).toBe("MTS, Rostelecom, ER-Telecom Holding and 3 more");
+  });
+
+  it("says whose probes got nothing when the sources disagree, never Globalping alone", () => {
+    const conflict = (networks: string, sources: string, verdict = "blocked") =>
+      alert({
+        kind: AlertKind.COUNTRY_BLOCKED,
+        titleKey: "health.alert.country_blocked.title",
+        whyKey: `health.alert.country_blocked.why.${verdict}`,
+        params: { country: "RU", verdict, confidence: "conflict", sources, networks, ports: verdict === "tcp_blocked" ? "443" : "" },
+      });
+    const nets = "Beeline (AS8402, Moscow, cheburcheck), MTS, Miranda (Крым, bsbord), Rostelecom (AS12389, Kirov, cheburcheck), Tele2 (AS15378, Omsk, cheburcheck)";
+    expect(alertWhy(tPlural, fmt, conflict(nets, "globalping,tspu,cheburcheck,bsbord"))).toMatch(
+      /^The sources disagree: the probes of cheburcheck, Globalping, and bsbord inside Russia \(Beeline, Miranda, MTS and 2 more\) cannot reach the node at all/,
+    );
+    expect(alertWhy(tRuPlural, fmtRu, conflict(nets, "globalping,tspu,cheburcheck,bsbord"))).toMatch(/^Источники расходятся: зонды cheburcheck, Globalping и bsbord внутри России/);
+    // Persian: each name its own isolate, so the list reads right to left with its "و"
+    const tFa = Object.assign((key: keyof typeof en, vars?: Record<string, string | number>) => fill(dictionaries.fa[key], vars, true), { n: () => "" }) as unknown as T;
+    const fmtFa = makeFmt("fa", tFa);
+    expect(alertWhy(tFa, fmtFa, conflict(nets, "globalping,tspu,cheburcheck,bsbord"))).toMatch(/⁨⁨cheburcheck⁩\S*\s⁨Globalping⁩\S*\sو ⁨bsbord⁩⁩/);
+    // no networks to read the sources from: the alert's live sources but the TSPU probe
+    expect(alertWhy(tPlural, fmt, conflict("", "globalping,tspu", "tcp_blocked"))).toMatch(/^The sources disagree: the probes of Globalping inside Russia \(\) find TCP to port 443 cut/);
   });
 });

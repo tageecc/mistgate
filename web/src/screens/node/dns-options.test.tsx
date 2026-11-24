@@ -34,12 +34,12 @@ afterEach(() => {
   for (const m of [listDnsPresets, listNodeDnsOptions, setNodeDnsOptions, me]) m.mockReset();
 });
 
-const preset = (id: string, name: string) => ({ id, name, servers: [], split: [], splitDirect: false, isDefault: false });
+const preset = (id: string, name: string, blockAds = false) => ({ id, name, servers: [], split: [], splitDirect: false, isDefault: false, blockAds });
 const presets = [preset("dns_a", "Preset A"), preset("dns_b", "Preset B"), preset("dns_c", "Preset C")];
 
-async function mount(role: number, offered: { presetIds: string[]; defaultPresetId: string } | null = { presetIds: ["dns_b"], defaultPresetId: "" }) {
+async function mount(role: number, offered: { presetIds: string[]; defaultPresetId: string } | null = { presetIds: ["dns_b"], defaultPresetId: "" }, list = presets) {
   me.mockResolvedValue({ admin: { id: "adm_1", role } });
-  listDnsPresets.mockResolvedValue({ presets, providers: [], clientSupport: [] });
+  listDnsPresets.mockResolvedValue({ presets: list, providers: [], clientSupport: [] });
   listNodeDnsOptions.mockResolvedValue({
     nodes: [{ nodeId: "nod_2", presetIds: ["dns_c"], defaultPresetId: "dns_c" }, ...(offered ? [{ nodeId: "nod_1", ...offered }] : [])],
   });
@@ -62,13 +62,15 @@ async function mount(role: number, offered: { presetIds: string[]; defaultPreset
 const settle = () => act(async () => void (await new Promise((r) => setTimeout(r, 0))));
 const text = () => document.body.textContent ?? "";
 const button = (label: string) => [...document.querySelectorAll("button")].find((b) => b.textContent?.trim() === label);
-const input = (aria: string) => document.querySelector<HTMLInputElement>(`input[aria-label="${aria}"]`);
+const input = (aria: string) => document.querySelector<HTMLElement>(`[aria-label="${aria}"]`);
+const checked = (el: Element | null | undefined) => el?.getAttribute("aria-checked") === "true";
+const locked = (el: Element | null | undefined) => !!el && (el.hasAttribute("disabled") || el.hasAttribute("data-disabled") || el.getAttribute("aria-disabled") === "true");
 const labelled = (aria: string) => document.querySelector<HTMLElement>(`[aria-label="${aria}"]`);
 const click = async (el: Element | null | undefined) => {
   await act(async () => void el?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
   for (let i = 0; i < 3; i++) await settle();
 };
-const order = () => [...document.querySelectorAll<HTMLInputElement>("input[type=checkbox]")].filter((c) => c.checked).map((c) => c.getAttribute("aria-label"));
+const order = () => [...document.querySelectorAll<HTMLElement>("[role=switch]")].filter((c) => checked(c)).map((c) => c.getAttribute("aria-label"));
 
 describe("DNS choice on the user page (node)", () => {
   it("says what it is not and warns that only AmneziaWG keys get a DNS per node", async () => {
@@ -76,6 +78,15 @@ describe("DNS choice on the user page (node)", () => {
     expect(text()).toContain("DNS choice on the user page");
     expect(text()).toContain(en["subs.dnsOpt.note"]);
     expect(text()).toContain("Happ, the Mihomo apps, Xray JSON and sing-box have one DNS for all nodes: offer it in Subscriptions → User page. Per node it works only for AmneziaWG keys.");
+  });
+
+  it("says that AmneziaWG keys do not block ads once a preset does", async () => {
+    await mount(1);
+    expect(text()).not.toContain(en["subs.dns.awgNoBlock"]);
+    act(() => root?.unmount());
+    host?.remove();
+    await mount(1, undefined, [...presets, preset("dns_builtin_ads_device", "Без рекламы на устройстве", true)]);
+    expect(text()).toContain("AmneziaWG keys take only the resolvers: ads are not blocked there.");
   });
 
   it("sends the offered presets in the owner's order and the default, and reads only its own node", async () => {
@@ -93,7 +104,7 @@ describe("DNS choice on the user page (node)", () => {
 
   it("drops the default when its preset is no longer offered, and an empty list is a valid save", async () => {
     await mount(1, { presetIds: ["dns_b"], defaultPresetId: "dns_b" });
-    expect(input("Default: Preset B")?.checked).toBe(true);
+    expect(checked(input("Default: Preset B"))).toBe(true);
     await click(input("Offer Preset B"));
     expect(text()).toContain(en["subs.dnsOpt.nothing"]);
     await click(button("Save"));
@@ -111,8 +122,8 @@ describe("DNS choice on the user page (node)", () => {
     expect(text()).toContain(en["subs.dnsOpt.ownerOnly"]);
     expect(button("Save")).toBeUndefined();
     expect(labelled("Move Preset B up")).toBeNull();
-    expect(input("Offer Preset A")?.disabled).toBe(true);
-    expect(input("Default: Preset B")?.disabled).toBe(true);
+    expect(locked(input("Offer Preset A"))).toBe(true);
+    expect(locked(input("Default: Preset B"))).toBe(true);
     expect(text()).toContain("Happ, the Mihomo apps, Xray JSON and sing-box have one DNS for all nodes"); // still shown
   });
 });

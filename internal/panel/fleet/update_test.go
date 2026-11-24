@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -14,20 +15,34 @@ import (
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
 	agentv1 "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
 	"github.com/mistgate/mistgate/gen/mistgate/agent/v1/agentv1connect"
+	"github.com/mistgate/mistgate/internal/agentcap"
 )
 
 // fakeUpdates is the updates module as the stream sees it.
 type fakeUpdates struct {
-	mu       sync.Mutex
-	updating map[string]bool
-	served   []string // "node/name@offset"
-	recorded []fakeRecordedAnswer
-	data     []byte
-	err      error
-	binary   map[string]string // "linux/amd64" -> path of the trusted bundle's file
-	assetURL string
-	assetErr error
-	assets   []fakeLinkAssetRequest
+	mu                                sync.Mutex
+	updating                          map[string]bool
+	served                            []string // "node/name@offset"
+	recorded                          []fakeRecordedAnswer
+	data                              []byte
+	err                               error
+	binary                            map[string]string // "linux/amd64" -> path of the trusted bundle's file
+	networkTableName, networkTableSHA string
+	assetURL                          string
+	assetErr                          error
+	assets                            []fakeLinkAssetRequest
+}
+
+func (u *fakeUpdates) NetworkTableFile() (name, sha256 string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.networkTableName, u.networkTableSHA
+}
+
+func (u *fakeUpdates) setNetworkTable(name, sha256 string) {
+	u.mu.Lock()
+	u.networkTableName, u.networkTableSHA = name, sha256
+	u.mu.Unlock()
 }
 
 type fakeLinkAssetRequest struct{ nodeID, name, token string }
@@ -49,10 +64,19 @@ func (u *fakeUpdates) Updating(id string) bool {
 	return u.updating[id]
 }
 
+func (u *fakeUpdates) ServeWithWriteDeadline(ctx context.Context, nodeID, name string, offset uint64,
+	_ func(time.Time) error, send func(chunk []byte, total uint64) error) error {
+	return u.Serve(ctx, nodeID, name, offset, send)
+}
+
 func (u *fakeUpdates) RecordAnswer(_ context.Context, nodeID, requestID string, result *agentv1.CommandResult) error {
 	u.mu.Lock()
 	u.recorded = append(u.recorded, fakeRecordedAnswer{nodeID: nodeID, requestID: requestID, result: result})
 	u.mu.Unlock()
+	return nil
+}
+
+func (u *fakeUpdates) RecordProgress(context.Context, string, *agentv1.UpdateProgress) error {
 	return nil
 }
 
@@ -113,6 +137,40 @@ func connectUpdater(a *agent, instance string, built int64, caps ...string) *con
 	return c
 }
 
+func TestUpdateSourcesAreSentOnlyToCapableAgents(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		capability bool
+	}{
+		{name: "older agent"},
+		{name: "source capable agent", capability: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			a := e.enroll("de1")
+			caps := []string{"update/1"}
+			if tc.capability {
+				caps = append(caps, agentcap.UpdateSources)
+			}
+			c := connectUpdater(a, "inst1", 1_790_000_000, caps...)
+			defer func() { c.st.CloseRequest(); c.ended() }()
+
+			frame := updateAgentFrame("req_test", nil, nil, 0)
+			frame.GetUpdateAgent().Sources = []string{"panel", "github"}
+			if _, err := e.f.readyForRequest(e.ctx, a.nodeID, frame, nil); err != nil {
+				t.Fatal(err)
+			}
+			got := frame.GetUpdateAgent().GetSources()
+			if tc.capability && !slices.Equal(got, []string{"panel", "github"}) {
+				t.Fatalf("source-capable agent sources = %v", got)
+			}
+			if !tc.capability && len(got) != 0 {
+				t.Fatalf("older agent received sources %v", got)
+			}
+		})
+	}
+}
+
 // Hello.built, the capabilities and Hello.last_update end up on the node row (what an offline node keeps showing).
 func TestHelloCarriesTheBuildAndTheLastUpdate(t *testing.T) {
 	e := newEnv(t)
@@ -167,7 +225,7 @@ func TestCommandsAreOfflineAfterPanelRestartWithFreshLiveRow(t *testing.T) {
 			t.Errorf("%s after restart = %v, want an offline precondition", name, err)
 		}
 	}
-	_, err = e.f.UpdateAgent(e.ctx, a.nodeID, nil, nil, time.Millisecond)
+	_, err = e.f.UpdateAgent(e.ctx, a.nodeID, nil, nil, time.Millisecond, 0)
 	checkOffline("UpdateAgent", err)
 	_, err = e.f.RunDoctor(e.ctx, a.nodeID, nil, time.Millisecond)
 	checkOffline("RunDoctor", err)
@@ -223,11 +281,11 @@ func TestUpdateAgentAnswerSurvivesTheStreamEnding(t *testing.T) {
 	}
 	done := make(chan out, 1)
 	go func() {
-		res, err := e.f.UpdateAgent(e.ctx, a.nodeID, []byte("manifest-bytes"), []byte("signature-bytes"), 10*time.Second)
+		res, err := e.f.UpdateAgent(e.ctx, a.nodeID, []byte("manifest-bytes"), []byte("signature-bytes"), 10*time.Second, 90*time.Minute)
 		done <- out{res, err}
 	}()
 	msg := c.wait(func(m *agentv1.ConnectResponse) bool { return m.GetUpdateAgent() != nil }).GetUpdateAgent()
-	if msg.RequestId == "" || !bytes.Equal(msg.Manifest, []byte("manifest-bytes")) || !bytes.Equal(msg.Signature, []byte("signature-bytes")) {
+	if msg.RequestId == "" || !bytes.Equal(msg.Manifest, []byte("manifest-bytes")) || !bytes.Equal(msg.Signature, []byte("signature-bytes")) || msg.DownloadTimeoutSeconds != 5400 {
 		t.Fatalf("UpdateAgent: %+v", msg)
 	}
 	c.send(0, &agentv1.ConnectRequest{Message: &agentv1.ConnectRequest_CommandResult{CommandResult: &agentv1.CommandResult{
@@ -265,14 +323,14 @@ func TestUpdateCommandsNeedTheCapability(t *testing.T) {
 	e := newEnv(t)
 	a := e.enroll("nodea")
 	e.fixture(a.nodeID)
-	_, err := e.f.UpdateAgent(e.ctx, a.nodeID, []byte("m"), []byte("s"), time.Second)
+	_, err := e.f.UpdateAgent(e.ctx, a.nodeID, []byte("m"), []byte("s"), time.Second, 0)
 	if connect.CodeOf(err) != connect.CodeFailedPrecondition || !strings.Contains(err.Error(), "offline") {
 		t.Fatalf("offline: %v", err)
 	}
 	c := connectUpdater(a, "inst1", 100, "doctor/1") // no update/1
 	for name, call := range map[string]func() error{
 		"UpdateAgent": func() error {
-			_, err := e.f.UpdateAgent(e.ctx, a.nodeID, []byte("m"), []byte("s"), time.Second)
+			_, err := e.f.UpdateAgent(e.ctx, a.nodeID, []byte("m"), []byte("s"), time.Second, 0)
 			return err
 		},
 		"RollbackAgent": func() error { _, err := e.f.RollbackAgent(e.ctx, a.nodeID, time.Second); return err },

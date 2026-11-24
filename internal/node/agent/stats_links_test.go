@@ -82,6 +82,131 @@ func TestBuildBatchLinkCounterWindow(t *testing.T) {
 	}
 }
 
+// links/3: the TCP stalls are events (the next batch), the handshake failures and the AmneziaWG handshake counts are volume
+// (held to the 10-minute boundary with hellos and accepted, so their ratios hold within one bucket).
+func TestBuildBatchLinkCountersV3(t *testing.T) {
+	h := newHarness(t, harnessOpts{noStart: true})
+	h.a.statsEvery = 10 * time.Second
+	h.a.linkWindow = 10 * time.Minute
+	start := time.Date(2026, 11, 7, 12, 9, 40, 0, time.UTC)
+	collect := func(from, to time.Time, c engine.Collected) *pb.StatsBatch {
+		t.Helper()
+		h.eng.mu.Lock()
+		h.eng.collectQueue = append(h.eng.collectQueue, c)
+		h.eng.mu.Unlock()
+		return h.a.buildBatch(context.Background(), from, to)
+	}
+	first := collect(start, start.Add(10*time.Second), engine.Collected{Links: []plugin.LinkStat{
+		{CredID: "crd_v", InboundID: "inb_v", Connects: 1, TCPStalls: 2, TCPStalls16K: 1},
+		{InboundID: "inb_v", Hellos: 5, HellosForeign: 1, RealityFallback: 2, AuthFailed: 1, HsUnfinished: 1},
+		{InboundID: "inb_h", TLSAlertsSent: 1, TLSAlertsRecv: 2, TLSCertRefused: 2, HsUnfinished: 3},
+		{CredID: "crd_w", InboundID: "inb_w", Initiations: 3, Responses: 3, ResponsesUnmatched: 2},
+	}})
+	if len(first.Links) != 1 || !sameLinkCounters(first.Links[0], &pb.LinkCounters{CredId: "crd_v", InboundId: "inb_v", Connects: 1}) ||
+		first.Links[0].TcpStalls != 2 || first.Links[0].TcpStalls_16K != 1 {
+		t.Fatalf("the stalls leave at once, the rest waits for the boundary: %+v", first.Links)
+	}
+	boundary := collect(start.Add(10*time.Second), start.Add(20*time.Second), engine.Collected{Links: []plugin.LinkStat{
+		{CredID: "crd_w", InboundID: "inb_w", Initiations: 1, Responses: 1},
+	}})
+	rows := map[string]*pb.LinkCounters{}
+	for _, r := range boundary.Links {
+		rows[r.InboundId+"/"+r.CredId] = r
+	}
+	if r := rows["inb_v/"]; r == nil || r.Hellos != 5 || r.HellosForeign != 1 || r.RealityFallback != 2 || r.AuthFailed != 1 || r.HsUnfinished != 1 {
+		t.Fatalf("VLESS inbound row = %+v", r)
+	}
+	if r := rows["inb_h/"]; r == nil || r.TlsAlertsSent != 1 || r.TlsAlertsRecv != 2 || r.TlsCertRefused != 2 || r.HsUnfinished != 3 {
+		t.Fatalf("Hysteria2 inbound row = %+v", r)
+	}
+	if r := rows["inb_w/crd_w"]; r == nil || r.Initiations != 4 || r.Responses != 4 || r.ResponsesUnmatched != 2 {
+		t.Fatalf("AmneziaWG key row = %+v", r)
+	}
+	if len(boundary.Links) != 3 {
+		t.Fatalf("boundary rows = %+v", boundary.Links)
+	}
+}
+
+// vless-hello-kex/1: the hello counts of a key are event counters, sent in the next batch with the key's connects.
+func TestBuildBatchHelloKexCounters(t *testing.T) {
+	h := newHarness(t, harnessOpts{noStart: true})
+	h.a.statsEvery = 10 * time.Second
+	h.a.linkWindow = 10 * time.Minute
+	start := time.Date(2026, 11, 7, 12, 9, 40, 0, time.UTC)
+	collect := func(from, to time.Time, c engine.Collected) *pb.StatsBatch {
+		t.Helper()
+		h.eng.mu.Lock()
+		h.eng.collectQueue = append(h.eng.collectQueue, c)
+		h.eng.mu.Unlock()
+		return h.a.buildBatch(context.Background(), from, to)
+	}
+	first := collect(start, start.Add(10*time.Second), engine.Collected{Links: []plugin.LinkStat{
+		{CredID: "crd_a", InboundID: "inb_v", Connects: 1, HelloPQ: 2, HelloClassic: 1},
+		{CredID: "crd_a", InboundID: "inb_v", HelloPQ: 1, HelloUnknown: 4},
+	}})
+	if len(first.Links) != 1 {
+		t.Fatalf("rows = %+v", first.Links)
+	}
+	if r := first.Links[0]; r.CredId != "crd_a" || r.Connects != 1 || r.HelloPq != 3 || r.HelloClassic != 1 || r.HelloUnknown != 4 {
+		t.Fatalf("key row = %+v; want 1 connect, pq 3, classic 1, unknown 4", r)
+	}
+	if after := collect(start.Add(10*time.Second), start.Add(20*time.Second), engine.Collected{}); len(after.Links) != 0 {
+		t.Fatalf("the counts were sent twice: %+v", after.Links)
+	}
+}
+
+// trusttunnel-refusals/1: the refusals of an inbound are event counters on its own row, sent in the next batch, each reason in its field.
+func TestBuildBatchTunnelRefusals(t *testing.T) {
+	h := newHarness(t, harnessOpts{noStart: true})
+	h.a.statsEvery = 10 * time.Second
+	h.a.linkWindow = 10 * time.Minute
+	start := time.Date(2026, 11, 17, 12, 9, 40, 0, time.UTC)
+	collect := func(from, to time.Time, c engine.Collected) *pb.StatsBatch {
+		t.Helper()
+		h.eng.mu.Lock()
+		h.eng.collectQueue = append(h.eng.collectQueue, c)
+		h.eng.mu.Unlock()
+		return h.a.buildBatch(context.Background(), from, to)
+	}
+	var all, some plugin.TunnelRefusals
+	for i := range all {
+		all[i] = uint32(i + 1) // a different count for each reason, so a swapped field shows
+	}
+	some[plugin.RefusedNoIPv4] = 7
+	first := collect(start, start.Add(10*time.Second), engine.Collected{Links: []plugin.LinkStat{
+		{InboundID: "inb_t", Refusals: all}, {InboundID: "inb_t", Refusals: some},
+	}})
+	if len(first.Links) != 1 || first.Links[0].CredId != "" || first.Links[0].InboundId != "inb_t" {
+		t.Fatalf("rows = %+v, want the inbound's own row", first.Links)
+	}
+	r := first.Links[0]
+	got := []uint32{r.TunnelBlocked, r.TunnelNoIpv4, r.TunnelConnRefused, r.TunnelConnUnreachable, r.TunnelConnDns, r.TunnelConnOther,
+		r.TunnelTimeout, r.TunnelOtherDeadlines, r.TunnelOtherAuthority, r.TunnelOtherIcmp, r.TunnelOtherDial, r.TunnelStreamClosed,
+		r.TunnelStreamCredGone, r.TunnelStreamConnLimit}
+	if len(got) != plugin.TunnelRefusalKinds {
+		t.Fatalf("the test lists %d fields for %d reasons", len(got), plugin.TunnelRefusalKinds)
+	}
+	for i, n := range got {
+		want := uint32(i + 1)
+		if plugin.TunnelRefusal(i) == plugin.RefusedNoIPv4 {
+			want += 7
+		}
+		if n != want {
+			t.Fatalf("%s = %d, want %d (row %+v)", plugin.TunnelRefusal(i).Name(), n, want, r)
+		}
+	}
+	if after := collect(start.Add(10*time.Second), start.Add(20*time.Second), engine.Collected{}); len(after.Links) != 0 {
+		t.Fatalf("the counts were sent twice: %+v", after.Links)
+	}
+}
+
+func TestCapabilitiesAdvertiseLinkCountersV3(t *testing.T) {
+	h := newHarness(t, harnessOpts{noStart: true})
+	if !contains(h.a.capabilities(), "links/3") {
+		t.Fatalf("capabilities = %v, want links/3", h.a.capabilities())
+	}
+}
+
 func TestCapabilitiesAdvertiseLinkCountersV2(t *testing.T) {
 	h := newHarness(t, harnessOpts{noStart: true})
 	if !contains(h.a.capabilities(), "links/2") {
@@ -96,4 +221,25 @@ func sameLinkCounters(a, b *pb.LinkCounters) bool {
 		a.Hellos == b.Hellos && a.Handshakes == b.Handshakes && a.ClientCloses == b.ClientCloses && a.Freezes == b.Freezes &&
 		a.Quiet == b.Quiet && a.Accepted == b.Accepted && a.HellosForeign == b.HellosForeign && a.RttMsSum == b.RttMsSum &&
 		a.RttSamples == b.RttSamples && a.PktsSent == b.PktsSent && a.PktsLost == b.PktsLost
+}
+
+// Every batch carries the host's resource fields and the agent's own process: the panel tells an agent that sends them from one
+// that predates them by HostMetrics.agent being there.
+func TestBuildBatchCarriesResources(t *testing.T) {
+	h := newHarness(t, harnessOpts{noStart: true})
+	at := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	b := h.a.buildBatch(context.Background(), at, at.Add(10*time.Second))
+	m := b.GetHost()
+	if m == nil || m.StealPct != 2 || m.IowaitPct != 1 || m.SwapUsedBytes != 10 || m.SwapTotalBytes != 20 || m.ConntrackCount != 30 || m.ConntrackMax != 40 ||
+		m.TcpSockets != 5 || m.UdpSockets != 6 || m.NicSpeedMbps != 1000 {
+		t.Fatalf("host metrics = %+v", m)
+	}
+	p := m.GetAgent()
+	if p == nil {
+		t.Fatal("no agent process in the batch")
+	}
+	// The Go runtime's counters are read on every OS; /proc only on Linux.
+	if p.Goroutines == 0 || p.GoTotalBytes == 0 || p.GoHeapBytes == 0 {
+		t.Errorf("agent process = %+v", p)
+	}
 }

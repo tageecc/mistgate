@@ -6,6 +6,8 @@ import { BackupService } from "@/gen/mistgate/admin/v1/backup_pb";
 import { BlocklistService } from "@/gen/mistgate/admin/v1/blocklist_pb";
 import { BsbordService } from "@/gen/mistgate/admin/v1/bsbord_pb";
 import { CheburcheckService } from "@/gen/mistgate/admin/v1/cheburcheck_pb";
+import { ClientApiService } from "@/gen/mistgate/admin/v1/client_api_pb";
+import { ClientCompatService } from "@/gen/mistgate/admin/v1/client_compat_pb";
 import { ClientProbeService } from "@/gen/mistgate/admin/v1/client_probe_pb";
 import { CountryReachabilityService } from "@/gen/mistgate/admin/v1/country_reachability_pb";
 import { AwgService } from "@/gen/mistgate/admin/v1/awg_pb";
@@ -16,6 +18,7 @@ import { GlobalpingService } from "@/gen/mistgate/admin/v1/globalping_pb";
 import { GroupService } from "@/gen/mistgate/admin/v1/group_pb";
 import { HealthService } from "@/gen/mistgate/admin/v1/health_pb";
 import { InstanceService } from "@/gen/mistgate/admin/v1/instance_pb";
+import { AssistantService } from "@/gen/mistgate/admin/v1/assistant_pb";
 import { ApiTokenService, ApprovalService } from "@/gen/mistgate/admin/v1/integrations_pb";
 import { NodeService } from "@/gen/mistgate/admin/v1/node_pb";
 import { ProfileService } from "@/gen/mistgate/admin/v1/profile_pb";
@@ -23,12 +26,20 @@ import { ProvisioningService } from "@/gen/mistgate/admin/v1/provisioning_pb";
 import { RelayService } from "@/gen/mistgate/admin/v1/relay_pb";
 import { SubscriptionService } from "@/gen/mistgate/admin/v1/subscription_pb";
 import { TelegramService } from "@/gen/mistgate/admin/v1/telegram_pb";
+import { DecoySiteService } from "@/gen/mistgate/decoysite/v1/decoysite_pb";
+import { TrustTunnelService } from "@/gen/mistgate/trusttunnel/v1/trusttunnel_pb";
 import { TspuProbeService } from "@/gen/mistgate/admin/v1/tspu_probe_pb";
 import { UpdateService } from "@/gen/mistgate/admin/v1/update_pb";
 import { UserService } from "@/gen/mistgate/admin/v1/user_pb";
 import { WarpService } from "@/gen/mistgate/admin/v1/warp_pb";
+import { OpsService } from "@/gen/mistgate/ops/v1/ops_pb";
+import { OwnProbeService } from "@/gen/mistgate/ownprobe/v1/own_probe_pb";
+import { ProbeService } from "@/gen/mistgate/probe/v1/probe_pb";
+import { TasksService } from "@/gen/mistgate/tasks/v1/tasks_pb";
+import { WarpReachService } from "@/gen/mistgate/warpreach/v1/warpreach_pb";
 import type { MessageKey } from "@/i18n/en";
 import { versionInterceptor } from "./stale";
+import type { QrBits } from "./qr-path";
 
 // The panel rewrites <base href> to the admin prefix (e.g. "/4hbx.../");
 // everything below derives from document.baseURI, nothing is hard-coded.
@@ -59,15 +70,34 @@ export const awg = createClient(AwgService, transport);
 export const warp = createClient(WarpService, transport);
 export const apiTokens = createClient(ApiTokenService, transport);
 export const approvals = createClient(ApprovalService, transport);
+export const assistant = createClient(AssistantService, transport);
 export const telegram = createClient(TelegramService, transport);
+// The tt:// keys of the official TrustTunnel apps (a package of its own: the Cloudflare edition answers unavailable_in_edition).
+export const trustTunnel = createClient(TrustTunnelService, transport);
+// The library of decoy sites (a package of its own: the Cloudflare edition keeps none and answers unavailable_in_edition: feature=decoy_own).
+export const decoySites = createClient(DecoySiteService, transport);
 export const globalping = createClient(GlobalpingService, transport);
 export const countryReach = createClient(CountryReachabilityService, transport);
 export const blocklist = createClient(BlocklistService, transport);
 // TestTspuProbe runs for minutes: no call here sets a deadline (timeoutMs), and the transport has none of its own.
 export const tspuProbe = createClient(TspuProbeService, transport);
 export const clientProbe = createClient(ClientProbeService, transport);
+// The owner's own probes (routers and servers in a country that check the nodes); a package of its own, the edge edition has none.
+export const ownProbe = createClient(OwnProbeService, transport);
+// The owner's switch for the Mistgate desktop app's direct connection (client_api.proto); both editions.
+export const clientApi = createClient(ClientApiService, transport);
+// Which apps and versions send a post-quantum key share in the REALITY handshake, and the devices that do not (client_compat.proto).
+export const clientCompat = createClient(ClientCompatService, transport);
 export const cheburcheck = createClient(CheburcheckService, transport);
 export const bsbord = createClient(BsbordService, transport);
+// The panel's own logs, retention, export and metrics settings (the VPS edition; the edge answers UNIMPLEMENTED).
+export const ops = createClient(OpsService, transport);
+// The probes between the owner's own nodes (the VPS edition; the edge answers UNIMPLEMENTED): the node page uses the channel measure of it.
+export const probe = createClient(ProbeService, transport);
+// The owner's scheduled tasks (the VPS edition; the edge answers UNIMPLEMENTED).
+export const tasks = createClient(TasksService, transport);
+// The sites each node's WARP is checked against (a package of its own, owner only: the Cloudflare edition answers unavailable_in_edition: feature=health_checks).
+export const warpReach = createClient(WarpReachService, transport);
 // CheckRelay and switching a relay on wait for probes and for the entry to install the forward (up to ~40 s): no deadline here either.
 export const relays = createClient(RelayService, transport);
 
@@ -77,6 +107,8 @@ export type RecoveryLoginResult = {
   password: string;
   totpUri: string;
   totpSecret: string;
+  /** The code of the new secret, drawn by the card (the route is plain JSON: the bits come as base64). */
+  totpQr?: QrBits;
   created: boolean;
   sessionsEnded: number;
 };
@@ -96,7 +128,14 @@ export async function recoverLogin(recoveryToken: string, login: string): Promis
     error.code = typeof body.code === "string" ? body.code : "unknown"; // no code at all means the request never got an answer
     throw error;
   }
-  return body as RecoveryLoginResult;
+  const q = body.totpQr as { n?: unknown; bits?: unknown; window?: unknown } | undefined;
+  let totpQr: QrBits | undefined;
+  try {
+    if (q && typeof q.bits === "string") totpQr = { n: q.n as number, bits: Uint8Array.from(atob(q.bits), (c) => c.charCodeAt(0)), window: q.window as number };
+  } catch {
+    // not base64: no code, the secret is still shown
+  }
+  return { ...(body as Omit<RecoveryLoginResult, "totpQr">), totpQr };
 }
 
 /** URL of a file next to the admin UI (respects the secret prefix), e.g. assetUrl("brand/logo.svg"). */

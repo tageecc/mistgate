@@ -28,8 +28,13 @@ Mistgate 没有自有客户端。用户使用现有应用连接，面板会向�
 | v2rayNG、v2rayN 和其他基于 Xray 内核的应用 | 链接列表（base64），或按你设置的规则提供 Xray JSON | Hysteria2 和 VLESS 服务器。在链接列表中，应用能否读取 `hysteria2://` 和 `vless://`（REALITY、XHTTP）链接取决于其版本。在 Xray JSON 中，每台服务器一份配置；不含 AmneziaWG，也不含使用 Gecko 的 Hysteria2。 |
 | sing-box 应用（SFA、SFI、SFM） | sing-box JSON：它们的 User-Agent 以 `SFA (sing-box …`、`SFI (sing-box …` 或 `SFM (sing-box …` 开头，由默认规则 `sing-box` 匹配 | 一个选择器，包含 Hysteria2（Let's Encrypt，不含 Gecko）和 VLESS（TCP 或 WebSocket）服务器，并带有用户的 DNS。参见 [sing-box](#sing-box)。 |
 | AmneziaVPN、AmneziaWG 应用 | 不使用订阅：每台设备从用户页面获取一个密钥（`vpn://`、`.conf` 文件或二维码） | 仅 AmneziaWG。 |
+| Telegram | 不使用订阅：从用户页面或管理后台获取 `tg://proxy` 链接 | 仅 MTProto 服务器，每位用户一个密钥。参见 [Telegram](#telegram)。 |
 
 只有在用户开启 AmneziaVPN 连接方式（在用户卡片或分组中的**订阅中的应用**设置），且用户所在分组有部署到节点的 AmneziaWG 协议配置时，基于 mihomo 内核的应用才会收到 AmneziaWG 服务器。此类应用首次获取订阅时，会为它的设备发放 AmneziaWG 密钥。内核版本需要足够新：面板会在每个密钥旁标出 AmneziaWG 3.1 所需的 Mihomo 1.19.30 或更新版本，以及 2.0 所需的 1.19.14 或更新版本（参见[AmneziaWG](amneziawg.md)）。
+
+**TrustTunnel。** [TrustTunnel 协议配置](trusttunnel.md)由**官方 TrustTunnel 应用**（iOS、Android、Windows、macOS、Linux 和路由器；列表见 <https://github.com/TrustTunnel/TrustTunnel> 的 Clients 一节）和 Mistgate 应用读取。官方应用不读取订阅：用户每个服务器得到一条 `tt://` 链接或一个二维码，在应用中打开即可。链接来自用户页面的 **TrustTunnel** 区块和管理后台中该用户的卡片，不会来自订阅。`tt://` 链接始终是 HTTP/2，并且要求服务器带有公共证书。
+
+这些应用不在**订阅 → 用户页面**的应用列表中。用户只需开启 **TrustTunnel** 开关（[用户与分组](users-and-groups.md#trusttunnel)）。该协议是实验性的。
 
 ## 哪些应用会发送设备 ID
 
@@ -71,6 +76,12 @@ Xray JSON 只会按规则（**订阅 → 下发规则**）提供给应用。v2ra
 - Happ 自己的文档没有说明 `happ://add/`。其他面板的订阅页面使用此格式，Mistgate 默认也采用这种格式。如果手机上点击按钮没有反应，用户可以复制链接。
 - 暂不在选择器中提供以下应用，因为它们的链接方案无法确认：Streisand 和 Shadowrocket（将模板留空，让用户粘贴链接）。
 - 多种 Clash 应用都会注册 `clash://` 方案，因此系统可能会打开其他应用。使用上表中的应用专属方案。
+
+## Telegram
+
+Telegram 应用是 [MTProto 协议配置](mtproto.md)的客户端，也是唯一使用它的应用。它不读取订阅：每台服务器对应用户的一条 `tg://proxy` 链接，Telegram 会提示将其添加为代理。这些链接来自用户页面上的 **Telegram 代理**区块（[用户页面](user-page.md#telegram-代理)），以及管理后台中该用户的同名区块。它们绝不会写入订阅，所以 Happ、kl!ck 和其他应用都看不到它们。
+
+Telegram 应用不在**订阅 → 用户页面**的应用列表中：没有可下载的内容，也无需用模板添加。用户只需开启 **Telegram 代理**开关，它是链接类应用或 AmneziaVPN 之外的补充（[用户与分组](users-and-groups.md#telegram-代理)）。该协议是实验性的。
 
 ## kl!ck
 
@@ -122,4 +133,4 @@ Xray JSON 只会按规则（**订阅 → 下发规则**）提供给应用。v2ra
 
 ## 通过 MCP 配置
 
-具有操作员权限或更高权限的 AI 智能体可以使用 `subscription_settings_get`、`subscription_app_upsert_plan` / `subscription_app_upsert_apply` 和 `subscription_app_remove_plan` / `subscription_app_remove_apply` 管理相同的列表。所有页面更改都需要所有者批准：所有者在**集成 → 待你审批**中批准，每张卡片都会完整显示各字段。[MCP](../reference/mcp.md#示例为-windows-和-macos-添加-klck) 中有一个为 Windows 和 macOS 添加 kl!ck 的完整示例。[AI 智能体指南](../getting-started/ai-agents.md)中的提示词也包含此步骤。
+具有操作员权限或更高权限的 AI 智能体可以使用 `subscription_settings_get`、`subscription_app_upsert_plan` / `subscription_app_upsert_apply` 和 `subscription_app_remove_plan` / `subscription_app_remove_apply` 管理相同的列表。所有页面更改都需要所有者批准：所有者在**AI → 等待您处理**中批准，每张卡片都会完整显示各字段。[MCP](../reference/mcp.md#示例为-windows-和-macos-添加-klck) 中有一个为 Windows 和 macOS 添加 kl!ck 的完整示例。[AI 智能体指南](../getting-started/ai-agents.md)中的提示词也包含此步骤。

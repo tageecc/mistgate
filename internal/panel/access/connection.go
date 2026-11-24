@@ -10,12 +10,10 @@ import (
 	"connectrpc.com/connect"
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
+	"github.com/mistgate/mistgate/internal/agentcap"
 	"github.com/mistgate/mistgate/internal/panel/connectiondiag"
 	"github.com/mistgate/mistgate/internal/panel/store"
 )
-
-// capLinks: the agent sends connection counters (StatsBatch.links, agent.proto LinkCounters).
-const capLinks = "links/1"
 
 // GetUserConnection: what the nodes saw of a person's connections over the last hours, per device, node and inbound (agent.proto
 // LinkCounters). A read; no address is stored or returned. nodes_without_counters are the nodes the person can use whose agent
@@ -30,7 +28,7 @@ func (s *Service) GetUserConnection(ctx context.Context, req *connect.Request[ad
 	}
 	now := s.now().UTC()
 	since := now.Add(-time.Duration(store.LinkWindowHours(req.Msg.Hours)) * time.Hour)
-	g, err := a.Group(ctx, u.GroupID)
+	gs, err := a.UserGroups(ctx, u)
 	if err != nil {
 		return nil, s.internal("group", err)
 	}
@@ -41,13 +39,15 @@ func (s *Service) GetUserConnection(ctx context.Context, req *connect.Request[ad
 	resp := &adminv1.GetUserConnectionResponse{SinceUnix: since.Unix(), NowUnix: now.Unix()}
 	seen := map[string]bool{}
 	links2ByNode := map[string]bool{}
+	capsByNode := map[string][]string{}
 	for _, f := range full {
-		if seen[f.Node.ID] || !s.usable(f, g, u) {
+		if seen[f.Node.ID] || !s.usable(f, gs, u) {
 			continue
 		}
 		seen[f.Node.ID] = true
-		links2ByNode[f.Node.ID] = slices.Contains(f.Node.AgentCaps, connectiondiag.Links2Capability)
-		if !slices.Contains(f.Node.AgentCaps, capLinks) {
+		links2ByNode[f.Node.ID] = slices.Contains(f.Node.AgentCaps, agentcap.Links2)
+		capsByNode[f.Node.ID] = f.Node.AgentCaps
+		if !slices.Contains(f.Node.AgentCaps, agentcap.Links) {
 			resp.NodesWithoutCounters = append(resp.NodesWithoutCounters, f.Node.ID)
 		}
 	}
@@ -60,6 +60,7 @@ func (s *Service) GetUserConnection(ctx context.Context, req *connect.Request[ad
 		hasLinks2 := connectiondiag.SupportsHysteria2Links2(r.Protocol, links2ByNode[r.NodeID])
 		msg := &adminv1.DeviceConnection{
 			DeviceId: r.DeviceID, NodeId: r.NodeID, NodeName: r.NodeName, InboundId: r.InboundID, ProfileName: r.ProfileName,
+			ViaCountry: r.ViaCountry, ViaNodeId: r.ViaNodeID,
 			Protocol: r.Protocol, Connects: clamp32(r.Connects), Rejects: clamp32(r.Rejects), Drops: clamp32(r.Drops),
 			Stalls: clamp32(r.Stalls), OnlineS: r.OnlineS, LastHourUnix: r.LastHour.Unix(), Platform: r.Platform,
 			Client: r.Client, Kind: store.DeviceKindName(r.Kind), Hours: userLinkHours(r.Hours, hasLinks2),
@@ -70,7 +71,30 @@ func (s *Service) GetUserConnection(ctx context.Context, req *connect.Request[ad
 			msg.LossPermille = connectiondiag.LossPermille(r.PktsLost, r.PktsSent)
 			msg.RttSamples, msg.PktsSent = clamp32(r.RttSamples), r.PktsSent
 		}
+		// links/3, per key: a node that is no longer in the person's reach is read as an old agent ("not known")
+		variant := connectiondiag.Variant{AwgBackend: r.AwgBackend}
+		if r.Protocol == "vless" {
+			variant = connectiondiag.VLESSVariant(r.Variant)
+		}
+		msg.Unsupported = connectiondiag.UnsupportedKeyCounters(r.Protocol, capsByNode[r.NodeID], variant)
+		msg.TcpStalls, msg.TcpStalls_16K = clamp32(r.TCPStalls), clamp32(r.TCPStalls16K)
+		msg.Initiations, msg.Responses, msg.ResponsesUnmatched = clamp32(r.Initiations), clamp32(r.Responses), clamp32(r.ResponsesUnmatched)
+		for i, h := range r.Hours {
+			if i < len(msg.Hours) {
+				msg.Hours[i].TcpStalls, msg.Hours[i].TcpStalls_16K = clamp32(h.TCPStalls), clamp32(h.TCPStalls16K)
+				msg.Hours[i].Initiations, msg.Hours[i].Responses, msg.Hours[i].ResponsesUnmatched = clamp32(h.Initiations), clamp32(h.Responses), clamp32(h.ResponsesUnmatched)
+			}
+		}
 		resp.Rows = append(resp.Rows, msg)
+	}
+	kex, err := s.st.UserHelloKex(ctx, u.ID, since)
+	if err != nil {
+		return nil, s.internal("hello key exchange", err)
+	}
+	resp.HelloKex = make([]*adminv1.HelloKexDevice, 0, len(kex))
+	for _, d := range kex {
+		resp.HelloKex = append(resp.HelloKex, &adminv1.HelloKexDevice{DeviceId: d.DeviceID, UserId: d.UserID, UserName: d.UserName, Client: d.Client,
+			Platform: d.Platform, HelloPq: clamp32(d.PQ), HelloClassic: clamp32(d.Classic), HelloUnknown: clamp32(d.Unknown), LastHourUnix: d.LastHour.Unix()})
 	}
 	return connect.NewResponse(resp), nil
 }

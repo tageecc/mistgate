@@ -5,16 +5,16 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
-	"net"
 	"net/netip"
 	"slices"
 	"sort"
 	"strconv"
-	"strings"
+	"sync"
 	"time"
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
 	agentv1 "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/internal/agentcap"
 	"github.com/mistgate/mistgate/internal/panel/protocols"
 	"github.com/mistgate/mistgate/internal/panel/store"
 	"github.com/mistgate/mistgate/internal/plugin"
@@ -27,16 +27,16 @@ import (
 // probes: a TLS handshake for the HTTPS ports, the marked GET for port 80.
 
 const (
-	capTCPCheck = "tcpcheck/1"
 	// tcpMarkHold is how long the target keeps the mark; the probe follows at once and takes at most 8 s.
 	tcpMarkHold = 30
 	tcpMarkWait = 5 * time.Second
 	// tcpProbeWait covers the 5 s connect and 8 s per port limits of the prober, in parallel, plus the name lookup.
 	tcpProbeWait = 15 * time.Second
 
-	tcpRoleACME  = "acme"
-	tcpRoleSite  = "site"
-	tcpRoleVLESS = "vless"
+	tcpRoleACME    = "acme"
+	tcpRoleSite    = "site"
+	tcpRoleMTProto = "mtproto"
+	tcpRoleVLESS   = "vless"
 )
 
 // tcpSpec is one enabled inbound of the node as the panel builds it for the agent.
@@ -48,37 +48,45 @@ type tcpSpec struct {
 
 // tcpTarget is one TCP port to probe and what to say about it.
 type tcpTarget struct {
-	Port    uint16
-	Role    string // acme | site | vless
-	ALPN    bool   // the listener answers TLS-ALPN-01
-	Profile string
-	Kind    string // tcpcheck.KindHTTPMark | tcpcheck.KindTLS
-	SNI     string
-	Pin     string // lower-case hex sha256 of the leaf the node reported, "" = none
+	Port       uint16
+	Role       string // acme | site | vless
+	ALPN       bool   // the listener answers TLS-ALPN-01
+	Profile    string
+	Kind       string // tcpcheck.KindHTTPMark | tcpcheck.KindTLS
+	SNI        string
+	Pin        string // lower-case hex sha256 of the leaf the node reported, "" = none
+	PublicCert bool   // an ACME certificate; a name without a pin can be checked by the node's system roots
+	Inbound    string // the REALITY inbound whose port this is: REALITY counts a TLS check of it as a wrong key (ownProbes)
 }
 
 // tcpTargets lists the ports to probe on a node from its enabled inbounds, 80 first and then by port, at most
 // tcpcheck.MaxTargets. pins maps an inbound id to the certificate pin the node reported. It is a pure function.
 //
 //   - 80 (acme): only when an inbound has an ACME certificate, the port the HTTP-01 challenge comes to.
-//   - the Hysteria2 HTTPS site (role site), unless an enabled VLESS TCP inbound listens on the same port: the node closes
-//     the site there, and the VLESS row says what answers.
+//   - the Hysteria2 HTTPS site (role site), unless an enabled TCP inbound listens on the same port (VLESS, TrustTunnel, MTProto):
+//     the node closes the site there, and the row of that inbound says what answers (plugin.TCPPortOwners).
 //   - a VLESS TCP port (role vless): REALITY with another site is probed with the target's name (a valid chain proves our
 //     REALITY forwarded the hello to that site), "self" and TLS with the node's own name.
+//   - a TrustTunnel TCP port (role site): its HTTPS site answers the node's own name; a Hysteria2 site on the same port is closed.
+//   - a TCP port that services share by SNI (plugin.TCPSharePlan) has one target, the default route: the service that answers a
+//     visitor with no name or a name it does not know, which is what a probe by IP address is. The other routes are probed by
+//     the checks of their protocols, each with its own name.
+//   - an MTProto TCP port (role mtproto): only its own-site Fake TLS fallback, whose decoy answers with the node's site and
+//     certificate (an ACME one: the spec has no TLS mode, the decoy makes it for the first domain); a Fake TLS fallback to another site cannot prove that the port belongs to this node.
 func tcpTargets(specs []tcpSpec, pins map[string]string) []tcpTarget {
 	sorted := slices.Clone(specs)
 	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].Spec.ID < sorted[j].Spec.ID })
 
 	acme := false
-	vlessPorts := make(map[uint16]bool)
-	for _, s := range sorted {
+	plain := make([]plugin.InboundSpec, len(sorted))
+	for i, s := range sorted {
 		if s.Spec.TLS.Mode == plugin.TLSAcmeDomain || s.Spec.TLS.Mode == plugin.TLSAcmeIP {
 			acme = true
 		}
-		if s.Spec.Protocol == "vless" && s.Spec.Listen.Network == "tcp" {
-			vlessPorts[s.Spec.Listen.Port] = true
-		}
+		plain[i] = s.Spec
 	}
+	owners := plugin.TCPPortOwners(plain) // the node closes a Hysteria2 site on a TCP port another inbound holds
+	shares := plugin.TCPSharePlan(plain)  // services that share a port by SNI: the probe asks the default route
 
 	byPort := make(map[uint16]tcpTarget)
 	add := func(t tcpTarget) {
@@ -96,10 +104,14 @@ func tcpTargets(specs []tcpSpec, pins map[string]string) []tcpTarget {
 	for _, s := range sorted {
 		spec := s.Spec
 		pin := pins[spec.ID]
+		if p := shares[spec.Listen.Port]; p.Front() && spec.Listen.Network == "tcp" && spec.ID != p.Default {
+			continue // one target per port: what answers there without a name is the default route's service
+		}
 		switch {
 		case spec.Protocol == "vless" && spec.Listen.Network == "tcp":
 			sni, ownName := vlessProbeName(spec)
-			t := tcpTarget{Port: spec.Listen.Port, Role: tcpRoleVLESS, Profile: s.Profile, Kind: tcpcheck.KindTLS, SNI: sni, Pin: pin}
+			t := tcpTarget{Port: spec.Listen.Port, Role: tcpRoleVLESS, Profile: s.Profile, Kind: tcpcheck.KindTLS, SNI: sni, Pin: pin,
+				PublicCert: hasPublicCertificate(spec.TLS)}
 			var settings struct {
 				ClientPort uint16 `json:"client_port"`
 			}
@@ -109,14 +121,34 @@ func tcpTargets(specs []tcpSpec, pins map[string]string) []tcpTarget {
 			if ownName {
 				t.ALPN = t.Port == 443 && alpn(spec.Listen.Port, spec.TLS)
 			}
+			if v, _ := plugin.VLESSOf(spec); !v.TLS() { // settings that name no security are REALITY
+				t.Inbound = spec.ID
+			}
 			add(t)
+		case spec.Protocol == "trusttunnel" && spec.Listen.Network == "tcp":
+			// An HTTPS site of its own: the TLS handshake with the node's name proves the port reaches this node (TLS-ALPN-01
+			// is answered on 443 with an ACME certificate, as for a Hysteria2 site).
+			add(tcpTarget{Port: spec.Listen.Port, Role: tcpRoleSite, ALPN: alpn(spec.Listen.Port, spec.TLS), Profile: s.Profile,
+				Kind: tcpcheck.KindTLS, SNI: spec.TLS.ServerName, Pin: pin, PublicCert: hasPublicCertificate(spec.TLS)})
+		case spec.Protocol == "mtproto" && spec.Listen.Network == "tcp":
+			var settings struct {
+				Fallback string `json:"fallback"`
+			}
+			if len(spec.Settings) > 0 && json.Unmarshal(spec.Settings, &settings) != nil {
+				continue
+			}
+			if settings.Fallback == "site" || (settings.Fallback != "" && settings.Fallback != "decoy") {
+				continue
+			}
+			add(tcpTarget{Port: spec.Listen.Port, Role: tcpRoleMTProto, Profile: s.Profile, Kind: tcpcheck.KindTLS,
+				SNI: spec.TLS.ServerName, Pin: pin, PublicCert: hasPublicCertificate(spec.TLS) || spec.TLS.Mode == 0})
 		case spec.Protocol == "hysteria2":
-			port := uint16(hy2SitePort(spec))
-			if port == 0 || vlessPorts[port] {
+			port := plugin.Hy2SitePort(spec)
+			if port == 0 || owners[port].Protocol != "hysteria2" {
 				continue
 			}
 			add(tcpTarget{Port: port, Role: tcpRoleSite, ALPN: alpn(port, spec.TLS), Profile: s.Profile, Kind: tcpcheck.KindTLS,
-				SNI: spec.TLS.ServerName, Pin: pin})
+				SNI: spec.TLS.ServerName, Pin: pin, PublicCert: hasPublicCertificate(spec.TLS)})
 		}
 	}
 
@@ -136,83 +168,43 @@ func tcpTargets(specs []tcpSpec, pins map[string]string) []tcpTarget {
 	return out
 }
 
+func hasPublicCertificate(tls plugin.TLS) bool {
+	return tls.Mode == plugin.TLSAcmeDomain || tls.Mode == plugin.TLSAcmeIP
+}
+
 // vlessProbeName is the TLS name to send to a VLESS listener, and whether it is the node's own name ("self" REALITY or a
 // TLS front, where the node holds the certificate itself) rather than the name of another site REALITY forwards to.
 func vlessProbeName(spec plugin.InboundSpec) (name string, own bool) {
-	var settings struct {
-		Security string `json:"security"`
-		Reality  struct {
-			Target      string   `json:"target"`
-			ServerNames []string `json:"server_names"`
-		} `json:"reality"`
-	}
-	if len(spec.Settings) > 0 && json.Unmarshal(spec.Settings, &settings) != nil {
+	v, ok := plugin.VLESSOf(spec)
+	if !ok {
 		return "", false
 	}
-	if settings.Security == "tls" || (settings.Security == "reality" || settings.Security == "") && settings.Reality.Target == "self" {
+	if v.OwnSite() {
 		if spec.TLS.ServerName != "" {
 			return spec.TLS.ServerName, true
 		}
-		if len(settings.Reality.ServerNames) > 0 {
-			return settings.Reality.ServerNames[0], true
+		if len(v.ServerNames) > 0 {
+			return v.ServerNames[0], true
 		}
 		return "", true
 	}
-	if len(settings.Reality.ServerNames) > 0 {
-		return settings.Reality.ServerNames[0], false
+	if len(v.ServerNames) > 0 {
+		return v.ServerNames[0], false
 	}
-	host, _, err := net.SplitHostPort(strings.TrimSpace(settings.Reality.Target))
-	if err != nil {
-		return "", false
-	}
+	host := v.TargetHost()
 	if _, err := netip.ParseAddr(host); err == nil { // an IP address is no name to send
 		return "", false
 	}
 	return host, false
 }
 
-// hy2SitePort is the TCP port of a Hysteria2 inbound's HTTPS site: settings.masquerade.tcp_port, 443 when omitted, 0 = no
-// site (the node's own rule, internal/node/hysteria2/settings.go).
-func hy2SitePort(spec plugin.InboundSpec) int {
-	if spec.Protocol != "hysteria2" || spec.TLS.Mode == 0 {
-		return 0
-	}
-	var settings struct {
-		Masquerade struct {
-			TCPPort *int `json:"tcp_port"`
-		} `json:"masquerade"`
-	}
-	if len(spec.Settings) > 0 && json.Unmarshal(spec.Settings, &settings) != nil {
-		return 0
-	}
-	if settings.Masquerade.TCPPort != nil {
-		return min(max(*settings.Masquerade.TCPPort, 0), 65535)
-	}
-	return 443
-}
-
 // runTCPCheck runs the TCP half for a node whose agent is connected. ran is false when there was nothing to do or nobody to
 // send, in which case the stored rows stay as they were. The rows come back whether or not they could be stored.
 func (f *Fleet) runTCPCheck(ctx context.Context, target store.NodeRow, allowPanel bool) (rows []store.TCPCheck, ran bool) {
-	inbounds, err := f.st.FleetInbounds(ctx, target.ID, false)
+	specs, pins, err := f.tcpSpecsOf(ctx, target)
 	if err != nil {
 		f.log.Warn("list inbounds for TCP port check", "node", target.ID, "err", err)
 		return nil, false
-	}
-	var specs []tcpSpec
-	pins := make(map[string]string)
-	for _, inbound := range inbounds {
-		if !inbound.Enabled {
-			continue
-		}
-		spec, err := f.buildSpec(target, inbound)
-		if err != nil {
-			continue
-		}
-		specs = append(specs, tcpSpec{Profile: inbound.ProfileName, Spec: spec, Settings: json.RawMessage(inbound.Settings)})
-		if pin, ok := protocols.NormalizePin(inbound.CertPin); ok {
-			pins[inbound.ID] = pin
-		}
 	}
 	targets := tcpTargets(specs, pins)
 	if len(targets) == 0 {
@@ -235,7 +227,7 @@ func (f *Fleet) runTCPCheck(ctx context.Context, target store.NodeRow, allowPane
 		f.log.Warn("list nodes for TCP port check", "node", target.ID, "err", err)
 		return nil, false
 	}
-	senders := f.portSenders(target, allNodes, live, capTCPCheck)
+	senders := f.portSenders(target, allNodes, live, agentcap.TCPCheck)
 	if len(senders) > 2 {
 		senders = senders[:2]
 	}
@@ -330,6 +322,31 @@ func (f *Fleet) runTCPCheck(ctx context.Context, target store.NodeRow, allowPane
 	return rows, true
 }
 
+// tcpSpecsOf are the specs of the node's enabled inbounds as the panel builds them for the agent, with the certificate pins the
+// node reported (inbound id to pin).
+func (f *Fleet) tcpSpecsOf(ctx context.Context, target store.NodeRow) ([]tcpSpec, map[string]string, error) {
+	inbounds, err := f.st.FleetInbounds(ctx, target.ID, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	var specs []tcpSpec
+	pins := make(map[string]string)
+	for _, inbound := range inbounds {
+		if !inbound.Enabled {
+			continue
+		}
+		spec, err := f.buildSpec(target, inbound)
+		if err != nil {
+			continue
+		}
+		specs = append(specs, tcpSpec{Profile: inbound.ProfileName, Spec: spec, Settings: json.RawMessage(inbound.Settings)})
+		if pin, ok := protocols.NormalizePin(inbound.CertPin); ok {
+			pins[inbound.ID] = pin
+		}
+	}
+	return specs, pins, nil
+}
+
 // withoutMark splits the HTTP-01 mark target off the list.
 func withoutMark(targets []tcpTarget) (rest []tcpTarget, mark *tcpTarget) {
 	for _, t := range targets {
@@ -375,7 +392,7 @@ func validTCPVerdict(v string) bool {
 // armTCPMark asks the target to answer one marked request on port 80. It returns "serving" when armed, "off" when the node
 // has no ACME name, "busy" when another program holds port 80 (a verdict of the row), or "" with the reason for the row.
 func (f *Fleet) armTCPMark(ctx context.Context, target store.NodeRow, live store.NodeLiveRow, token, answer *[tcpcheck.MarkSize]byte) (verdict, reason string) {
-	if !slices.Contains(live.AgentCaps, capTCPCheck) {
+	if !slices.Contains(live.AgentCaps, agentcap.TCPCheck) {
 		return "", "agent_too_old"
 	}
 	if _, err := rand.Read(token[:]); err != nil {
@@ -418,6 +435,7 @@ func (f *Fleet) probeTCPTargets(ctx context.Context, host string, sender portSen
 			probes[i].Token, probes[i].Answer = token, answer
 			wire[i].Token, wire[i].Answer = token, answer
 		}
+		f.noteOwnProbe(t)
 	}
 	if sender.panel {
 		probe := f.probeTCP
@@ -471,4 +489,62 @@ func tcpCheckMessages(names map[string]string, rows []store.TCPCheck) []*adminv1
 			Verdict: row.Verdict, Reason: row.Reason, Sender: sender, CheckedUnix: row.CheckedAt.Unix()})
 	}
 	return out
+}
+
+// ownProbeTTL is how long a TLS check the panel ordered may wait for its count: the node reports in batches of 10 s, so a check
+// that has not come back in this time never reached the node (a refused or lost connection) and takes nothing off later counters.
+// ownProbeMax bounds the list of one inbound.
+const (
+	ownProbeTTL = 2 * time.Minute
+	ownProbeMax = 256
+)
+
+// ownProbes remembers, per REALITY inbound, the TLS checks of its port the panel ordered (probeTCPTargets, pathProbeTCP). Such a
+// check says the profile's name and holds no key, so REALITY counts it as a fallback and a failed authentication, which the page
+// shows as "wrong REALITY key". The node cannot tell the panel's senders from a stranger, so the panel takes its own checks off the
+// inbound's counters when they arrive (guardLinks). Its zero value is ready; a restart forgets the checks of the last two minutes.
+type ownProbes struct {
+	mu sync.Mutex
+	at map[string][]time.Time // inbound id to when each check was ordered, oldest first
+}
+
+// noteOwnProbe records a TLS check about to be sent to the port of a REALITY inbound, before it leaves: the count comes back in a
+// batch that may overtake the answer.
+func (f *Fleet) noteOwnProbe(t tcpTarget) {
+	if t.Inbound != "" && t.Kind == tcpcheck.KindTLS {
+		f.ownProbes.add(t.Inbound, f.now())
+	}
+}
+
+// dropStale cuts the checks older than ownProbeTTL off the front of at.
+func dropStale(at []time.Time, now time.Time) []time.Time {
+	i := 0
+	for i < len(at) && now.Sub(at[i]) > ownProbeTTL {
+		i++
+	}
+	return at[i:]
+}
+
+func (o *ownProbes) add(inbound string, now time.Time) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.at == nil {
+		o.at = make(map[string][]time.Time)
+	}
+	at := append(dropStale(o.at[inbound], now), now)
+	o.at[inbound] = at[max(0, len(at)-ownProbeMax):]
+}
+
+// take uses up to want of the inbound's fresh checks and says how many it used.
+func (o *ownProbes) take(inbound string, want uint32, now time.Time) uint32 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	at := dropStale(o.at[inbound], now)
+	n := min(len(at), int(want))
+	if at = at[n:]; len(at) == 0 {
+		delete(o.at, inbound)
+	} else {
+		o.at[inbound] = at
+	}
+	return uint32(n)
 }

@@ -8,12 +8,10 @@ import (
 	"connectrpc.com/connect"
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
+	"github.com/mistgate/mistgate/internal/agentcap"
 	"github.com/mistgate/mistgate/internal/logscrub"
 	"github.com/mistgate/mistgate/internal/panel/store"
 )
-
-// capJournal: the agent sends the saved warning and error journal (StatsBatch.journal, agent.proto JournalEntry).
-const capJournal = "journal/1"
 
 // GetNodeJournal reads the saved warning and error journal. Records are privacy-cleaned before storage and carry no addresses.
 func (s nodeService) GetNodeJournal(ctx context.Context, req *connect.Request[adminv1.GetNodeJournalRequest]) (*connect.Response[adminv1.GetNodeJournalResponse], error) {
@@ -43,7 +41,7 @@ func (s nodeService) GetNodeJournal(ctx context.Context, req *connect.Request[ad
 		inScope = nodes
 	}
 	for _, n := range inScope {
-		if !capabilityPresent(n.AgentCaps, capJournal) {
+		if !store.CapabilityPresent(n.AgentCaps, agentcap.Journal) {
 			resp.NodesWithoutJournal = append(resp.NodesWithoutJournal, n.ID)
 		}
 	}
@@ -58,7 +56,7 @@ func (s nodeService) GetNodeJournal(ctx context.Context, req *connect.Request[ad
 	}
 	rows, err := f.st.NodeJournal(ctx, store.NodeJournalFilter{
 		NodeID: req.Msg.NodeId, Since: since, Until: now, MinLevel: minLevel, Source: req.Msg.Source,
-		InboundID: req.Msg.InboundId, Query: logscrub.ClipRunes(req.Msg.Query, 100), Limit: limit + 1,
+		InboundID: req.Msg.InboundId, Query: logscrub.ClipRunes(req.Msg.Query, 100), Code: logscrub.ClipRunes(req.Msg.Code, 64), Limit: limit + 1,
 	})
 	if err != nil {
 		return nil, internalErr(f.log.Error, "read node journal", err)

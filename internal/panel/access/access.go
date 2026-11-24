@@ -30,6 +30,7 @@ import (
 	"github.com/mistgate/mistgate/gen/mistgate/admin/v1/adminv1connect"
 	"github.com/mistgate/mistgate/internal/panel/dns"
 	"github.com/mistgate/mistgate/internal/panel/protocols"
+	"github.com/mistgate/mistgate/internal/panel/securitylimit"
 	"github.com/mistgate/mistgate/internal/panel/store"
 	"github.com/mistgate/mistgate/internal/panel/vault"
 	"github.com/mistgate/mistgate/internal/plugin"
@@ -55,13 +56,20 @@ type Config struct {
 	// SubscriptionBaseURL is the public subscription address up to and including the secret prefix, e.g.
 	// "https://sub.example.com/k3xq8"; the user's token is appended after a slash.
 	SubscriptionBaseURL string
-	Log                 *slog.Logger
-	AfterResponse       AfterResponseRunner
+	// StepUp is auth.Service.RequireStepUp. A nil callback denies destructive user deletion.
+	StepUp        func(context.Context) error
+	Log           *slog.Logger
+	AfterResponse AfterResponseRunner
 	// CheckPorts runs the fleet UDP delivery check; nil disables save-time checks.
 	CheckPorts func(context.Context, string, []uint16) ([]store.PortCheck, string, string)
-	// CheckRelay runs the fleet's check of a relay (fleet.CheckRelay): the stages it names (store.RelayStageLeg, RelayStagePath;
-	// none = both), the result stored in the relay and returned. nil: relays cannot be checked, so none is switched on.
+	// CheckRelay runs the fleet's check of a relay (fleet.CheckRelay): the stages it names (store.RelayStageLeg, RelayStagePath,
+	// RelayStageReverseReach, RelayStageReverseSpeed; none = leg and path), the result stored in the relay and returned. nil: relays cannot be checked, so none is switched on.
 	CheckRelay func(ctx context.Context, relayID string, stages ...string) (store.RelayCheck, error)
+	// Limiter is the shared backend for token user-change budgets and their refusal-event gate.
+	Limiter securitylimit.Limiter
+	// OwnHosts are the hosts and URLs of the panel itself (its site, admin and agent addresses): a REALITY target set on a node is never one
+	// of them (reality_own.go).
+	OwnHosts []string
 }
 
 // Service implements ProfileService, UserService, GroupService, DeviceService, AwgService and RelayService (adminv1connect
@@ -75,12 +83,15 @@ type Service struct {
 	dns           *dns.Service
 	cfg           Config
 	log           *slog.Logger
+	limiter       securitylimit.Limiter
 	now           func() time.Time
 	afterResponse AfterResponseRunner
+	tokens        tokenIndex // the subscription tokens known to exist (token_index.go)
 
 	touching                  sync.Map // device id -> struct{}: a last_seen_at write is in flight (sub.go)
 	limited                   sync.Map // "lim:<user id>" -> time.Time: when the limit event of the user was last queued (sub.go)
 	touchHookForTest          func(started bool)
+	snapshotHookForTest       func()
 	portChecksReadHookForTest func()
 
 	// awgNets serialises "check the client networks of an AWG profile against the others" with the write that stores
@@ -91,8 +102,15 @@ type Service struct {
 
 	// relayMu makes "check the entry's ports, then write the relay" one step in this process (relay_rpc.go); the unique keys
 	// of the relay table keep several panels apart. relayGate decides whether a relay may be switched on.
-	relayMu   sync.Mutex
-	relayGate func(context.Context, store.RelayLink) error
+	relayMu sync.Mutex
+	// controlling holds the relays the mode controller is deciding now: a second call for the same relay (the next report, the next
+	// round) is dropped, not queued, because it would decide from the same state, and the proof it may run takes a minute.
+	controlling sync.Map
+	// bridgeWanted is, per relay, whether the last decision of the controller wanted the exit to hold the bridge
+	// (RelayLink.BridgeWanted). The exit's dials are part of its desired state and a stored check stage does not rebuild it, so a
+	// change is told to the nodes.
+	bridgeWanted sync.Map
+	relayGate    func(context.Context, store.RelayLink) error
 	// relaySettleFn follows the switch on (relaySettle); relayWait and relayPoll are how long it waits for the entry's report
 	// and how often it looks; relayHints is the source of the candidates' hints (SetRelayHints).
 	relaySettleFn func(context.Context, store.RelayLink) error
@@ -117,7 +135,7 @@ func (noOnline) OnlineDevices() map[string][]string { return nil }
 // New builds the service. notify and online may be nil (nothing to notify, nobody online).
 func New(st *store.Store, v *vault.Vault, reg *protocols.Registry, notify StateNotifier, online OnlineSource, cfg Config) (*Service, error) {
 	s := &Service{
-		st: st, vault: v, reg: reg, notify: notify, online: online, cfg: cfg, log: cfg.Log, now: time.Now,
+		st: st, vault: v, reg: reg, notify: notify, online: online, cfg: cfg, log: cfg.Log, limiter: cfg.Limiter, now: time.Now,
 		afterResponse: cfg.AfterResponse,
 		dns:           dns.New(st),
 		secretPtrs:    map[string][]string{}, criticalPtrs: map[string][]string{},
@@ -200,21 +218,33 @@ func (s *Service) Sweep(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return s.refresh(ctx, states)
+	changed, err := s.refresh(ctx, states)
+	if changed > 0 || err != nil {
+		s.notify.StateChanged()
+	}
+	return changed, err
 }
 
 // Recompute refreshes the status of the given users; the fleet calls it after it added their usage, so a
 // quota overrun takes effect within one stats interval. Changed statuses notify the nodes.
 func (s *Service) Recompute(ctx context.Context, userIDs []string) error {
+	changed, refreshed, err := s.recompute(ctx, userIDs)
+	if refreshed && (changed > 0 || err != nil) {
+		s.notify.StateChanged()
+	}
+	return err
+}
+
+func (s *Service) recompute(ctx context.Context, userIDs []string) (int, bool, error) {
 	if len(userIDs) == 0 {
-		return nil
+		return 0, false, nil
 	}
 	states, err := s.st.Access().UserStates(ctx, userIDs)
 	if err != nil {
-		return err
+		return 0, false, err
 	}
-	_, err = s.refresh(ctx, states)
-	return err
+	changed, err := s.refresh(ctx, states)
+	return changed, true, err
 }
 
 func (s *Service) refresh(ctx context.Context, states []store.AccessUserState) (int, error) {
@@ -238,15 +268,11 @@ func (s *Service) refresh(ctx context.Context, states []store.AccessUserState) (
 			continue
 		}
 		if err != nil {
-			s.notify.StateChanged()
 			return changed, err
 		}
 		if status != u.Status {
 			changed++
 		}
-	}
-	if changed > 0 {
-		s.notify.StateChanged()
 	}
 	return changed, nil
 }
@@ -345,7 +371,7 @@ func (s *Service) mergedSettings(p store.AccessProfile) (json.RawMessage, error)
 }
 
 // appsOf lists the client apps a user has switched on.
-func appsOf(happ, amnezia bool) []plugin.ClientID {
+func appsOf(happ, amnezia, telegram, trustTunnel bool) []plugin.ClientID {
 	var apps []plugin.ClientID
 	if happ {
 		apps = append(apps, plugin.ClientHapp)
@@ -353,13 +379,19 @@ func appsOf(happ, amnezia bool) []plugin.ClientID {
 	if amnezia {
 		apps = append(apps, plugin.ClientAmnezia)
 	}
+	if telegram {
+		apps = append(apps, plugin.ClientTelegram)
+	}
+	if trustTunnel {
+		apps = append(apps, plugin.ClientTrustTunnel)
+	}
 	return apps
 }
 
 // allowed reports whether one of the user's enabled apps consumes the protocol.
-func (s *Service) allowed(protocol string, happ, amnezia bool) bool {
+func (s *Service) allowed(protocol string, happ, amnezia, telegram, trustTunnel bool) bool {
 	p, ok := s.reg.Get(protocol)
-	return ok && protocols.AllowedForApps(p, appsOf(happ, amnezia)...)
+	return ok && protocols.AllowedForApps(p, appsOf(happ, amnezia, telegram, trustTunnel)...)
 }
 
 func nodeView(n store.AccessNode) protocols.NodeView {
@@ -379,11 +411,15 @@ func (s *Service) buildSpec(f store.AccessInboundFull, settings json.RawMessage)
 			return plugin.InboundSpec{}, fmt.Errorf("cannot open the inbound's key material: %w", err)
 		}
 	}
+	if f.Inbound.RealityTargetOverride != "" && f.Profile.Protocol != "vless" {
+		return plugin.InboundSpec{}, &protocols.RealityTargetError{Reason: "unsupported", Target: f.Inbound.RealityTargetOverride}
+	}
 	spec, err := proto.BuildInbound(protocols.InboundInput{
 		Profile:               protocols.ProfileView{ID: f.Profile.ID, Version: f.Profile.Version, Settings: settings},
 		Node:                  nodeView(f.Node),
 		PortOverride:          f.Inbound.PortOverride,
 		TLSServerNameOverride: f.Inbound.TLSServerNameOverride,
+		RealityTargetOverride: f.Inbound.RealityTargetOverride,
 		SpecVersion:           f.Inbound.SpecVersion,
 		Enabled:               f.Inbound.Enabled,
 		InboundID:             f.Inbound.ID,

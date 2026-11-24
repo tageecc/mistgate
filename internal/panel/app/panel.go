@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"connectrpc.com/connect"
@@ -43,6 +44,13 @@ type InstanceConfig struct {
 	AgentSNI    string
 	SubPrefix   string
 	LinkPrefix  string // secret path prefix of the signed agent WebSocket link; empty = not served by this handler
+	ProbePrefix string // secret path prefix of the owner-managed probe endpoint
+}
+
+// logSecrets are the values that name a hidden path or host of this instance: the log scrubbers cut them out of every line.
+func (in InstanceConfig) logSecrets() []string {
+	agentSNIPrefix, _, _ := strings.Cut(in.AgentSNI, ".")
+	return []string{in.AgentSNI, agentSNIPrefix, in.AdminPrefix, in.SubPrefix, in.LinkPrefix, in.ProbePrefix}
 }
 
 // linkURL is the base of the signed agent link (and of link-only enrolment): wss:// + the public host + the secret
@@ -104,6 +112,20 @@ type BackgroundJob struct {
 	Run  func(context.Context)
 }
 
+type assistantRetention interface {
+	Retention(context.Context, time.Time) error
+}
+
+type assistantRPC interface {
+	Handler(opts ...connect.HandlerOption) (string, http.Handler)
+}
+
+// scheduledTasks is the TasksService with its scheduler (internal/panel/tasks, the VPS edition).
+type scheduledTasks interface {
+	Handler(opts ...connect.HandlerOption) (string, http.Handler)
+	Run(context.Context)
+}
+
 // Config contains the edition-specific dependencies and settings for the shared panel.
 type Config struct {
 	Store              *store.Store
@@ -140,17 +162,23 @@ type Config struct {
 	NodeBinaries nodeprovision.BinarySource
 	// OnAlertTransition, when set, sees every alert the health module opens or resolves, besides the Telegram announcement.
 	OnAlertTransition func(health.Transition)
+	// Ops is the VPS process's log ring and level (see OpsConfig); nil on the edge and in most tests.
+	Ops *OpsConfig
 }
 
 // Panel is the assembled panel: its public HTTP handler, VPS listener adapter and services.
 type Panel struct {
-	Handler        http.Handler
-	Server         *httpserver.Server
-	Fleet          *fleet.Fleet
-	Access         *access.Service
-	Health         *health.Service
-	Blocklist      *blocklist.Service
-	CountryProbe   *countryprobe.Service
+	Handler      http.Handler
+	Server       *httpserver.Server
+	Fleet        *fleet.Fleet
+	Access       *access.Service
+	Health       *health.Service
+	Blocklist    *blocklist.Service
+	CountryProbe *countryprobe.Service
+	OwnProbes    interface {
+		Handler(...connect.HandlerOption) (string, http.Handler)
+		PublicHandler(string) http.Handler
+	}
 	Cheburcheck    *cheburcheck.Service
 	Bsbord         *bsbord.Service
 	Update         *update.Service
@@ -177,8 +205,11 @@ type jobServices struct {
 	cheburcheck *cheburcheck.Service
 	bsbord      *bsbord.Service
 	update      *update.Service
+	warp        *warp.Service
 	backup      *backup.Service
 	telegram    *telegram.Service
+	assistant   assistantRetention
+	tasks       scheduledTasks
 	provision   *nodeprovision.Service
 	store       *store.Store
 	log         *slog.Logger

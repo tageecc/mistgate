@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"slices"
 	"strconv"
 	"strings"
@@ -32,13 +31,29 @@ func (s *Service) protocol(id string) (protocols.Protocol, error) {
 	return p, nil
 }
 
-func clientApps(p protocols.Protocol) (happ, amnezia bool, apps []adminv1.App) {
+// isTelegram: the protocol is for Telegram clients (MTProto). Its credential is the person's own key, not a link device's,
+// and what it renders is never a line of a subscription.
+func isTelegram(p protocols.Protocol) bool {
+	_, _, telegram, _, _ := clientApps(p)
+	return telegram
+}
+
+func isTrustTunnel(p protocols.Protocol) bool {
+	_, _, _, trustTunnel, _ := clientApps(p)
+	return trustTunnel
+}
+
+func clientApps(p protocols.Protocol) (happ, amnezia, telegram, trustTunnel bool, apps []adminv1.App) {
 	for _, c := range p.Clients() {
 		switch c.Client {
 		case plugin.ClientHapp:
 			happ = true
 		case plugin.ClientAmnezia:
 			amnezia = true
+		case plugin.ClientTelegram:
+			telegram = true
+		case plugin.ClientTrustTunnel:
+			trustTunnel = true
 		}
 	}
 	if happ {
@@ -46,6 +61,12 @@ func clientApps(p protocols.Protocol) (happ, amnezia bool, apps []adminv1.App) {
 	}
 	if amnezia {
 		apps = append(apps, adminv1.App_APP_AMNEZIA)
+	}
+	if telegram {
+		apps = append(apps, adminv1.App_APP_TELEGRAM)
+	}
+	if trustTunnel {
+		apps = append(apps, adminv1.App_APP_TRUST_TUNNEL)
 	}
 	return
 }
@@ -62,10 +83,10 @@ func (s *Service) ListProtocols(ctx context.Context, _ *connect.Request[adminv1.
 		if err != nil {
 			return nil, s.internal("mask defaults", err)
 		}
-		_, _, apps := clientApps(p)
+		_, _, _, _, apps := clientApps(p)
 		resp.Protocols = append(resp.Protocols, &adminv1.ProtocolInfo{
 			Id: p.ID(), DisplayName: p.DisplayName(), SettingsSchemaJson: string(p.SettingsSchema()),
-			DefaultSettingsJson: string(masked), Apps: apps,
+			DefaultSettingsJson: string(masked), Apps: apps, Experimental: protocols.IsExperimental(p),
 		})
 	}
 	return connect.NewResponse(resp), nil
@@ -84,8 +105,8 @@ func (s *Service) profileSummary(ctx context.Context, p store.AccessProfile, inb
 }
 
 func (s *Service) summaryOf(ctx context.Context, p store.AccessProfile, proto protocols.Protocol, merged json.RawMessage, inbounds []store.AccessInbound) (*adminv1.ProfileSummary, error) {
-	happ, amnezia, _ := clientApps(proto)
-	users, err := s.st.Access().ProfileUsers(ctx, p.ID, happ, amnezia)
+	happ, amnezia, telegram, trustTunnel, _ := clientApps(proto)
+	users, err := s.st.Access().ProfileUsers(ctx, p.ID, happ, amnezia, telegram, trustTunnel)
 	if err != nil {
 		return nil, s.internal("profile users", err)
 	}
@@ -277,8 +298,8 @@ func (s *Service) profileImpact(ctx context.Context, p store.AccessProfile, prot
 	if len(restartedNodes) == 0 {
 		return impact, nil
 	}
-	happ, amnezia, _ := clientApps(proto)
-	users, err := a.ProfileUsers(ctx, p.ID, happ, amnezia)
+	happ, amnezia, telegram, trustTunnel, _ := clientApps(proto)
+	users, err := a.ProfileUsers(ctx, p.ID, happ, amnezia, telegram, trustTunnel)
 	if err != nil {
 		return nil, s.internal("profile users", err)
 	}
@@ -387,7 +408,7 @@ func (s *Service) UpdateProfile(ctx context.Context, req *connect.Request[adminv
 	}
 	type changedInboundPort struct {
 		node        store.AccessNode
-		listen      plugin.Listen
+		spec        plugin.InboundSpec
 		others      []nodeListen
 		portChanged bool
 	}
@@ -411,15 +432,12 @@ func (s *Service) UpdateProfile(ctx context.Context, req *connect.Request[adminv
 			if oldErr == nil && !specChanged(oldSpec, newSpec) {
 				continue
 			}
-			if newSpec.Listen.Network != "udp" {
-				continue
-			}
 			others, _, err := s.nodeInbounds(ctx, f.Node.ID, f.Inbound.ID)
 			if err != nil {
 				return nil, err
 			}
 			changedPorts = append(changedPorts, changedInboundPort{
-				node: f.Node, listen: newSpec.Listen, others: others,
+				node: f.Node, spec: newSpec, others: others,
 				portChanged: oldErr != nil || oldSpec.Listen.Port != newSpec.Listen.Port,
 			})
 		}
@@ -428,40 +446,27 @@ func (s *Service) UpdateProfile(ctx context.Context, req *connect.Request[adminv
 		nodeIDs := make([]string, 0, len(changedPorts))
 		seen := make(map[string]bool, len(changedPorts))
 		for _, changed := range changedPorts {
-			if !seen[changed.node.ID] {
+			if specHasUDPListen(changed.spec) && !seen[changed.node.ID] {
 				seen[changed.node.ID] = true
 				nodeIDs = append(nodeIDs, changed.node.ID)
 			}
 		}
-		portChecks, err := s.readPortChecks(ctx, nodeIDs...)
-		if err != nil {
-			return nil, s.internal("read UDP port checks", err)
+		portChecks := portCheckCache{}
+		if len(nodeIDs) > 0 {
+			portChecks, err = s.readPortChecks(ctx, nodeIDs...)
+			if err != nil {
+				return nil, s.internal("read UDP port checks", err)
+			}
 		}
 		for _, changed := range changedPorts {
-			checks := portChecks[changed.node.ID]
-			if m.DryRun {
-				if bad, ok := cachedListenPortLossy(changed.listen, checks, s.now()); ok {
-					if changed.portChanged && !m.AllowLossyPort {
-						free := freePortFor(p.Protocol, changed.listen, changed.others, checks, s.now())
-						return nil, portLossyRefusal(ctx, s, changed.node.Name, bad, free)
-					}
-					portWarnings = append(portWarnings, s.portLossyWarning(ctx, changed.node.Name, bad))
-				}
-				continue
+			warnings, override, err := s.admitInbound(ctx, inboundAdmission{node: changed.node, profile: p.Name, spec: changed.spec, others: changed.others,
+				checks: portChecks[changed.node.ID], moved: changed.portChanged, check: m.DryRun, allowLossy: m.AllowLossyPort})
+			if err != nil {
+				return nil, err
 			}
-			if changed.portChanged {
-				warning, override, err := s.checkPort(ctx, changed.node, p.Protocol, changed.listen, changed.others, checks, m.AllowLossyPort)
-				if err != nil {
-					return nil, err
-				}
-				if warning != nil {
-					portWarnings = append(portWarnings, warning)
-				}
-				if override {
-					lossyOverrides = append(lossyOverrides, changed)
-				}
-			} else if bad, ok := cachedListenPortLossy(changed.listen, checks, s.now()); ok {
-				portWarnings = append(portWarnings, s.portLossyWarning(ctx, changed.node.Name, bad))
+			portWarnings = append(portWarnings, warnings...)
+			if override {
+				lossyOverrides = append(lossyOverrides, changed)
 			}
 		}
 	}
@@ -486,7 +491,7 @@ func (s *Service) UpdateProfile(ctx context.Context, req *connect.Request[adminv
 		}
 		s.audit(ctx, actor(ctx), "profile_update", map[string]any{"profile": p.ID, "name": next.Name, "settings_changed": settingsChanged, "reissue": reissue})
 		for _, changed := range lossyOverrides {
-			s.auditLossyPort(ctx, changed.node.Name, changed.listen.Port)
+			s.auditLossyPort(ctx, changed.node.Name, changed.spec.Listen.Port)
 		}
 	}
 	sum, err := s.summaryOf(ctx, next, proto, newMerged, inbounds)
@@ -543,8 +548,13 @@ func (s *Service) PreviewProfile(ctx context.Context, req *connect.Request[admin
 		return connect.NewResponse(resp), nil
 	}
 	format := plugin.FormatURIList
-	if protocols.IsPerDevice(proto) { // an L3 protocol: Happ cannot carry it, the .conf is what Amnezia users import
+	switch {
+	case protocols.IsPerDevice(proto): // an L3 protocol: Happ cannot carry it, the .conf is what Amnezia users import
 		format, resp.ClientLabel = plugin.FormatAWGConf, "AmneziaVPN · .conf"
+	case isTelegram(proto): // no subscription carries it: the person gets the link from their own page
+		format, resp.ClientLabel = plugin.FormatTelegramLink, "Telegram · tg://proxy link"
+	case s.mistgateConsumes(proto.ID()): // only the Mistgate app takes it: its path settings, the credential masked
+		format, resp.ClientLabel = plugin.FormatMistgate, "Mistgate app · path settings"
 	}
 	if frag, ok := trialRender(proto, merged, node, in, spec, format, ""); ok {
 		resp.ClientPreview = string(frag.Data)
@@ -571,19 +581,110 @@ func (s *Service) DeleteProfile(ctx context.Context, req *connect.Request[adminv
 		if err != nil {
 			return nil, s.internal("profile inbounds", err)
 		}
-		var nodes []string // a retired node keeps its inbounds, so it is named too
-		for _, in := range ins {
-			if n, err := a.Node(ctx, in.NodeID); err == nil {
-				nodes = append(nodes, n.Name)
-			}
-		}
-		slices.Sort(nodes)
-		return nil, coded(connect.CodeFailedPrecondition, "profile_deployed", "nodes", strings.Join(nodes, ", "))
+		return nil, s.profileDeployed(ctx, ins)
 	case err != nil:
 		return nil, s.internal("delete profile", err)
 	}
 	s.audit(ctx, actor(ctx), "profile_delete", map[string]any{"profile": req.Msg.ProfileId, "name": gone.Name, "protocol": gone.Protocol})
 	return connect.NewResponse(&adminv1.DeleteProfileResponse{}), nil
+}
+
+// profileDeployed is the refusal "the profile is still on these nodes": FAILED_PRECONDITION profile_deployed, naming them.
+func (s *Service) profileDeployed(ctx context.Context, ins []store.AccessInbound) error {
+	var nodes []string // a retired node keeps its inbounds, so it is named too
+	for _, in := range ins {
+		if n, err := s.st.Access().Node(ctx, in.NodeID); err == nil {
+			nodes = append(nodes, n.Name)
+		}
+	}
+	slices.Sort(nodes)
+	return coded(connect.CodeFailedPrecondition, "profile_deployed", "nodes", strings.Join(nodes, ", "))
+}
+
+// RemoveProfileFromNodes takes the profile off the listed nodes in one transaction and, with delete_profile, deletes it in
+// the same one. There is no per-node step to fail half way: the nodes learn the new desired state from the panel, so one that
+// is offline drops the profile when it connects again (a retired node has nothing to tell).
+func (s *Service) RemoveProfileFromNodes(ctx context.Context, req *connect.Request[adminv1.RemoveProfileFromNodesRequest]) (*connect.Response[adminv1.RemoveProfileFromNodesResponse], error) {
+	m := req.Msg
+	a := s.st.Access()
+	if len(m.NodeIds) == 0 {
+		return nil, invalid("node_ids is empty")
+	}
+	prof, err := a.Profile(ctx, m.ProfileId)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, notFound("profile")
+	} else if err != nil {
+		return nil, s.internal("get profile", err)
+	}
+	if m.DeleteProfile && m.ConfirmName != prof.Name {
+		return nil, invalid("confirm_name does not match the profile name")
+	}
+	ins, err := a.InboundsOfProfile(ctx, prof.ID) // for the vault AAD of the kept keys, the relays, the events and the audit row
+	if err != nil {
+		return nil, s.internal("profile inbounds", err)
+	}
+	inboundOf := map[string]string{} // node id -> inbound id
+	var relays []store.RelayLink     // they go with the inbounds (foreign key)
+	for _, in := range ins {
+		if !slices.Contains(m.NodeIds, in.NodeID) {
+			continue
+		}
+		inboundOf[in.NodeID] = in.ID
+		links, err := s.st.RelayLinks(ctx, store.RelayFilter{InboundID: in.ID})
+		if err != nil {
+			return nil, s.internal("list relays", err)
+		}
+		relays = append(relays, links...)
+	}
+	retain := func(enc []byte, profileID, nodeID string) ([]byte, error) {
+		return s.retainKey(enc, inboundOf[nodeID], profileID, nodeID)
+	}
+	removed, err := a.RemoveProfileInbounds(ctx, prof.ID, m.NodeIds, m.DeleteProfile, s.now(), retain)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return nil, notFound("profile")
+	case errors.Is(err, store.ErrAccessInUse):
+		var left []store.AccessInbound
+		for _, in := range ins {
+			if !slices.Contains(m.NodeIds, in.NodeID) {
+				left = append(left, in)
+			}
+		}
+		if len(left) == 0 { // the profile got a new node after the list was read
+			if left, err = a.InboundsOfProfile(ctx, prof.ID); err != nil {
+				return nil, s.internal("profile inbounds", err)
+			}
+		}
+		return nil, s.profileDeployed(ctx, left)
+	case errors.Is(err, store.ErrConflict):
+		return nil, coded(connect.CodeAborted, "stale_version") // its nodes kept changing: the page is out of date
+	case err != nil:
+		return nil, s.internal("remove profile from nodes", err)
+	}
+	resp := &adminv1.RemoveProfileFromNodesResponse{Removed: uint32(len(removed)), ProfileDeleted: m.DeleteProfile}
+	var names []string
+	for _, in := range removed {
+		node, _ := a.Node(ctx, in.NodeID) // a retired node keeps its row and its name
+		names = append(names, node.Name)
+		s.nodeEvent(ctx, "profile_removed", in.NodeID, in.ID, prof)
+	}
+	slices.Sort(names)
+	gone := relays[:0]
+	for _, l := range relays {
+		if slices.ContainsFunc(removed, func(in store.AccessInbound) bool { return in.ID == l.InboundID }) {
+			gone = append(gone, l)
+		}
+	}
+	resp.RelaysRemoved = uint32(len(gone))
+	s.auditRelaysGone(ctx, gone, "inbound_removed")
+	if len(removed) > 0 {
+		s.audit(ctx, actor(ctx), "inbounds_remove", map[string]any{"profile": prof.Name, "count": len(removed), "nodes": nameList(names)})
+	}
+	if m.DeleteProfile {
+		s.audit(ctx, actor(ctx), "profile_delete", map[string]any{"profile": prof.ID, "name": prof.Name, "protocol": prof.Protocol, "nodes": len(removed)})
+	}
+	s.notify.StateChanged()
+	return connect.NewResponse(resp), nil
 }
 
 // ---- inbounds ----
@@ -603,12 +704,15 @@ func (s *Service) inboundProto(f store.AccessInboundFull, settings json.RawMessa
 		NodeId: f.Node.ID, NodeName: f.Node.Name, State: inboundStates[f.Inbound.State], LastError: f.Inbound.LastError,
 		CertPinSha256: f.Inbound.CertPinSHA256, Port: uint32(f.Inbound.PortOverride), TlsServerName: f.Inbound.TLSServerNameOverride,
 		PortOverride: uint32(f.Inbound.PortOverride), TlsServerNameOverride: f.Inbound.TLSServerNameOverride, Enabled: f.Inbound.Enabled,
+		DirectInSubscriptions: f.Inbound.DirectInSubscriptions, RealityTargetOverride: f.Inbound.RealityTargetOverride,
 	}
 	if !f.Inbound.CertNotAfter.IsZero() {
 		out.CertNotAfterUnix = f.Inbound.CertNotAfter.Unix()
 	}
 	if spec, err := s.buildSpec(f, settings); err == nil {
 		out.Port, out.TlsServerName, out.Egress = uint32(spec.Listen.Port), spec.TLS.ServerName, spec.Egress
+		out.Cdn = plugin.ServerCDN(spec)
+		out.RealityTarget = plugin.RealityTargetShown(spec)
 	}
 	out.Awg = awgStatus(f.Inbound)
 	return out
@@ -654,7 +758,34 @@ type nodeListen struct {
 	protocol string
 	enabled  bool
 	l        plugin.Listen
+	listens  []plugin.Listen
 	spec     plugin.InboundSpec
+}
+
+func inboundListens(spec plugin.InboundSpec) []plugin.Listen {
+	listens := []plugin.Listen{spec.Listen}
+	return append(listens, plugin.SideListens(spec)...)
+}
+
+func specHasUDPListen(spec plugin.InboundSpec) bool {
+	return len(specUDPListens(spec)) > 0
+}
+
+func specUDPListens(spec plugin.InboundSpec) []plugin.Listen {
+	var out []plugin.Listen
+	for _, listen := range inboundListens(spec) {
+		if listen.Network == "udp" {
+			out = append(out, listen)
+		}
+	}
+	return out
+}
+
+func (n nodeListen) allListens() []plugin.Listen {
+	if len(n.listens) > 0 {
+		return n.listens
+	}
+	return []plugin.Listen{n.l}
 }
 
 // nodeInbounds is what the checks need of a node's inbounds other than skip (the one being changed; a relay's id also
@@ -677,7 +808,7 @@ func (s *Service) nodeInbounds(ctx context.Context, nodeID, skip string) (listen
 			return nil, nil, s.internal("open profile secrets", err)
 		}
 		if os, err := s.buildSpec(o, merged); err == nil {
-			listens = append(listens, nodeListen{profile: o.Profile.Name, protocol: os.Protocol, enabled: o.Inbound.Enabled, l: os.Listen, spec: os})
+			listens = append(listens, nodeListen{profile: o.Profile.Name, protocol: os.Protocol, enabled: o.Inbound.Enabled, l: os.Listen, listens: inboundListens(os), spec: os})
 		}
 	}
 	forwards, err := s.st.RelayLinks(ctx, store.RelayFilter{ViaNodeID: nodeID})
@@ -690,14 +821,25 @@ func (s *Service) nodeInbounds(ctx context.Context, nodeID, skip string) (listen
 				l: plugin.Listen{Network: r.Network, Port: r.Port}})
 		}
 	}
+	if n, err := s.st.Node(ctx, nodeID); err == nil && n.BridgePort != 0 {
+		listens = append(listens, nodeListen{profile: "reverse relay bridge", protocol: "bridge", enabled: true,
+			l: plugin.Listen{Network: "tcp", Port: n.BridgePort}})
+	}
 	return listens, profiles, nil
 }
 
 // clashOf is the first neighbour that fights l over a listener port (listenOverlap), or nil.
 func clashOf(l plugin.Listen, others []nodeListen) *nodeListen {
+	return clashOfExcept(l, others, nil)
+}
+
+// clashOfExcept is clashOf that does not count the listener ol of a neighbour o when skip(o, ol) says so.
+func clashOfExcept(l plugin.Listen, others []nodeListen, skip func(o nodeListen, ol plugin.Listen) bool) *nodeListen {
 	for i := range others {
-		if listenOverlap(l, others[i].l) {
-			return &others[i]
+		for _, other := range others[i].allListens() {
+			if listenOverlap(l, other) && (skip == nil || !skip(others[i], other)) {
+				return &others[i]
+			}
 		}
 	}
 	return nil
@@ -705,8 +847,8 @@ func clashOf(l plugin.Listen, others []nodeListen) *nodeListen {
 
 // freePortFor is a port an inbound listening as l could take instead of l.Port, with its own hop range and, for UDP,
 // stored bad checks excluded; 0 when none is free.
-func freePortFor(protocol string, l plugin.Listen, others []nodeListen, checks map[uint16]store.PortCheck, now time.Time) uint16 {
-	ports := freePortCandidates(protocol, 1, l, others, checks, now)
+func freePortFor(spec plugin.InboundSpec, others []nodeListen, checks map[uint16]store.PortCheck, now time.Time) uint16 {
+	ports := freePortCandidates(spec, 1, others, checks, now)
 	if len(ports) == 0 {
 		return 0
 	}
@@ -715,7 +857,11 @@ func freePortFor(protocol string, l plugin.Listen, others []nodeListen, checks m
 
 // portRefusal is the coded refusal of a listen that another profile of the node fights over, or nil: "hop_taken" when
 // the inbound's own hop range is what overlaps (no port fixes that), else "port_taken" with a free port to take instead.
-func portRefusal(protocol, node string, l plugin.Listen, others []nodeListen, checks map[uint16]store.PortCheck, now time.Time) error {
+//
+// A TCP inbound that stands on the port of another TCP inbound of the node does not fight over it when the two can share it
+// (shareRefusal): the agent puts a front on the port and tells them apart by the name in the ClientHello.
+func portRefusal(spec plugin.InboundSpec, node string, others []nodeListen, checks map[uint16]store.PortCheck, now time.Time, who portSubject) error {
+	l := spec.Listen
 	if l.HopFrom != 0 {
 		// the range alone: its start stands in for the port, so that only the range is compared
 		if c := clashOf(plugin.Listen{Network: l.Network, Port: l.HopFrom, HopFrom: l.HopFrom, HopTo: l.HopTo}, others); c != nil {
@@ -723,12 +869,19 @@ func portRefusal(protocol, node string, l plugin.Listen, others []nodeListen, ch
 				"profile", c.profile, "node", node)
 		}
 	}
-	c := clashOf(l, others)
+	var c *nodeListen
+	for i, candidate := range inboundListens(spec) {
+		if c = clashOfExcept(candidate, others, func(o nodeListen, ol plugin.Listen) bool {
+			return i == 0 && ol == o.l && isSharePeer(spec, o) // the two TCP listeners that may stand on one port
+		}); c != nil {
+			break
+		}
+	}
 	if c == nil {
-		return nil
+		return shareRefusal(spec, node, others, who, func() uint16 { return freePortFor(spec, others, checks, now) })
 	}
 	kv := []string{"port", strconv.Itoa(int(l.Port)), "profile", c.profile, "node", node,
-		"free", strconv.Itoa(int(freePortFor(protocol, l, others, checks, now)))}
+		"free", strconv.Itoa(int(freePortFor(spec, others, checks, now)))}
 	if c.l.Port != l.Port {
 		kv = append(kv, "hop", fmt.Sprintf("%d-%d", c.l.HopFrom, c.l.HopTo)) // the port lies in that profile's hop range
 	}
@@ -741,7 +894,16 @@ func buildRefusal(err error, node string) error {
 	var domain *protocols.NeedsDomainError
 	var hop *protocols.PortInHopError
 	var name *protocols.ServerNameError
+	var target *protocols.RealityTargetError
 	switch {
+	case errors.As(err, &target) && target.Reason == "unsupported":
+		return coded(connect.CodeInvalidArgument, "reality_target_unsupported", "target", target.Target, "node", node)
+	case errors.As(err, &target) && target.Reason == "same_node":
+		return coded(connect.CodeInvalidArgument, "reality_target_same_node", "target", target.Target, "node", node)
+	case errors.As(err, &target):
+		return coded(connect.CodeInvalidArgument, "reality_target_invalid", "target", target.Target, "node", node)
+	case errors.As(err, &domain) && domain.MTProto:
+		return coded(connect.CodeInvalidArgument, "mtproto_needs_domain", "address", domain.Address, "node", node)
 	case errors.As(err, &domain) && domain.Reality:
 		return coded(connect.CodeInvalidArgument, "reality_needs_domain", "address", domain.Address, "node", node)
 	case errors.As(err, &domain):
@@ -761,53 +923,161 @@ func buildRefusal(err error, node string) error {
 func nodeBuildRefusal(err error, node string) error {
 	var domain *protocols.NeedsDomainError
 	var name *protocols.ServerNameError
-	if errors.As(err, &domain) || errors.As(err, &name) {
+	var target *protocols.RealityTargetError
+	if errors.As(err, &domain) || errors.As(err, &name) || errors.As(err, &target) {
 		return buildRefusal(err, node)
 	}
 	return invalid("node %s: %v", node, err)
 }
 
+// inboundAdmission is an inbound that is being put on a node, as CreateInbound, UpdateInbound and UpdateProfile see it.
+type inboundAdmission struct {
+	node    store.AccessNode
+	profile string // the profile's name, for what is said about it
+	spec    plugin.InboundSpec
+	others  []nodeListen
+	checks  map[uint16]store.PortCheck // the node's stored UDP port checks
+	extra   []*adminv1.StatusReason    // warnings of the call itself, told after the inbound's and before the port's
+	// moved: the port is new to the node (a new inbound, a new port, an inbound switched on), so a lossy one is refused
+	// and, in a real run, probed. Otherwise a lossy port the node already has only warns.
+	moved bool
+	// check: validate_only / dry_run. Nothing is probed: only the stored results speak.
+	check      bool
+	allowLossy bool
+}
+
+// admitInbound is what the three calls ask before an inbound goes on a node: the refusal for its ports, the warnings, and the loss of
+// a UDP port. lossyOverride is set when the admin chose to save a port that was found lossy, for the audit.
+func (s *Service) admitInbound(ctx context.Context, a inboundAdmission) (warnings []*adminv1.StatusReason, lossyOverride bool, err error) {
+	if err = portRefusal(a.spec, a.node.Name, a.others, a.checks, s.now(), portSubject{Profile: a.profile, Agent: a.node.AgentCaps, Address: a.node.Address}); err != nil {
+		return nil, false, err
+	}
+	if warnings, err = s.inboundWarnings(ctx, a.node.ID, a.node.Name, a.profile, a.spec, a.others); err != nil {
+		return nil, false, err
+	}
+	warnings = append(warnings, a.extra...)
+	bad, cachedBad := cachedSpecPortLossy(a.spec, a.checks, s.now())
+	switch {
+	case a.check:
+		if cachedBad {
+			if a.moved && !a.allowLossy {
+				return nil, false, portLossyRefusal(ctx, s, a.node.Name, bad, freePortFor(a.spec, a.others, a.checks, s.now()))
+			}
+			warnings = append(warnings, s.portLossyWarning(ctx, a.node.Name, bad))
+		}
+	case a.moved:
+		var warning *adminv1.StatusReason
+		if warning, lossyOverride, err = s.checkPort(ctx, a.node, a.spec, a.others, a.checks, a.allowLossy); err != nil {
+			return nil, false, err
+		}
+		if warning != nil {
+			warnings = append(warnings, warning)
+		}
+	case cachedBad:
+		warnings = append(warnings, s.portLossyWarning(ctx, a.node.Name, bad))
+	}
+	return warnings, lossyOverride, nil
+}
+
+// normalizeTargetOverride is a REALITY target set on one node as the node gets it, so that the same site written another way
+// (Shop.Example.com.:443) compares equal to the stored one later: no new spec version, no restart.
+func normalizeTargetOverride(target string, spec plugin.InboundSpec) string {
+	if target == "" {
+		return ""
+	}
+	if clean := plugin.RealityTargetShown(spec); clean != "" && clean != "self" {
+		return clean
+	}
+	return target
+}
+
+// retainKey is the retain step of a removal that parks the server key of an inbound for its (profile, node) pair: opened under
+// the inbound's own AAD, sealed again under the pair's. A key that does not open is not kept: a new one is made when the
+// profile comes back.
+func (s *Service) retainKey(enc []byte, inboundID, profileID, nodeID string) ([]byte, error) {
+	state, err := s.vault.Open(enc, inboundID)
+	if err != nil {
+		s.log.Warn("access: server key of the removed inbound is unreadable, not kept", "code", "awg_server_key_unreadable", "inbound", inboundID, "err", err)
+		return nil, nil
+	}
+	return s.vault.Seal(state, store.RetainedKeyAAD(profileID, nodeID)), nil
+}
+
 // inboundWarnings is what the admin should know before adding or switching on an inbound although it does not stop it:
-// a VLESS listener that pauses a Hysteria2 site, or a WARP exit whose account is missing, paused, or down.
+// a VLESS listener that pauses a Hysteria2 site, a TCP port that services share by SNI (tcp_port_shared, share_two_faces), or a
+// WARP exit whose account is missing, paused, or down.
 func (s *Service) inboundWarnings(ctx context.Context, nodeID, nodeName, profileName string, spec plugin.InboundSpec, others []nodeListen) ([]*adminv1.StatusReason, error) {
 	var warnings []*adminv1.StatusReason
 	var port80Err error
 	appendDecoyWarning := func(port int, hy2, vless string, vlessSpec, hy2Spec plugin.InboundSpec) {
 		// via self: REALITY shows the node's own site, so the Hysteria2 site stays and nothing is borrowed; via site: another
 		// site is shown, which is named by target
+		view, _ := plugin.VLESSOf(vlessSpec)
 		via := "site"
-		if vlessTargetSelf(vlessSpec) {
+		if view.TargetSelf() {
 			via = "self"
 		}
-		params := map[string]string{"node": nodeName, "port": strconv.Itoa(port), "hy2": hy2, "vless": vless, "via": via, "target": vlessTargetHost(vlessSpec)}
+		params := map[string]string{"node": nodeName, "port": strconv.Itoa(port), "hy2": hy2, "vless": vless, "via": via, "target": view.TargetHost()}
 		// only an ACME certificate renews through the site port, so only then does TCP 80 become its sole way (§7.1)
 		if m := hy2Spec.TLS.Mode; m == plugin.TLSAcmeDomain || m == plugin.TLSAcmeIP {
 			params["port80"], port80Err = s.port80State(ctx, nodeID)
 		}
 		warnings = append(warnings, &adminv1.StatusReason{Code: "hy2_decoy_paused", Params: params})
 	}
+	// TrustTunnel serves the node's own site on its TCP port, so a Hysteria2 site there is closed and nothing else changes: the
+	// same pause as under VLESS, told apart by its code because the admin's sentence for hy2_decoy_paused names VLESS. An MTProto
+	// inbound closes the site the same way (the agent gives the port up to any TCP inbound) and shows its own fallback instead;
+	// its code is hy2_site_taken_mtproto, since the sentence of hy2_site_taken names TrustTunnel.
+	appendTakenWarning := func(port int, hy2, taker, protocol string) {
+		code := "hy2_site_taken"
+		if protocol == "mtproto" {
+			code += "_mtproto"
+		}
+		warnings = append(warnings, &adminv1.StatusReason{Code: code, Params: map[string]string{
+			"node": nodeName, "port": strconv.Itoa(port), "hy2": hy2, protocol: taker}})
+	}
+	if (spec.Protocol == "trusttunnel" || spec.Protocol == "mtproto") && spec.Listen.Network == "tcp" {
+		for _, other := range others {
+			if other.enabled && other.protocol == "hysteria2" && plugin.Hy2SitePort(other.spec) == spec.Listen.Port {
+				appendTakenWarning(int(spec.Listen.Port), other.profile, profileName, spec.Protocol)
+				break
+			}
+		}
+	}
 	if spec.Protocol == "vless" && spec.Listen.Network == "tcp" {
 		for _, other := range others {
-			if !other.enabled || other.protocol != "hysteria2" || hy2TCPPort(other.spec) != int(spec.Listen.Port) {
+			if !other.enabled || other.protocol != "hysteria2" || plugin.Hy2SitePort(other.spec) != spec.Listen.Port {
 				continue
 			}
 			appendDecoyWarning(int(spec.Listen.Port), other.profile, profileName, spec, other.spec)
 			break
 		}
 	} else if spec.Protocol == "hysteria2" {
-		port := hy2TCPPort(spec)
+		port := int(plugin.Hy2SitePort(spec))
 		if port > 0 {
 			for _, other := range others {
-				if !other.enabled || other.protocol != "vless" || other.l.Network != "tcp" || int(other.l.Port) != port {
+				if !other.enabled || other.l.Network != "tcp" || int(other.l.Port) != port {
 					continue
 				}
-				appendDecoyWarning(port, profileName, other.profile, other.spec, spec)
-				break
+				if other.protocol == "vless" {
+					appendDecoyWarning(port, profileName, other.profile, other.spec, spec)
+					break
+				}
+				if other.protocol == "trusttunnel" || other.protocol == "mtproto" {
+					appendTakenWarning(port, profileName, other.profile, other.protocol)
+					break
+				}
 			}
 		}
 	}
 	if port80Err != nil {
 		return nil, port80Err
+	}
+	warnings = append(warnings, shareWarnings(nodeName, spec, profileName, others)...)
+	if w, err := s.bridgeSiteWarning(ctx, nodeID, nodeName, spec, others); err != nil {
+		return nil, err
+	} else if w != nil {
+		warnings = append(warnings, w)
 	}
 	if spec.Egress != "warp" {
 		return warnings, nil
@@ -851,57 +1121,6 @@ func (s *Service) port80State(ctx context.Context, nodeID string) (string, error
 		}
 	}
 	return "unchecked", nil
-}
-
-// hy2TCPPort matches the node's Hysteria2 site rule: omitted means 443 and zero disables the site.
-func hy2TCPPort(spec plugin.InboundSpec) int {
-	if spec.Protocol != "hysteria2" || spec.TLS.Mode == 0 {
-		return 0
-	}
-	var settings struct {
-		Masquerade struct {
-			TCPPort *int `json:"tcp_port"`
-		} `json:"masquerade"`
-	}
-	if len(spec.Settings) > 0 && json.Unmarshal(spec.Settings, &settings) != nil {
-		return 0
-	}
-	if settings.Masquerade.TCPPort != nil {
-		return max(*settings.Masquerade.TCPPort, 0)
-	}
-	return 443
-}
-
-// vlessTargetSelf: the VLESS inbound's REALITY target is the node's own site (wire value "self").
-func vlessTargetSelf(spec plugin.InboundSpec) bool {
-	if spec.Protocol != "vless" {
-		return false
-	}
-	var settings struct {
-		Reality struct {
-			Target string `json:"target"`
-		} `json:"reality"`
-	}
-	return json.Unmarshal(spec.Settings, &settings) == nil && strings.TrimSpace(settings.Reality.Target) == "self"
-}
-
-func vlessTargetHost(spec plugin.InboundSpec) string {
-	if spec.Protocol != "vless" {
-		return ""
-	}
-	var settings struct {
-		Reality struct {
-			Target string `json:"target"`
-		} `json:"reality"`
-	}
-	if json.Unmarshal(spec.Settings, &settings) != nil {
-		return ""
-	}
-	host, _, err := net.SplitHostPort(strings.TrimSpace(settings.Reality.Target))
-	if err != nil {
-		return ""
-	}
-	return strings.Trim(host, "[]")
 }
 
 // warpDown: the node's last WARP report says the tunnel does not work (down, or no backend to run it on).
@@ -956,7 +1175,7 @@ func (s *Service) CreateInbound(ctx context.Context, req *connect.Request[adminv
 	}
 	f := store.AccessInboundFull{Inbound: store.AccessInbound{
 		ID: store.NewID("inb_"), ProfileID: m.ProfileId, NodeID: m.NodeId, PortOverride: port, TLSServerNameOverride: sni,
-		Enabled: true, SpecVersion: 1, State: "pending", CreatedAt: s.now(),
+		RealityTargetOverride: strings.TrimSpace(m.RealityTargetOverride), Enabled: true, DirectInSubscriptions: true, SpecVersion: 1, State: "pending", CreatedAt: s.now(),
 	}}
 	var proto protocols.Protocol
 	var merged json.RawMessage
@@ -1008,6 +1227,9 @@ func (s *Service) CreateInbound(ctx context.Context, req *connect.Request[adminv
 	if f.Node.State != "pending" && f.Node.State != "active" {
 		return nil, coded(connect.CodeFailedPrecondition, "node_retired")
 	}
+	if err := realityTargetAgentRefusal(f.Node.AgentCaps, f.Inbound.RealityTargetOverride); err != nil {
+		return nil, err
+	}
 	others, here, err := s.nodeInbounds(ctx, f.Node.ID, "")
 	if err != nil {
 		return nil, err
@@ -1048,37 +1270,25 @@ func (s *Service) CreateInbound(ctx context.Context, req *connect.Request[adminv
 	if err != nil {
 		return nil, buildRefusal(err, f.Node.Name)
 	}
+	f.Inbound.RealityTargetOverride = normalizeTargetOverride(f.Inbound.RealityTargetOverride, spec)
+	if err := s.realityTargetOwnRefusal(ctx, f, spec); err != nil {
+		return nil, err
+	}
 	var portChecks portCheckCache
-	if spec.Listen.Network == "udp" {
+	if specHasUDPListen(spec) {
 		portChecks, err = s.readPortChecks(ctx, f.Node.ID)
 		if err != nil {
 			return nil, s.internal("read UDP port checks", err)
 		}
 	}
-	if err := portRefusal(proto.ID(), f.Node.Name, spec.Listen, others, portChecks[f.Node.ID], s.now()); err != nil {
-		return nil, err
-	}
-	warnings, err := s.inboundWarnings(ctx, f.Node.ID, f.Node.Name, f.Profile.Name, spec, others)
+	warnings, lossyOverride, err := s.admitInbound(ctx, inboundAdmission{node: f.Node, profile: f.Profile.Name, spec: spec, others: others,
+		checks: portChecks[f.Node.ID], moved: true, check: m.ValidateOnly, allowLossy: m.AllowLossyPort})
 	if err != nil {
 		return nil, err
 	}
 	if m.ValidateOnly {
-		if bad, ok := cachedListenPortLossy(spec.Listen, portChecks[f.Node.ID], s.now()); ok {
-			free := freePortFor(proto.ID(), spec.Listen, others, portChecks[f.Node.ID], s.now())
-			if !m.AllowLossyPort {
-				return nil, portLossyRefusal(ctx, s, f.Node.Name, bad, free)
-			}
-			warnings = append(warnings, s.portLossyWarning(ctx, f.Node.Name, bad))
-		}
 		return connect.NewResponse(&adminv1.CreateInboundResponse{Inbound: s.inboundProto(f, merged), Warnings: warnings,
-			FreePort: uint32(freePortFor(proto.ID(), spec.Listen, others, portChecks[f.Node.ID], s.now()))}), nil
-	}
-	portWarning, lossyOverride, err := s.checkPort(ctx, f.Node, proto.ID(), spec.Listen, others, portChecks[f.Node.ID], m.AllowLossyPort)
-	if err != nil {
-		return nil, err
-	}
-	if portWarning != nil {
-		warnings = append(warnings, portWarning)
+			FreePort: uint32(freePortFor(spec, others, portChecks[f.Node.ID], s.now()))}), nil
 	}
 	switch err := a.CreateInbound(ctx, f.Inbound); {
 	case errors.Is(err, store.ErrAccessExists):
@@ -1106,11 +1316,13 @@ func (s *Service) UpdateInbound(ctx context.Context, req *connect.Request[adminv
 		return nil, s.internal("load inbound", err)
 	}
 	in := f.Inbound
+	was := in // what the write below is checked against: another edit of the row in between is refused, not overwritten
 	oldEnabled := in.Enabled
-	oldSpec, err := s.buildSpec(f, merged)
-	if err != nil {
-		return nil, buildRefusal(err, f.Node.Name)
-	}
+	oldDirectInSubscriptions := in.DirectInSubscriptions
+	// The spec before the change only tells whether the port moves: an inbound that does not build now (a disabled one whose profile
+	// went to TLS while it kept a target of the node) must still be editable, or its target could never be reset.
+	oldSpec, oldErr := s.buildSpec(f, merged)
+	storedTarget := in.RealityTargetOverride
 	specChangedByAdmin := false
 	if m.PortOverride != nil {
 		port, _, err := checkOverrides(*m.PortOverride, "")
@@ -1128,69 +1340,89 @@ func (s *Service) UpdateInbound(ctx context.Context, req *connect.Request[adminv
 		specChangedByAdmin = specChangedByAdmin || sni != in.TLSServerNameOverride
 		in.TLSServerNameOverride = sni
 	}
+	if m.RealityTargetOverride != nil {
+		target := strings.TrimSpace(*m.RealityTargetOverride)
+		if len(target) > 300 {
+			return nil, invalid("reality target override is too long")
+		}
+		if target != in.RealityTargetOverride {
+			if err := realityTargetAgentRefusal(f.Node.AgentCaps, target); err != nil {
+				return nil, err
+			}
+		}
+		in.RealityTargetOverride = target
+	}
 	enabledChanged := false
 	if m.Enabled != nil {
 		enabledChanged = *m.Enabled != in.Enabled
 		in.Enabled = *m.Enabled
+	}
+	directInSubscriptionsChanged := false
+	if m.DirectInSubscriptions != nil {
+		directInSubscriptionsChanged = *m.DirectInSubscriptions != in.DirectInSubscriptions
+		in.DirectInSubscriptions = *m.DirectInSubscriptions
 	}
 	f.Inbound = in
 	spec, err := s.buildSpec(f, merged)
 	if err != nil {
 		return nil, buildRefusal(err, f.Node.Name)
 	}
+	if m.RealityTargetOverride != nil {
+		in.RealityTargetOverride = normalizeTargetOverride(in.RealityTargetOverride, spec)
+		f.Inbound = in
+	}
+	if in.RealityTargetOverride != storedTarget {
+		specChangedByAdmin = true
+	}
+	if in.RealityTargetOverride != "" && in.RealityTargetOverride != storedTarget { // a target of the node's own is being set: not one of the fleet's own names
+		if err := s.realityTargetOwnRefusal(ctx, f, spec); err != nil {
+			return nil, err
+		}
+	}
 	others, _, err := s.nodeInbounds(ctx, f.Node.ID, f.Inbound.ID)
 	if err != nil {
 		return nil, err
 	}
 	var warnings []*adminv1.StatusReason
-	var portWarning *adminv1.StatusReason
 	var lossyOverride bool
 	var portChecks portCheckCache
-	if spec.Listen.Network == "udp" && (m.ValidateOnly || in.Enabled) {
+	if specHasUDPListen(spec) && (m.ValidateOnly || in.Enabled) {
 		portChecks, err = s.readPortChecks(ctx, f.Node.ID)
 		if err != nil {
 			return nil, s.internal("read UDP port checks", err)
 		}
 	}
 	if in.Enabled {
-		if err := portRefusal(f.Profile.Protocol, f.Node.Name, spec.Listen, others, portChecks[f.Node.ID], s.now()); err != nil {
-			return nil, err
-		}
-		if warnings, err = s.inboundWarnings(ctx, f.Node.ID, f.Node.Name, f.Profile.Name, spec, others); err != nil {
-			return nil, err
-		}
-		portChanged := oldSpec.Listen.Port != spec.Listen.Port
-		switchedOn := !oldEnabled && in.Enabled
-		if m.ValidateOnly {
-			if bad, ok := cachedListenPortLossy(spec.Listen, portChecks[f.Node.ID], s.now()); ok {
-				free := freePortFor(f.Profile.Protocol, spec.Listen, others, portChecks[f.Node.ID], s.now())
-				if (portChanged || switchedOn) && !m.AllowLossyPort {
-					return nil, portLossyRefusal(ctx, s, f.Node.Name, bad, free)
-				}
-				warnings = append(warnings, s.portLossyWarning(ctx, f.Node.Name, bad))
-			}
-		} else if portChanged || switchedOn {
-			portWarning, lossyOverride, err = s.checkPort(ctx, f.Node, f.Profile.Protocol, spec.Listen, others, portChecks[f.Node.ID], m.AllowLossyPort)
+		adm := inboundAdmission{node: f.Node, profile: f.Profile.Name, spec: spec, others: others, checks: portChecks[f.Node.ID],
+			moved: oldErr != nil || oldSpec.Listen.Port != spec.Listen.Port || !oldEnabled, check: m.ValidateOnly, allowLossy: m.AllowLossyPort}
+		if directInSubscriptionsChanged && oldDirectInSubscriptions && !in.DirectInSubscriptions {
+			warning, err := s.inboundNoWayInWarning(ctx, f, spec)
 			if err != nil {
-				return nil, err
+				return nil, s.internal("check inbound subscription routes", err)
 			}
-			if portWarning != nil {
-				warnings = append(warnings, portWarning)
+			if warning != nil {
+				adm.extra = append(adm.extra, warning)
 			}
-		} else if bad, ok := cachedListenPortLossy(spec.Listen, portChecks[f.Node.ID], s.now()); ok {
-			warnings = append(warnings, s.portLossyWarning(ctx, f.Node.Name, bad))
+		}
+		if warnings, lossyOverride, err = s.admitInbound(ctx, adm); err != nil {
+			return nil, err
 		}
 	}
 	if m.ValidateOnly {
 		return connect.NewResponse(&adminv1.UpdateInboundResponse{Inbound: s.inboundProto(f, merged), Warnings: warnings,
-			FreePort: uint32(freePortFor(f.Profile.Protocol, spec.Listen, others, portChecks[f.Node.ID], s.now()))}), nil
+			FreePort: uint32(freePortFor(spec, others, portChecks[f.Node.ID], s.now()))}), nil
 	}
 	if specChangedByAdmin {
 		in.SpecVersion++
 		f.Inbound = in
 	}
-	if specChangedByAdmin || enabledChanged {
-		if err := s.st.Access().UpdateInbound(ctx, in, true, s.now()); err != nil {
+	desiredChanged := specChangedByAdmin || enabledChanged
+	if desiredChanged || directInSubscriptionsChanged {
+		if err := s.st.Access().UpdateInbound(ctx, in, was, desiredChanged, s.now()); errors.Is(err, store.ErrAccessVersion) {
+			return nil, coded(connect.CodeAborted, "stale_inbound")
+		} else if errors.Is(err, store.ErrNotFound) {
+			return nil, notFound("inbound")
+		} else if err != nil {
 			return nil, s.internal("update inbound", err)
 		}
 		if p, ok := s.reg.Get(f.Profile.Protocol); ok && specChangedByAdmin && protocols.IsPerDevice(p) {
@@ -1199,17 +1431,57 @@ func (s *Service) UpdateInbound(ctx context.Context, req *connect.Request[adminv
 				return nil, s.internal("mark devices stale", err)
 			}
 		}
-		f.Inbound.State = "pending"
-		if !in.Enabled {
-			f.Inbound.State = "disabled"
+		if desiredChanged {
+			f.Inbound.State = "pending"
+			if !in.Enabled {
+				f.Inbound.State = "disabled"
+			}
 		}
-		s.audit(ctx, actor(ctx), "inbound_update", map[string]any{"inbound": in.ID, "profile": f.Profile.Name, "node": f.Node.Name, "port": spec.Listen.Port, "enabled": in.Enabled})
+		s.audit(ctx, actor(ctx), "inbound_update", map[string]any{"inbound": in.ID, "profile": f.Profile.Name, "node": f.Node.Name,
+			"port": spec.Listen.Port, "enabled": in.Enabled, "direct_in_subscriptions": in.DirectInSubscriptions,
+			"reality_target": in.RealityTargetOverride})
 		if lossyOverride {
 			s.auditLossyPort(ctx, f.Node.Name, spec.Listen.Port)
 		}
-		s.notify.StateChanged()
+		if desiredChanged {
+			s.notify.StateChanged()
+		}
 	}
 	return connect.NewResponse(&adminv1.UpdateInboundResponse{Inbound: s.inboundProto(f, merged), Warnings: warnings}), nil
+}
+
+// inboundNoWayInWarning warns when hiding the node's address would leave no address, CDN, or operational relay through which a
+// possible subscriber could reach this inbound. The synthetic audience permits every supported app and node; relayUsable keeps
+// this check aligned with subscription relay enablement, checks, entry state, and the live inbound rules.
+func (s *Service) inboundNoWayInWarning(ctx context.Context, f store.AccessInboundFull, spec plugin.InboundSpec) (*adminv1.StatusReason, error) {
+	if !f.Inbound.Enabled || f.Inbound.DirectInSubscriptions || plugin.ServerCDN(spec) ||
+		(ipv6EntryAddr(f.Node) != "" && protocols.IPv6Unsupported(spec) == "") {
+		return nil, nil
+	}
+
+	unsupported := protocols.IPv6Unsupported(spec)
+	if unsupported == "" {
+		links, err := s.st.RelayLinks(ctx, store.RelayFilter{InboundID: f.Inbound.ID})
+		if err != nil {
+			return nil, err
+		}
+		groups := store.AccessGroups{{ProfileIDs: []string{f.Profile.ID}}}
+		user := store.AccessUser{AllNodes: true, AppHapp: true, AppAmnezia: true, AppTelegram: true}
+		for _, link := range links {
+			if link.ViaNodeAddress != "" && s.relayUsableFor(link, f, groups, user, plugin.FormatMistgate) {
+				return nil, nil
+			}
+		}
+	}
+
+	// a code the admin words: "acme_ip" (a certificate for the node's IP), "cdn", or no usable relay
+	reason := unsupported
+	if reason == "" {
+		reason = "no_usable_relay"
+	}
+	return &adminv1.StatusReason{Code: "inbound_no_way_in", Params: map[string]string{
+		"profile": f.Profile.Name, "node": f.Node.Name, "reason": reason,
+	}}, nil
 }
 
 // nodeEvent puts "an admin changed the profiles of this node" on the node's event list. The profile name and protocol go
@@ -1232,13 +1504,7 @@ func (s *Service) DeleteInbound(ctx context.Context, req *connect.Request[adminv
 	// The server key of a per-device (AWG) inbound is parked for the pair, so that adding the profile back to the
 	// node keeps it (see CreateInbound); re-sealed here under the pair's AAD, in the delete's own transaction.
 	retain := func(enc []byte, profileID, nodeID string) ([]byte, error) {
-		inID := req.Msg.InboundId
-		state, err := s.vault.Open(enc, inID)
-		if err != nil {
-			s.log.Warn("access: server key of the removed inbound is unreadable, not kept", "inbound", inID, "err", err)
-			return nil, nil
-		}
-		return s.vault.Seal(state, store.RetainedKeyAAD(profileID, nodeID)), nil
+		return s.retainKey(enc, req.Msg.InboundId, profileID, nodeID)
 	}
 	relays, err := s.st.RelayLinks(ctx, store.RelayFilter{InboundID: req.Msg.InboundId}) // they go with the server (foreign key)
 	if err != nil {

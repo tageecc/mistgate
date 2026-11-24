@@ -15,12 +15,15 @@ import (
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
 	"github.com/mistgate/mistgate/gen/mistgate/admin/v1/adminv1connect"
+	decoysitev1 "github.com/mistgate/mistgate/gen/mistgate/decoysite/v1"
+	"github.com/mistgate/mistgate/gen/mistgate/decoysite/v1/decoysitev1connect"
 	"github.com/mistgate/mistgate/internal/panel/auth"
 	"github.com/mistgate/mistgate/internal/panel/edition"
 	"github.com/mistgate/mistgate/internal/panel/store"
 )
 
-// Every deferred edge function takes some admin feature away, and every unavailable feature is backed by deferred work.
+// Every deferred edge function takes some admin feature away, and every unavailable feature is backed by deferred work, except
+// the ones that have no work to defer: the decoy, and the owner-managed probes (a probe's endpoint is not mounted on the edge).
 func TestEdgeDeferredJobsMatchUnavailableFeatures(t *testing.T) {
 	jobs := slices.Sorted(maps.Keys(edgeDeferred))
 	mapped := slices.Sorted(maps.Keys(edgeDeferredFeatures))
@@ -37,8 +40,9 @@ func TestEdgeDeferredJobsMatchUnavailableFeatures(t *testing.T) {
 		}
 	}
 	listed := edition.Unavailable(true)
+	noJob := []string{edition.DecoyOwn, edition.OwnProbes, edition.SNIScan, edition.TrustTunnel}
 	for _, id := range listed {
-		if !covered[id] && id != edition.DecoyOwn {
+		if !covered[id] && !slices.Contains(noJob, id) {
 			t.Errorf("unavailable id %q has no deferred job behind it", id)
 		}
 	}
@@ -47,8 +51,8 @@ func TestEdgeDeferredJobsMatchUnavailableFeatures(t *testing.T) {
 			t.Errorf("deferred job maps to %q, which Me does not list as unavailable", id)
 		}
 	}
-	if len(listed) != len(covered)+1 || !slices.Contains(listed, edition.DecoyOwn) {
-		t.Errorf("unavailable ids %v, ids behind jobs %v plus %q", listed, slices.Sorted(maps.Keys(covered)), edition.DecoyOwn)
+	if len(listed) != len(covered)+len(noJob) || !slices.Contains(listed, edition.DecoyOwn) || !slices.Contains(listed, edition.OwnProbes) || !slices.Contains(listed, edition.SNIScan) || !slices.Contains(listed, edition.TrustTunnel) {
+		t.Errorf("unavailable ids %v, ids behind jobs %v plus %v", listed, slices.Sorted(maps.Keys(covered)), noJob)
 	}
 }
 
@@ -129,6 +133,11 @@ func TestBuildEditionWiresTheRefusals(t *testing.T) {
 		"UploadNodeDecoy": {edition.DecoyOwn, func(p *Panel, _ *auth.Service) error {
 			base, hc := serve(p.Fleet.NodeHandler())
 			_, err := adminv1connect.NewNodeServiceClient(hc, base).UploadNodeDecoy(ctx, connect.NewRequest(&adminv1.UploadNodeDecoyRequest{}))
+			return err
+		}},
+		"ListDecoySites": {edition.DecoyOwn, func(p *Panel, _ *auth.Service) error {
+			base, hc := serve(p.Fleet.DecoySiteHandler())
+			_, err := decoysitev1connect.NewDecoySiteServiceClient(hc, base).ListDecoySites(ctx, connect.NewRequest(&decoysitev1.ListDecoySitesRequest{}))
 			return err
 		}},
 	}

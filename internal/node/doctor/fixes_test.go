@@ -3,10 +3,14 @@ package doctor
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/mistgate/mistgate/internal/node/awgprep"
 	"github.com/mistgate/mistgate/internal/node/hostctl"
+	"github.com/mistgate/mistgate/internal/node/secupdates"
+	"github.com/mistgate/mistgate/internal/node/unit"
 )
 
 // fakeFixer records the calls that would change the host.
@@ -59,9 +63,12 @@ type fixRig struct {
 	fx                *fakeFixer
 	forward           *fakeForwardFixer
 	baseline          int
+	securityLaunches  int
+	nftLaunches       int
 	restarts          []string
 	warpReconnections int
 	warpRechecks      int
+	awgRepairs        int
 }
 
 func newFixRig(t *testing.T) (*fixRig, func(...func(*Env)) *Doctor) {
@@ -78,10 +85,24 @@ func newFixRig(t *testing.T) (*fixRig, func(...func(*Env)) *Doctor) {
 	f.put("/proc/sys/net/ipv4/tcp_congestion_control", "cubic\n")
 	f.put("/proc/sys/net/ipv4/tcp_available_congestion_control", "cubic bbr\n")
 	f.put("/run/systemd/system/.keep", "")
+	f.put("/etc/os-release", "ID=ubuntu\n")
+	f.bin("apt-config", "apt-get") // and no nft: the install_nftables fix has something to do
+	f.cmd(securityPackageQuery, "deinstall ok config-files", nil)
+	f.cmd(securityAPTConfig, "E='0'; L='0'; U='0';", nil)
+	f.cmd(securityTimers, "masked\ndisabled\n", nil)
+	f.cmd(securityTimersActive, "inactive\ninactive\n", nil)
+	f.put("/proc/sys/kernel/osrelease", "7.0.0-38-generic\n")
+	f.put("/sys/module/amneziawg/.keep", "")  // the module is loaded now: the fallback can move back
+	f.cmd(securityJobUnit, unitNotFound, nil) // what systemd says of a unit that never ran: the fix must start it
 	mk := func(tweak ...func(*Env)) *Doctor {
 		return f.doctor(append([]func(*Env){func(e *Env) {
 			e.Fixer = r.fx
 			e.ForwardFixer = r.forward
+			e.StateDir = f.root
+			e.LaunchSecurityUpdates = func(context.Context) error {
+				r.securityLaunches++
+				return nil
+			}
 			e.ApplyBaseline = func(context.Context) error {
 				r.baseline++
 				f.put("/proc/sys/net/core/default_qdisc", "fq\n")
@@ -90,6 +111,11 @@ func newFixRig(t *testing.T) (*fixRig, func(...func(*Env)) *Doctor) {
 				f.put(hostctl.JournaldFilePath, hostctl.JournaldFileBody)
 				return nil
 			}
+			e.AwgBackend = func() AwgBackend {
+				return AwgBackend{Mode: "kernel", Name: "userspace", Available: true, Fallback: true, Reason: "the amneziawg kernel module is not loaded"}
+			}
+			e.AwgModuleRepair = func(context.Context) error { r.awgRepairs++; return nil }
+			e.LaunchInstallNftables = func(context.Context) error { r.nftLaunches++; return nil }
 			e.RestartInbound = func(_ context.Context, id string) (uint32, error) { r.restarts = append(r.restarts, id); return 1, nil }
 			e.Warp = func(context.Context) WarpInfo { return WarpInfo{Configured: true, State: "down"} }
 			e.ReconnectWarp = func(context.Context) (bool, error) { r.warpReconnections++; return true, nil }
@@ -127,14 +153,21 @@ func TestDryRunChangesNothing(t *testing.T) {
 			t.Errorf("%s dry run found nothing to do on a host that needs it: %+v", fix, out)
 		}
 	}
-	if r.fx.vacuum != 0 || r.fx.set != 0 || r.baseline != 0 || len(r.restarts) != 0 || r.warpReconnections != 0 || r.forward.applies != 0 {
-		t.Fatalf("a dry run acted: vacuum=%d set=%d baseline=%d restarts=%v warp_reconnects=%d forward_applies=%d", r.fx.vacuum, r.fx.set, r.baseline, r.restarts, r.warpReconnections, r.forward.applies)
+	if r.fx.vacuum != 0 || r.fx.set != 0 || r.baseline != 0 || len(r.restarts) != 0 || r.warpReconnections != 0 || r.forward.applies != 0 || r.securityLaunches != 0 || r.nftLaunches != 0 || r.awgRepairs != 0 {
+		t.Fatalf("a dry run acted: vacuum=%d set=%d baseline=%d restarts=%v warp_reconnects=%d forward_applies=%d security_launches=%d", r.fx.vacuum, r.fx.set, r.baseline, r.restarts, r.warpReconnections, r.forward.applies, r.securityLaunches)
 	}
 	if after := snapshot(t, r.f.root); after != before {
 		t.Fatalf("a dry run changed the filesystem:\nbefore:\n%s\nafter:\n%s", before, after)
 	}
 	for _, c := range r.f.calls {
-		t.Errorf("a dry run ran a command: %s", c)
+		for _, forbidden := range []string{"apt-get ", "systemd-run ", "systemctl enable", "systemctl unmask"} {
+			if strings.Contains(c, forbidden) {
+				t.Errorf("a dry run ran a mutating command: %s", c)
+			}
+		}
+		if strings.HasPrefix(c, "unattended-upgrade ") {
+			t.Errorf("a dry run ran a package upgrade: %s", c)
+		}
 	}
 }
 
@@ -157,6 +190,90 @@ func TestDryRunFacts(t *testing.T) {
 	if out.Params["mode"] != "resolv_conf" || out.Params["before"] != "10.0.0.1" || out.Params["after"] != "1.1.1.1,8.8.8.8" {
 		t.Errorf("resolver plan: %+v", out)
 	}
+	out = d.Apply(context.Background(), FixEnableSecurityUpdates, true, nil)
+	if out.Params["install"] != "1" || out.Params["conf"] != "APT::Periodic::Enable,APT::Periodic::Update-Package-Lists,APT::Periodic::Unattended-Upgrade" ||
+		out.Params["timers"] != "apt-daily.timer,apt-daily-upgrade.timer" || out.Params["unmask"] != "apt-daily.timer" || !strings.HasPrefix(out.Detail, "would ") {
+		t.Errorf("security updates plan: %+v", out)
+	}
+}
+
+func TestEnableSecurityUpdatesNoopAndStart(t *testing.T) {
+	t.Run("already on", func(t *testing.T) {
+		f := newFake(t)
+		securityUpdatesFixture(f)
+		launches := 0
+		d := f.doctor(func(e *Env) {
+			e.StateDir = f.root
+			e.LaunchSecurityUpdates = func(context.Context) error { launches++; return nil }
+		})
+		out := d.Apply(context.Background(), FixEnableSecurityUpdates, false, nil)
+		if !out.OK || out.Params["noop"] != "1" || launches != 0 {
+			t.Fatalf("already-on result = %+v, launches=%d", out, launches)
+		}
+	})
+
+	t.Run("started after owner confirmation", func(t *testing.T) {
+		r, mk := newFixRig(t)
+		out := mk().Apply(context.Background(), FixEnableSecurityUpdates, false, nil)
+		if !out.OK || out.Affected != 1 || out.Params["started"] != "1" || out.Detail != "security updates enablement started in the background" || r.securityLaunches != 1 {
+			t.Fatalf("apply result = %+v, launches=%d", out, r.securityLaunches)
+		}
+	})
+
+	t.Run("no launcher", func(t *testing.T) {
+		out := newFake(t).doctor().Apply(context.Background(), FixEnableSecurityUpdates, false, nil)
+		if out.Err != ErrUnsupportedHost {
+			t.Fatalf("without a launcher = %+v, want unsupported_host", out)
+		}
+	})
+}
+
+func TestEnableSecurityUpdatesBusyCases(t *testing.T) {
+	t.Run("running status and active unit", func(t *testing.T) {
+		f := newFake(t)
+		securityUpdatesFixture(f)
+		f.cmd(securityJobUnit, unitActive, nil)
+		if err := awgprep.WriteStatus(filepath.Join(f.root, secupdates.StatusFileName), awgprep.Status{State: awgprep.StateRunning}); err != nil {
+			t.Fatal(err)
+		}
+		launches := 0
+		d := f.doctor(func(e *Env) {
+			e.StateDir = f.root
+			e.LaunchSecurityUpdates = func(context.Context) error { launches++; return nil }
+		})
+		if out := d.Apply(context.Background(), FixEnableSecurityUpdates, false, nil); out.Err != ErrFixBusy || launches != 0 {
+			t.Fatalf("running job result = %+v, launches=%d", out, launches)
+		}
+	})
+
+	t.Run("systemd still has the unit loaded", func(t *testing.T) {
+		f := newFake(t)
+		securityUpdatesFixture(f)
+		f.cmd(securityAPTConfig, "E='0'; L='0'; U='0';", nil)
+		f.cmd(securityJobUnit, unitLoaded, nil)
+		launches := 0
+		d := f.doctor(func(e *Env) {
+			e.StateDir = f.root
+			e.LaunchSecurityUpdates = func(context.Context) error { launches++; return nil }
+		})
+		if out := d.Apply(context.Background(), FixEnableSecurityUpdates, false, nil); out.Err != ErrFixBusy || launches != 0 {
+			t.Fatalf("loaded-unit result = %+v, launches=%d", out, launches)
+		}
+	})
+
+	t.Run("systemd-run reports an existing unit", func(t *testing.T) {
+		f := newFake(t)
+		securityUpdatesFixture(f)
+		f.cmd(securityAPTConfig, "E='0'; L='0'; U='0';", nil)
+		launches := 0
+		d := f.doctor(func(e *Env) {
+			e.StateDir = f.root
+			e.LaunchSecurityUpdates = func(context.Context) error { launches++; return unit.ErrBusy }
+		})
+		if out := d.Apply(context.Background(), FixEnableSecurityUpdates, false, nil); out.Err != ErrFixBusy || launches != 1 {
+			t.Fatalf("systemd-run conflict result = %+v, launches=%d", out, launches)
+		}
+	})
 }
 
 func TestReconnectWarpOnlyActsOnAStillDownTunnel(t *testing.T) {
@@ -480,6 +597,32 @@ func TestApplyForwardingFixPlanAndConfirmation(t *testing.T) {
 	}
 }
 
+// The doctor fix starts a bounded systemd unit and leaves reprobe to the agent loop.
+func TestAwgModuleRepairStartsUnit(t *testing.T) {
+	r, mk := newFixRig(t)
+	d := mk()
+	plan := d.Apply(context.Background(), FixAwgModuleRepair, true, nil)
+	if !plan.OK || plan.Params["kernel"] != "7.0.0-38-generic" || !strings.Contains(plan.Detail, "would be rebuilt") || r.awgRepairs != 0 {
+		t.Fatalf("dry run: %+v repairs=%d", plan, r.awgRepairs)
+	}
+	out := d.Apply(context.Background(), FixAwgModuleRepair, false, nil)
+	if !out.OK || out.Params["kernel"] != "7.0.0-38-generic" || out.Params["moved"] != "" || !strings.Contains(out.Detail, "repair started") || r.awgRepairs != 1 {
+		t.Fatalf("apply: %+v repairs=%d", out, r.awgRepairs)
+	}
+	if got := d.Apply(context.Background(), FixAwgModuleRepair, false, map[string]string{"x": "1"}); got.Err != ErrBadParams {
+		t.Fatalf("parameters: %+v", got)
+	}
+	active := mk(func(e *Env) {
+		e.AwgBackend = func() AwgBackend { return AwgBackend{Mode: "kernel", Name: "kernel", Available: true} }
+	})
+	if got := active.Apply(context.Background(), FixAwgModuleRepair, false, nil); !got.OK || got.Params["noop"] != "1" || r.awgRepairs != 1 {
+		t.Fatalf("already on kernel: %+v repairs=%d", got, r.awgRepairs)
+	}
+	if got := newFake(t).doctor().Apply(context.Background(), FixAwgModuleRepair, true, nil); got.Err != ErrUnsupportedHost {
+		t.Fatalf("unsupported host: %+v", got)
+	}
+}
+
 func TestOneFixAtATime(t *testing.T) {
 	_, mk := newFixRig(t)
 	in, release := make(chan struct{}), make(chan struct{})
@@ -517,6 +660,9 @@ func TestRecheckIDsMatchTheChecksOfferingTheFix(t *testing.T) {
 	}
 	if RecheckIDs("nope") != nil {
 		t.Error("unknown fix has re-checks")
+	}
+	if got := RecheckIDs(FixEnableSecurityUpdates); len(got) != 1 || got[0] != CheckSecurityUpdates {
+		t.Errorf("enable_security_updates re-checks %v, want [%s]", got, CheckSecurityUpdates)
 	}
 	if RecheckIDs(FixRefreshUnit) != nil {
 		t.Error("refresh_unit has an immediate re-check; the restarted process reports it after reconnect")

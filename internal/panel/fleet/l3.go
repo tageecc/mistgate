@@ -12,6 +12,7 @@ import (
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
 	agentv1 "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/internal/agentcap"
 	"github.com/mistgate/mistgate/internal/panel/store"
 	"github.com/mistgate/mistgate/internal/plugin"
 )
@@ -165,13 +166,22 @@ func (f *Fleet) dispatchWarpAttention(w Warp, nodeID, reason string) {
 }
 
 // withheldReason is what the node page shows when the agent lacks a protocol capability.
-const withheldReason = "agent_too_old: this node's agent does not list a required protocol capability, update the agent (mistgate-node install, or the self-update)"
+const withheldReason = "agent_too_old: this node's agent does not list a capability this inbound needs (its protocol, or sharing a TCP port between services by SNI), update the agent (mistgate-node install, or the self-update)"
 
-// withheldApplied are the inbound results the panel writes for inbounds it did not send to this agent.
-func withheldApplied(ids []string) []store.InboundApplied {
+// withheldShareReason is what the node page shows for an inbound held back only because the agent cannot share a TCP port: a code
+// of its own, so that the page says "update the agent to put it beside the other service" instead of the general sentence.
+const withheldShareReason = "share_agent_old: this node's agent cannot share a TCP port between services by SNI (it lacks tcp-share/1), so only the default service of the port is sent to it, update the agent (mistgate-node install, or the self-update)"
+
+// withheldApplied are the inbound results the panel writes for inbounds it did not send to this agent; share is the part of ids
+// held back for the port they stand on (withheldShareReason).
+func withheldApplied(ids, share []string) []store.InboundApplied {
 	out := make([]store.InboundApplied, 0, len(ids))
 	for _, id := range ids {
-		out = append(out, store.InboundApplied{ID: id, State: "failed", Error: withheldReason})
+		reason := withheldReason
+		if slices.Contains(share, id) {
+			reason = withheldShareReason
+		}
+		out = append(out, store.InboundApplied{ID: id, State: "failed", Error: reason})
 	}
 	return out
 }
@@ -247,7 +257,7 @@ func (f *Fleet) checkAwgBackend(ctx context.Context, n store.NodeRow, value stri
 	if !has {
 		return nil
 	}
-	if !slices.Contains(n.AgentCaps, capAWG) {
+	if !slices.Contains(n.AgentCaps, agentcap.AWG) {
 		return connect.NewError(connect.CodeFailedPrecondition, errors.New("agent too old"))
 	}
 	return nil

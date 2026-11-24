@@ -70,6 +70,7 @@ type profile struct {
 	Proxies []map[string]any `yaml:"proxies"`
 	Groups  []struct {
 		Name    string   `yaml:"name"`
+		Type    string   `yaml:"type"`
 		Proxies []string `yaml:"proxies"`
 	} `yaml:"proxy-groups"`
 	DNS   map[string]any `yaml:"dns"`
@@ -144,7 +145,9 @@ func TestMihomoSubscription(t *testing.T) {
 	if nh != "p" || nw != "awg31" {
 		t.Errorf("names = %q %q", nh, nw)
 	}
-	if len(p.Groups) != 1 || p.Groups[0].Name != title || strings.Join(p.Groups[0].Proxies, "|") != p.Proxies[0]["name"].(string)+"|"+p.Proxies[1]["name"].(string)+"|DIRECT" {
+	if len(p.Groups) != 2 || p.Groups[0].Name != title || p.Groups[0].Type != "select" || p.Groups[0].Proxies[0] != p.Groups[1].Name ||
+		p.Groups[1].Type != "url-test" || strings.Join(p.Groups[0].Proxies, "|") != p.Groups[1].Name+"|"+p.Proxies[0]["name"].(string)+"|"+p.Proxies[1]["name"].(string)+"|DIRECT" ||
+		strings.Join(p.Groups[1].Proxies, "|") != p.Proxies[0]["name"].(string)+"|"+p.Proxies[1]["name"].(string) {
 		t.Errorf("groups = %+v (title %q)", p.Groups, title)
 	}
 	if p.Rules[len(p.Rules)-1] != "MATCH,"+title || p.Rules[0] != "DOMAIN-SUFFIX,ru,DIRECT" {
@@ -198,6 +201,71 @@ func TestMihomoSubscription(t *testing.T) {
 
 // What the stack really serves (hysteria2 with and without hopping and Gecko, AWG 3.1, the DNS of the default preset and
 // of a DoH one) is accepted by the Mihomo core; skipped without the binary (see mihomo_core_test.go).
+func TestMihomoLinkAWGSwitchAndAWGOnlyPlaceholder(t *testing.T) {
+	m := newM3Rig(t)
+	h, cache := m.handler(func(c *subs.Config) { c.MinInterval = time.Hour })
+	userID, tok := m.newUser("awg-only", func(req *adminv1.CreateUserRequest) {
+		req.Apps = &adminv1.AppToggles{Amnezia: true}
+	})
+
+	// An absent setting keeps the existing profile and creates its link-device credential.
+	onBefore := fetch(h, "/"+tok, mihomoUA)
+	if onBefore.Code != http.StatusOK {
+		t.Fatalf("enabled Mihomo status = %d: %s", onBefore.Code, onBefore.Body.String())
+	}
+	initial := parseYAML(t, onBefore.Body.Bytes())
+	if len(initial.Proxies) != 1 || initial.Proxies[0]["type"] != "wireguard" {
+		t.Fatalf("absent link_awg did not keep the AWG proxy: %+v", initial.Proxies)
+	}
+	var live int
+	if err := m.st.R.QueryRow(`SELECT count(*) FROM device d JOIN device_credential c ON c.device_id = d.id
+		WHERE d.user_id = ? AND d.kind = 'link' AND c.protocol = 'awg' AND c.revoked_at IS NULL`, userID).Scan(&live); err != nil || live != 1 {
+		t.Fatalf("initial link AWG credentials = %d, %v; want one", live, err)
+	}
+
+	off := subsettings.Defaults()
+	no := false
+	off.LinkAwg = &no
+	if _, err := cache.Update(m.ctx, off); err != nil {
+		t.Fatal(err)
+	}
+	offRec := fetch(h, "/"+tok, mihomoUA)
+	if offRec.Code != http.StatusOK {
+		t.Fatalf("disabled Mihomo status = %d: %s", offRec.Code, offRec.Body.String())
+	}
+	withoutAWG := parseYAML(t, offRec.Body.Bytes())
+	const note = "Your servers do not work in this app. The subscription page shows which app does"
+	if len(withoutAWG.Proxies) != 1 || withoutAWG.Proxies[0]["type"] != "hysteria2" || withoutAWG.Proxies[0]["name"] != note {
+		t.Fatalf("AWG-only placeholder = %+v", withoutAWG.Proxies)
+	}
+	if len(withoutAWG.Groups) != 1 || !slices.Equal(withoutAWG.Groups[0].Proxies, []string{note, "DIRECT"}) {
+		t.Fatalf("placeholder proxy group = %+v", withoutAWG.Groups)
+	}
+	if err := m.st.R.QueryRow(`SELECT count(*) FROM device_credential c JOIN device d ON d.id = c.device_id
+		WHERE d.user_id = ? AND d.kind = 'link' AND c.protocol = 'awg' AND c.revoked_at IS NULL`, userID).Scan(&live); err != nil || live != 0 {
+		t.Fatalf("live link AWG credentials after off fetch = %d, %v; want zero", live, err)
+	}
+
+	on := subsettings.Defaults()
+	yes := true
+	on.LinkAwg = &yes
+	if _, err := cache.Update(m.ctx, on); err != nil {
+		t.Fatal(err)
+	}
+	onAgain := fetch(h, "/"+tok, mihomoUA)
+	if onAgain.Code != http.StatusOK {
+		t.Fatalf("re-enabled Mihomo status = %d: %s", onAgain.Code, onAgain.Body.String())
+	}
+	reissued := parseYAML(t, onAgain.Body.Bytes())
+	if len(reissued.Proxies) != 1 || reissued.Proxies[0]["type"] != "wireguard" {
+		t.Fatalf("re-enabled profile did not issue AWG again: %+v", reissued.Proxies)
+	}
+	if err := m.st.R.QueryRow(`SELECT count(*) FROM device_credential c JOIN device d ON d.id = c.device_id
+		WHERE d.user_id = ? AND d.kind = 'link' AND c.protocol = 'awg' AND c.revoked_at IS NULL`, userID).Scan(&live); err != nil || live != 1 {
+		t.Fatalf("live link AWG credentials after re-enable = %d, %v; want one", live, err)
+	}
+}
+
 func TestMihomoCoreAcceptsTheServedProfile(t *testing.T) {
 	m := newM3Rig(t)
 	hop := must(m.svc.CreateProfile(m.ctx, connect.NewRequest(&adminv1.CreateProfileRequest{
@@ -316,8 +384,14 @@ func TestSubscriptionOrderByLocationAndProtocol(t *testing.T) {
 	if !slices.Equal(gotProxies, wantProxies) {
 		t.Errorf("Mihomo proxy order = %v, want %v", gotProxies, wantProxies)
 	}
-	wantGroup := append(slices.Clone(wantProxies), "DIRECT")
-	if len(p.Groups) != 1 || !slices.Equal(p.Groups[0].Proxies, wantGroup) {
+	if len(p.Groups) != 2 {
+		t.Fatalf("Mihomo groups = %+v, want select and Auto", p.Groups)
+	}
+	wantAutoGroup := slices.Clone(wantProxies)
+	wantGroup := append([]string{p.Groups[1].Name}, wantProxies...)
+	wantGroup = append(wantGroup, "DIRECT")
+	if p.Groups[0].Type != "select" || p.Groups[1].Type != "url-test" ||
+		!slices.Equal(p.Groups[0].Proxies, wantGroup) || !slices.Equal(p.Groups[1].Proxies, wantAutoGroup) {
 		t.Errorf("Mihomo select group = %+v, want %v", p.Groups, wantGroup)
 	}
 
@@ -487,8 +561,11 @@ func TestMihomoHostileNames(t *testing.T) {
 	_, tok := m.newUser("al\"ice - x", nil)
 	rec := fetch(h, "/"+tok, mihomoUA)
 	p := parseYAML(t, rec.Body.Bytes())
-	if len(p.Proxies) != 2 || len(p.Groups) != 1 || len(p.Rules) < 2 {
+	if len(p.Proxies) != 2 || len(p.Groups) != 2 || len(p.Rules) < 2 {
 		t.Fatalf("proxies=%d groups=%d rules=%d\n%s", len(p.Proxies), len(p.Groups), len(p.Rules), rec.Body.String())
+	}
+	if p.Groups[0].Type != "select" || p.Groups[1].Type != "url-test" || p.Groups[0].Proxies[0] != p.Groups[1].Name {
+		t.Errorf("automatic selection groups = %+v", p.Groups)
 	}
 	for _, px := range p.Proxies {
 		if px["type"] == "direct" || strings.Contains(px["name"].(string), "\n") {
@@ -849,12 +926,12 @@ func TestSelfServiceUnknownTokenIsADecoyAndAMiss(t *testing.T) {
 			t.Fatalf("unknown token %d: %d %q", i, rec.Code, rec.Body.String())
 		}
 	}
-	// Blocked: even the valid token gets the decoy, for a fetch and for a write.
-	if rec := (call{h, t, tok}).post("/devices", m.addBody("")); rec.Code != 404 || rec.Body.String() != decoyBody {
-		t.Errorf("blocked client, valid token: %d %q", rec.Code, rec.Body.String())
+	// A cold valid token is checked within the lookup budget and then reaches the normal self-service handlers.
+	if rec := (call{h, t, tok}).post("/devices", m.addBody("")); rec.Code != 200 {
+		t.Errorf("blocked client, cold valid token write: %d %q", rec.Code, rec.Body.String())
 	}
-	if rec := fetch(h, "/"+tok, happUA); rec.Body.String() != decoyBody {
-		t.Errorf("blocked client fetch: %q", rec.Body.String())
+	if rec := fetch(h, "/"+tok, happUA); rec.Code != 200 || rec.Body.String() == decoyBody {
+		t.Errorf("blocked client, cold valid token fetch: %d %q", rec.Code, rec.Body.String())
 	}
 }
 

@@ -28,6 +28,7 @@ import (
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
 	"github.com/mistgate/mistgate/gen/mistgate/admin/v1/adminv1connect"
+	"github.com/mistgate/mistgate/internal/agentcap"
 	"github.com/mistgate/mistgate/internal/panel/auth"
 	"github.com/mistgate/mistgate/internal/panel/countryreach"
 	"github.com/mistgate/mistgate/internal/panel/edition"
@@ -41,9 +42,6 @@ const (
 	settingInterval = "tspu.interval_min" // minutes
 	settingLastRun  = "tspu.last_run"     // JSON of lastRun
 
-	// Capability is what the probe node's agent lists when it can run the probe.
-	Capability = "country-probe/1"
-
 	DefaultIntervalMin = 120
 	MinIntervalMin     = 30
 	MaxIntervalMin     = 1440
@@ -56,7 +54,7 @@ const (
 
 	// busyRetry: a probe node that was busy is asked again after this, not after the whole interval.
 	busyRetry = 5 * time.Minute
-	testEvery = 60 * time.Second
+	testEvery = censorSimTestEvery
 	// runBudget bounds a whole run. ponytail: a fleet so big that its batches do not fit loses the batches at the end every time;
 	// rotate the starting batch if a fleet ever gets that big.
 	runBudget = 30 * time.Minute
@@ -92,7 +90,7 @@ type Node struct {
 	Ports                          []uint16 // the TCP ports of its enabled inbounds
 }
 
-func (n Node) declares() bool { return slices.Contains(n.Caps, Capability) }
+func (n Node) declares() bool { return slices.Contains(n.Caps, agentcap.CountryProbe) }
 
 // Config configures Service. Store, StepUp, Fleet and Nodes are required.
 type Config struct {
@@ -121,10 +119,10 @@ type Service struct {
 
 	runMu sync.Mutex // one run at a time
 
+	// guard keeps a run of an integration that was switched off or disconnected since it started from storing anything.
+	guard countryreach.RunGuard
+
 	mu       sync.Mutex
-	gen      uint64 // bumped when the integration is switched off or disconnected; a run of an older one stores nothing
-	inflight map[uint64]context.CancelFunc
-	next     uint64
 	lastTest time.Time
 }
 
@@ -139,7 +137,7 @@ func New(cfg Config) (*Service, error) {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	return &Service{cfg: cfg, log: cfg.Log, now: cfg.Now, inflight: map[uint64]context.CancelFunc{}}, nil
+	return &Service{cfg: cfg, log: cfg.Log, now: cfg.Now}, nil
 }
 
 // Handler is the admin TspuProbeService.
@@ -239,43 +237,6 @@ func (s *Service) State(ctx context.Context) State {
 // The run
 
 var errSwitchedOff = errors.New("countryprobe: switched off")
-
-// generation is the version of the settings; a run takes it before it reads them.
-func (s *Service) generation() uint64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.gen
-}
-
-// track registers a run in flight so that switching the source off can cancel it. A run whose settings were read under an
-// older generation (the source was switched off or changed meanwhile) is not admitted.
-func (s *Service) track(ctx context.Context, gen uint64) (context.Context, func(), bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if gen != s.gen {
-		return nil, nil, false
-	}
-	ctx, cancel := context.WithTimeout(ctx, runBudget)
-	id := s.next
-	s.next++
-	s.inflight[id] = cancel
-	return ctx, func() {
-		s.mu.Lock()
-		delete(s.inflight, id)
-		s.mu.Unlock()
-		cancel()
-	}, true
-}
-
-// stop cancels every run in flight and keeps a run that started earlier from storing anything.
-func (s *Service) stop() {
-	s.mu.Lock()
-	s.gen++
-	for _, cancel := range s.inflight {
-		cancel()
-	}
-	s.mu.Unlock()
-}
 
 // nodeResult is what the probe saw of one node.
 type nodeResult struct {
@@ -419,7 +380,10 @@ func transportDetail(err error) string {
 
 // execute runs the probe against the targets, batch after batch, and stores each batch's rows as its answer comes in. gen is
 // the generation the run started under: once the source is switched off or disconnected, nothing more is stored.
-func (s *Service) execute(ctx context.Context, gen uint64, st settings, probe Node, nodes []Node) (outcome, error) {
+//
+// solo is a run for one node asked by hand (now.go): nodes is the probe node and that node, the run is not the schedule's, so it
+// leaves the rotation of batches and the status of the newest run as they are.
+func (s *Service) execute(ctx context.Context, gen uint64, st settings, probe Node, nodes []Node, solo bool) (outcome, error) {
 	refs, ok := ReferencesFor(s.country(ctx))
 	if !ok {
 		return outcome{}, errors.New("countryprobe: no references for the country")
@@ -434,7 +398,7 @@ func (s *Service) execute(ctx context.Context, gen uint64, st settings, probe No
 	out.run.Status = StatusOK
 	batchList := batches(targetsOf(probe, nodes))
 	start := 0
-	if len(batchList) > 0 {
+	if len(batchList) > 0 && !solo {
 		start = st.last.BatchCursor
 		if start < 0 {
 			start = 0
@@ -479,6 +443,9 @@ func (s *Service) execute(ctx context.Context, gen uint64, st settings, probe No
 		out.nodes = append(out.nodes, results...)
 	}
 	out.run.Checked, out.run.At = len(out.nodes), s.now().Unix()
+	if solo {
+		return out, nil
+	}
 	if err := s.saveRun(ctx, gen, out.run); err != nil {
 		return outcome{}, err
 	}
@@ -510,23 +477,25 @@ func (s *Service) rowsOf(probe Node, batch []Node, res fleet.CountryProbeResult)
 
 // store saves rows unless the source was switched off since the run started.
 func (s *Service) store(ctx context.Context, gen uint64, rows []store.TSPUCheck) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if gen != s.gen {
+	var err error
+	if !s.guard.Do(gen, func() {
+		// a run that has just hit its budget still stores the answers it has
+		err = s.cfg.Store.InsertTSPUChecks(context.WithoutCancel(ctx), rows)
+	}) {
 		return errSwitchedOff
 	}
-	// a run that has just hit its budget still stores the answers it has
-	return s.cfg.Store.InsertTSPUChecks(context.WithoutCancel(ctx), rows)
+	return err
 }
 
 func (s *Service) saveRun(ctx context.Context, gen uint64, r lastRun) error {
 	b, _ := json.Marshal(r)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if gen != s.gen {
+	var err error
+	if !s.guard.Do(gen, func() {
+		err = s.cfg.Store.SetSettings(context.WithoutCancel(ctx), map[string]string{settingLastRun: string(b)})
+	}) {
 		return errSwitchedOff
 	}
-	return s.cfg.Store.SetSettings(context.WithoutCancel(ctx), map[string]string{settingLastRun: string(b)})
+	return err
 }
 
 // probeNode finds the chosen node among the active ones and says whether it can run the probe now.
@@ -540,13 +509,13 @@ func probeNode(nodes []Node, id string) (Node, bool) {
 }
 
 // runNow runs the probe: runMu must be held.
-func (s *Service) runNow(ctx context.Context, gen uint64, st settings, probe Node, nodes []Node) (outcome, error) {
-	ctx, done, admitted := s.track(ctx, gen)
+func (s *Service) runNow(ctx context.Context, gen uint64, st settings, probe Node, nodes []Node, solo bool) (outcome, error) {
+	ctx, done, admitted := s.guard.Track(ctx, gen, runBudget)
 	if !admitted {
 		return outcome{}, errSwitchedOff
 	}
 	defer done()
-	return s.execute(ctx, gen, st, probe, nodes)
+	return s.execute(ctx, gen, st, probe, nodes, solo)
 }
 
 // due says whether the next run is due: the newest row of this probe node is older than the interval (read from the store, so a
@@ -573,10 +542,10 @@ func (s *Service) due(ctx context.Context, st settings) (bool, error) {
 // happens (no command, no request of any kind) while the source is off, has no probe node, covers another country, or on the
 // Cloudflare edition; the probe node being offline or too old skips the round without a trace.
 func (s *Service) Tick(ctx context.Context) bool {
-	if s.cfg.Edge {
+	if s.cfg.Edge || censorSimManualOnly {
 		return false
 	}
-	gen := s.generation()
+	gen := s.guard.Generation()
 	st, err := s.load(ctx)
 	if err != nil {
 		s.log.Warn("countryprobe: read settings", "err", err)
@@ -603,7 +572,7 @@ func (s *Service) Tick(ctx context.Context) bool {
 	if !fit {
 		return false
 	}
-	if _, err := s.runNow(ctx, gen, st, probe, nodes); err != nil {
+	if _, err := s.runNow(ctx, gen, st, probe, nodes, false); err != nil {
 		if ctx.Err() == nil && !errors.Is(err, errSwitchedOff) {
 			s.log.Warn("countryprobe: run failed", "err", err)
 		}
@@ -627,15 +596,6 @@ type rpc struct{ s *Service }
 func fail(code connect.Code, msg string) error { return connect.NewError(code, errors.New(msg)) }
 
 var errInternal = fail(connect.CodeInternal, "internal error")
-
-// owner is the signed-in owner; a token (API or MCP) is refused again here, whatever the policy table says.
-func owner(ctx context.Context) (store.Admin, error) {
-	a, ok := auth.AdminFrom(ctx)
-	if !ok || strings.HasPrefix(a.ID, "token:") || strings.HasPrefix(a.ID, "mcp:") || auth.PrincipalFrom(ctx).Token || a.Role != store.RoleOwner {
-		return a, fail(connect.CodePermissionDenied, "owner access required")
-	}
-	return a, nil
-}
 
 func runMsg(r lastRun) *adminv1.TspuProbeRun {
 	return &adminv1.TspuProbeRun{Status: r.Status, AtUnix: r.At, NodeId: r.Node, DpiHop: uint32(max(r.DPIHop, 0)), BlockedRef: r.Ref,
@@ -679,7 +639,7 @@ func (s *Service) current(ctx context.Context) (*adminv1.TspuProbeSettings, erro
 }
 
 func (r rpc) GetTspuProbe(ctx context.Context, _ *connect.Request[adminv1.GetTspuProbeRequest]) (*connect.Response[adminv1.GetTspuProbeResponse], error) {
-	if _, err := owner(ctx); err != nil {
+	if _, err := auth.OwnerSession(ctx); err != nil {
 		return nil, err
 	}
 	cur, err := r.s.current(ctx)
@@ -690,7 +650,7 @@ func (r rpc) GetTspuProbe(ctx context.Context, _ *connect.Request[adminv1.GetTsp
 }
 
 func (r rpc) UpdateTspuProbe(ctx context.Context, req *connect.Request[adminv1.UpdateTspuProbeRequest]) (*connect.Response[adminv1.UpdateTspuProbeResponse], error) {
-	admin, err := owner(ctx)
+	admin, err := auth.OwnerSession(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -737,7 +697,7 @@ func (r rpc) UpdateTspuProbe(ctx context.Context, req *connect.Request[adminv1.U
 	}
 	if len(kv) > 0 {
 		if stopRun {
-			s.stop() // a run for the old choice must not store anything
+			s.guard.Stop() // a run for the old choice must not store anything
 		}
 		if err := s.cfg.Store.SetSettings(ctx, kv); err != nil {
 			s.log.Error("countryprobe: save settings", "err", err)
@@ -771,7 +731,7 @@ func checkProbeNode(nodes []Node, id string) error {
 }
 
 func (r rpc) DisconnectTspuProbe(ctx context.Context, _ *connect.Request[adminv1.DisconnectTspuProbeRequest]) (*connect.Response[adminv1.DisconnectTspuProbeResponse], error) {
-	admin, err := owner(ctx)
+	admin, err := auth.OwnerSession(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -779,7 +739,7 @@ func (r rpc) DisconnectTspuProbe(ctx context.Context, _ *connect.Request[adminv1
 	if err := s.cfg.StepUp(ctx); err != nil {
 		return nil, err
 	}
-	s.stop() // first: nothing new may be stored while the settings go
+	s.guard.Stop() // first: nothing new may be stored while the settings go
 	if err := s.cfg.Store.DeleteSettings(ctx, settingEnabled, settingNode, settingInterval, settingLastRun); err != nil {
 		s.log.Error("countryprobe: disconnect", "err", err)
 		return nil, errInternal
@@ -799,14 +759,14 @@ func (r rpc) DisconnectTspuProbe(ctx context.Context, _ *connect.Request[adminv1
 
 // TestTspuProbe runs the probe now against the fleet, whatever the schedule says, and stores the rows like a scheduled run.
 func (r rpc) TestTspuProbe(ctx context.Context, _ *connect.Request[adminv1.TestTspuProbeRequest]) (*connect.Response[adminv1.TestTspuProbeResponse], error) {
-	if _, err := owner(ctx); err != nil {
+	if _, err := auth.OwnerSession(ctx); err != nil {
 		return nil, err
 	}
 	s := r.s
 	if err := edition.Check(s.cfg.Edge, edition.TSPUProbe); err != nil {
 		return nil, err
 	}
-	gen := s.generation()
+	gen := s.guard.Generation()
 	st, err := s.load(ctx)
 	if err != nil {
 		return nil, errInternal
@@ -845,7 +805,7 @@ func (r rpc) TestTspuProbe(ctx context.Context, _ *connect.Request[adminv1.TestT
 	// HTTP server lifts its write deadline for this procedure (httpserver.longUnary).
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), runBudget)
 	defer cancel()
-	res, err := s.runNow(rctx, gen, st, probe, nodes)
+	res, err := s.runNow(rctx, gen, st, probe, nodes, false)
 	switch {
 	case errors.Is(err, errSwitchedOff):
 		return nil, fail(connect.CodeFailedPrecondition, "tspu_off")

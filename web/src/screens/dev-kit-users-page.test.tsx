@@ -1,0 +1,143 @@
+import { QueryClientProvider } from "@tanstack/react-query";
+import { act, type ReactNode } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { AddNodeProvider } from "@/components/add-node";
+import { ToastProvider } from "@/components/ui/toast";
+import { Role } from "@/gen/mistgate/admin/v1/auth_pb";
+import { setLang } from "@/i18n";
+import { setEffectsEnabled } from "@/lib/effects";
+import { demoOf, editOf, frames, SceneEdit, seeded } from "./dev-kit-users-page";
+import { UsersScreen } from "./users/list";
+
+// The scenes of /dev-kit?only=pn-users draw the real screen on made-up data: every state a scene names must draw, in every language.
+
+// the address of the scene: only the order of the list lives there (?sort=traffic&desc=1)
+let search: Record<string, unknown> = {};
+
+// the scene's own calls are put on these objects by `seeded`
+vi.mock("@/lib/api", () => ({ basepath: "/", auth: { me: () => Promise.resolve({}) }, users: {}, groups: {}, instance: { encodeQr: () => Promise.reject(new Error("no server in a scene test")) } }));
+vi.mock("@tanstack/react-router", () => ({
+  Link: ({ children, className }: { children?: ReactNode; className?: string }) => <a className={className}>{children}</a>,
+  useBlocker: () => ({ status: "idle" }),
+  useSearch: () => search,
+  useNavigate: () => vi.fn(),
+}));
+
+beforeAll(() => {
+  (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+});
+
+let root: Root | null = null;
+let host: HTMLDivElement | null = null;
+afterEach(() => {
+  act(() => root?.unmount());
+  host?.remove();
+  root = host = null;
+  localStorage.clear();
+  setLang("en");
+  document.body.innerHTML = "";
+});
+
+const states = [...new Set(frames.map((f) => f.state))].filter((s) => !s.startsWith("job-"));
+const groupsTab = (s: string) => s.startsWith("groups") || s === "group-new" || s in editOf;
+
+async function draw(state: string, role = Role.OWNER) {
+  setEffectsEnabled(false, false); // a scene is still unless its address says fx=1 (the pages read it; the tests draw the body)
+  search = state === "sorted" ? { sort: "traffic", desc: 1 } : {};
+  host = document.createElement("div");
+  document.body.append(host);
+  root = createRoot(host);
+  const qc = seeded(state, role);
+  await act(async () =>
+    root!.render(
+      <QueryClientProvider client={qc}>
+        <ToastProvider>
+          <AddNodeProvider>
+            <UsersScreen demo={{ ...demoOf[state], ...(groupsTab(state) && { tab: "groups" as const }) }} />
+            <SceneEdit state={state} />
+          </AddNodeProvider>
+        </ToastProvider>
+      </QueryClientProvider>,
+    ),
+  );
+  for (let i = 0; i < 8; i++) await act(async () => void (await new Promise((r) => setTimeout(r, 0))));
+}
+
+const rows = () => document.querySelectorAll("section .us-e");
+
+describe("the scenes of the People screen", () => {
+  it.each(states)("%s draws", async (state) => {
+    await draw(state);
+    expect(document.querySelector("h1")?.textContent).toBeTruthy();
+    expect(document.body.textContent).not.toContain("undefined");
+    if (state === "list") expect(rows()).toHaveLength(3);
+    if (state === "many" || state === "open-erin" || state === "open-heidi" || state === "open-ten" || state === "ten" || state === "sorted") expect(rows()).toHaveLength(10);
+    if (state.startsWith("filter-")) expect([...document.querySelectorAll("[role=radio][aria-checked=true]")].map((e) => e.textContent).join(" ")).toMatch(state === "filter-over" ? /Over quota/ : /Expiring/);
+    if (state === "ten") {
+      // ten places each: a bar after the figure instead of the dots, and the figures of the board (alice 10/10, heidi 0/10)
+      expect(document.querySelectorAll("section .us-e i.h-1.w-12")).toHaveLength(10);
+      expect(rows()[0]!.textContent).toContain("10/10");
+      expect(rows()[7]!.textContent).toContain("0/10");
+    }
+    if (state === "sorted") {
+      expect(document.querySelector("[role=columnheader][aria-sort=descending]")?.textContent).toContain("Traffic");
+      expect(document.querySelectorAll("[role=columnheader][aria-sort=ascending]")).toHaveLength(0);
+    }
+    if (state === "open-heidi") expect(document.querySelector("button[aria-label='heidi'][aria-expanded=true]")).not.toBeNull();
+    if (state === "open-heidi") expect(document.body.textContent).toContain("None yet. They appear when the person opens the link");
+    if (state === "open-ten") expect(document.body.textContent).toContain("Show all 10");
+    if (state === "extra") {
+      // alice: her main group and "+2" for the two extra ones (friends, colleagues), named in the label; the others have none
+      expect(rows()[0]!.textContent).toContain("family");
+      expect(rows()[0]!.textContent).toContain("+2");
+      expect(rows()[0]!.querySelector("[aria-label$='colleagues, friends']")).not.toBeNull();
+      expect(rows()[1]!.textContent).not.toContain("+");
+    }
+    if (state === "none") expect(document.querySelectorAll("ol li")).toHaveLength(3);
+    if (state === "search") expect(rows()).toHaveLength(1);
+    if (state === "nomatch") expect(document.body.textContent).toContain("Nobody found");
+    if (state === "open") expect(document.querySelector("button[aria-label='alice'][aria-expanded=true]")).not.toBeNull();
+    if (state === "send") expect(document.querySelector("[data-shot=link-modal]")?.textContent).toContain("lake-2718-moss");
+    if (state === "send-plain") expect(document.querySelector("[data-shot=link-modal]")?.textContent).toContain("not set, anyone with the link can open the page");
+    if (state === "send-off") expect(document.querySelector("[data-shot=link-modal]")?.textContent).toContain("Page passwords are switched off for everyone.");
+    if (state === "open-removed") expect(rows()[1]!.textContent).toContain("Bring the password back");
+    if (state === "open-off") expect(rows()[0]!.textContent).toContain("Page passwords are switched off for everyone.");
+    if (state === "open") expect(rows()[0]!.querySelector("[data-pw=set]")).not.toBeNull();
+    if (state === "select") expect(document.querySelector("[role=toolbar]")?.textContent).toContain("2 people");
+    if (state === "select-ask") expect(document.querySelector("[role=toolbar]")?.textContent).toContain("Links stop working. Sure?");
+    if (state === "groups") expect(document.querySelectorAll("h3")).toHaveLength(2);
+    if (state === "groups-many") expect(document.querySelectorAll("h3")).toHaveLength(10);
+    if (state === "groups-none") expect(document.body.textContent).toContain("No such group");
+    if (state === "group-new") expect(document.querySelector("[data-shot=new-group]")).not.toBeNull();
+    if (state === "group-edit") expect(document.querySelector<HTMLInputElement>("[data-shot=edit-group] input")?.value).toBe("friends");
+    if (state === "group-edit-lose") expect(document.querySelector("[data-shot=edit-group]")?.textContent).toContain("6 people lose: “AmneziaWG 3.1” (3 AmneziaVPN keys stop working)");
+    if (state === "group-edit-held") expect(document.querySelector("[data-shot=edit-group]")?.textContent).toContain("“msk1” is not handed out to this group");
+    if (state === "person-new") expect(document.querySelector("[data-shot=create-user]")?.textContent).toContain("Result");
+    if (state === "person-name") expect(document.querySelector<HTMLInputElement>("[data-shot=create-user] input")?.value).toBe("carol");
+    if (state.startsWith("person-done")) expect(document.querySelector("[data-shot=create-user]")?.textContent).toContain("carol added");
+  });
+
+  it("opens alice's row on the devices and the link of the made-up panel", async () => {
+    await draw("open");
+    expect(rows()[0]!.textContent).toContain("https://sub.example.com/s/alice-7f3k9q");
+    expect(rows()[0]!.textContent).toContain("Desktop-Alice");
+  });
+
+  it.each(["ru", "zh", "fa", "tr"] as const)("the list and its open row draw in %s", async (lang) => {
+    setLang(lang);
+    await draw("open");
+    expect(rows()).toHaveLength(3);
+    expect(document.body.textContent).not.toContain("undefined");
+  });
+
+  it("gives a helper the list and an observer a list with nothing to change", async () => {
+    await draw("list", Role.HELPER);
+    expect([...document.querySelectorAll("button")].some((b) => b.textContent === "Select")).toBe(true);
+    act(() => root?.unmount());
+    host?.remove();
+    await draw("list", Role.READONLY);
+    expect([...document.querySelectorAll("button")].some((b) => b.textContent === "Select")).toBe(false);
+    expect(rows()).toHaveLength(3);
+  });
+});

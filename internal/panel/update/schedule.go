@@ -6,14 +6,18 @@ import (
 	"fmt"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/mistgate/mistgate/gen/mistgate/admin/v1/adminv1connect"
+	"github.com/mistgate/mistgate/internal/agentcap"
+	"github.com/mistgate/mistgate/internal/panel/auth"
 	"github.com/mistgate/mistgate/internal/panel/store"
+	"github.com/mistgate/mistgate/internal/panel/tasks/spec"
 )
 
 const (
-	updateScheduleTimezoneKey = "update_schedule_timezone_offset_minutes"
 	// defaultScheduleTimezoneOffsetMin is UTC. Installations made while the default was UTC+3 got that value stored
 	// by migration 00041, so their schedules are entered as before.
 	defaultScheduleTimezoneOffsetMin = 0
@@ -24,30 +28,32 @@ const (
 	scheduleMissAfter = 2 * time.Hour
 )
 
-func validScheduleTimezoneOffset(offset int32) bool {
-	return offset >= -12*60 && offset <= 14*60 && offset%15 == 0
-}
-
 func (s *Service) scheduleTimezoneOffset(ctx context.Context) (int32, error) {
-	raw, err := s.st.Setting(ctx, updateScheduleTimezoneKey)
-	if errors.Is(err, store.ErrNotFound) {
-		return defaultScheduleTimezoneOffsetMin, nil
-	}
-	if err != nil {
-		return 0, err
-	}
-	n, err := strconv.ParseInt(raw, 10, 32)
-	if err != nil || !validScheduleTimezoneOffset(int32(n)) {
-		return defaultScheduleTimezoneOffsetMin, nil
-	}
-	return int32(n), nil
+	n, err := s.st.PanelTimezone(ctx)
+	return int32(n), err
 }
 
 func (s *Service) setScheduleTimezone(ctx context.Context, offset int32) error {
-	if !validScheduleTimezoneOffset(offset) {
+	if !store.ValidTimezoneOffset(int(offset)) {
 		return connect.NewError(connect.CodeInvalidArgument, errors.New("timezone offset must be between UTC-12:00 and UTC+14:00 in 15-minute steps"))
 	}
-	if err := s.st.SetSettings(ctx, map[string]string{updateScheduleTimezoneKey: strconv.FormatInt(int64(offset), 10)}); err != nil {
+	previous, err := s.scheduleTimezoneOffset(ctx)
+	if err != nil {
+		return s.internal("load update timezone", err)
+	}
+	var nexts []store.ScheduledTaskNext
+	if offset != previous {
+		schedules, err := s.st.EnabledScheduledTaskSchedules(ctx)
+		if err != nil {
+			return s.internal("load scheduled tasks", err)
+		}
+		now := s.now()
+		for _, task := range schedules {
+			schedule := spec.Schedule{Kind: task.Kind, EveryMinutes: task.EveryMinutes, MinuteOfDay: task.MinuteOfDay, Weekday: task.Weekday}
+			nexts = append(nexts, store.ScheduledTaskNext{ID: task.ID, NextRunAt: schedule.Next(now, int(offset), spec.Jitter(task.ID, schedule))})
+		}
+	}
+	if err := s.st.SetPanelTimezone(ctx, int(offset), nexts); err != nil {
 		return s.internal("save update timezone", err)
 	}
 	s.audit(ctx, "update_schedule_timezone", map[string]string{"offset_minutes": strconv.FormatInt(int64(offset), 10)})
@@ -65,7 +71,7 @@ func timezoneName(offset int32) string {
 }
 
 func parseScheduleLocalTime(local string, offset int32) (time.Time, error) {
-	if !validScheduleTimezoneOffset(offset) || len(local) != len("2006-01-02T15:04") {
+	if !store.ValidTimezoneOffset(int(offset)) || len(local) != len("2006-01-02T15:04") {
 		return time.Time{}, errors.New("date and time must use YYYY-MM-DDTHH:mm")
 	}
 	zone := time.FixedZone(timezoneName(offset), int(offset)*60)
@@ -87,7 +93,7 @@ func (s *Service) scheduleNodeUpdate(ctx context.Context, nodeID, localDateTime 
 	if err != nil {
 		return store.NodeUpdateScheduleRow{}, s.internal("load update timezone", err)
 	}
-	if !validScheduleTimezoneOffset(requestedOffset) {
+	if !store.ValidTimezoneOffset(int(requestedOffset)) {
 		return store.NodeUpdateScheduleRow{}, connect.NewError(connect.CodeInvalidArgument, errors.New("timezone offset is invalid"))
 	}
 	if requestedOffset != offset {
@@ -148,13 +154,79 @@ func (s *Service) scheduleNodeUpdate(ctx context.Context, nodeID, localDateTime 
 func updatableWhenOffline(n nodeView) bool {
 	updateCap := n.updateCap
 	if updateCap == "" {
-		updateCap = capUpdate
+		updateCap = agentcap.Update
 	}
 	return updatableWhenOfflineForCap(n, updateCap)
 }
 
 func updatableWhenOfflineForCap(n nodeView, updateCap string) bool {
 	return n.row.State == "active" && slices.Contains(n.row.AgentCaps, updateCap)
+}
+
+func (s *Service) scheduledActorReason(ctx context.Context, actor string) (string, error) {
+	const procedure = adminv1connect.UpdateServiceStartRolloutProcedure
+	requiredRole := auth.ProcedureRole(procedure)
+	if actor == "" {
+		return "creator_missing", nil
+	}
+	prefix, id, tokenActor := strings.Cut(actor, ":")
+	if tokenActor && (prefix == "token" || prefix == "mcp") {
+		if id == "" {
+			return "creator_missing", nil
+		}
+		tok, err := s.st.GetAPIToken(ctx, id)
+		if errors.Is(err, store.ErrNotFound) {
+			return "creator_missing", nil
+		}
+		if err != nil {
+			return "", err
+		}
+		if tok.Revoked() {
+			return "creator_revoked", nil
+		}
+		if tok.Expired(s.now()) {
+			return "creator_expired", nil
+		}
+		if auth.TokenProfileRole(tok.Profile) != auth.TokenProcedureRole(procedure) {
+			return "creator_role_changed", nil
+		}
+		admin, err := s.st.Admin(ctx, tok.CreatedBy)
+		if errors.Is(err, store.ErrNotFound) {
+			return "creator_missing", nil
+		}
+		if err != nil {
+			return "", err
+		}
+		if admin.Role != requiredRole {
+			return "creator_role_changed", nil
+		}
+		return "", nil
+	}
+	admin, err := s.st.Admin(ctx, actor)
+	if errors.Is(err, store.ErrNotFound) {
+		return "creator_missing", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if admin.Role != requiredRole {
+		return "creator_role_changed", nil
+	}
+	return "", nil
+}
+
+func (s *Service) cancelScheduledNodeUpdate(ctx context.Context, schedule store.NodeUpdateScheduleRow, reason string) {
+	deleted, err := s.st.DeleteNodeUpdateScheduleIfMatches(ctx, schedule)
+	if err != nil {
+		s.log.Warn("update: cancel scheduled node update", "code", "scheduled_cancel_failed", "node", schedule.NodeID, "err", err)
+		return
+	}
+	if !deleted {
+		return
+	}
+	params := map[string]string{"node_id": schedule.NodeID, "version": schedule.ToVersion, "reason": reason}
+	s.auditAs(ctx, schedule.CreatedBy, "node_update_schedule_cancel", params)
+	s.log.Warn("update: scheduled node update cancelled", "code", "scheduled_creator_unavailable", "node", schedule.NodeID, "reason", reason)
 }
 
 func (s *Service) processScheduledNodeUpdates(ctx context.Context) {
@@ -188,6 +260,9 @@ func (s *Service) processScheduledNodeUpdates(ctx context.Context) {
 	} else if !errors.Is(err, store.ErrNotFound) {
 		s.log.Warn("update: check active rollout before scheduled update", "err", err)
 		return
+	}
+	if active, err := s.osRolloutRunning(ctx); err != nil || active {
+		return // an OS update of a node is going: the schedule waits for it
 	}
 	schedules, err := s.st.DueNodeUpdateSchedules(ctx, now)
 	if err != nil {
@@ -229,14 +304,19 @@ func (s *Service) processScheduledNodeUpdates(ctx context.Context) {
 			}
 			continue
 		}
+		reason, err := s.scheduledActorReason(ctx, schedule.CreatedBy)
+		if err != nil {
+			s.log.Warn("update: check scheduled update creator", "code", "scheduled_creator_check_failed", "node", schedule.NodeID, "err", err)
+			continue
+		}
+		if reason != "" {
+			s.cancelScheduledNodeUpdate(ctx, schedule, reason)
+			continue
+		}
 		if !node.connected || (!s.cfg.Edge && !s.fl.HasSession(schedule.NodeID)) || !updatable(node.state) {
 			continue
 		}
-		actor := schedule.CreatedBy
-		if actor == "" {
-			actor = "system:schedule"
-		}
-		ro, err := s.startWithActorAndSchedule(ctx, []string{schedule.NodeID}, 0, actor, nil, &schedule)
+		ro, err := s.startWithActorAndSchedule(ctx, []string{schedule.NodeID}, 0, schedule.CreatedBy, nil, &schedule)
 		if err != nil {
 			if connect.CodeOf(err) == connect.CodeFailedPrecondition || ctx.Err() != nil {
 				return

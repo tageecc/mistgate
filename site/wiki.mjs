@@ -9,10 +9,11 @@ import { parseArgs } from "node:util";
 import YAML from "yaml";
 import { parseNav } from "./src/markdown.mjs";
 import { expandRoadmap } from "./src/roadmap.mjs";
-import { SITE, GITHUB, LANGS, COMPLETE, pageUrl, editUrl } from "./src/urls.mjs";
+import { SITE, GITHUB, LANGS as SITE_LANGS, COMPLETE, pageUrl, editUrl } from "./src/urls.mjs";
 
 const RAW = GITHUB.replace("github.com", "raw.githubusercontent.com");
 const RESERVED = new Set(["home", "_sidebar", "_footer"]);
+const DEMO_ALT = "A demo of the Mistgate admin: a new node is added, checked and comes online, and it appears on the person's page at once";
 
 const T = {
   en: {
@@ -34,6 +35,9 @@ const T = {
     heading: "Mistgate 文档",
   },
 };
+
+// the wiki speaks the languages it has strings for (fa and tr are on the site only, for now)
+const LANGS = SITE_LANGS.filter((l) => T[l]);
 
 const ALERTS = { note: "NOTE", tip: "TIP", warning: "WARNING", danger: "CAUTION", "важно": "NOTE", "совет": "TIP", "внимание": "WARNING", "опасно": "CAUTION", "注意": "NOTE", "提示": "TIP", "警告": "WARNING", "危险": "CAUTION" };
 
@@ -183,7 +187,12 @@ export function rewriteBody(body, ctx) {
     prevQuote = quote;
     const ref = !kind && REFDEF.exec(out);
     if (ref) return ref[1] + target(ref[2]) + (ref[3] ?? "");
-    return mapInline(out, (s) => s.replace(LINK, (_m, bang, text, href, title) => `${bang}[${text}](${bang ? image(href) : target(href)}${title})`));
+    return mapInline(out, (s) => s.replace(LINK, (_m, bang, text, href, title) => {
+      const video = bang && /images\/video\/([a-z]+)-poster-([a-z]+)\.webp$/.exec(href);
+      // a video's poster opens the video on the site (the wiki plays no MP4 from the repository)
+      if (video) return `[![${text}](${image(href)}${title})](${SITE}/video/${video[1]}-${video[2]}.mp4)`;
+      return `${bang}[${text}](${bang ? image(href) : target(href)}${title})`;
+    }));
   });
   return lines.join("\n");
 }
@@ -258,6 +267,7 @@ export function buildWiki(sources) {
   const shown = LANGS.filter((l) => byLang[l].size); // en and ru always; zh once it has pages
   files.set("Home.md", [
     `# ${[...new Set(shown.map((l) => T[l].heading))].join(" · ")}`, "",
+    `<img alt="${DEMO_ALT}" src="${RAW}/main/docs/images/video/hero-en.webp" width="100%">`, "",
     ...shown.flatMap((l) => [T[l].intro, ""]),
     startLinks, "",
     `Website: [mistgate.app](${SITE}) · Repository: [Mistgate/mistgate](${GITHUB})${shown.slice(1).map((l) => ` · ${T[l].name}: [mistgate.app/${l}/](${SITE}/${l}/)`).join("")}`, "",
@@ -291,7 +301,7 @@ export function buildWiki(sources) {
 export function loadDocs(docsDir) {
   const walk = (d) => readdirSync(d).sort().flatMap((n) => { const p = join(d, n); return statSync(p).isDirectory() ? walk(p) : p.endsWith(".md") ? [p] : []; });
   const out = {};
-  for (const lang of LANGS) {
+  for (const lang of SITE_LANGS) {
     const dir = join(docsDir, lang);
     out[lang] = {};
     if (existsSync(dir)) for (const f of walk(dir)) out[lang][relative(dir, f).replace(/\\/g, "/").replace(/\.md$/, "")] = readFileSync(f, "utf8");

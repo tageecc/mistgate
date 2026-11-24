@@ -2,6 +2,7 @@ package warp
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/mistgate/mistgate/internal/node/egress"
 	"github.com/mistgate/mistgate/internal/node/engine"
+	"github.com/mistgate/mistgate/internal/node/nftmissing"
 	"github.com/mistgate/mistgate/internal/plugin"
 )
 
@@ -61,6 +63,9 @@ type Manager struct {
 	// routesDirty: the last reassert failed, so the host may not match subnets/spec. SetRoutedSubnets then retries
 	// even for an unchanged list, which keeps the agent's dependent inbounds blocked until a reassert succeeds.
 	routesDirty bool
+	// nftLogged: the last reassert failed for want of the nft command and the log said so. The agent reports the missing
+	// command once (nftmissing.Watch); this tick, every few seconds, must not say it again.
+	nftLogged bool
 
 	state      State
 	backend    string
@@ -79,6 +84,13 @@ type Manager struct {
 	h          Health // last measured fields (State and Backend are filled in by Health())
 
 	egAuto, egV4 *egress.Direct
+
+	// Reach (reach.go): one run at a time, and one per health interval. reachDial and reachTLS are a test's seams;
+	// production dials through the guarded probeDialContext and verifies certificates against the system roots.
+	reachMu   sync.Mutex
+	reachAt   time.Time // when the last run began (mu)
+	reachDial func(ctx context.Context, network, address string) (net.Conn, error)
+	reachTLS  *tls.Config
 }
 
 // New builds the manager for this OS.
@@ -566,10 +578,17 @@ func (m *Manager) healthTick(ctx context.Context) {
 			st, err = m.plane.Stat(ctx)
 		}
 	}
-	if repaired, rerr := m.reassertLocked(ctx); rerr != nil {
-		m.log.Warn("warp routing reassert failed", "err", rerr)
-	} else if repaired {
-		m.log.Info("warp routing repaired")
+	repaired, rerr := m.reassertLocked(ctx)
+	if rerr != nil {
+		if !nftmissing.Is(rerr) || !m.nftLogged {
+			m.log.Warn("warp routing reassert failed", "err", rerr)
+		}
+		m.nftLogged = nftmissing.Is(rerr)
+	} else {
+		m.nftLogged = false
+		if repaired {
+			m.log.Info("warp routing repaired")
+		}
 	}
 	gen := m.gen
 	m.mu.Unlock()

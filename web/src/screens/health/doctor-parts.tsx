@@ -4,13 +4,12 @@ import { useState } from "react";
 import { CopyButton } from "@/components/copy-button";
 import { Chip } from "@/components/ui/bits";
 import { Button, buttonClass } from "@/components/ui/button";
-import { Icon, IconChip, type IconName, type Tone } from "@/components/ui/icons";
-import { StatusDot, StatusPill } from "@/components/ui/status";
+import { Icon, type IconName, type Tone } from "@/components/ui/icons";
 import { useToast } from "@/components/ui/toast";
 import { DoctorStatus } from "@/gen/mistgate/admin/v1/health_pb";
 import { useT } from "@/i18n";
 import { cx } from "@/lib/cx";
-import { health } from "@/lib/api";
+import { health, nodes as nodesApi } from "@/lib/api";
 import { itemDetail, itemParams } from "@/lib/doctor-detail";
 import { errorText } from "@/lib/errors";
 import { useFmt } from "@/lib/format";
@@ -18,11 +17,9 @@ import {
   checkTitle,
   doctorKind,
   doctorQuery,
-  doctorWord,
   isAccepted,
   itemCommand,
   itemFix,
-  itemTitle,
   itemWhy,
   manualSteps,
   useCan,
@@ -37,12 +34,14 @@ import { FixControl, type FixFlow } from "./fix";
  * What a check looks at, by family: the host's disk, memory and clock sand, the network sky, certificates lavender,
  * the tunnel engines sage. An unknown check (a newer agent) gets no chip. The result's colour stays the status dot's.
  */
-const checkMarks: Record<string, { icon: IconName; tone: Tone }> = {
+export const checkMarks: Record<string, { icon: IconName; tone: Tone }> = {
   disk_space: { icon: "disk", tone: "sand" },
   journald_size: { icon: "disk", tone: "sand" },
   dstate_tasks: { icon: "cpu", tone: "sand" },
   memory_pressure: { icon: "memory", tone: "sand" },
   cpu_softirq: { icon: "cpu", tone: "sand" },
+  cpu_steal: { icon: "cpu", tone: "sand" },
+  agent_fds: { icon: "file", tone: "sand" },
   kernel_headers: { icon: "cpu", tone: "sand" },
   time_sync: { icon: "clock", tone: "sand" },
   resolver: { icon: "dns", tone: "sky" },
@@ -51,17 +50,14 @@ const checkMarks: Record<string, { icon: IconName; tone: Tone }> = {
   foreign_nft: { icon: "shieldOff", tone: "sky" },
   port_conflicts: { icon: "plug", tone: "sky" },
   net_baseline: { icon: "network", tone: "sky" },
+  conntrack_fill: { icon: "network", tone: "sky" },
   warp_path: { icon: "bolt", tone: "sky" },
   cert_expiry: { icon: "lock", tone: "lavender" },
+  reality_target: { icon: "lock", tone: "lavender" },
   awg_backend: { icon: "shield", tone: "sage" },
 };
 
-function CheckChip({ id }: { id: string }) {
-  const m = checkMarks[id];
-  return m ? <IconChip icon={m.icon} tone={m.tone} size={20} /> : <span className="size-5 flex-none" />;
-}
-
-const linkClass = "font-mono text-xs font-bold underline decoration-dotted underline-offset-2 hover:text-accent-text";
+const linkClass = "font-mono text-xs font-medium underline decoration-dotted underline-offset-2 hover:text-accent-text";
 
 /** A node's name that opens its Doctor tab (the fleet tab names the node of every row). */
 export function NodeDoctorLink({ id, name }: { id: string; name: string }) {
@@ -122,29 +118,11 @@ export function useAcceptDoctor() {
 }
 
 /**
- * One doctor item: a status dot, the title (with the node's name on the fleet tab) and its status word, the
- * plain-language reason of a problem, the agent's own fact line, and on the right the fix button or what stands in its
- * place: the copyable command, the WARP card, the steps by hand ("Manual ▾"). A warning can be accepted as normal for
- * the node; an accepted one says by whom and when, with the way back. A row that is fine or skipped is one quiet line.
+ * What one doctor item means and what can be done about it: its kind, whether it is a problem (or accepted as normal), the reason
+ * and the node's fact, the action that fits (the fix, the copyable command, the WARP card, the steps by hand), and whether it can
+ * be accepted. DoctorRow and the node's Doctor tab both read it, so a fix started from either shows its progress on both.
  */
-export function DoctorRow({
-  flow,
-  nodeId,
-  nodeName,
-  item,
-  showNode,
-  first,
-  stale,
-}: {
-  flow: FixFlow;
-  nodeId: string;
-  nodeName: string;
-  item: DoctorItem;
-  showNode?: boolean;
-  first?: boolean;
-  /** The node has not sent a newer report than this (its age as text): the row is greyed out. */
-  stale?: string;
-}) {
+export function useDoctorItem({ flow, nodeId, nodeName, item, stale }: { flow: FixFlow; nodeId: string; nodeName: string; item: DoctorItem; stale?: string }) {
   const t = useT();
   const fmt = useFmt();
   const can = useCan();
@@ -184,6 +162,7 @@ export function DoctorRow({
       </div>
     );
   else if (item.id === "warp_path" && issue) action = <WarpPathActions nodeId={nodeId} />;
+  else if (issue && item.id === "awg_backend" && item.params.switch_auto === "1" && can.fix) action = <SwitchToAuto nodeId={nodeId} nodeName={nodeName} />;
   else if (steps.length > 0)
     action = (
       <Button variant="secondary" size="md" aria-expanded={open} onClick={() => setOpen((o) => !o)}>
@@ -193,68 +172,14 @@ export function DoctorRow({
     );
   else if (issue) action = <Chip>{t("hl.doctor.manual")}</Chip>;
 
-  return (
-    <div
-      title={stale ? t("hl.doctor.stale", { age: stale }) : undefined}
-      className={cx("flex flex-wrap items-center gap-x-3 gap-y-2 py-2.5", !first && "border-t border-line", issue && "min-h-16", stale && "opacity-60")}
-    >
-      <div className="flex min-w-0 flex-[1_1_260px] items-start gap-2.5">
-        <span className="mt-[5px] flex">
-          <StatusDot kind={phase === "done" ? "ok" : accepted ? "off" : kind} />
-        </span>
-        <CheckChip id={item.id} />
-        <div className="flex min-w-0 flex-col gap-[3px]">
-          <span className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[13px]">
-            {showNode && <NodeDoctorLink id={nodeId} name={nodeName} />}
-            <b>{itemTitle(t, item)}</b>
-            {issue && phase === "idle" && <StatusPill kind={kind} label={t(doctorWord(item.status))} sm />}
-            {!issue && !accepted && item.status !== DoctorStatus.OK && <span className="text-xs text-muted">{t("hl.doctor.status.skip")}</span>}
-          </span>
-          {why && <span className="text-xs leading-[1.45] text-pretty text-muted">{why}</span>}
-          {fact ? (
-            <span className="text-xs leading-snug break-words text-muted">{fact}</span>
-          ) : (
-            item.detail && <span className="font-mono text-[11px] leading-snug break-words text-muted">{item.detail}</span>
-          )}
-          {command && <span className="text-xs leading-snug text-muted">{t("hl.doctor.runCommand")}</span>}
-        </div>
-      </div>
-      {accepted ? (
-        <span className="flex flex-wrap items-center gap-x-1.5 text-xs text-muted">
-          {item.acceptedBy === me
-            ? t("hl.doctor.acceptedByYou", { date: fmt.date(item.acceptedUnix) })
-            : t("hl.doctor.acceptedBy", { name: item.acceptedByName || item.acceptedBy, date: fmt.date(item.acceptedUnix) })}
-          {can.run && (
-            <>
-              <span aria-hidden>·</span>
-              <button type="button" disabled={accept.busy} onClick={() => accept.run(who, false)} className="font-bold text-accent-text underline decoration-dotted underline-offset-2 disabled:opacity-50">
-                {t("hl.doctor.unaccept")}
-              </button>
-            </>
-          )}
-        </span>
-      ) : (
-        (action || canAccept) && (
-          <div className="flex max-w-full flex-wrap items-center gap-2">
-            {action}
-            {canAccept && (
-              <Button variant="ghost" size="md" disabled={accept.busy} title={t("hl.doctor.acceptHint")} onClick={() => accept.run(who, true)}>
-                {t("hl.doctor.accept")}
-              </Button>
-            )}
-          </div>
-        )
-      )}
-      {open && steps.length > 0 && <ManualSteps steps={steps} nodeId={nodeId} />}
-    </div>
-  );
+  return { t, fmt, can, accept, me, open, setOpen, kind, accepted, issue, why, fact, command, steps, phase, canAccept, who, action, fixKey: target?.key ?? "", target };
 }
 
 /** "Manual ▾" opened: each step in words, with the exact command to copy or the button to where it is done. */
-function ManualSteps({ steps, nodeId }: { steps: readonly ManualStep[]; nodeId: string }) {
+export function ManualSteps({ steps, nodeId }: { steps: readonly ManualStep[]; nodeId: string }) {
   const t = useT();
   return (
-    <ol className="flex basis-full flex-col gap-2.5 rounded-field border border-line bg-canvas p-3 sm:ml-12">
+    <ol className="flex basis-full flex-col gap-2.5 rounded-field border border-line bg-canvas p-3 sm:ms-12">
       {steps.map((s) => (
         <li key={s.text} className="flex flex-col gap-1.5 text-xs leading-snug">
           <span className="text-pretty">{t(s.text, s.params)}</span>
@@ -275,6 +200,30 @@ function ManualSteps({ steps, nodeId }: { steps: readonly ManualStep[]; nodeId: 
   );
 }
 
+/**
+ * The way out for an agent that cannot fall back to userspace by itself (no awg-fallback/1; the panel marks the row with
+ * switch_auto): the node's AmneziaWG backend becomes "auto", the same call the settings card makes. The module is used when it
+ * loads and userspace when it does not.
+ */
+function SwitchToAuto({ nodeId, nodeName }: { nodeId: string; nodeName: string }) {
+  const t = useT();
+  const toast = useToast();
+  const qc = useQueryClient();
+  const run = useMutation({
+    mutationFn: () => nodesApi.updateNode({ nodeId, awgBackend: "auto" }),
+    onSuccess: () => {
+      toast(t("awg.switchAuto.done", { node: nodeName }));
+      for (const k of ["health", "node", "nodes", "overview"]) void qc.invalidateQueries({ queryKey: [k] });
+    },
+    onError: (e) => toast.error(errorText(e, t)),
+  });
+  return (
+    <Button variant="primary" size="md" title={t("awg.switchAuto.hint")} disabled={run.isPending} onClick={() => run.mutate()}>
+      {t("awg.switchAuto.label")}
+    </Button>
+  );
+}
+
 /** What the owner can do about warp_path: look at the WARP card (node settings), or have the node report again right now. */
 function WarpPathActions({ nodeId, hasFix = false }: { nodeId: string; hasFix?: boolean }) {
   const t = useT();
@@ -288,33 +237,5 @@ function WarpPathActions({ nodeId, hasFix = false }: { nodeId: string; hasFix?: 
         {run.isPending ? t("hl.doctor.rerunning") : t("warp.recheck")}
       </Button>
     </div>
-  );
-}
-
-/**
- * What is fine or was not checked, as a compact two-column list (one column on a phone): the title and the node's
- * fact in one line each, no explanation and no button. Problems stay in DoctorRow with their full text.
- */
-export function DoctorCompact({ items, stale }: { items: readonly DoctorItem[]; stale?: boolean }) {
-  const t = useT();
-  const fmt = useFmt();
-  return (
-    <ul className={cx("grid gap-x-8 pt-1.5 pb-2.5 sm:grid-cols-2", stale && "opacity-60")}>
-      {items.map((item) => {
-        const fact = itemDetail(t, item, itemParams(t, fmt, item)) ?? item.detail;
-        return (
-          <li key={item.id} className="flex items-start gap-2.5 border-t border-line py-1.5 first:border-t-0 sm:[&:nth-child(2)]:border-t-0">
-            <span className="mt-[5px] flex">
-              <StatusDot kind={doctorKind(item.status)} />
-            </span>
-            <CheckChip id={item.id} />
-            <span className="min-w-0 text-[13px] leading-snug">
-              <b>{itemTitle(t, item)}</b>
-              {fact && <span className="ml-2 text-xs break-words text-muted">{fact}</span>}
-            </span>
-          </li>
-        );
-      })}
-    </ul>
   );
 }

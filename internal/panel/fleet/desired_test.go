@@ -13,6 +13,7 @@ import (
 	"time"
 
 	agentv1 "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/internal/agentcap"
 	"github.com/mistgate/mistgate/internal/panel/store"
 	"github.com/mistgate/mistgate/internal/plugin"
 	"github.com/mistgate/mistgate/internal/statehash"
@@ -25,12 +26,17 @@ func TestRequiredProtocolCapability(t *testing.T) {
 		spec plugin.InboundSpec
 		want string
 	}{
-		{name: "AWG", spec: plugin.InboundSpec{Protocol: "awg"}, want: capAWG},
-		{name: "VLESS", spec: plugin.InboundSpec{Protocol: "vless"}, want: capVLESS},
-		{name: "VLESS, another site", spec: plugin.InboundSpec{Protocol: "vless", Settings: []byte(`{"reality":{"target":"www.example.org:443"}}`)}, want: capVLESS},
-		{name: "VLESS, the node's own site", spec: plugin.InboundSpec{Protocol: "vless", Settings: []byte(`{"reality":{"target":"self"}}`)}, want: capVLESSSelf},
-		{name: "VLESS TLS front", spec: plugin.InboundSpec{Protocol: "vless", Settings: []byte(`{"security":"tls"}`)}, want: capVLESSTLS},
-		{name: "other L3 protocol", spec: plugin.InboundSpec{Tunnel: plugin.Tunnel{MTU: 1280}}, want: capAWG},
+		{name: "AWG", spec: plugin.InboundSpec{Protocol: "awg"}, want: agentcap.AWG},
+		{name: "VLESS", spec: plugin.InboundSpec{Protocol: "vless"}, want: agentcap.VLESS},
+		{name: "VLESS, another site", spec: plugin.InboundSpec{Protocol: "vless", Settings: []byte(`{"reality":{"target":"www.example.org:443"}}`)}, want: agentcap.VLESS},
+		{name: "VLESS, a site chosen on the node", spec: plugin.InboundSpec{Protocol: "vless", TLS: plugin.TLS{ServerName: "shop.example.com"}, Settings: []byte(`{"reality":{"target":"shop.example.com:443"}}`)}, want: agentcap.VLESSTarget},
+		{name: "VLESS, the node's own site", spec: plugin.InboundSpec{Protocol: "vless", Settings: []byte(`{"reality":{"target":"self"}}`)}, want: agentcap.VLESSSelf},
+		{name: "VLESS TLS front", spec: plugin.InboundSpec{Protocol: "vless", Settings: []byte(`{"security":"tls"}`)}, want: agentcap.VLESSTLS},
+		{name: "other L3 protocol", spec: plugin.InboundSpec{Tunnel: plugin.Tunnel{MTU: 1280}}, want: agentcap.AWG},
+		{name: "MTProto", spec: plugin.InboundSpec{Protocol: "mtproto"}, want: agentcap.MTProto},
+		{name: "TrustTunnel", spec: plugin.InboundSpec{Protocol: "trusttunnel"}, want: agentcap.TrustTunnel},
+		{name: "TrustTunnel HTTP/2", spec: plugin.InboundSpec{Protocol: "trusttunnel", Settings: []byte(`{"h3":false}`)}, want: agentcap.TrustTunnel},
+		{name: "TrustTunnel HTTP/3", spec: plugin.InboundSpec{Protocol: "trusttunnel", Settings: []byte(`{"h3":true}`)}, want: agentcap.TrustTunnelH3},
 		{name: "Hysteria2", spec: plugin.InboundSpec{Protocol: "hysteria2"}},
 	}
 	for _, tt := range tests {
@@ -39,6 +45,61 @@ func TestRequiredProtocolCapability(t *testing.T) {
 				t.Errorf("requiredCap() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestTrustTunnelInboundIsWithheldWithoutCapability(t *testing.T) {
+	tt := plugin.InboundSpec{ID: "inb_tt", Protocol: "trusttunnel", Enabled: true,
+		Listen: plugin.Listen{Network: "tcp", Port: 443}, Settings: []byte(`{"h3":false}`)}
+	e := newEnv(t)
+	e.f.cfg.Desired = func(context.Context, string) ([]statehash.Inbound, error) {
+		return []statehash.Inbound{{Spec: tt}}, nil
+	}
+	node := store.NodeRow{ID: "nod_1", State: "active"}
+	for _, tc := range []struct {
+		name     string
+		caps     []string
+		held     bool
+		withheld bool
+	}{
+		{name: "agent without TrustTunnel", withheld: true},
+		{name: "agent with TrustTunnel", caps: []string{agentcap.TrustTunnel}, held: true},
+	} {
+		st, err := e.f.buildState(context.Background(), node, tc.caps)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, held := st.in[tt.ID]
+		if held != tc.held || slices.Contains(st.withheld, tt.ID) != tc.withheld {
+			t.Errorf("%s: held=%v withheld=%v, want held=%v withheld=%v", tc.name, held, st.withheld, tc.held, tc.withheld)
+		}
+	}
+}
+
+// An agent with the HTTP/2 engine alone (trusttunnel/1) rejects h3:true: the panel keeps that inbound from it.
+func TestTrustTunnelHTTP3NeedsItsOwnCapability(t *testing.T) {
+	tt := plugin.InboundSpec{ID: "inb_tt3", Protocol: "trusttunnel", Enabled: true,
+		Listen: plugin.Listen{Network: "tcp", Port: 443}, Settings: []byte(`{"h3":true}`)}
+	e := newEnv(t)
+	e.f.cfg.Desired = func(context.Context, string) ([]statehash.Inbound, error) {
+		return []statehash.Inbound{{Spec: tt}}, nil
+	}
+	node := store.NodeRow{ID: "nod_1", State: "active"}
+	for _, tc := range []struct {
+		name string
+		caps []string
+		held bool
+	}{
+		{name: "HTTP/2 engine only", caps: []string{agentcap.TrustTunnel}},
+		{name: "HTTP/2 and HTTP/3", caps: []string{agentcap.TrustTunnel, agentcap.TrustTunnelH3}, held: true},
+	} {
+		st, err := e.f.buildState(context.Background(), node, tc.caps)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, held := st.in[tt.ID]; held != tc.held || slices.Contains(st.withheld, tt.ID) == tc.held {
+			t.Errorf("%s: held=%v withheld=%v, want held=%v", tc.name, held, st.withheld, tc.held)
+		}
 	}
 }
 
@@ -522,5 +583,75 @@ func TestVLESSSelfInboundIsWithheldFromAnAgentWithoutTheCapability(t *testing.T)
 		if !slices.Equal(held, tc.held) || !slices.Equal(st.withheld, tc.withheld) {
 			t.Errorf("%s: held %v withheld %v, want %v and %v", tc.name, held, st.withheld, tc.held, tc.withheld)
 		}
+	}
+}
+
+// A REALITY target chosen on the node has its name in the TLS block, which an agent without vless-target/1 rejects: the inbound is
+// withheld from it (agent_too_old on its row) and a site of the profile still goes out.
+func TestVLESSTargetOfTheNodeIsWithheldFromAnAgentWithoutTheCapability(t *testing.T) {
+	site := plugin.InboundSpec{ID: "inb_site", Protocol: "vless", Enabled: true, Settings: []byte(`{"reality":{"target":"www.example.org:443"}}`)}
+	chosen := plugin.InboundSpec{ID: "inb_chosen", Protocol: "vless", Enabled: true, TLS: plugin.TLS{ServerName: "shop.example.com"},
+		Settings: []byte(`{"reality":{"target":"shop.example.com:443","server_names":["shop.example.com"]}}`)}
+	e := newEnv(t)
+	e.f.cfg.Desired = func(context.Context, string) ([]statehash.Inbound, error) {
+		return []statehash.Inbound{{Spec: site}, {Spec: chosen}}, nil
+	}
+	node := store.NodeRow{ID: "nod_1", State: "active"}
+	for _, tc := range []struct {
+		name     string
+		caps     []string
+		withheld []string
+	}{
+		{"agent with VLESS self", []string{"vless/1", "vless-self/1", "vless-tls/1"}, []string{"inb_chosen"}},
+		{"agent with the target capability", []string{"vless/1", "vless-target/1"}, nil},
+	} {
+		st, err := e.f.buildState(context.Background(), node, tc.caps)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(st.withheld, tc.withheld) || st.in["inb_site"] == nil {
+			t.Errorf("%s: withheld %v, site held %v, want withheld %v and the site held", tc.name, st.withheld, st.in["inb_site"] != nil, tc.withheld)
+		}
+	}
+}
+
+// An agent of v0.1.68 has no MTProto engine and rejects a state with an mtproto inbound whole, so every other change to
+// the node stalls: the inbound is withheld from it (agent_too_old on its row) while the rest goes out. An agent with the
+// engine gets it.
+func TestMTProtoInboundGoesOnlyToAnAgentWithTheEngine(t *testing.T) {
+	hy2 := plugin.InboundSpec{ID: "inb_hy2", Protocol: "hysteria2", Enabled: true}
+	mt := plugin.InboundSpec{ID: "inb_mt", Protocol: "mtproto", Enabled: true}
+	e := newEnv(t)
+	e.f.cfg.Desired = func(context.Context, string) ([]statehash.Inbound, error) {
+		return []statehash.Inbound{{Spec: hy2}, {Spec: mt}}, nil
+	}
+	node := store.NodeRow{ID: "nod_1", State: "active"}
+	v68 := capabilities(&agentv1.Hello{Capabilities: []string{"doctor/1"}, Engines: []*agentv1.EngineInfo{{Protocol: "hysteria2"}}})
+	v69 := capabilities(&agentv1.Hello{Capabilities: []string{"doctor/1"}, Engines: []*agentv1.EngineInfo{{Protocol: "hysteria2"}, {Protocol: "mtproto"}}})
+	for _, tc := range []struct {
+		name     string
+		caps     []string
+		held     []string
+		withheld []string
+	}{
+		{"agent v0.1.68", v68, []string{"inb_hy2"}, []string{"inb_mt"}},
+		{"agent with the MTProto engine", v69, []string{"inb_hy2", "inb_mt"}, nil},
+	} {
+		st, err := e.f.buildState(context.Background(), node, tc.caps)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var held []string
+		for id := range st.in {
+			held = append(held, id)
+		}
+		sort.Strings(held)
+		if !slices.Equal(held, tc.held) || !slices.Equal(st.withheld, tc.withheld) {
+			t.Errorf("%s: held %v withheld %v, want %v and %v", tc.name, held, st.withheld, tc.held, tc.withheld)
+		}
+	}
+	listed := capabilities(&agentv1.Hello{Capabilities: []string{agentcap.MTProto}, Engines: []*agentv1.EngineInfo{{Protocol: "mtproto"}}})
+	if !slices.Equal(listed, []string{agentcap.MTProto}) {
+		t.Errorf("an agent that lists mtproto/1 itself: %v", listed)
 	}
 }

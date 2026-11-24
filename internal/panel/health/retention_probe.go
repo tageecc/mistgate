@@ -1,0 +1,56 @@
+//go:build !js
+
+package health
+
+import (
+	"context"
+	"time"
+
+	"github.com/mistgate/mistgate/internal/panel/store"
+)
+
+// sweepProbes prunes the on-demand path probes (7 days) and speed-test reservations (24 hours). It is VPS-only: the Cloudflare
+// edition cannot run a probe, so its cron has nothing to prune and makes no extra D1 call for it.
+func (s *Service) sweepProbes(ctx context.Context, now time.Time) {
+	if n, err := s.st.PrunePathProbes(ctx, now.Add(-time.Duration(store.PathProbeKeepHours)*time.Hour)); err != nil && ctx.Err() == nil {
+		s.log.Warn("health: prune path probes", "code", "prune_failed", "err", err)
+	} else if n > 0 {
+		s.log.Info("health: pruned path probes", "count", n)
+	}
+	if _, err := s.st.PrunePathSpeeds(ctx, now.Add(-time.Duration(store.PathSpeedKeepHours)*time.Hour)); err != nil && ctx.Err() == nil {
+		s.log.Warn("health: prune path speeds", "code", "prune_failed", "err", err)
+	}
+	if _, err := s.st.PrunePathSpeedStarts(ctx, now.Add(-24*time.Hour)); err != nil && ctx.Err() == nil {
+		s.log.Warn("health: prune path speed reservations", "code", "prune_failed", "err", err)
+	}
+}
+
+// sweepDebugCaptures prunes the on-demand debug captures of a node and their lines (24 hours). VPS only for the same reason: the
+// edition on Cloudflare cannot start a capture, so its cron does not touch the tables.
+func (s *Service) sweepDebugCaptures(ctx context.Context, now time.Time) {
+	if n, err := s.st.PruneDebugCaptures(ctx, now.Add(-store.DebugCaptureKeep)); err != nil && ctx.Err() == nil {
+		s.log.Warn("health: prune debug captures", "code", "prune_debug_captures_failed", "err", err)
+	} else if n > 0 {
+		s.log.Info("health: pruned debug captures", "count", n)
+	}
+}
+
+// sweepClientDebug prunes the logs people sent for support and the owner's requests for them (7 days from the request), with their lines, and
+// the rows whose person or device is gone. VPS only: the Cloudflare edition takes no logs, so its cron does not touch the tables.
+func (s *Service) sweepClientDebug(ctx context.Context, now time.Time) {
+	if n, err := s.st.PruneClientDebug(ctx, now.Add(-store.ClientDebugKeep)); err != nil && ctx.Err() == nil {
+		s.log.Warn("health: prune client logs", "code", "prune_client_debug_failed", "err", err)
+	} else if n > 0 {
+		s.log.Info("health: pruned client logs", "count", n)
+	}
+}
+
+// sweepScheduledRuns prunes the runs of the scheduled tasks (the last 50 of a task, at most 30 days) and the conversations of
+// the assistant tasks alike. VPS only: the Cloudflare edition runs no task.
+func (s *Service) sweepScheduledRuns(ctx context.Context, now time.Time) {
+	if n, err := s.st.PruneScheduledTaskRuns(ctx, now.Add(-store.ScheduledRunsKeep)); err != nil && ctx.Err() == nil {
+		s.log.Warn("health: prune scheduled task runs", "code", "prune_failed", "err", err)
+	} else if n > 0 {
+		s.log.Info("health: pruned scheduled task runs", "count", n)
+	}
+}

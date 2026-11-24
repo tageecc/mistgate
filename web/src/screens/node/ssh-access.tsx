@@ -1,12 +1,20 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useState } from "react";
+import { authorizedKeysFile } from "@/components/panel-ssh-key";
 import { isStepUpCancelled, useStepUp } from "@/components/step-up";
 import { Button } from "@/components/ui/button";
-import { SectionLabel } from "@/components/ui/bits";
+import { Icon } from "@/components/ui/icons";
+import { Callout } from "@/components/ui/notice";
 import { useToast } from "@/components/ui/toast";
 import { useT } from "@/i18n";
 import { errorText } from "@/lib/errors";
 import { provisioning } from "@/lib/api";
+import { useEdition } from "@/lib/edition";
+import { SSHAttach } from "./ssh-attach";
+import { Fingerprint } from "@/components/ssh-login";
+import { addPanelKey, keyError, SSHKeys, useServerKeys } from "./ssh-keys";
+import { SSHPassword } from "./ssh-password";
+import { Facts, SvCard, SvHead } from "./server-parts";
 
 /** The node's saved SSH access (public metadata only), or null when the panel keeps none. */
 export function useServerAccess(nodeId: string) {
@@ -20,92 +28,50 @@ export function useServerAccess(nodeId: string) {
   });
 }
 
-export function SSHAccessCard({ nodeId }: { nodeId: string }) {
-  return <SSHAccessCardContent key={nodeId} nodeId={nodeId} />;
+/** `attach`: a live node's name and address; with it, a node the panel keeps no access to offers Connect SSH access. */
+export function SSHAccessCard({ nodeId, attach }: { nodeId: string; attach?: { name: string; address: string } }) {
+  return <SSHAccessCardContent key={nodeId} nodeId={nodeId} attach={attach} />;
 }
 
-function SSHAccessCardContent({ nodeId }: { nodeId: string }) {
+/**
+ * Server tab, SSH access: where the panel logs in (address, login, the pinned server key) and how (the panel key or the
+ * password only, in the header, with a calm way to add the key to a password-only node), then a block per way in, each
+ * under a hairline: the password (ssh-password.tsx) and, on a live node, the keys (ssh-keys.tsx). A retired node adds
+ * Forget at the end. A live node with no saved access shows how to connect it (ssh-attach.tsx).
+ */
+function SSHAccessCardContent({ nodeId, attach }: { nodeId: string; attach?: { name: string; address: string } }) {
   const t = useT();
   const toast = useToast();
   const guard = useStepUp();
   const qc = useQueryClient();
-  const [password, setPassword] = useState("");
-  // set only when an interrupted change could not be checked: then both are shown, labelled unverified
-  const [pendingPassword, setPendingPassword] = useState("");
-  const [passwordNodeId, setPasswordNodeId] = useState("");
-  const [visible, setVisible] = useState(false);
+  const { edge } = useEdition();
   const [busy, setBusy] = useState(false);
   const [confirmForget, setConfirmForget] = useState(false);
-  const cardRef = useRef<HTMLElement>(null);
-  const expiryTimer = useRef<number | undefined>(undefined);
-  const revealEpoch = useRef(0);
-  const showingPassword = visible && passwordNodeId === nodeId;
+  const [installing, setInstalling] = useState(false);
+  const [problem, setProblem] = useState("");
+  // an attach that saved the password access but could not add the panel key says why, once, under the header
+  const [attachedWithout, setAttachedWithout] = useState("");
   const access = useServerAccess(nodeId);
+  const live = !!access.data && !access.data.nodeRetired;
+  const keys = useServerKeys(nodeId, live);
+  const passwordOnly = !!access.data && access.data.passwordSaved && access.data.panelKeyFingerprint === "";
+  // the key already in the file but unused has its own Use in the keys block
+  const offerKey = live && passwordOnly && !keys.data?.keys.some((k) => k.panelKey);
+  const keyGone = !!keys.data && !!access.data?.panelKeyFingerprint && !keys.data.keys.some((k) => k.panelKey);
 
-  const clearSecret = useCallback(() => {
-    revealEpoch.current += 1;
-    if (expiryTimer.current !== undefined) {
-      window.clearTimeout(expiryTimer.current);
-      expiryTimer.current = undefined;
-    }
-    setVisible(false);
-    setPassword("");
-    setPendingPassword("");
-    setPasswordNodeId("");
-    setBusy(false);
-  }, []);
-
-  useEffect(() => {
-    const accessLoaded = access.data !== undefined || access.isError;
-    if (!accessLoaded) return;
-    const panel = cardRef.current?.closest<HTMLElement>('[role="tabpanel"]');
-    const clearIfInactive = () => {
-      if (document.visibilityState === "hidden" || panel?.hidden || panel?.getAttribute("aria-hidden") === "true") {
-        clearSecret();
-      }
-    };
-    const observer = panel ? new MutationObserver(clearIfInactive) : undefined;
-    if (panel) observer?.observe(panel, { attributes: true, attributeFilter: ["hidden", "aria-hidden"] });
-    document.addEventListener("visibilitychange", clearIfInactive);
-    window.addEventListener("pagehide", clearSecret);
-    return () => {
-      revealEpoch.current += 1;
-      observer?.disconnect();
-      document.removeEventListener("visibilitychange", clearIfInactive);
-      window.removeEventListener("pagehide", clearSecret);
-      if (expiryTimer.current !== undefined) window.clearTimeout(expiryTimer.current);
-      expiryTimer.current = undefined;
-    };
-  }, [access.data, access.isError, clearSecret]);
-
-  async function reveal() {
-    const requestedNodeId = nodeId;
-    const epoch = ++revealEpoch.current;
-    setBusy(true);
+  async function installKey() {
+    setInstalling(true);
+    setProblem("");
     try {
-      const response = await guard(() => provisioning.revealNodeServerPassword({ nodeId: requestedNodeId }));
-      const panel = cardRef.current?.closest<HTMLElement>('[role="tabpanel"]');
-      if (
-        epoch !== revealEpoch.current ||
-        document.visibilityState === "hidden" ||
-        panel?.hidden ||
-        panel?.getAttribute("aria-hidden") === "true"
-      ) {
-        return;
-      }
-      setPassword(response.password);
-      setPendingPassword(response.unverified ? response.pendingPassword : "");
-      setPasswordNodeId(requestedNodeId);
-      setVisible(true);
-      if (expiryTimer.current !== undefined) window.clearTimeout(expiryTimer.current);
-      expiryTimer.current = window.setTimeout(() => {
-        expiryTimer.current = undefined;
-        if (epoch === revealEpoch.current) clearSecret();
-      }, 60_000);
+      await guard(() => addPanelKey(nodeId));
+      toast(t("node.sshAccess.keyInstalled"));
+      setAttachedWithout("");
     } catch (error) {
-      if (epoch === revealEpoch.current && !isStepUpCancelled(error)) toast.error(errorText(error, t));
+      if (!isStepUpCancelled(error)) setProblem(keyError(error, t, edge));
     } finally {
-      if (epoch === revealEpoch.current) setBusy(false);
+      setInstalling(false);
+      void qc.invalidateQueries({ queryKey: ["node-server-keys", nodeId] });
+      void qc.invalidateQueries({ queryKey: ["node-server-access"] });
     }
   }
 
@@ -114,7 +80,6 @@ function SSHAccessCardContent({ nodeId }: { nodeId: string }) {
     setBusy(true);
     try {
       await guard(() => provisioning.forgetNodeServerAccess({ nodeId }));
-      clearSecret();
       toast(t("node.sshAccess.forgotten"));
       await qc.invalidateQueries({ queryKey: ["node-server-access", nodeId] });
     } catch (error) {
@@ -125,81 +90,97 @@ function SSHAccessCardContent({ nodeId }: { nodeId: string }) {
     }
   }
 
-  if (!access.data && !access.isError) return null;
+  if (!access.data && !access.isError) {
+    return access.isSuccess && attach ? <SSHAttach nodeId={nodeId} name={attach.name} address={attach.address} onAttached={setAttachedWithout} /> : null;
+  }
 
   return (
-    <section ref={cardRef} className="rounded-card-lg border border-line bg-panel p-4">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <SectionLabel as="h2" icon="server" tone="sky">
-          {t("node.sshAccess.title")}
-        </SectionLabel>
-        {access.data && (
-          <Button variant="secondary" size="md" disabled={busy} onClick={() => (showingPassword ? clearSecret() : void reveal())}>
-            {busy ? t("common.loading") : showingPassword ? t("node.sshAccess.hide") : t("node.sshAccess.show")}
-          </Button>
-        )}
-      </div>
-      {access.isError ? (
-        <p role="alert" className="mt-3 text-[13px] text-danger">
-          {t("node.sshAccess.loadFailed")}
-        </p>
-      ) : access.data ? (
-        <>
-          <p className="mt-2 text-[13px] leading-snug text-muted">{t("node.sshAccess.body")}</p>
-          {access.data.passwordGenerated && <p className="mt-2 text-[13px] leading-snug text-muted">{t("node.sshAccess.generated")}</p>}
-          <dl className="mt-3 grid gap-2 text-[13px] sm:grid-cols-2">
-            <div>
-              <dt className="text-xs text-muted">{t("node.sshAccess.host")}</dt>
-              <dd className="mt-0.5 break-all font-mono">{access.data.host}:{access.data.port}</dd>
-            </div>
-            <div>
-              <dt className="text-xs text-muted">{t("node.sshAccess.username")}</dt>
-              <dd className="mt-0.5 break-all font-mono">{access.data.username}</dd>
-            </div>
-          </dl>
-          {showingPassword && (
-            <div className="mt-3 flex flex-col gap-1.5">
-              {pendingPassword && <p className="text-[13px] leading-snug text-danger">{t("node.sshAccess.unverified")}</p>}
-              {[
-                { id: `ssh-password-${nodeId}`, value: password, label: pendingPassword ? t("node.sshAccess.unverifiedCurrent") : t("node.sshAccess.password") },
-                ...(pendingPassword ? [{ id: `ssh-pending-password-${nodeId}`, value: pendingPassword, label: t("node.sshAccess.unverifiedPending") }] : []),
-              ].map((field) => (
-                <div key={field.id} className="flex flex-col gap-1.5">
-                  <label htmlFor={field.id} className="text-xs font-semibold text-muted">
-                    {field.label}
-                  </label>
-                  <input
-                    id={field.id}
-                    type="text"
-                    value={field.value}
-                    readOnly
-                    autoComplete="off"
-                    spellCheck={false}
-                    className="min-h-11 rounded-xl border border-line bg-inset px-3 font-mono text-sm text-main outline-none focus-visible:ring-2 focus-visible:ring-accent"
-                  />
-                </div>
-              ))}
-              <p className="text-xs leading-snug text-muted">{t("node.sshAccess.revealHint")}</p>
-            </div>
-          )}
-          {access.data.nodeRetired && (
-            <div className="mt-3 flex flex-col gap-2 border-t border-line pt-3">
-              <p className="text-[13px] leading-snug text-muted">{t("node.sshAccess.retired")}</p>
-              {confirmForget && <p className="text-[13px] leading-snug text-danger">{t("node.sshAccess.forgetConfirm")}</p>}
-              <div className="flex flex-wrap gap-2">
-                <Button variant="danger" size="md" disabled={busy} onClick={() => (confirmForget ? void forget() : setConfirmForget(true))}>
-                  {confirmForget ? t("node.sshAccess.forgetNow") : t("node.sshAccess.forget")}
+    <>
+      <SvCard aria-label={t("np.sv.ssh.title")}>
+        <SvHead
+          title={t("np.sv.ssh.title")}
+          hint={
+            access.isError ? (
+              <span role="alert" className="text-danger-text">
+                {t("node.sshAccess.loadFailed")}
+              </span>
+            ) : (
+              t("np.sv.ssh.hint")
+            )
+          }
+        />
+        {attachedWithout ? (
+          <Callout
+            className="mx-6 mb-4 max-[720px]:mx-4"
+            kind="warn"
+            action={
+              offerKey && (
+                <Button variant="secondary" size="sm" data-install-key disabled={installing} onClick={() => void installKey()}>
+                  {installing ? t("node.sshAccess.installingKey") : t("node.sshAccess.installKey")}
                 </Button>
-                {confirmForget && (
-                  <Button variant="ghost" size="md" disabled={busy} onClick={() => setConfirmForget(false)}>
-                    {t("common.cancel")}
-                  </Button>
-                )}
-              </div>
+              )
+            }
+          >
+            {t("node.sshAccess.keyNotAdded", { reason: keyError(attachedWithout, t, edge) })}
+          </Callout>
+        ) : (
+          offerKey && (
+            // a password-only node: the same key every node can take, offered calmly, not as a warning
+            <div className="mx-6 mb-4 flex flex-col gap-3 rounded-xl border border-line bg-surface-2 p-3 max-[720px]:mx-4">
+              <p className="text-[13px] leading-[18px] text-pretty text-fg">{t("node.sshAccess.keyPrompt")}</p>
+              <Button variant="secondary" size="md" data-install-key disabled={installing} className="self-start max-sm:w-full" onClick={() => void installKey()}>
+                <Icon name="key" size={14} />
+                {installing ? t("node.sshAccess.installingKey") : t("node.sshAccess.installKey")}
+              </Button>
             </div>
-          )}
-        </>
-      ) : null}
-    </section>
+          )
+        )}
+        {problem && (
+          <Callout className="mx-6 mb-4 max-[720px]:mx-4" kind="bad" alert>
+            {problem}
+          </Callout>
+        )}
+        {access.data && (
+          <>
+            <Facts
+              className="sv-facts"
+              items={[
+                { l: t("node.sshAccess.host"), v: <span dir="ltr">{access.data.host}:{access.data.port}</span>, mono: true },
+                { l: t("node.sshAccess.username"), v: <span dir="ltr">{access.data.username}</span>, mono: true },
+                {
+                  l: t("np.sv.ssh.login"),
+                  v: access.data.panelKeyFingerprint ? t("np.sv.ssh.byKey") : t("node.sshAccess.passwordOnly"),
+                  tone: access.data.panelKeyFingerprint && keyGone ? "warn" : undefined,
+                },
+                ...(access.data.fingerprint ? [{ l: t("node.sshAccess.serverKey"), v: <Fingerprint value={access.data.fingerprint} />, mono: true }] : []),
+              ]}
+            />
+            <SSHPassword nodeId={nodeId} access={access.data} />
+            {access.data.nodeRetired && (
+              <div className="sv-body line">
+                <p className="text-[13px] leading-[18px] text-pretty text-muted">{t("node.sshAccess.retired")}</p>
+                {confirmForget && (
+                  <div className="flex flex-col gap-1.5 text-[13px] leading-snug text-pretty text-danger-text">
+                    {access.data.passwordSaved && <p>{t("node.sshAccess.forgetConfirm")}</p>}
+                    {access.data.panelKeyFingerprint && <p>{t("node.sshAccess.forgetKey", { file: authorizedKeysFile })}</p>}
+                  </div>
+                )}
+                <div className="grid gap-2 md:flex md:flex-wrap">
+                  <Button variant="danger" size="md" disabled={busy} onClick={() => (confirmForget ? void forget() : setConfirmForget(true))}>
+                    {confirmForget ? t("node.sshAccess.forgetNow") : t("node.sshAccess.forget")}
+                  </Button>
+                  {confirmForget && (
+                    <Button variant="ghost" size="md" disabled={busy} onClick={() => setConfirmForget(false)}>
+                      {t("common.cancel")}
+                    </Button>
+                  )}
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </SvCard>
+      {access.data && live && <SSHKeys nodeId={nodeId} access={access.data} />}
+    </>
   );
 }

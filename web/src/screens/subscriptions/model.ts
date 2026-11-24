@@ -95,8 +95,11 @@ export function dnsChips(items: readonly { category: DnsCategory; country: strin
 }
 /** The country of a regional chip ("CN"), "" for any other chip. */
 export const chipCountry = (chip: string): string => (chip.startsWith(`${DnsCategory.REGIONAL}:`) ? chip.slice(chip.indexOf(":") + 1) : "");
+/** A rule's geo list holds a site category alone as "geosite:<name>" (internal/panel/dns/geo.go). */
+const geositePrefix = "geosite:";
 /** A country by its code ("cn", "IR") in the UI language: the panel's own word for Russia and China, else the browser's, else the code. */
 export function countryName(code: string, t: Tx): string {
+  if (code.startsWith(geositePrefix)) return code; // a site category, not a country: the subtitle names it as written
   const c = code.toUpperCase();
   const key = countryKey[c];
   if (key) return t(key);
@@ -115,12 +118,26 @@ export function chipLabel(chip: string, t: Tx): string {
 }
 
 /**
- * The country lists the split-rule editor offers: China only, the one with a built-in preset and resolvers checked from
+ * The country lists the split-rule editor offers: China and Russia, the ones with a built-in preset and resolvers checked from
  * inside the country. The panel knows "ir" too (internal/panel/dns/geo.go); a rule that already holds it, or any other
  * code, shows it as well so it can be seen and turned off.
  */
-const geoOffered = ["cn"];
-export const geoChoices = (have: readonly string[]): string[] => [...new Set([...geoOffered, ...have])];
+const geoOffered = ["cn", "ru"];
+export const geoChoices = (have: readonly string[]): string[] => [...new Set([...geoOffered, ...have.filter((g) => !g.startsWith(geositePrefix))])];
+/** The category names of a rule ("telegram" for "geosite:telegram"). */
+export const geoCategories = (geo: readonly string[]): string[] => geo.filter((g) => g.startsWith(geositePrefix)).map((g) => g.slice(geositePrefix.length));
+// The form the panel checks: lower-case letters and digits, then also - ! @, at most 64. A name the lists do not hold is not caught here or there.
+const categoryRe = /^[a-z0-9][a-z0-9!@-]{0,63}$/;
+/** Categories typed in one go, separated by commas, semicolons or spaces, lower-cased, with or without the "geosite:" in front: the well-formed ones and the rest. */
+export function parseCategories(text: string): { ok: string[]; bad: string[] } {
+  const tokens = [...new Set(text.toLowerCase().split(/[\s,;]+/).filter(Boolean))];
+  const name = (n: string) => (n.startsWith(geositePrefix) ? n.slice(geositePrefix.length) : n);
+  return { ok: [...new Set(tokens.map(name).filter((n) => categoryRe.test(n)))], bad: tokens.filter((n) => !categoryRe.test(name(n))) };
+}
+/** The geo list of a rule with these category names added (the ones it has already are not repeated). */
+export const addCategories = (geo: readonly string[], names: readonly string[]): string[] => [...geo, ...names.filter((n) => !geo.includes(geositePrefix + n)).map((n) => geositePrefix + n)];
+/** The geo list of a rule without this category. */
+export const removeCategory = (geo: readonly string[], name: string): string[] => geo.filter((g) => g !== geositePrefix + name);
 /** The country lists of a rule with `code` switched on (added at the end) or off; the others keep their order. */
 export const toggleGeo = (geo: readonly string[], code: string): string[] => (geo.includes(code) ? geo.filter((g) => g !== code) : [...geo, code]);
 
@@ -154,10 +171,11 @@ export const catalogOf = (providers: readonly Provider[]): Catalog => new Map(pr
 
 /** "Cloudflare · Family": the provider and the variant in the UI language. */
 export function variantLabel(e: { provider: Provider; variant: Variant }, lang: string): string {
-  const name = lang === "ru" ? e.variant.nameRu : lang === "zh" ? (variantNamesZh[e.variant.id] ?? e.variant.nameEn) : e.variant.nameEn;
+  const name = lang === "ru" ? e.variant.nameRu : (variantNames[lang]?.[e.variant.id] ?? e.variant.nameEn);
   return `${e.provider.name} · ${name}`;
 }
-// The catalog (internal/panel/dns/providers.go) names its variants in Russian and English only; this is the Chinese for each.
+// The catalog (internal/panel/dns/providers.go) names its variants in Russian and English only; these are the other
+// languages of the admin.
 const variantNamesZh: Record<string, string> = {
   "cloudflare/standard": "标准",
   "cloudflare/security": "安全",
@@ -178,7 +196,48 @@ const variantNamesZh: Record<string, string> = {
   "alidns/standard": "标准",
   "dnspod/standard": "标准",
 };
-// The catalog's notes are Russian and English only; this is the Chinese for each variant.
+const variantNamesFa: Record<string, string> = {
+  "cloudflare/standard": "استاندارد",
+  "cloudflare/security": "امنیت",
+  "cloudflare/family": "خانواده",
+  "google/standard": "استاندارد",
+  "quad9/standard": "امنیت",
+  "adguard/default": "پیش‌فرض",
+  "adguard/family": "خانواده",
+  "adguard/unfiltered": "بدون فیلتر",
+  "yandex/basic": "پایه",
+  "yandex/safe": "امن",
+  "yandex/family": "خانواده",
+  "mullvad/standard": "استاندارد",
+  "mullvad/adblock": "بدون تبلیغ",
+  "mullvad/base": "تبلیغ و بدافزار",
+  "opendns/familyshield": "FamilyShield",
+  "dnssb/standard": "استاندارد",
+  "alidns/standard": "استاندارد",
+  "dnspod/standard": "استاندارد",
+};
+const variantNamesTr: Record<string, string> = {
+  "cloudflare/standard": "Standart",
+  "cloudflare/security": "Güvenlik",
+  "cloudflare/family": "Aile",
+  "google/standard": "Standart",
+  "quad9/standard": "Güvenlik",
+  "adguard/default": "Varsayılan",
+  "adguard/family": "Aile",
+  "adguard/unfiltered": "Filtresiz",
+  "yandex/basic": "Temel",
+  "yandex/safe": "Güvenli",
+  "yandex/family": "Aile",
+  "mullvad/standard": "Standart",
+  "mullvad/adblock": "Reklamsız",
+  "mullvad/base": "Reklam ve zararlı yazılım",
+  "opendns/familyshield": "FamilyShield",
+  "dnssb/standard": "Standart",
+  "alidns/standard": "Standart",
+  "dnspod/standard": "Standart",
+};
+const variantNames: Record<string, Record<string, string>> = { zh: variantNamesZh, fa: variantNamesFa, tr: variantNamesTr };
+// The catalog's notes are Russian and English only; these are the other languages of the admin.
 const variantNotesZh: Record<string, string> = {
   "cloudflare/standard": "速度快，不过滤。2026 年 8 月起，俄罗斯封锁了到 Cloudflare 的 DoH，在隧道内不受影响。",
   "cloudflare/security": "拦截恶意和钓鱼网站。2026 年 8 月起，俄罗斯封锁了 DoH。",
@@ -199,7 +258,48 @@ const variantNotesZh: Record<string, string> = {
   "alidns/standard": "国内网站解析更稳定。仅支持普通 DNS，不支持 DoH 和 DoT。",
   "dnspod/standard": "国内网站解析更稳定。仅支持普通 DNS，不支持 DoH 和 DoT。",
 };
-export const variantNote = (v: Variant, lang: string) => (lang === "ru" ? v.noteRu : lang === "zh" ? (variantNotesZh[v.id] ?? v.noteEn) : v.noteEn);
+const variantNotesFa: Record<string, string> = {
+  "cloudflare/standard": "سریع و بدون فیلتر. از اوت 2026 روسیه DoH به Cloudflare را مسدود کرده است؛ داخل تونل اثری ندارد.",
+  "cloudflare/security": "بدافزار و سایت‌های فیشینگ را مسدود می‌کند. از اوت 2026 روسیه DoH آن را مسدود کرده است.",
+  "cloudflare/family": "بدافزار و محتوای بزرگسالان را مسدود می‌کند. از اوت 2026 روسیه DoH آن را مسدود کرده است.",
+  "google/standard": "بدون فیلتر.",
+  "quad9/standard": "دامنه‌های شناخته‌شدهٔ بدافزار و فیشینگ را مسدود می‌کند.",
+  "adguard/default": "تبلیغ‌ها و ردیاب‌ها را مسدود می‌کند.",
+  "adguard/family": "تبلیغ‌ها، ردیاب‌ها و محتوای بزرگسالان را مسدود می‌کند.",
+  "adguard/unfiltered": "هیچ چیزی را مسدود نمی‌کند.",
+  "yandex/basic": "سایت‌های روسی را پایدارتر پیدا می‌کند. DoH و DoT در روسیه کار می‌کنند.",
+  "yandex/safe": "بدافزار و سایت‌های کلاه‌برداری را مسدود می‌کند. DoH و DoT در روسیه کار می‌کنند.",
+  "yandex/family": "محتوای بزرگسالان و بدافزار را مسدود می‌کند. DoH و DoT در روسیه کار می‌کنند.",
+  "mullvad/standard": "فقط DoH/DoT، بدون DNS معمولی. این سرویس از 2026-11-02 کار نمی‌کند.",
+  "mullvad/adblock": "تبلیغ‌ها و ردیاب‌ها را مسدود می‌کند. فقط DoH/DoT. این سرویس از 2026-11-02 کار نمی‌کند.",
+  "mullvad/base": "تبلیغ‌ها، ردیاب‌ها و بدافزار را مسدود می‌کند. فقط DoH/DoT. این سرویس از 2026-11-02 کار نمی‌کند.",
+  "opendns/familyshield": "محتوای بزرگسالان را مسدود می‌کند. DoT ندارد: نام میزبان آن هنوز تأیید نشده است.",
+  "dnssb/standard": "بدون لاگ، با DNSSEC و بدون فیلتر.",
+  "alidns/standard": "سایت‌های چینی را پایدارتر پیدا می‌کند. فقط DNS معمولی، بدون DoH و DoT.",
+  "dnspod/standard": "سایت‌های چینی را پایدارتر پیدا می‌کند. فقط DNS معمولی، بدون DoH و DoT.",
+};
+const variantNotesTr: Record<string, string> = {
+  "cloudflare/standard": "Hızlı, filtresiz. Ağustos 2026'dan beri Rusya Cloudflare'a giden DoH'yi engelliyor; tünelin içinde etkisi yok.",
+  "cloudflare/security": "Zararlı ve oltalama sitelerini engeller. Ağustos 2026'dan beri Rusya bunun DoH'sini engelliyor.",
+  "cloudflare/family": "Zararlı siteleri ve yetişkin içeriğini engeller. Ağustos 2026'dan beri Rusya bunun DoH'sini engelliyor.",
+  "google/standard": "Filtresiz.",
+  "quad9/standard": "Bilinen zararlı ve oltalama alan adlarını engeller.",
+  "adguard/default": "Reklamları ve izleyicileri engeller.",
+  "adguard/family": "Reklamları, izleyicileri ve yetişkin içeriğini engeller.",
+  "adguard/unfiltered": "Hiçbir şeyi engellemez.",
+  "yandex/basic": "Rus sitelerini daha kararlı çözümler. DoH ve DoT Rusya'da çalışır.",
+  "yandex/safe": "Zararlı ve dolandırıcı siteleri engeller. DoH ve DoT Rusya'da çalışır.",
+  "yandex/family": "Yetişkin içeriğini ve zararlı siteleri engeller. DoH ve DoT Rusya'da çalışır.",
+  "mullvad/standard": "Yalnızca DoH/DoT, düz DNS yok. Hizmet 2026-11-02 tarihinde kapanıyor.",
+  "mullvad/adblock": "Reklamları ve izleyicileri engeller. Yalnızca DoH/DoT. Hizmet 2026-11-02 tarihinde kapanıyor.",
+  "mullvad/base": "Reklamları, izleyicileri ve zararlı siteleri engeller. Yalnızca DoH/DoT. Hizmet 2026-11-02 tarihinde kapanıyor.",
+  "opendns/familyshield": "Yetişkin içeriğini engeller. DoT yok: sunucu adı henüz doğrulanmadı.",
+  "dnssb/standard": "Kayıt tutmaz, DNSSEC destekler, filtresiz.",
+  "alidns/standard": "Çin sitelerini daha kararlı çözümler. Yalnızca düz DNS; DoH ve DoT yok.",
+  "dnspod/standard": "Çin sitelerini daha kararlı çözümler. Yalnızca düz DNS; DoH ve DoT yok.",
+};
+const variantNotes: Record<string, Record<string, string>> = { zh: variantNotesZh, fa: variantNotesFa, tr: variantNotesTr };
+export const variantNote = (v: Variant, lang: string) => (lang === "ru" ? v.noteRu : (variantNotes[lang]?.[v.id] ?? v.noteEn));
 
 type ServerLike = { address: string; kind?: DnsServerKind; providerVariant?: string };
 
@@ -334,7 +434,6 @@ export function parseSuffixes(text: string): string[] {
   return [...new Set(text.toLowerCase().split(/[\s,;]+/).filter(Boolean))];
 }
 
-
 // A client-side look at a server address. It is here to tell the admin early and is lenient: the panel's own check
 // (internal/panel/dns/validate.go) has the last word.
 const hostRe = /^(?=.{1,253}$)[\p{L}\p{N}]([\p{L}\p{N}-]{0,61}[\p{L}\p{N}])?(\.[\p{L}\p{N}]([\p{L}\p{N}-]{0,61}[\p{L}\p{N}])?)*$/u;
@@ -460,56 +559,36 @@ export function shortAddress(kind: DnsServerKind, address: string): string {
   }
 }
 
-/** What a card's glyph stands for: the built-in presets by id, anything else is a plain resolver. */
-export type PresetLook = { glyph: "map" | "globe" | "shieldOff" | "family" | "bugShield" | "letter" | "server"; tone: "sky" | "lavender" | "mint" | "sand" | "sage" | "rose" | "muted" };
-const looks: Record<string, PresetLook> = {
-  dns_builtin_ru_split: { glyph: "map", tone: "sky" },
-  dns_builtin_ru_proxied: { glyph: "map", tone: "lavender" },
-  dns_builtin_cn_split: { glyph: "map", tone: "mint" },
-  dns_builtin_standard: { glyph: "globe", tone: "mint" },
-  dns_builtin_adblock: { glyph: "shieldOff", tone: "sand" },
-  dns_builtin_family: { glyph: "family", tone: "sage" },
-  dns_builtin_quad9: { glyph: "bugShield", tone: "rose" },
-  dns_builtin_yandex: { glyph: "letter", tone: "sand" },
-  dns_builtin_yandex_family: { glyph: "letter", tone: "sage" },
-  dns_builtin_yandex_safe: { glyph: "letter", tone: "rose" },
-};
-const categoryLooks: Partial<Record<DnsCategory, PresetLook>> = {
-  [DnsCategory.REGIONAL]: { glyph: "map", tone: "sky" },
-  [DnsCategory.REGULAR]: { glyph: "globe", tone: "mint" },
-  [DnsCategory.NO_ADS]: { glyph: "shieldOff", tone: "sand" },
-  [DnsCategory.FAMILY]: { glyph: "family", tone: "sage" },
-  [DnsCategory.SECURITY]: { glyph: "bugShield", tone: "rose" },
-};
-/** The glyph of a preset: the first built-ins keep their own, the rest take the look of their category. */
-export const presetLook = (p: { id: string; category?: DnsCategory }): PresetLook => looks[p.id] ?? categoryLooks[p.category ?? DnsCategory.UNSPECIFIED] ?? { glyph: "server", tone: "muted" };
-
-// The built-in presets have one stored name (Russian). An English or Chinese UI shows these while the stored name is still
+// The built-in presets have one stored name (Russian). Any other UI language shows these while the stored name is still
 // the stock one; a name an admin edited is shown as stored. The Chinese names are the ones the user page shows
-// (internal/panel/dns/node.go builtinNames).
-const builtinNames: Record<string, { ru: string; en: string; zh: string }> = {
-  dns_builtin_ru_split: { ru: "Россия: .ru напрямую", en: "Russia: .ru direct", zh: "俄罗斯：.ru 直连" },
-  dns_builtin_ru_proxied: { ru: "Россия: всё через VPN", en: "Russia: all through VPN", zh: "俄罗斯：全部经 VPN" },
-  dns_builtin_cn_split: { ru: "Китай: китайские сайты напрямую", en: "China: Chinese sites direct", zh: "中国：国内网站直连" },
-  dns_builtin_standard: { ru: "Cloudflare + Google", en: "Cloudflare + Google", zh: "Cloudflare + Google" },
-  dns_builtin_adblock: { ru: "AdGuard: без рекламы", en: "AdGuard: no ads", zh: "AdGuard：无广告" },
-  dns_builtin_family: { ru: "AdGuard Family: без рекламы и 18+", en: "AdGuard Family: no ads, no 18+", zh: "AdGuard Family：无广告和成人内容" },
-  dns_builtin_quad9: { ru: "Quad9: защита от вредоносных", en: "Quad9: malware blocking", zh: "Quad9：拦截恶意网站" },
-  dns_builtin_yandex: { ru: "Яндекс DNS", en: "Yandex DNS", zh: "Yandex DNS" },
-  dns_builtin_cloudflare: { ru: "Cloudflare: без фильтров", en: "Cloudflare: no filtering", zh: "Cloudflare：无过滤" },
-  dns_builtin_google: { ru: "Google: без фильтров", en: "Google: no filtering", zh: "Google：无过滤" },
-  dns_builtin_dnssb: { ru: "DNS.SB: без фильтров", en: "DNS.SB: no filtering", zh: "DNS.SB：无过滤" },
-  dns_builtin_cloudflare_family: { ru: "Cloudflare Family: без вредоносных и 18+", en: "Cloudflare Family: no malware, no 18+", zh: "Cloudflare Family：无恶意网站和成人内容" },
-  dns_builtin_yandex_family: { ru: "Яндекс семейный: без 18+", en: "Yandex Family: no 18+", zh: "Yandex Family：无成人内容" },
-  dns_builtin_opendns_family: { ru: "OpenDNS FamilyShield: без 18+", en: "OpenDNS FamilyShield: no 18+", zh: "OpenDNS FamilyShield：无成人内容" },
-  dns_builtin_cloudflare_security: { ru: "Cloudflare Security: защита от вредоносных", en: "Cloudflare Security: malware blocking", zh: "Cloudflare Security：拦截恶意网站" },
-  dns_builtin_yandex_safe: { ru: "Яндекс безопасный: защита от вредоносных", en: "Yandex Safe: malware blocking", zh: "Yandex Safe：拦截恶意网站" },
+// (internal/panel/dns/node.go builtinNames); model.test.ts holds both to internal/panel/dns/testdata/builtin_names.json.
+// The Persian ".ru" starts with a left-to-right mark: a leading dot would otherwise take the right-to-left side of the
+// Persian around it.
+export const builtinNames: Record<string, { ru: string; en: string; zh: string; fa: string; tr: string }> = {
+  dns_builtin_ru_split: { ru: "Россия: .ru напрямую", en: "Russia: .ru direct", zh: "俄罗斯：.ru 直连", fa: "روسیه: \u200E.ru مستقیم", tr: "Rusya: .ru doğrudan" },
+  dns_builtin_ru_geo: { ru: "Россия: российские сайты напрямую (список сообщества)", en: "Russia: Russian sites direct (community list)", zh: "俄罗斯：俄罗斯网站直连（社区列表）", fa: "روسیه: سایت‌های روسی مستقیم (فهرست جامعه)", tr: "Rusya: Rus siteleri doğrudan (topluluk listesi)" },
+  dns_builtin_ru_proxied: { ru: "Россия: всё через VPN", en: "Russia: all through VPN", zh: "俄罗斯：全部经 VPN", fa: "روسیه: همه‌چیز از راه VPN", tr: "Rusya: her şey VPN üzerinden" },
+  dns_builtin_cn_split: { ru: "Китай: китайские сайты напрямую", en: "China: Chinese sites direct", zh: "中国：国内网站直连", fa: "چین: سایت‌های چینی مستقیم", tr: "Çin: Çin siteleri doğrudan" },
+  dns_builtin_standard: { ru: "Cloudflare + Google", en: "Cloudflare + Google", zh: "Cloudflare + Google", fa: "Cloudflare + Google", tr: "Cloudflare + Google" },
+  dns_builtin_adblock: { ru: "AdGuard: без рекламы", en: "AdGuard: no ads", zh: "AdGuard：无广告", fa: "AdGuard: بدون تبلیغ", tr: "AdGuard: reklamsız" },
+  dns_builtin_family: { ru: "AdGuard Family: без рекламы и 18+", en: "AdGuard Family: no ads, no 18+", zh: "AdGuard Family：无广告和成人内容", fa: "AdGuard Family: بدون تبلیغ و محتوای بزرگسالان", tr: "AdGuard Family: reklam ve +18 yok" },
+  dns_builtin_quad9: { ru: "Quad9: защита от вредоносных", en: "Quad9: malware blocking", zh: "Quad9：拦截恶意网站", fa: "Quad9: مسدودسازی بدافزار", tr: "Quad9: zararlı yazılım engeli" },
+  dns_builtin_yandex: { ru: "Яндекс DNS", en: "Yandex DNS", zh: "Yandex DNS", fa: "Yandex DNS", tr: "Yandex DNS" },
+  dns_builtin_cloudflare: { ru: "Cloudflare: без фильтров", en: "Cloudflare: no filtering", zh: "Cloudflare：无过滤", fa: "Cloudflare: بدون فیلتر", tr: "Cloudflare: filtresiz" },
+  dns_builtin_google: { ru: "Google: без фильтров", en: "Google: no filtering", zh: "Google：无过滤", fa: "Google: بدون فیلتر", tr: "Google: filtresiz" },
+  dns_builtin_dnssb: { ru: "DNS.SB: без фильтров", en: "DNS.SB: no filtering", zh: "DNS.SB：无过滤", fa: "DNS.SB: بدون فیلتر", tr: "DNS.SB: filtresiz" },
+  dns_builtin_cloudflare_family: { ru: "Cloudflare Family: без вредоносных и 18+", en: "Cloudflare Family: no malware, no 18+", zh: "Cloudflare Family：无恶意网站和成人内容", fa: "Cloudflare Family: بدون بدافزار و محتوای بزرگسالان", tr: "Cloudflare Family: zararlı ve +18 yok" },
+  dns_builtin_yandex_family: { ru: "Яндекс семейный: без 18+", en: "Yandex Family: no 18+", zh: "Yandex Family：无成人内容", fa: "Yandex Family: بدون محتوای بزرگسالان", tr: "Yandex Family: +18 yok" },
+  dns_builtin_opendns_family: { ru: "OpenDNS FamilyShield: без 18+", en: "OpenDNS FamilyShield: no 18+", zh: "OpenDNS FamilyShield：无成人内容", fa: "OpenDNS FamilyShield: بدون محتوای بزرگسالان", tr: "OpenDNS FamilyShield: +18 yok" },
+  dns_builtin_cloudflare_security: { ru: "Cloudflare Security: защита от вредоносных", en: "Cloudflare Security: malware blocking", zh: "Cloudflare Security：拦截恶意网站", fa: "Cloudflare Security: مسدودسازی بدافزار", tr: "Cloudflare Security: zararlı yazılım engeli" },
+  dns_builtin_yandex_safe: { ru: "Яндекс безопасный: защита от вредоносных", en: "Yandex Safe: malware blocking", zh: "Yandex Safe：拦截恶意网站", fa: "Yandex Safe: مسدودسازی بدافزار", tr: "Yandex Safe: zararlı yazılım engeli" },
+  dns_builtin_ads_device: { ru: "Без рекламы на устройстве", en: "No ads on the device", zh: "设备端拦截广告", fa: "مسدودسازی تبلیغ روی دستگاه", tr: "Cihazda reklam engeli" },
 };
 
 /** The name of a preset in the UI language (see builtinNames). */
 export function presetName(p: { id: string; name: string }, lang: string): string {
   const b = builtinNames[p.id];
-  return b && lang !== "ru" && p.name === b.ru ? (lang === "zh" ? b.zh : b.en) : p.name;
+  return b && lang !== "ru" && p.name === b.ru ? (lang === "zh" || lang === "fa" || lang === "tr" ? b[lang] : b.en) : p.name;
 }
 
 // Who runs a resolver, by address: what a person knows it by ("Cloudflare · Google"), not the IPs.
@@ -561,4 +640,177 @@ export function presetSubtitle(
   const first = rule?.suffixes[0] !== undefined ? unicodeSuffix(rule.suffixes[0]) : rule?.geo[0] && country(rule.geo[0]);
   if (p.splitDirect && first) parts.push(direct(first));
   return parts.join(" · ");
+}
+
+/** The first thing a preset's split sends direct: a suffix, else (a rule of country lists only) the country; "" when it has no rule (what a row of the list says under its servers). */
+export function splitFirst(split: readonly SplitRuleN[], country: (code: string) => string): string {
+  const rule = split.find((r) => r.suffixes.length > 0 || r.geo.length > 0);
+  return rule?.suffixes[0] !== undefined ? unicodeSuffix(rule.suffixes[0]) : rule?.geo[0] ? country(rule.geo[0]) : "";
+}
+
+// ---- the owner's own response headers ("Response headers" tab) ----
+
+export type ResponseHeader = Settings["responseHeaders"][number];
+/** The answer formats a header can be limited to: what an app is served. */
+export const headerFormats = [SubFormat.BASE64_URIS, SubFormat.MIHOMO_YAML, SubFormat.XRAY_JSON, SubFormat.SINGBOX_JSON] as const;
+/** The limits the panel enforces on save (internal/panel/subsettings/headers.go); the panel is the one that refuses, this only says why early. */
+export const headerLimit = { count: 20, name: 64, value: 1000, total: 4096 } as const;
+
+/** A message of the editor: the dictionary key and what fills it. */
+export type HeaderProblem = { key: Key; vars?: Record<string, string | number> };
+
+const utf8 = new TextEncoder();
+const tokenName = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
+/** Whether the panel keeps this name (any case): `reserved` is GetSubscriptionSettingsResponse.reserved_header_names, a trailing "*" being a prefix. */
+export function reservedHeaderName(name: string, reserved: readonly string[]): boolean {
+  const l = name.toLowerCase();
+  return reserved.some((r) => (r.endsWith("*") ? l.startsWith(r.slice(0, -1).toLowerCase()) : l === r.toLowerCase()));
+}
+
+/** The entry of the panel's list of kept names that holds this name (a trailing * is a family): what the message names. */
+export const reservedEntry = (name: string, reserved: readonly string[]): string | undefined => {
+  const l = name.toLowerCase();
+  return reserved.find((r) => (r.endsWith("*") ? l.startsWith(r.slice(0, -1).toLowerCase()) : l === r.toLowerCase()));
+};
+
+export function headerNameProblem(name: string, reserved: readonly string[]): HeaderProblem | null {
+  const n = name.trim();
+  if (n === "") return { key: "subs.hdr.err.noName" };
+  if (n.length > headerLimit.name || !tokenName.test(n)) return { key: "subs.hdr.err.name", vars: { max: headerLimit.name } };
+  if (reservedHeaderName(n, reserved)) return { key: "subs.hdr.err.reserved", vars: { name: n } };
+  return null;
+}
+
+export function headerValueProblem(value: string, base64: boolean): HeaderProblem | null {
+  const v = value.trim();
+  if (v === "") return { key: "subs.hdr.err.noValue" };
+  if (utf8.encode(v).length > headerLimit.value) return { key: "subs.hdr.err.long", vars: { max: headerLimit.value } };
+  if (/\p{Cc}/u.test(v)) return { key: "subs.hdr.err.ctl" };
+  if (!base64 && [...v].some((c) => c.charCodeAt(0) > 0x7f)) return { key: "subs.hdr.err.ascii" };
+  return null;
+}
+
+/** The bytes one header takes in an answer, as the panel counts them: the name, the value as sent and the separators. */
+export function headerSize(h: Pick<ResponseHeader, "name" | "value" | "base64">): number {
+  const bytes = utf8.encode(h.value.trim()).length;
+  return h.name.trim().length + (h.base64 ? 7 + 4 * Math.ceil(bytes / 3) : bytes) + 4;
+}
+
+/**
+ * What goes to the panel: trimmed, a format list that names every format folded into "all", and no group id of a group that is
+ * gone (`known` is the ids of the groups there are; null = not known, nothing is dropped).
+ */
+export function headerToSave(h: ResponseHeader, known: readonly string[] | null): ResponseHeader {
+  const formats = h.formats.length === headerFormats.length ? [] : [...h.formats];
+  const groupIds = !h.onlyGroups ? [] : known === null ? [...h.groupIds] : h.groupIds.filter((g) => known.includes(g));
+  return { ...h, name: h.name.trim(), value: h.value.trim(), formats, groupIds };
+}
+
+/**
+ * Whether an entry above this one with the same name (any case) is sent where this one would be too, so that this one is not (only the first
+ * of two goes). Checked for every format and every group in `groupIds`, and for a person in none of them ("").
+ */
+export function headerShadowed(rows: readonly ResponseHeader[], i: number, groupIds: readonly string[]): boolean {
+  const name = rows[i]!.name.trim().toLowerCase();
+  if (name === "") return false;
+  const fits = (h: ResponseHeader, f: SubFormat, g: string) => (h.formats.length === 0 || h.formats.includes(f)) && (!h.onlyGroups || h.groupIds.includes(g));
+  const above = rows.slice(0, i).filter((q) => q.name.trim().toLowerCase() === name);
+  return above.length > 0 && headerFormats.some((f) => ["", ...groupIds].some((g) => fits(rows[i]!, f, g) && above.some((q) => fits(q, f, g))));
+}
+
+// ---- the owner's own Mihomo templates ("Mihomo templates" tab) ----
+
+export type MihomoTemplate = Settings["mihomoTemplates"][number];
+/** What the panel enforces on save (internal/panel/subsettings/mihomo.go); the panel is the one that refuses, this only says why early. */
+export const templateLimit = { count: 20, name: 60, bytes: 64 << 10, total: 256 << 10 } as const;
+/** The largest file the editor takes from a drop or the file button; a template is far smaller, the panel says by how much. */
+export const templateFileMax = 1 << 20;
+
+export const templateBytes = (yaml: string): number => utf8.encode(yaml).length;
+/** Bytes as KiB with one decimal ("12.3"): the unit of the panel's limits. */
+export const kib = (bytes: number): string => (bytes / 1024).toFixed(1);
+
+/** A short key for a text (its length and a hash): what a query is told apart by, so that 64 KiB are not a key. */
+export function textKey(s: string): string {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) | 0;
+  return `${s.length}:${h >>> 0}`;
+}
+
+/** The text a new template starts with: one select group over every server of the person (and Auto while the panel adds it). */
+export const starterTemplate = (auto: boolean): string =>
+  [
+    "# The panel puts the person's servers at the start of `proxies` (the key may be missing).",
+    "# Groups take them with include-all-proxies or filter.",
+    "mixed-port: 7890",
+    "mode: rule",
+    "proxy-groups:",
+    "  - name: Proxy",
+    "    type: select",
+    "    include-all-proxies: true",
+    `    proxies: [${auto ? "Auto, " : ""}DIRECT]`,
+    "rules:",
+    "  - MATCH,Proxy",
+    "",
+  ].join("\n");
+
+/** What the form can say about a template before the panel does (the panel's save checks all of it again). */
+export function templateProblems(rows: readonly Pick<MihomoTemplate, "name" | "yaml">[], i: number): { name: HeaderProblem | null; text: HeaderProblem | null } {
+  const r = rows[i]!;
+  const name = r.name.trim();
+  const taken = rows.some((o, j) => j !== i && o.name.trim().toLowerCase() === name.toLowerCase());
+  const bytes = templateBytes(r.yaml);
+  return {
+    name: name === "" ? { key: "subs.mt.err.noName" } : [...name].length > templateLimit.name ? { key: "subs.mt.err.nameLong", vars: { max: templateLimit.name } } : taken ? { key: "subs.mt.err.nameTaken" } : null,
+    text: r.yaml.trim() === "" ? { key: "subs.mt.err.empty" } : bytes > templateLimit.bytes ? { key: "subs.mt.err.big", vars: { n: kib(bytes), max: templateLimit.bytes >> 10 } } : null,
+  };
+}
+
+/** What the panel's refusal of a template says: the words without the field's path, the line of the text it names, and which template (an index of the list sent). */
+export function templateRefusal(raw: string): { text: string; line?: number; index?: number } {
+  let s = raw.replace(/^invalid subscription settings:\s*/, "");
+  let index: number | undefined;
+  const m = /^mihomo_templates\[(\d+)\](?: \("(?:[^"\\]|\\.)*"\))?\.yaml:\s*/.exec(s);
+  if (m) {
+    index = Number(m[1]);
+    s = s.slice(m[0].length);
+  } else {
+    const f = /^mihomo_templates\[(\d+)\]\./.exec(s);
+    if (f) index = Number(f[1]);
+  }
+  const line = /(?:^|: )line (\d+):/.exec(s)?.[1];
+  return { text: s, ...(line && { line: Number(line) }), ...(index !== undefined && { index }) };
+}
+
+// ---- the owner's own routing profiles for Happ and INCY ("Routing" tab) ----
+
+export type RoutingProfile = Settings["routingProfiles"][number];
+export type RoutingInfo = NonNullable<RoutingProfile["info"]>;
+/** What the panel enforces on save (internal/panel/subsettings/routing.go); the panel is the one that refuses, this only says why early. `header` is the longest link the `routing` header holds: a longer one goes on a line of the subscription. */
+export const routingLimit = { count: 20, profile: 32 << 10, input: 128 << 10, header: 3000 } as const;
+
+/** What the panel's refusal of a profile says: the words without the field's path, and which profile (an index of the list sent). */
+export function routingRefusal(raw: string): { text: string; index?: number } {
+  const s = raw.replace(/^invalid subscription settings:\s*/, "");
+  const m = /^routing_profiles\[(\d+)\]\.(?:profile|group_ids):\s*/.exec(s);
+  return { text: m ? s.slice(m[0].length) : s, ...(m && { index: Number(m[1]) }) };
+}
+
+/** The mode a pasted link says: `routing/add/` adds only, `routing/onadd/` adds and turns on; null for text that is no such link. */
+export function linkMode(text: string): "add" | "onadd" | null {
+  const m = /:\/\/routing\/(onadd|add)\//i.exec(text.trim());
+  return m ? (m[1]!.toLowerCase() as "add" | "onadd") : null;
+}
+
+/** The hosts a profile's geo files come from, in the words of a list ("geo.example.com"); empty when it has none. */
+export function geoHosts(info: Pick<RoutingInfo, "geoipAddress" | "geositeAddress">): string[] {
+  const host = (u: string) => {
+    try {
+      return new URL(u).host;
+    } catch {
+      return u;
+    }
+  };
+  return [...new Set([info.geoipAddress, info.geositeAddress].filter(Boolean).map(host))];
 }

@@ -10,6 +10,7 @@ import (
 	"connectrpc.com/connect"
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
+	"github.com/mistgate/mistgate/gen/mistgate/admin/v1/adminv1connect"
 	"github.com/mistgate/mistgate/internal/panel/store"
 )
 
@@ -21,28 +22,29 @@ func (s *Service) groupProtos(ctx context.Context, gs ...store.AccessGroup) ([]*
 	}
 	out := make([]*adminv1.Group, len(gs))
 	for i, g := range gs {
-		happ, amnezia := s.reachOf(g, full)
-		out[i] = &adminv1.Group{Id: g.ID, Name: g.Name, ProfileIds: g.ProfileIDs, UserCount: uint32(g.UserCount), DnsPresetId: g.DNSPresetID,
-			HappNodes: happ, AmneziaNodes: amnezia, Color: g.Color}
+		happ, amnezia, telegram := s.reachOf(g, full)
+		out[i] = &adminv1.Group{Id: g.ID, Name: g.Name, ProfileIds: g.ProfileIDs, UserCount: uint32(g.UserCount), ExtraUserCount: uint32(g.ExtraUserCount), DnsPresetId: g.DNSPresetID,
+			HappNodes: happ, AmneziaNodes: amnezia, TelegramNodes: telegram, Color: g.Color, DisabledNodeIds: g.DisabledNodeIDs}
 	}
 	return out, nil
 }
 
 // reachOf counts the nodes where the group's profiles give something now, by the kind of app that takes them: the
 // subscription's rule (liveInbound) for a user with every node and both apps.
-func (s *Service) reachOf(g store.AccessGroup, full []store.AccessInboundFull) (happ, amnezia uint32) {
-	hn, an := map[string]bool{}, map[string]bool{}
+func (s *Service) reachOf(g store.AccessGroup, full []store.AccessInboundFull) (happ, amnezia, telegram uint32) {
+	hn, an, tn := map[string]bool{}, map[string]bool{}, map[string]bool{}
 	for _, f := range full {
-		if !liveInbound(f) || !slices.Contains(g.ProfileIDs, f.Profile.ID) {
+		if !liveInbound(f) || !slices.Contains(g.ProfileIDs, f.Profile.ID) || !g.GetsNode(f.Node.ID) {
 			continue
 		}
 		proto, ok := s.reg.Get(f.Profile.Protocol)
 		if !ok {
 			continue
 		}
-		h, a, _ := clientApps(proto)
+		h, a, tg, _, _ := clientApps(proto)
 		hn[f.Node.ID] = hn[f.Node.ID] || h
 		an[f.Node.ID] = an[f.Node.ID] || a
+		tn[f.Node.ID] = tn[f.Node.ID] || tg
 	}
 	for _, on := range hn {
 		if on {
@@ -54,7 +56,12 @@ func (s *Service) reachOf(g store.AccessGroup, full []store.AccessInboundFull) (
 			amnezia++
 		}
 	}
-	return happ, amnezia
+	for _, on := range tn {
+		if on {
+			telegram++
+		}
+	}
+	return happ, amnezia, telegram
 }
 
 // impactOf says what moving people from the profile set `from` to `to` does: profiles lost and gained (in name
@@ -108,7 +115,7 @@ func groupErr(s *Service, op string, err error) error {
 	case errors.Is(err, store.ErrAccessExists):
 		return coded(connect.CodeAlreadyExists, "name_taken")
 	case errors.Is(err, store.ErrNotFound):
-		return notFound("group or profile")
+		return notFound("group, profile or node")
 	}
 	return s.internal(op, err)
 }
@@ -125,7 +132,8 @@ func (s *Service) CreateGroup(ctx context.Context, req *connect.Request[adminv1.
 		return nil, err
 	}
 	g := store.AccessGroup{ID: store.NewID("grp_"), Name: name, ProfileIDs: slices.Compact(slices.Sorted(slices.Values(req.Msg.ProfileIds))),
-		CreatedAt: s.now(), DNSPresetID: req.Msg.DnsPresetId, Color: req.Msg.Color}
+		DisabledNodeIDs: slices.Compact(slices.Sorted(slices.Values(req.Msg.DisabledNodeIds))),
+		CreatedAt:       s.now(), DNSPresetID: req.Msg.DnsPresetId, Color: req.Msg.Color}
 	a := s.st.Access()
 	if err := a.CreateGroup(ctx, g); err != nil {
 		return nil, groupErr(s, "create group", err)
@@ -158,6 +166,11 @@ func (s *Service) UpdateGroup(ctx context.Context, req *connect.Request[adminv1.
 		ids := slices.Compact(slices.Sorted(slices.Values(m.ProfileIds.Values)))
 		profiles = &ids
 	}
+	var disabledNodeIDs *[]string
+	if m.DisabledNodeIds != nil {
+		ids := slices.Compact(slices.Sorted(slices.Values(m.DisabledNodeIds.Values)))
+		disabledNodeIDs = &ids
+	}
 	if m.DnsPresetId != nil {
 		if err := s.checkDNSPreset(ctx, *m.DnsPresetId); err != nil {
 			return nil, err
@@ -172,36 +185,60 @@ func (s *Service) UpdateGroup(ctx context.Context, req *connect.Request[adminv1.
 	if err != nil {
 		return nil, groupErr(s, "get group", err)
 	}
+	if disabledNodeIDs != nil {
+		if err := s.checkHeldNodes(ctx, before, *disabledNodeIDs); err != nil {
+			return nil, err
+		}
+	}
 	var impact *adminv1.AccessImpact
 	if profiles != nil {
 		awg := map[string]int{}
-		if before.UserCount > 0 {
+		if before.UserCount+before.ExtraUserCount > 0 {
 			if awg, err = a.AWGDevicesPerProfile(ctx, before.ID, ""); err != nil {
 				return nil, s.internal("awg devices", err)
 			}
 		}
-		if impact, err = s.impactOf(ctx, before.ProfileIDs, *profiles, before.UserCount, awg); err != nil {
+		if impact, err = s.impactOf(ctx, before.ProfileIDs, *profiles, before.UserCount+before.ExtraUserCount, awg); err != nil {
 			return nil, err
 		}
 	}
+	asked := groupUpdateUserChangeCount(before, profiles, disabledNodeIDs, m.DryRun)
+	reservation, err := s.reserveTokenUserChanges(ctx, adminv1connect.GroupServiceUpdateGroupProcedure, asked)
+	if err != nil {
+		return nil, err
+	}
+	defer reservation.finish()
 	got := before
 	if !m.DryRun {
-		if err := a.UpdateGroup(ctx, m.GroupId, name, profiles, m.DnsPresetId, m.Color); err != nil {
+		if err := a.UpdateGroupWithDisabledNodes(ctx, m.GroupId, name, profiles, m.DnsPresetId, m.Color, disabledNodeIDs); err != nil {
 			return nil, groupErr(s, "update group", err)
 		}
+		reservation.markTouched(asked)
 		if got, err = a.Group(ctx, m.GroupId); err != nil {
 			return nil, s.internal("get group", err)
 		}
-		if !slices.Equal(before.ProfileIDs, got.ProfileIDs) && got.UserCount > 0 {
-			s.notify.StateChanged() // the users of the group gained or lost profiles
+		if got.UserCount+got.ExtraUserCount > 0 && (!slices.Equal(before.ProfileIDs, got.ProfileIDs) || !slices.Equal(before.DisabledNodeIDs, got.DisabledNodeIDs)) {
+			s.notify.StateChanged() // the users of the group gained or lost access
 		}
-		s.audit(ctx, actor(ctx), "group_update", map[string]any{"group": got.ID, "name": got.Name})
+		s.audit(ctx, actor(ctx), "group_update", map[string]any{"group": got.ID, "name": got.Name, "disabled_nodes": got.DisabledNodeIDs})
 	}
 	out, err := s.groupProtos(ctx, got)
 	if err != nil {
 		return nil, err
 	}
 	return connect.NewResponse(&adminv1.UpdateGroupResponse{Group: out[0], Impact: impact}), nil
+}
+
+// groupUpdateUserChangeCount counts a group's users when an update changes its profile or available-node set.
+func groupUpdateUserChangeCount(before store.AccessGroup, profiles, disabledNodeIDs *[]string, dryRun bool) int {
+	if dryRun {
+		return 0
+	}
+	if profiles != nil && !slices.Equal(before.ProfileIDs, *profiles) ||
+		disabledNodeIDs != nil && !slices.Equal(before.DisabledNodeIDs, *disabledNodeIDs) {
+		return before.UserCount + before.ExtraUserCount
+	}
+	return 0
 }
 
 func (s *Service) DeleteGroup(ctx context.Context, req *connect.Request[adminv1.DeleteGroupRequest]) (*connect.Response[adminv1.DeleteGroupResponse], error) {
@@ -214,18 +251,29 @@ func (s *Service) DeleteGroup(ctx context.Context, req *connect.Request[adminv1.
 	if err != nil {
 		return nil, groupErr(s, "get group", err)
 	}
+	// the people it moves (the ones that have it as their main group) and the ones that just leave it (extra group) are asked for
+	asked := g.ExtraUserCount
+	if m.MoveUsersTo != "" {
+		asked += g.UserCount
+	}
+	reservation, err := s.reserveTokenUserChanges(ctx, adminv1connect.GroupServiceDeleteGroupProcedure, asked)
+	if err != nil {
+		return nil, err
+	}
+	defer reservation.finish()
 	switch err := a.DeleteGroup(ctx, m.GroupId, m.MoveUsersTo); {
 	case errors.Is(err, store.ErrAccessInUse):
 		return nil, coded(connect.CodeFailedPrecondition, "group_not_empty", "users", strconv.Itoa(g.UserCount))
 	case err != nil:
 		return nil, groupErr(s, "delete group", err)
 	}
-	// The moved users now get the other group's profiles. Not g.UserCount: it was read before the move, and a user
-	// created into the group since then was moved too.
-	if m.MoveUsersTo != "" {
+	reservation.markTouched(asked)
+	// DeleteGroup may move a user created after the count was read, so notify from the move request rather than g.UserCount; the
+	// people that had it as an extra group lose what it gave them.
+	if m.MoveUsersTo != "" || g.ExtraUserCount > 0 {
 		s.notify.StateChanged()
 	}
-	s.audit(ctx, actor(ctx), "group_delete", map[string]any{"group": m.GroupId, "name": g.Name})
+	s.audit(ctx, actor(ctx), "group_delete", map[string]any{"group": m.GroupId, "name": g.Name, "extra_left": g.ExtraUserCount})
 	return connect.NewResponse(&adminv1.DeleteGroupResponse{}), nil
 }
 

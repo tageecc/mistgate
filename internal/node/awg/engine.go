@@ -29,6 +29,7 @@ import (
 
 	"github.com/mistgate/mistgate/internal/node/awg/awgcfg"
 	"github.com/mistgate/mistgate/internal/node/engine"
+	"github.com/mistgate/mistgate/internal/node/nets"
 	"github.com/mistgate/mistgate/internal/plugin"
 	"github.com/mistgate/mistgate/internal/statehash"
 )
@@ -37,6 +38,9 @@ import (
 const (
 	ReasonBackendUnavailable = "awg_backend_unavailable"
 	ReasonModuleTooOld       = "awg_module_too_old"
+	// EventBackendFallback is the agent event (warning) of a "kernel" setting that runs on userspace because the module
+	// does not load: {reason, kernel}.
+	EventBackendFallback = "awg_backend_fallback"
 )
 
 const (
@@ -51,6 +55,10 @@ type Options struct {
 	// Backend is NodeSettings.awg_backend: "auto" (the kernel module if it is already loaded, else userspace),
 	// "kernel" or "userspace". "" means auto. Chosen once here; the agent does not install packages.
 	Backend string
+	// Peers counts the AmneziaWG devices the node serves, for the memory ceiling of the userspace fallback in "kernel"
+	// mode (choose.go). nil = unknown, counted as none.
+	Peers func() int
+	probe *probes // tests only
 }
 
 // Factory is the engine.Factory with the default (auto) backend choice; FactoryFor takes the setting.
@@ -79,7 +87,20 @@ func NewWithOptions(env engine.Env, opts Options) (*Engine, error) {
 	if log == nil {
 		log = slog.Default()
 	}
-	be, st := pickBackend(mode, log)
+	var be awgBackend
+	var st BackendStatus
+	if opts.probe != nil {
+		be, st = chooseBackend(mode, log, *opts.probe, opts.Peers)
+	} else {
+		be, st = pickBackend(mode, log, opts.Peers)
+	}
+	if st.Fallback && env.Event != nil { // once per build: the engine is built once per start or settings change
+		rel := runningKernel()
+		if opts.probe != nil {
+			rel = opts.probe.release()
+		}
+		env.Event(engine.Event{Code: EventBackendFallback, Warning: true, Params: map[string]string{"reason": st.Reason, "kernel": rel}})
+	}
 	return newEngine(env, be, st), nil
 }
 
@@ -125,6 +146,23 @@ type counters struct {
 	hs     time.Time
 	online bool
 	seen   bool
+	// pending: responses of the previous round that no handshake has confirmed yet (handshakeRound).
+	pending uint32
+}
+
+// handshakeRound turns one round of a peer's handshake counts into the responses its device never confirmed. A response is
+// confirmed when the device's first packet under the new keys arrives, which moves the peer's last handshake; it gets until
+// the end of the next round (10 to 20 s; the device answers within one RTT). advanced says the last handshake moved in this
+// round: it confirms the newest response, and every earlier one of the round and of the pending ones was lost. Without a
+// move the pending ones are lost and this round's responses wait.
+func handshakeRound(pending, responses uint32, advanced bool) (unmatched, next uint32) {
+	if advanced {
+		if pending+responses == 0 {
+			return 0, 0 // the node itself initiated, or a response of before the first round
+		}
+		return pending + responses - 1, 0
+	}
+	return pending, responses
 }
 
 // inbound is one interface.
@@ -146,6 +184,42 @@ type inbound struct {
 	since            time.Time
 	restarts         uint32
 	unknownForHealth uint32 // copied from the single TakeUnknownPeers read in Collect
+}
+
+// KernelDebugInterface identifies an active AWG kernel interface without exposing the engine's internal state.
+type KernelDebugInterface struct {
+	InboundID string
+	Name      string
+}
+
+// KernelDebugInfo reports whether the engine uses the kernel backend and which active interfaces belong to each inbound.
+func (e *Engine) KernelDebugInfo() (bool, []KernelDebugInterface) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.backend == nil || e.backend.Name() != "kernel" {
+		return false, nil
+	}
+	var out []KernelDebugInterface
+	for _, in := range e.sortedInbounds() {
+		if in.up {
+			out = append(out, KernelDebugInterface{InboundID: in.spec.ID, Name: in.cfg.name})
+		}
+	}
+	return true, out
+}
+
+// WatchKernelUnknownPeers forwards kernel unknown-peer events until the returned stop function is called.
+func (e *Engine) WatchKernelUnknownPeers(fn func(ifname string)) (bool, func()) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.backend == nil || e.backend.Name() != "kernel" {
+		return false, func() {}
+	}
+	source, ok := e.backend.(unknownPeerWatcher)
+	if !ok {
+		return true, func() {}
+	}
+	return true, source.WatchUnknownPeers(fn)
 }
 
 // Protocol implements engine.Engine.
@@ -202,9 +276,22 @@ func (e *Engine) Apply(ctx context.Context, spec plugin.InboundSpec, creds []plu
 	if cfg.version == awgcfg.Version31 && !e.backend.Is31() {
 		return e.fail(old, spec, sh, creds, fmt.Errorf("%s: %s cannot run AWG 3.1 (RandomTrailers/DisableCookies missing): needs amneziawg module v3.1.20260812 or newer, no silent fallback", ReasonModuleTooOld, e.backend.Version()))
 	}
-	peers, err := parsePeers(cfg, creds)
-	if err != nil {
-		return engine.ApplyReport{SpecHash: sh}, fmt.Errorf("awg inbound %q: %w", spec.ID, err)
+	peers, skipped := parsePeers(cfg, creds)
+	accepted := make(map[string]bool, len(peers))
+	for _, peer := range peers {
+		accepted[peer.credID] = true
+	}
+	kept := creds[:0]
+	for _, cred := range creds {
+		if accepted[cred.CredID] {
+			kept = append(kept, cred)
+			delete(accepted, cred.CredID)
+		}
+	}
+	creds = kept
+	warnings := make([]string, len(skipped))
+	for i, err := range skipped {
+		warnings[i] = err.Error()
 	}
 	if other := e.byIface[cfg.name]; other != "" && other != spec.ID {
 		return engine.ApplyReport{SpecHash: sh}, fmt.Errorf("awg inbound %q: udp port %d is already served by inbound %q", spec.ID, cfg.port, other)
@@ -218,16 +305,16 @@ func (e *Engine) Apply(ctx context.Context, spec plugin.InboundSpec, creds []plu
 			e.log.Warn("awg peer removal could not be confirmed; rebuilding the interface", "inbound", spec.ID, "err", err)
 			if rebuildErr := e.rebuildLive(ctx, old, spec, sh, creds, cfg, peers); rebuildErr != nil {
 				e.log.Error("awg interface rebuild failed", "inbound", spec.ID, "err", rebuildErr)
-				return engine.ApplyReport{SpecHash: sh, CredCount: len(creds)}, fmt.Errorf("awg inbound %q: rebuild after failed live update: %w", spec.ID, rebuildErr)
+				return engine.ApplyReport{SpecHash: sh, CredCount: len(creds), Warnings: warnings}, fmt.Errorf("awg inbound %q: rebuild after failed live update: %w", spec.ID, rebuildErr)
 			}
 			restarted = true
 		} else if err != nil {
 			e.log.Error("awg live update failed", "inbound", spec.ID, "err", err)
-			return engine.ApplyReport{SpecHash: sh, CredCount: len(creds)}, fmt.Errorf("awg inbound %q: %w", spec.ID, err)
+			return engine.ApplyReport{SpecHash: sh, CredCount: len(creds), Warnings: warnings}, fmt.Errorf("awg inbound %q: %w", spec.ID, err)
 		}
 		old.spec, old.specHash, old.creds, old.cfg = spec, sh, creds, cfg
 		old.warnedMissing = false
-		return engine.ApplyReport{SpecHash: sh, CredCount: len(creds), Restarted: restarted}, nil
+		return engine.ApplyReport{SpecHash: sh, CredCount: len(creds), Restarted: restarted, Warnings: warnings}, nil
 	}
 
 	// New inbound, changed identity, or a retry of one that failed or lost its interface: (re)build it.
@@ -249,10 +336,10 @@ func (e *Engine) Apply(ctx context.Context, spec plugin.InboundSpec, creds []plu
 		e.log.Error("awg inbound failed to start", "inbound", spec.ID, "err", err)
 		e.destroy(ctx, in)
 		in.state, in.detail, in.since = plugin.RunFailed, err.Error(), e.now()
-		return engine.ApplyReport{SpecHash: sh, CredCount: len(creds)}, fmt.Errorf("awg inbound %q: %w", spec.ID, err)
+		return engine.ApplyReport{SpecHash: sh, CredCount: len(creds), Warnings: warnings}, fmt.Errorf("awg inbound %q: %w", spec.ID, err)
 	}
 	in.state, in.detail, in.since = plugin.RunRunning, "", e.now()
-	return engine.ApplyReport{SpecHash: sh, CredCount: len(creds), Restarted: restarted}, nil
+	return engine.ApplyReport{SpecHash: sh, CredCount: len(creds), Restarted: restarted, Warnings: warnings}, nil
 }
 
 // fail records a failed inbound (keeping nothing running for it) and returns the error.
@@ -502,27 +589,79 @@ func (e *Engine) Collect(ctx context.Context) (engine.Collected, error) {
 			continue
 		}
 		links := make(map[string]*plugin.LinkStat)
+		var hs map[[32]byte]handshakeCounts
+		source, counted := e.backend.(handshakeSource)
+		if counted {
+			keys := make([][32]byte, 0, len(st))
+			for _, h := range st {
+				keys = append(keys, h.PublicKey)
+			}
+			hs = source.TakeHandshakes(in.cfg.name, keys)
+		}
 		for _, h := range st {
 			w := in.peers[h.PublicKey]
 			if w == nil {
 				continue // not ours: a peer we did not add
 			}
 			p := in.prev[h.PublicKey]
+			pending := p.pending
+			var attempts, unfinished uint32
+			if counted {
+				c := hs[h.PublicKey]
+				attempts = c.initiations
+				advanced := p.seen && h.LastHS.After(p.hs) || !p.seen && h.LastHS.After(in.since)
+				var unmatched uint32
+				unmatched, pending = handshakeRound(p.pending, c.responses, advanced)
+				unfinished = unmatched
+				if c.initiations|c.responses|unmatched != 0 {
+					stat := linkStatFor(links, in.spec.ID, w.credID)
+					stat.Initiations += c.initiations
+					stat.Responses += c.responses
+					stat.ResponsesUnmatched += unmatched
+				}
+			}
+			connect, stalled := false, false
 			if p.seen {
 				if !p.online && h.LastHS.After(p.hs) {
 					linkStatFor(links, in.spec.ID, w.credID).Connects++
+					connect = true
 				}
 				if h.RxBytes > p.rx && handshakeOlderThan(h.LastHS, now) {
 					linkStatFor(links, in.spec.ID, w.credID).Stalls++
+					stalled = true
 				}
 			} else if h.LastHS.After(in.since) {
 				// The first round that sees the peer: a handshake made since the inbound runs is a connection that came between
 				// two rounds (a new device connects within seconds). An older one predates this agent: a kernel interface kept
 				// across a restart.
 				linkStatFor(links, in.spec.ID, w.credID).Connects++
+				connect = true
+			}
+			if e.env.Nets != nil && e.env.Nets.Enabled() && h.Endpoint.IsValid() && (attempts|unfinished != 0 || connect || stalled) {
+				asn := e.env.Nets.Lookup(h.Endpoint.Addr().Unmap())
+				if !counted {
+					// Kernel snapshots expose connects and later stalls, but cannot distinguish unanswered initiations.
+					if connect {
+						attempts++
+					}
+				}
+				if stalled {
+					if attempts < ^uint32(0) {
+						attempts++
+					}
+					if unfinished < ^uint32(0) {
+						unfinished++
+					}
+				}
+				e.env.Nets.AddN(in.spec.ID, asn, nets.Attempt, "", w.userID, attempts)
+				e.env.Nets.AddN(in.spec.ID, asn, nets.Unfinished, "", w.userID, unfinished)
+				if connect {
+					e.env.Nets.Add(in.spec.ID, asn, nets.Connect, w.credID, w.userID)
+				}
+				// AWG exposes no per-peer close result, so this hook cannot report broken connections.
 			}
 			e.addTraffic(in.spec.ID, w.credID, deltaOf(p.rx, h.RxBytes), deltaOf(p.tx, h.TxBytes))
-			in.prev[h.PublicKey] = counters{rx: h.RxBytes, tx: h.TxBytes, hs: h.LastHS, online: online(h, now), seen: true}
+			in.prev[h.PublicKey] = counters{rx: h.RxBytes, tx: h.TxBytes, hs: h.LastHS, online: online(h, now), seen: true, pending: pending}
 			if online(h, now) {
 				out.Sessions = append(out.Sessions, plugin.Session{CredID: w.credID, InboundID: in.spec.ID, Since: h.LastHS})
 			}

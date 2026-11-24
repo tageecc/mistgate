@@ -102,6 +102,16 @@ func serverByID(d map[string]any, id string) map[string]any {
 	return nil
 }
 
+// takeHost is the one place a node's address may stand in an answer: the host of its server. The host must be the node's
+// address; it is taken out, so the leak checks that follow see the rest of the answer and nothing of the address.
+func takeHost(t *testing.T, srv map[string]any, want string) {
+	t.Helper()
+	if srv["host"] != want {
+		t.Fatalf("host = %v, want %q", srv["host"], want)
+	}
+	delete(srv, "host")
+}
+
 func TestServersOnThePage(t *testing.T) {
 	r := newDNSRig(t, nil)
 	_, tok := r.newUser("alice", nil)
@@ -141,6 +151,18 @@ func TestServersOnThePage(t *testing.T) {
 	if d["server_count"] != float64(2) {
 		t.Errorf("server_count = %v", d["server_count"])
 	}
+	// The node's address is allowed in one place: the host of its server. Here the host is checked and taken out; the checks below
+	// run on what is left, and the address stands in the page data exactly twice (one host per node).
+	takeHost(t, de, "de1.example.com")
+	takeHost(t, nl, "nl1.example.com")
+	if n := strings.Count(raw, "de1.example.com") + strings.Count(raw, "nl1.example.com"); n != 2 {
+		t.Errorf("the page data holds the addresses %d times, want 2 (the hosts)", n)
+	}
+	cleaned, err := json.Marshal(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw = string(cleaned) // the IP check below reads the page without its hosts
 	// No node name, operator notes, address, or sample rate as a JSON value, and no private rate fields.
 	for _, leak := range []string{de1Name, nl1Name, nodeNotes, "de1.example.com", "nl1.example.com", "85000000"} {
 		if jsonHasExactScalar(d, leak) {
@@ -236,6 +258,35 @@ func jsonHasField(v any, want string) bool {
 		}
 	}
 	return false
+}
+
+// A node added by its IP: its host is the IP, and the IP stands nowhere else on the page (nor the node's name or notes).
+func TestServerByIPHostIsTheIP(t *testing.T) {
+	r := newDNSRig(t, nil)
+	if _, err := r.st.W.Exec(`UPDATE node SET address = '203.0.113.24' WHERE id = 'nod_2'`); err != nil {
+		t.Fatal(err)
+	}
+	_, tok := r.newUser("alice", nil)
+	d, raw := r.page(tok, "Accept-Language", "en")
+	de, nl := serverByID(d, "nod_1"), serverByID(d, "nod_2")
+	if n := strings.Count(raw, "203.0.113.24"); n != 1 {
+		t.Errorf("the page data holds the IP %d times, want 1 (the host)", n)
+	}
+	takeHost(t, nl, "203.0.113.24")
+	takeHost(t, de, "de1.example.com")
+	cleaned, err := json.Marshal(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clean := string(cleaned)
+	if m := regexp.MustCompile(`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b`).FindString(clean); m != "" {
+		t.Errorf("the page data holds an IP address outside host: %s", m)
+	}
+	for _, leak := range []string{de1Name, nl1Name, nodeNotes, "de1.example.com", "nl1.example.com"} {
+		if strings.Contains(clean, leak) {
+			t.Errorf("the page data without the hosts holds %q", leak)
+		}
+	}
 }
 
 // A server that no node offers anything on has no DNS row; with nothing offered anywhere there is nothing to name.
@@ -393,8 +444,17 @@ func TestPickingADNS(t *testing.T) {
 		strings.Join(strs(dd["keys_to_refresh"]), ",") != dev || len(ans.StaleDevices) != 1 || ans.StaleDevices[0] != dev {
 		t.Errorf("answer = %+v", ans)
 	}
-	if strings.Contains(rec.Body.String(), de1Name) || strings.Contains(rec.Body.String(), "de1.example.com") {
-		t.Errorf("the answer carries a node name: %s", rec.Body.String())
+	// The node's address is allowed in one place: the host of the server. Taken out, the answer holds no node name and no address.
+	takeHost(t, ans.Server, "de1.example.com")
+	clean, err := json.Marshal(ans)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(clean), de1Name) || strings.Contains(string(clean), "de1.example.com") {
+		t.Errorf("the answer carries a node name or an address outside host: %s", clean)
+	}
+	if n := strings.Count(rec.Body.String(), "de1.example.com"); n != 1 {
+		t.Errorf("the answer holds the address %d times, want 1 (the host)", n)
 	}
 
 	// The page lists the key as stale because of the DNS, and the server as having a key to refresh.
@@ -550,7 +610,7 @@ func (r *dnsRig) countRows(q string, args ...any) int {
 // The same start as the device calls, in the same order: the page password, then the token (unknown = the decoy and a miss),
 // the cross-origin check, the switch, the status, the budget (shared with the devices), and only then the body.
 func TestPickingADNSSharesTheChainOfTheDeviceCalls(t *testing.T) {
-	// 1. A locked page locks the pick, for a token that exists and for one that does not (the same answer).
+	// 1. A locked page locks the pick of a token that exists; a token that does not is the decoy, as on every other route.
 	g := newGate(t, nil)
 	set := subsettings.Defaults()
 	set.UserPage.AllowDnsChoice = proto.Bool(true)
@@ -558,11 +618,11 @@ func TestPickingADNSSharesTheChainOfTheDeviceCalls(t *testing.T) {
 		t.Fatal(err)
 	}
 	uid, tok := g.newUser("alice", nil)
-	for name, token := range map[string]string{"a token": tok, "no such token": strings.Repeat("z", 43)} {
-		rec := call{g.h, t, token}.post("/dns", pickBody("nod_1", ""))
-		if rec.Code != 401 || decodeDNS(t, rec).Error != "locked" {
-			t.Errorf("%s without the cookie: %d %s", name, rec.Code, rec.Body.String())
-		}
+	if rec := (call{g.h, t, tok}).post("/dns", pickBody("nod_1", "")); rec.Code != 401 || decodeDNS(t, rec).Error != "locked" {
+		t.Errorf("a token without the cookie: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := (call{g.h, t, strings.Repeat("z", 43)}).post("/dns", pickBody("nod_1", "")); rec.Code != 404 {
+		t.Errorf("no such token without the cookie: %d %s", rec.Code, rec.Body.String())
 	}
 	cookie := cookieOf(t, g.unlock(t, tok, g.password(uid)))
 	if rec := (call{g.h, t, tok}).post("/dns", pickBody("nod_1", ""), "Cookie", ck(cookie)); rec.Code != 200 {
@@ -581,8 +641,8 @@ func TestPickingADNSSharesTheChainOfTheDeviceCalls(t *testing.T) {
 			t.Fatalf("unknown token %d: %d %q", i, rec.Code, rec.Body.String())
 		}
 	}
-	if rec := (call{m.h, t, tok2}).post("/dns", pickBody("nod_1", "")); rec.Code != 404 || rec.Body.String() != decoyBody {
-		t.Errorf("blocked client, valid token: %d %q", rec.Code, rec.Body.String())
+	if rec := (call{m.h, t, tok2}).post("/dns", pickBody("nod_1", "")); rec.Code != 200 {
+		t.Errorf("blocked client, cold valid token: %d %q", rec.Code, rec.Body.String())
 	}
 
 	// 3. The budget of writes is one for the devices and the DNS: 3 an hour here. A refusal that comes before it costs

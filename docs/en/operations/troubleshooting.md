@@ -47,15 +47,16 @@ A pending node whose command has expired needs a **New install command**; the ol
 | `already enrolled; use --force to replace the identity` | The state directory already holds an identity. | Add `--force` to a fresh command, or remove the old node first. |
 | `too many failed attempts, try later` | Too many failed attempts from this address in the last minute. | Wait a minute. |
 | `node retired` | The node was retired in the panel. | Add the server as a new node. |
+| `remote error: tls: handshake failure` (also `unrecognized name` or `internal error`) | The server at that address did not accept the panel's agent name, so it is not the panel itself: a CDN proxy (a proxied record at Cloudflare), a reverse proxy or a hosting control panel ends TLS there, another service holds the port, or the command is from another panel. The certificate behind the agent name is issued by the panel's own CA on purpose and is pinned by `--ca-sha256`: there is nothing to replace or configure. | Give the agents a direct TLS path: put the server's own IP or a DNS-only name into `--agent-addr`; behind a reverse proxy give them a port of their own with `--agent-listen` ("Behind a reverse proxy" in [Install the panel](../getting-started/install-panel.md), and [Can the panel run behind Cloudflare?](../reference/faq.md)). Then make a **New install command**. |
 | A connection error or a timeout | The panel cannot be reached on that address and port. | Check DNS, the firewalls, and that the panel speaks TLS there (see above). |
 
 `install` needs root and an enrolled state directory: run `enroll` first, with the same `--state-dir` if you changed it.
 
-If **Create install command** in the admin fails with "panel address is not configured", the panel does not know the address agents should dial: run setup with `--public-url`, or serve with `--agent-addr` (see [CLI](../reference/cli.md)).
+If **Get install command** in the admin fails with "panel address is not configured", the panel does not know the address agents should dial: run setup with `--public-url`, or serve with `--agent-addr` (see [CLI](../reference/cli.md)).
 
 ## An SSH installation fails
 
-**Nodes → Add node → Install automatically over SSH** connects from the panel's server, so the node's SSH port must be reachable from there, and the node must reach the panel back. When a job fails, the wizard says why and offers **Retry installation** (with the SSH password again; it continues from where it stopped) and **Open install manager**, which shows the exact reason.
+**Nodes → Add node → Over SSH** connects from the panel's server, so the node's SSH port must be reachable from there, and the node must reach the panel back. When a job fails, the wizard says why and offers **Retry installation** (with the SSH password again; it continues from where it stopped) and **Open install manager**, which shows the exact reason.
 
 The most common causes:
 
@@ -100,7 +101,17 @@ A port inside the port-hopping range of another profile, or held by Caddy or ano
 5. The doctor's **Foreign firewall rules** and **Leftovers of other VPNs**: a foreign nat or redirect rule can swallow the traffic.
 6. The doctor's **IPv6**: an IPv6 address that cannot connect out makes sites with IPv6 records stall.
 
-If the checks are green but one person cannot connect, look at the person: their status (disabled, expired, over quota) and devices on the Users page. See [Users and groups](../guide/users-and-groups.md).
+### The checks pass, but one person's app does not work
+
+The panel's checks connect with the panel's own key, so a green check says nothing about the keys of a person's apps. Each app that fetches the subscription with a device ID gets keys of its own (see [Users and groups](../guide/users-and-groups.md)); the keys of a removed device stop working, and an app over the device limit gets only a placeholder named after the limit.
+
+1. On the person's page, look at their status (disabled, expired, over quota) and **Devices**: how many places are taken out of the limit, and which apps by link.
+2. The **24 h** line under the profile on the node's **Profiles** tab: **unknown keys** that grow while the person tries mean their app comes with a key the node does not know, from a removed device or an old subscription.
+3. Remove the old apps there, then in the app delete the subscription, add the link again and refresh it. One new device appears. Check that the app's list has no entry named after the device limit.
+
+## A proxy on the same server stops working when the VPN is on
+
+A full-tunnel AmneziaWG client can reach the panel on TCP 443 when it shares the node's address, plus other enabled inbounds and the Hysteria2 HTTPS decoy on their configured ports. The AWG UDP listener ports, SSH, and node management ports stay closed from inside the tunnel. This needs the node agent v0.1.85; on an older agent only TCP 443 is open.
 
 ## The hoster blocks UDP
 
@@ -122,6 +133,51 @@ Hysteria2 and AmneziaWG run over UDP, and some hosters drop UDP on some ports or
 4. If every port is cut, write to the hoster's support or move the node.
 
 The check uses the profile's main port, not the port-hopping range, so a blocked hop range does not show here.
+
+## Works on Wi-Fi, not on mobile data
+
+**How it shows**
+
+- On Wi-Fi the app works; on mobile data it connects and stops answering a few seconds later, or never connects.
+- With AmneziaWG on mobile data the first handshake may pass, and then the app's new handshakes never reach the node; a profile on UDP 443 may get no packet at all.
+- The panel's checks and the port check pass.
+
+**What it means**
+
+The person's mobile operator cuts the traffic, not the node or the hoster: UDP to foreign addresses, QUIC, or every connection to foreign hosting after a few kilobytes. The panel cannot see it: the port check sends from data centres, and the [reachability](reachability.md) checks from the country test ICMP and TCP, not the UDP ports of AmneziaWG and Hysteria2.
+
+**What to do**
+
+1. Give the person a VLESS REALITY server over TCP 443 for mobile data: see [VLESS](../guide/vless.md).
+2. If connections to foreign hosting freeze after a few kilobytes, add a [relay](../guide/relays.md) through an entry node in the person's country. It carries VLESS and Hysteria2, not AmneziaWG yet; under a mobile whitelist it helps only if the entry address is on the list.
+3. Another UDP port or another AmneziaWG mimicry preset sometimes helps. The obfuscation parameters rarely do: the operator cuts the flow, not a signature.
+
+## The bridge does not hold
+
+This is about a relay whose method is **Auto** or **Bridge only** (see [Relays](../guide/relays.md)). Look at the **Method** block of the pair and at its checks on the entry node's page: *from the exit to the entry, for a bridge* and *Bridge held by the exit*.
+
+**How it shows**
+
+- The relay stays on forwarding although people say it is cut.
+- **Bridge only** is refused: "A bridge is not possible for this relay: ...", or "A bridge is not available for this server: its path cannot be checked."
+- A `relay_down` alert opens with the stage `bridge`, or the relay goes back to forwarding by itself with the reason "The bridge did not hold while direct works".
+- A bridge that works turns new people away, or quiet sessions end after two minutes.
+
+**What it means and what to do**
+
+| What you see | What it means | What to do |
+|:--|:--|:--|
+| The relay stays on forwarding while direct is cut | **Auto** moves to the bridge only after two failed checks in a row (the panel checks about every 10 minutes), and only when the bridge is up and the exit reaches the entry. The check *from the exit to the entry* says why not. | `timeout`: the exit does not reach the entry's site either, so a bridge will not help here. "Something other than its site answers": find what holds the bridge port on the entry. "Nothing to check against": the entry has no site of its own on 443 yet; the panel prepares one when the first relay in **Auto** or **Via bridge** exists. "The agent cannot run this check": update it. |
+| "A bridge is not possible: UDP" | The bridge carries TCP only. | Hysteria2 and AmneziaWG stay direct. |
+| "... the agent of the entry (the exit) is too old" | Both agents need the bridge. | Update the named node on the Updates page. |
+| "... its path cannot be checked" | The bridge starts only after the panel proves, from a third node, that people get through the entry to the server. A server it cannot prove (an MTProto server whose Fake TLS falls back to another site) never passes. | Choose **Forwarding only** for this relay. |
+| `relay_down` with the stage `bridge`, the exit shows no connection | The exit holds no connection to the entry. The bridge line names the agent's error. `pin_mismatch`: the exit sees another certificate than the one the entry reported (a renewal in progress, or something between them); wait a few minutes. `no_verification`: the exit has no certificate pin yet, because the entry has not reported its site. `port_conflict`: another listener holds the bridge port of the entry. `connection_limit` or `queue_full`: the entry is overloaded. | Fix what the code names. The panel sends the exit a new pin by itself after a renewal. |
+| The relay went back to forwarding, reason "bridge did not hold" | Direct works, and two checks in a row found the bridge broken. | The panel does not try the bridge again for 30 minutes unless the direct leg fails. Fix the bridge and wait, or choose **Bridge only**. |
+| The relay stays on the bridge for hours although direct works again | Going back takes at least an hour: three passes in a row, 30 minutes apart, then a flow test of 8 MB. | Nothing is wrong. The row shows "Returning to direct: k of 3". If the flow test fails, the next one waits at least 6 hours. |
+| New people are turned away, or the line says **nearly full** | One connection of the bridge serves 121 people. Two connections: 242 people. Four: 484. From 80 % the panel moves from two to four by itself. | At four, add a second entry: the line offers **Another entry for ...**. |
+| A quiet session ends after about two minutes | The bridge closes a session that sends nothing for two minutes (direct would keep it longer). | An app without keep-alive reconnects by itself. Nothing to fix on the node. |
+
+If the exit itself cannot reach the panel, its agent keeps its control session through the bridge: the exit's page says "Link to the panel: through" and the entry's name. It comes up within about a minute after the agent restarts; until then the exit shows offline.
 
 ## The clock drifts
 
@@ -147,9 +203,11 @@ If authenticator codes for the admin keep failing, check the clock of the panel 
 
 - The profile on the node: "AmneziaWG did not start on the node: see “AmneziaWG backend” on the node's Server tab".
 - The doctor's **AmneziaWG backend** reports no working backend; **Kernel headers** lists what is missing for the module.
+- On an up-to-date agent with the setting on **Kernel module**, the profiles keep working: the doctor warns "AmneziaWG runs in userspace for now: the kernel module does not load on kernel …" (a kernel update usually left the module behind). Build the module as below, then press **Switch back to the module** in the doctor. The node does not move back by itself while people are connected.
 
 **What to do**
 
+- On an agent without this fallback the doctor card offers **Switch this node to auto** in one click.
 - The simplest: set the node's **AmneziaWG backend** to **Auto** (the kernel module when it is already loaded, else userspace) or **Userspace**. Userspace needs no module, only `/dev/net/tun`.
 - To use the kernel module: choose **Kernel module**. An up-to-date agent builds the module itself after you confirm; AmneziaWG keeps running in userspace until it is ready. Otherwise run it on the node yourself; without `--yes` it only prints the plan:
 
@@ -162,6 +220,33 @@ If authenticator codes for the admin keep failing, check the clock of the panel 
 - If the doctor says the service file hides `/dev/net/tun` (an outdated unit), apply **Refresh the service** from Health → Doctor. For an agent too old to offer the fix, run `mistgate-node install` once with the current binary.
 
 See [AmneziaWG](../guide/amneziawg.md).
+
+## A kernel update fails in the AmneziaWG module build
+
+**How it shows**
+
+- apt or dpkg prints `Bad return status for module build on kernel: ...`, and a kernel or headers package stays half configured (`dpkg --audit` lists it); apt then refuses other installs.
+- An OS update job ends with `awg_module_build_failed`.
+
+**Why**
+
+The module's source (`amneziawg-dkms` 1.0.0 from the Amnezia PPA; the Debian recipe builds the same file) calls two kernel functions in a way it chooses by the kernel's version number. Some distribution kernels (Ubuntu 7.0.0-38) carry one of the two changes under an older number, so the module does not compile.
+
+**What Mistgate does**
+
+Before it builds the module, and again when a build fails, the update job (and `awg prepare-kernel`) looks at `/usr/src/amneziawg-*/compat/compat.h`. If the file is exactly one of the two files known to be bad (the PPA's, or the same file with its first macro line deleted by hand), it replaces those lines with ones that look at the real signature of the kernel's function, checks that the result is exactly the expected file, finishes dpkg and tries the step once more. Any other file is left as it is, and the failure says `the module source is not one Mistgate knows (sha256 ...)` with the first 12 characters of its hash.
+
+**What to do**
+
+- Look, then repair, then let dpkg finish:
+
+  ```sh
+  mistgate-node awg fix-source --check
+  mistgate-node awg fix-source
+  dpkg --configure -a
+  ```
+
+- For a file Mistgate does not know, nothing is changed. Update `amneziawg-dkms` (a fixed package replaces the file), or edit the file yourself and finish with `dpkg --configure -a`.
 
 ## WARP does not work
 
@@ -230,3 +315,58 @@ Start-up errors of `mistgate serve` and what they mean:
 | `vault: … is accessible to group or others …; run chmod 600 on it` | Run `chmod 600` on the key file. |
 | `--admin-listen conflicts with the stored admin address …` | The installation was set up for a secret host or prefix; drop `--admin-listen`. |
 | `--tls-cert and --tls-key go together` | Give both or neither. |
+
+## Panel logs, retention, export and metrics
+
+On the VPS edition the owner finds these in **Settings → System**; an admin-profile token reads them through MCP (`panel_logs`, `retention_status`, `log_level_plan`, `retention_plan`).
+
+- **Panel resources.** Settings → System → **Panel resources** shows what the panel itself costs its server: its process (CPU in percent of the whole server, memory with the Go heap, open files against the limit, goroutines and threads, how long it has run), the server (CPU busy with steal and disk wait, load, memory, swap, the disk of the data directory), the database (its size with the write-ahead log, and how much of it is free pages), the agents connected and the admin API's last 5 minutes (requests, server errors, the 95th-percentile response time). Every admin sees it, and any token reads it through MCP (`panel_resources`). The database is measured at most once a minute.
+
+- **Log level.** `mistgate serve --log-level debug|info|warn|error` (or `MISTGATE_LOG_LEVEL`, default `info`) sets the level at start, and `--log-format json` (or `MISTGATE_LOG_FORMAT`) writes the log to stderr as JSON. The owner can change the level while the panel runs; a restart returns to the configured one.
+- **Panel logs.** The last 5000 records at the current level are kept in memory (lost on restart) and shown, with filters for level, time, text, part of the panel, error code and request code. Addresses, the panel's secret names and key-shaped values are removed from every record, and only allow-listed attributes are shown. Every warning and error the panel writes carries a short `code`.
+- **Request code.** A failed call in the admin shows "request code abc12345". The same code is in the response header `X-Request-Id`, in the log records of that request and in the audit row of a change it made, so a person who quotes it and an operator reading the logs talk about the same request. The Cloudflare edition does not stamp request codes.
+- **Retention.** Settings → System → Retention sets how long each table the hourly sweep prunes keeps its rows: the node journal (1 to 7 days, default 7), info events (90) and warning and error events (400), the audit log (30 to 1095, default 400), resolved alerts (90), raw check rounds (25 to 168 hours, default 25), daily check aggregates (90), the hourly host load of a node (90), and the hourly traffic per person and per node (400 days each). A shorter time deletes the older rows at the next sweep, for good, and asks for a step-up. The sweep reads the values on every edition; they can be changed on the VPS edition.
+- **Export.** Settings → System → Export downloads the events, the audit log, the nodes' saved journal and the panel's own logs of a window of up to 31 days as newline-delimited JSON (one object per line, a `source` field names the kind). Every row is cleaned like the panel logs, and client addresses are left out of the audit rows. It asks for a step-up.
+- **Metrics.** `/metrics` on the admin address serves fleet gauges in the OpenMetrics text format: nodes by status, people online, active alerts by severity, deployed checks by latest result, per-node download and upload speed and CPU, relays by state, and the panel process's resident memory (`process_resident_memory_bytes`), goroutines (`go_goroutines`) and database size (`mistgate_db_bytes`). No person's name and no address. It is off until the owner turns it on in Settings → System; that makes a token, shown once and stored only as a hash, and a scraper sends it as `Authorization: Bearer <token>`. While it is off the address answers as any unknown admin path does.
+
+## Debug capture of one node
+
+When a node misbehaves and its warnings are not enough, the owner can ask it to log in detail for a few minutes. On the node's page, **Server → Debug capture**, pick the sources (the agent, `hysteria2`, `vless`, `xray`, `awg`, `update`, `kernel`; none picked means all), the level (debug or info) and the length (1, 5, 10 or 15 minutes), then press **Debug for N min**. A countdown shows the time left; **Stop and show** ends it at once. When the time is up the node sends what it kept and the panel shows the records with filters for level, source and text. The `kernel` source reads the node's kernel log from 30 minutes before capture start through the end; firewall packet-log lines are counted in its summary and not kept. On a kernel-backend node, `awg` turns on the module's debug output during the capture and adds a summary of handshake initiations without a response within five seconds.
+
+- **Limits.** One capture per node at a time, at most 15 minutes, at most 20000 records and 4 MiB (what does not fit is counted, not kept). The node puts its log level back when the capture ends, and a restart of the agent ends it too: nothing is written to disk on the node. The panel keeps a capture and its records 24 hours and at most 5 captures per node; the hourly sweep deletes the rest (VPS edition only).
+- **What is in it.** Every record is cleaned on the node (client addresses become `<ip>`, key-shaped text is removed, host names are cut from xray's lines, and only the node journal's short list of attributes is kept), again when the panel stores it, and once more when it is read, with the panel's secret names removed. Debug lines of the chosen sources go only to the capture, not to the node's own log.
+- **Who and what is recorded.** The owner starts and stops a capture in the admin. An admin-profile token starts one with `node_debug_capture_plan` / `node_debug_capture_apply` and reads it with `node_debug_logs` (a capture or a node, filters `min_level`, `source`, `query`, `limit`, `cursor`). Every start is in the audit log with who asked, the node, the sources and the duration. An agent that is too old (it does not list `debug/1`) and a node that is offline are refused without anything being sent. The Cloudflare edition does not have it.
+
+## A node did not come back after an OS update
+
+**How it shows**
+
+- The node's row says **Rebooting…** and, after 15 minutes, the update stops with "did not come back"; the alert "The OS update of a node stopped" is open (Critical) and Telegram has written.
+- The node's events: `os_reboot_started`, then nothing.
+
+**What to do**
+
+1. Open the hoster's console (the panel cannot reach a server that does not boot). If the server shows the boot menu or hangs, choose the previous kernel under GRUB's *Advanced options*: an update never removes old kernels.
+2. When the server is up, the node comes back by itself and the panel reconnects it. Look at **Last update** and the node's **History** tab for why the new kernel did not start.
+3. Press **Close** on the node's row to clear the alert. Do not try the update again before the server runs the kernel you chose on purpose.
+
+A server that did boot but is on another kernel than the one installed shows "started on another kernel" (`kernel_not_switched`): the boot menu (GRUB) does not start the newest kernel; set `GRUB_DEFAULT=0` and run `update-grub`.
+
+## The panel does not reboot a node after installing updates
+
+The update ends with **Reboot not done** and one of the sentences of the table in [Update one server's system](updates.md#update-one-servers-system) (`reboot_held`). The updates are installed. The node checks that a reboot is safe and refuses when it cannot be sure: the AmneziaWG module is not built for the new kernel (`awg_module_missing`, `awg_module_build_failed`), the boot menu is set to a chosen entry (`boot_default_custom`), the files for the new kernel are incomplete (`initramfs_missing`), the server restarted a few minutes ago (`too_soon`) or the panel has rebooted it already within the hour or three times in the day (`reboot_limit`). Fix the cause that the sentence names, or reboot the server yourself from the hoster's panel; the panel has no "reboot anyway" for this.
+
+## Multipath TCP and CVE-2026-98432
+
+CVE-2026-98432 is a flaw in the Linux kernel's IPv4 TCP (CVSS 9.8) that was shown as remote root through a listener that accepts Multipath TCP (MPTCP). Go opens every listener with MPTCP by default since Go 1.24, so the panel, the node agent and the Xray listeners it hosts accepted it up to v0.1.82. From v0.1.83 they open plain TCP, which nothing in Mistgate needs to change: clients that ask for MPTCP fall back to TCP.
+
+The bug itself is in the kernel, so on every node and on the panel's server also:
+
+1. Turn MPTCP off for every program on the host, Caddy and other Go programs included, and keep it off after a reboot:
+
+   ```bash
+   echo 'net.mptcp.enabled = 0' | sudo tee /etc/sysctl.d/99-no-mptcp.conf && sudo sysctl -w net.mptcp.enabled=0
+   ```
+
+2. Restart what listens (`sudo systemctl restart mistgate-node` on a node, `mistgate` on the panel's server, and Caddy where it runs): sockets opened before the change keep MPTCP until then. `ss -Hl -M` lists the MPTCP listeners that are left.
+3. Install your distribution's patched kernel as soon as it is published, and reboot.

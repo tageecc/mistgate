@@ -13,7 +13,7 @@ import type { Approvals } from "@/lib/integrations";
 import { instanceQuery } from "@/lib/instance";
 import { nodesQuery } from "@/lib/queries";
 import { meQuery } from "@/lib/session";
-import { ApprovalHistory, ApprovalQueue } from "@/screens/integrations/approvals";
+import { ApprovalsTab } from "@/screens/ai/approvals";
 import { SettingsLayout } from "@/screens/settings";
 import { AdminsPage } from "@/screens/settings-pages/admins";
 import { AuditPage } from "@/screens/settings-pages/audit";
@@ -23,10 +23,12 @@ import { InterfacePage } from "@/screens/settings-pages/interface";
 import { ChangePassword, Enroll, passwordLoginQuery } from "@/screens/settings-pages/password";
 import { passkeysQuery, SecurityPage } from "@/screens/settings-pages/security";
 import { SessionsPage } from "@/screens/settings-pages/sessions";
+import { SxRoot } from "@/screens/settings-pages/sx-bits";
 import { DnsTab } from "@/screens/subscriptions/dns";
 import { FormatsTab } from "@/screens/subscriptions/formats";
 import type { Settings } from "@/screens/subscriptions/model";
 import { clientsQuery, dnsPresetsQuery, settingsQuery, testAgentQuery } from "@/screens/subscriptions/queries";
+import { demoQr } from "@/lib/qr-demo";
 import { RulesTab } from "@/screens/subscriptions/rules";
 import { DnsSelect } from "@/screens/users/dns-select";
 import { groupsQuery, protocolsQuery } from "@/screens/users/rpc";
@@ -274,7 +276,7 @@ export function ProfileApprovalsKit() {
     <>
       {profileQueues.map(({ tool, data }) => (
         <Demo key={tool} id={`demo-ap-${tool}`} title={`Integrations → ${tool}`}>
-          <ApprovalQueue data={data} />
+          <ApprovalsTab data={data} />
         </Demo>
       ))}
     </>
@@ -291,13 +293,19 @@ export function SettingsDemos() {
         <SettingsLayout />
       </Demo>
       <Demo id="demo-settings-interface" title="Settings → Interface (owner)" seed={[me(), instance]}>
-        <InterfacePage />
+        <SxRoot>
+          <InterfacePage />
+        </SxRoot>
       </Demo>
       <Demo id="demo-settings-security" title="Settings → Security: passkeys, password and code, sign-in (check on)" seed={[me(), passkeys(2), [passwordLoginQuery.queryKey, { enabled: true, login: "alice", available: true }], security(true)]}>
-        <SecurityPage />
+        <SxRoot>
+          <SecurityPage />
+        </SxRoot>
       </Demo>
       <Demo id="demo-settings-security-passkey" title="Settings → Security: a passkey admin, the check off" seed={[me(), passkeys(1), [passwordLoginQuery.queryKey, { enabled: false, login: "", available: true }], security(false)]}>
-        <SecurityPage />
+        <SxRoot>
+          <SecurityPage />
+        </SxRoot>
       </Demo>
       <Demo id="demo-settings-password-modals" title="Password and code: the windows">
         <div className="flex flex-wrap gap-2">
@@ -306,7 +314,7 @@ export function SettingsDemos() {
           <Button onClick={() => setModal("add")}>Add password and code (form)</Button>
         </div>
         {modal === "change" && <ChangePassword login="alice" onClose={() => setModal(null)} />}
-        {modal === "rebind" && <Enroll begun={{ ceremonyId: "cer_demo", uri: "otpauth://totp/mistgate:alice?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&issuer=mistgate", secret: "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP" }} onClose={() => setModal(null)} />}
+        {modal === "rebind" && <Enroll begun={{ ceremonyId: "cer_demo", qr: demoQr, secret: "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP" }} onClose={() => setModal(null)} />}
         {modal === "add" && <Enroll onClose={() => setModal(null)} />}
       </Demo>
       <Demo
@@ -325,19 +333,29 @@ export function SettingsDemos() {
           ],
         ]}
       >
-        <SessionsPage />
+        <SxRoot>
+          <SessionsPage />
+        </SxRoot>
       </Demo>
       <Demo id="demo-settings-audit" title="Settings → Audit" seed={[[["audit", "all", "all"], auditPage]]}>
-        <AuditPage />
+        <SxRoot>
+          <AuditPage />
+        </SxRoot>
       </Demo>
       <Demo id="demo-settings-admins" title="Settings → Admins" seed={[me(), passkeys(2), [passwordLoginQuery.queryKey, { enabled: true, login: "alice", available: true }]]}>
-        <AdminsPage />
+        <SxRoot>
+          <AdminsPage />
+        </SxRoot>
       </Demo>
       <Demo id="demo-settings-domains" title="Settings → Domains (owner)" seed={[me(), instance]}>
-        <DomainsPage />
+        <SxRoot>
+          <DomainsPage />
+        </SxRoot>
       </Demo>
       <Demo id="demo-settings-backups" title="Settings → Backups">
-        <BackupsPage />
+        <SxRoot>
+          <BackupsPage />
+        </SxRoot>
       </Demo>
       <Demo id="demo-subs-formats" title="Subscriptions → Apps & formats" seed={subsSeed}>
         <FormatsTab go={() => {}} />
@@ -353,8 +371,7 @@ export function SettingsDemos() {
         </div>
       </Demo>
       <Demo id="demo-int-approvals" title="Integrations → what an agent asks, and what came of it">
-        <ApprovalQueue data={{ ...approvals, awaiting: 4, approvals: [...approvals.approvals.slice(0, 2), muteFacts, createFacts] as never }} />
-        <ApprovalHistory data={approvals} />
+        <ApprovalsTab data={{ ...approvals, awaiting: 4, approvals: [...approvals.approvals.slice(0, 2), muteFacts, createFacts, ...approvals.approvals.slice(2)] as never }} />
       </Demo>
       <Demo id="demo-palette" title="Command palette" seed={[[nodesQuery.queryKey, { nodes: [{ id: "n1", name: "de1", countryCode: "DE", location: "Frankfurt", provider: "", address: "", status: NodeStatus.ONLINE }] }]]}>
         <Button onClick={() => setPalette(true)}>Open the palette</Button>

@@ -54,8 +54,8 @@ type installForm struct {
 }
 
 type serverAccessView struct {
-	ID, Name, Host, Username, ConfiguredAt string
-	Pending, Retired                       bool
+	ID, Name, Host, Username, LoginMethod, ConfiguredAt string
+	Pending, Retired                                    bool
 }
 
 type preflightView struct {
@@ -67,6 +67,7 @@ type preflightView struct {
 	Memory         uint64 // bytes
 	Disk           uint64 // bytes
 	Systemd        bool
+	Nftables       bool // the nft command is there; without it the install adds the nftables package as a step of its own
 	PanelReachable bool
 }
 
@@ -179,9 +180,13 @@ func (s *Service) getPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, item := range access.Msg.Access {
+		loginMethod := "Пароль"
+		if item.PanelKeyFingerprint != "" {
+			loginMethod = "Ключ панели"
+		}
 		page.Access = append(page.Access, serverAccessView{
 			ID: item.NodeId, Name: item.NodeName, Host: net.JoinHostPort(item.Host, strconv.FormatUint(uint64(item.Port), 10)),
-			Username: item.Username, ConfiguredAt: time.Unix(item.ConfiguredUnix, 0).Local().Format("2006-01-02 15:04"),
+			Username: item.Username, LoginMethod: loginMethod, ConfiguredAt: time.Unix(item.ConfiguredUnix, 0).Local().Format("2006-01-02 15:04"),
 			Pending: item.RotationPending, Retired: item.NodeRetired,
 		})
 	}
@@ -301,6 +306,7 @@ func (s *Service) retryPageJob(w http.ResponseWriter, r *http.Request, values ur
 	}
 	result, err := s.RetryNodeProvision(r.Context(), connect.NewRequest(&adminv1.RetryNodeProvisionRequest{
 		JobId: jobID, ConfirmInstall: true, Password: values.Get("password"), SshUsername: sshUsername(values.Get("username")),
+		UsePanelKey: confirmed(values.Get("use_panel_key")),
 	}))
 	if err != nil {
 		s.getPageWithMessage(w, r, jobID, s.userMessage(err, "Не удалось повторить установку. Проверьте логин, пароль и состояние задания."))
@@ -421,7 +427,7 @@ func makePreflightView(facts *adminv1.NodePreflight) *preflightView {
 	return &preflightView{
 		Distribution: facts.Distribution, Version: facts.Version, Kernel: facts.Kernel, Architecture: facts.Architecture,
 		CPUCount: facts.CpuCount, Memory: facts.MemoryBytes, Disk: facts.DiskAvailableBytes,
-		Systemd: facts.Systemd, PanelReachable: facts.PanelReachable,
+		Systemd: facts.Systemd, Nftables: facts.Nftables, PanelReachable: facts.PanelReachable,
 	}
 }
 
@@ -473,6 +479,10 @@ func phaseLabel(phase string) string {
 		return "Ожидает запуска"
 	case "preflight":
 		return "Проверка сервера"
+	case "access":
+		return "Установка ключа панели"
+	case "nftables":
+		return "Установка nftables"
 	case "firewall":
 		return "Настройка firewall сервера"
 	case "transfer":
@@ -510,6 +520,8 @@ func eventLabel(phase, code string) string {
 		return "SSH-работа остановлена; состояние сервера нужно проверить"
 	case "checking_host":
 		return "Проверка сервера и SSH-ключа"
+	case "installing_nftables":
+		return "Установка пакета nftables на сервер (команды nft на нём нет)"
 	case "preparing_host_firewall":
 		return "Настройка активного firewall сервера"
 	case "uploading_agent":
@@ -522,9 +534,14 @@ func eventLabel(phase, code string) string {
 		return "Ожидание подключения агента"
 	case "agent_connected":
 		return "Нода подключилась к панели"
+	case "installing_panel_key":
+		return "Установка ключа панели на сервер"
 	default:
 		if code == "" {
 			return phaseLabel(phase)
+		}
+		if phase == "access" { // a password install goes on without the panel key; the code says why
+			return "Ключ панели не установлен, панель входит по паролю · " + strings.ReplaceAll(code, "_", " ")
 		}
 		return phaseLabel(phase) + " · " + strings.ReplaceAll(code, "_", " ")
 	}
@@ -576,7 +593,17 @@ func errorLabel(code string) string {
 		// root or a sudo user: the login is the owner's, so is the refusal
 		return "Сервер отклонил SSH-логин или пароль. Проверьте их и повторите установку."
 	case "ssh_password_auth_unavailable":
-		return "Сервер не принимает вход по паролю, только по ключу. Поставьте ноду командой вручную или временно разрешите вход по паролю в sshd."
+		return "Сервер не принимает вход по паролю, только по ключу. Добавьте на сервер ключ панели и повторите установку с ним."
+	case "ssh_panel_key_not_accepted":
+		return "Сервер не принял ключ панели. Проверьте, что он есть в ~/.ssh/authorized_keys этого логина."
+	case "authorized_keys_unsafe":
+		return "~/.ssh или authorized_keys на сервере — ссылка или не обычный файл. Панель такой файл не меняет."
+	case "authorized_keys_changed":
+		return "authorized_keys на сервере изменился во время записи. Повторите установку."
+	case "authorized_keys_too_large":
+		return "authorized_keys на сервере больше 64 КиБ. Панель такой файл не меняет."
+	case "ssh_authorized_keys_unavailable":
+		return "Панели не удалось прочитать или записать authorized_keys на сервере."
 	case "ssh_connection_timeout", "ssh_preflight_timeout":
 		return "Сервер не ответил вовремя. Проверьте сеть и порт SSH."
 	case "unsupported_os", "unsupported_os_version":
@@ -605,6 +632,8 @@ func errorLabel(code string) string {
 		return "Панели не удалось безопасно продолжить это задание. Проверьте журналы панели."
 	case "node_retired":
 		return "Эта нода была выведена из эксплуатации и не может быть зарегистрирована повторно."
+	case "nftables_install_failed":
+		return "Не удалось установить пакет nftables: на сервере нет команды nft, а агенту она нужна для защиты SSH, прыжков по портам и WARP. Установите его вручную (apt-get install nftables) и повторите установку."
 	case "host_firewall_configuration_failed":
 		return "Не удалось настроить активный firewall на сервере. Проверьте права SSH-пользователя и правила UFW/firewalld, затем повторите установку. Firewall хостера настраивается отдельно."
 	case "agent_bundle_unavailable":

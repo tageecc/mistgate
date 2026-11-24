@@ -54,8 +54,8 @@ func TestPeoplesChangesAreAudited(t *testing.T) {
 		{"users_enable", map[string]any{"count": float64(1), "names": "Марина К."}},
 		{"users_extend", map[string]any{"count": float64(1), "days": float64(30)}},
 		{"group_update", map[string]any{"name": "close friends"}},
-		{"inbound_update", map[string]any{"profile": "hy2 443", "node": "de1", "port": float64(8443), "enabled": true}},
-		{"inbound_update", map[string]any{"node": "de1", "enabled": false}},
+		{"inbound_update", map[string]any{"profile": "hy2 443", "node": "de1", "port": float64(8443), "enabled": true, "direct_in_subscriptions": true}},
+		{"inbound_update", map[string]any{"node": "de1", "enabled": false, "direct_in_subscriptions": true}},
 		{"profile_update", map[string]any{"name": "hy2 main", "settings_changed": false}},
 		{"user_delete", map[string]any{"count": float64(1), "names": "Марина К."}},
 		{"inbound_remove", map[string]any{"profile": "hy2 main", "node": "de1"}},
@@ -98,6 +98,40 @@ func TestPeoplesChangesAreAudited(t *testing.T) {
 	must(e.s.DeleteGroup(store.WithAuditSource(e.ctx, store.AuditMCP), req(&adminv1.DeleteGroupRequest{GroupId: g2})))
 	if top := must(e.st.ListAudit(e.ctx, "", 0, 1)); top[0].Action != "group_delete" || top[0].Source != store.AuditMCP {
 		t.Errorf("token's change: %+v", top)
+	}
+}
+
+func TestSubscriptionLinkRotationIsAuditedWithoutSecrets(t *testing.T) {
+	e := newEnv(t)
+	g := e.group("friends")
+	u := e.user("alice", g, nil).User
+	before := must(e.st.ListAudit(e.ctx, "", 0, 100))
+
+	plain := must(e.s.GetSubscriptionLink(e.ctx, req(&adminv1.GetSubscriptionLinkRequest{UserId: u.Id})))
+	if got := len(must(e.st.ListAudit(e.ctx, "", 0, 100))); got != len(before) {
+		t.Fatalf("plain read wrote an audit row: count %d, want %d", got, len(before))
+	}
+	rotated := must(e.s.GetSubscriptionLink(e.ctx, req(&adminv1.GetSubscriptionLinkRequest{UserId: u.Id, Rotate: true})))
+	rows := must(e.st.ListAudit(e.ctx, "", 0, 100))
+	if len(rows) != len(before)+1 {
+		t.Fatalf("rotate wrote %d audit rows, want exactly one", len(rows)-len(before))
+	}
+	row := rows[0]
+	if row.Action != "user_link_rotate" {
+		t.Fatalf("rotate action = %q, want user_link_rotate", row.Action)
+	}
+	var params map[string]any
+	if err := json.Unmarshal([]byte(row.Params), &params); err != nil {
+		t.Fatalf("rotate params %q: %v", row.Params, err)
+	}
+	if len(params) != 2 || params["user"] != u.Id || params["name"] != u.Name {
+		t.Errorf("rotate params = %v, want user %q and name %q", params, u.Id, u.Name)
+	}
+	oldToken := plain.Msg.Url[strings.LastIndex(plain.Msg.Url, "/")+1:]
+	newToken := rotated.Msg.Url[strings.LastIndex(rotated.Msg.Url, "/")+1:]
+	if strings.Contains(row.Params, oldToken) || strings.Contains(row.Params, newToken) ||
+		strings.Contains(row.Params, plain.Msg.Url) || strings.Contains(row.Params, rotated.Msg.Url) {
+		t.Errorf("rotate audit params contain a token or URL: %s", row.Params)
 	}
 }
 

@@ -1,8 +1,9 @@
 import type { Api } from "./amz-actions";
 import { ApiError, type Answer, type DnsAnswer } from "./api";
 import type { DnsApi } from "./dns-actions";
+import { sampleQr } from "./dev-data";
 import { awgConfig, awgDevice, linkDns, serverEntry } from "./logic";
-import type { ServerEntry } from "./types";
+import type { AwgConfig, ServerEntry } from "./types";
 
 // DEV SERVER ONLY (main.ts reaches this through `import.meta.env.DEV`, a build drops it): answers the self-service calls
 // of the sample cases ("dev:" endpoints) with made-up data, so the Amnezia section can be worked on without a panel.
@@ -46,22 +47,36 @@ PersistentKeepalive = 25
 `;
 
 // the names the server gives servers, keys and files (access/names.go): the country, "mistgate-de.conf"
-const cfg = (node: string, cc: string, stale = false) =>
+// `via` is the country of an entry node: the key of the path through it (the same node id, a name that ends "· via RU", its own file)
+const cfg = (node: string, cc: string, stale = false, via = "") =>
   awgConfig({
     node_id: `nod_${node}`,
-    label: new Intl.DisplayNames(["ru"], { type: "region" }).of(cc) ?? cc,
+    ...(via ? { via_node_id: "nod_msk1", via_country: via } : {}),
+    // the server names keys in the instance's language; the sample follows the page's, so each page shows its own
+    label: (new Intl.DisplayNames([document.documentElement.lang || "ru"], { type: "region" }).of(cc) ?? cc) + (via ? ` · via ${via}` : ""),
     country_code: cc,
     version: "3.1",
-    conf: conf(node),
+    conf: conf(via ? "msk1" : node),
+    qr: sampleQr,
     vpn_key: `vpn://${"AAAAAQAAAGh4nO".repeat(10)}`,
-    filename: `mistgate-${cc.toLowerCase()}.conf`,
+    filename: `mistgate-${cc.toLowerCase()}${via ? `-via-${via.toLowerCase()}` : ""}.conf`,
     stale,
     warnings: ["amnezia_desktop_mtu"],
     min_clients: [{ client: "amnezia", app: "AmneziaVPN", min: "5.0.1.5" }, { client: "amnezia", app: "AmneziaWG Android", min: "v3.1.20260814" }],
   });
 
-const nodes = () => [cfg("de1", "DE"), cfg("fi1", "FI")];
+// the "awg-relay" case: the path through the entry in Russia comes right after the direct config of its server
+const viaRu = () => new URLSearchParams(location.search).get("case") === "awg-relay";
+const fixed = () => (viaRu() ? [cfg("de1", "DE"), cfg("de1", "DE", false, "RU"), cfg("fi1", "FI")] : [cfg("de1", "DE"), cfg("fi1", "FI")]);
 const perPlatform = new Map<string, number>();
+// the profile of the devices made in this session: they are not in the page's data
+const madeOn = new Map<string, string>();
+// a page whose servers say which carry a profile gets one config for each of them (the key-* cases); any other page the two above
+const nodes = (profile = ""): AwgConfig[] => {
+  const on = pageServers().filter((x) => x.connections.some((c) => c.way === "key" && c.profile_id === profile));
+  return on.length > 0 ? on.map((x) => cfg(x.id.replace(/^nod_/, ""), x.country_code)) : fixed();
+};
+const profileOf = (device: string) => madeOn.get(device) ?? pageData().amnezia?.devices?.find((x) => x.id === device)?.profile_id ?? "";
 
 /** The dev server's password form accepts abcd-2345; three wrong tries in a row get the "try later" answer. */
 let wrong = 0;
@@ -74,9 +89,9 @@ export async function devUnlock(_url: string, password: string): Promise<void> {
 }
 
 // the page's own data, to answer a DNS choice with the server (or the link apps' DNS) as it would be afterwards
-const pageData = (): { servers?: unknown; dns?: { link?: unknown } } => {
+const pageData = (): { servers?: unknown; dns?: { link?: unknown }; amnezia?: { devices?: { id: string; profile_id: string }[] } } => {
   try {
-    return JSON.parse(document.getElementById("mg-data")?.textContent ?? "{}") as { servers?: unknown; dns?: { link?: unknown } };
+    return JSON.parse(document.getElementById("mg-data")?.textContent ?? "{}") as ReturnType<typeof pageData>;
   } catch {
     return {};
   }
@@ -121,15 +136,16 @@ export const devApi: Api & DnsApi = {
       address: `10.66.4.${n % 250}, fd66:66:0:1::${n % 250}`,
       min_clients: [{ client: "amnezia", app: "AmneziaVPN", min: "5.0.1.5" }],
     });
-    return { device, configs: nodes() };
+    madeOn.set(device.id, body.profile_id);
+    return { device, configs: nodes(body.profile_id) };
   },
-  async getConfigs(): Promise<Answer> {
+  async getConfigs(_e, id): Promise<Answer> {
     await pause();
-    return { configs: nodes() };
+    return { configs: nodes(profileOf(id)) };
   },
-  async rotateKey(): Promise<Answer> {
+  async rotateKey(_e, id): Promise<Answer> {
     await pause();
-    return { configs: nodes() };
+    return { configs: nodes(profileOf(id)) };
   },
   async revokeDevice() {
     await pause();

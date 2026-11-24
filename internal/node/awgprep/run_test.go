@@ -13,10 +13,15 @@ import (
 
 // recRun is the fake command runner: it records what ran and fails, blocks or answers on a command prefix.
 type recRun struct {
-	ran   []string
-	fail  string            // a command prefix that fails ("exit status 100")
-	block string            // a command prefix that never ends until the context does
-	out   map[string]string // output per command prefix
+	ran     []string
+	fail    string            // a command prefix that fails ("exit status 100")
+	failToo string            // a second one
+	block   string            // a command prefix that never ends until the context does
+	out     map[string]string // output per command prefix
+}
+
+func (r *recRun) fails(line string) bool {
+	return r.fail != "" && strings.HasPrefix(line, r.fail) || r.failToo != "" && strings.HasPrefix(line, r.failToo)
 }
 
 func (r *recRun) run(ctx context.Context, _ io.Writer, _ string, cmd ...string) (string, error) {
@@ -28,13 +33,13 @@ func (r *recRun) run(ctx context.Context, _ io.Writer, _ string, cmd ...string) 
 	}
 	for k, v := range r.out {
 		if strings.HasPrefix(line, k) {
-			if r.fail != "" && strings.HasPrefix(line, r.fail) {
+			if r.fails(line) {
 				return v, errors.New("exit status 100")
 			}
 			return v, nil
 		}
 	}
-	if r.fail != "" && strings.HasPrefix(line, r.fail) {
+	if r.fails(line) {
 		return "", errors.New("exit status 100")
 	}
 	return "", nil
@@ -68,9 +73,12 @@ func debianPlan(t *testing.T) []Step {
 	return steps
 }
 
-func ubuntuPlan(t *testing.T) []Step {
+func ubuntuPlan(t *testing.T) []Step { return ubuntuPlanFor(t, "6.8.0-142-generic") }
+
+// ubuntuPlanFor is the Ubuntu plan of a node whose running kernel is the given release.
+func ubuntuPlanFor(t *testing.T, kernel string) []Step {
 	t.Helper()
-	steps, _, err := Plan(Env{OSRelease: osr("ubuntu", ""), Kernel: "6.8.0-142-generic", CPUs: 1})
+	steps, _, err := Plan(Env{OSRelease: osr("ubuntu", ""), Kernel: kernel, CPUs: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +86,7 @@ func ubuntuPlan(t *testing.T) []Step {
 }
 
 func TestRunRunsThePlanThenVerifies(t *testing.T) {
-	r := &recRun{out: map[string]string{"git -C": pinnedModuleCommit + "abcdef0123456789\n"}}
+	r := &recRun{out: map[string]string{"git -C": pinnedModuleCommit + "\n"}}
 	var wrote string
 	var buf bytes.Buffer
 	var seen [][2]int
@@ -102,9 +110,10 @@ func TestRunRunsThePlanThenVerifies(t *testing.T) {
 	}
 }
 
-// A moved tag stops the build before anything is compiled or installed.
+// A moved tag stops the build before anything is compiled or installed. The whole commit is compared: one that only
+// starts like the pinned commit is another commit.
 func TestRunStopsOnAMovedTag(t *testing.T) {
-	r := &recRun{out: map[string]string{"git -C": "deadbeef00000000\n"}}
+	r := &recRun{out: map[string]string{"git -C": pinnedModuleCommit[:39] + "f\n"}}
 	var wrote string
 	err := Run(context.Background(), io.Discard, debianPlan(t), "/tmp/src", r.run, goodSys(&wrote), JobTimeout, nil)
 	if err == nil || !strings.Contains(err.Error(), "tag moved") || codeOf(t, err) != CodeSourceMoved {
@@ -183,13 +192,13 @@ func TestRunWritesUbuntuFilesThroughSysAndRemovesTheLegacyList(t *testing.T) {
 	if got := files[sourcePath]; !strings.Contains(got, "Signed-By: /etc/apt/keyrings/amnezia-ppa.asc") {
 		t.Errorf("source write = %q", got)
 	}
-	if len(writes) != 3 || writes[0] != "/etc/apt/keyrings/amnezia-ppa.asc" || writes[1] != sourcePath || writes[2] != modulesLoadFile {
+	if len(writes) != 4 || writes[0] != KmodHookPath || writes[1] != "/etc/apt/keyrings/amnezia-ppa.asc" || writes[2] != sourcePath || writes[3] != modulesLoadFile {
 		t.Errorf("writes = %v", writes)
 	}
 	if len(removes) != 1 || removes[0] != legacy {
 		t.Errorf("removes = %v", removes)
 	}
-	if len(progress) != 6 || progress[0] != [2]int{1, 6} || progress[5] != [2]int{6, 6} {
+	if len(progress) != 7 || progress[0] != [2]int{1, 7} || progress[6] != [2]int{7, 7} {
 		t.Errorf("progress = %v", progress)
 	}
 	for _, cmd := range r.ran {
@@ -199,6 +208,61 @@ func TestRunWritesUbuntuFilesThroughSysAndRemovesTheLegacyList(t *testing.T) {
 	}
 	if len(r.ran) != 5 {
 		t.Errorf("commands = %v", r.ran)
+	}
+}
+
+// What an Ubuntu 26.04 node on Linux 7.0 printed: the module's DKMS build fails inside apt and dpkg leaves amneziawg-dkms
+// half-configured, after which every apt install on the host fails.
+const dkmsBuildOutput = "Building module(s)......(bad exit status: 2)\n" +
+	"Error! Bad return status for module build on kernel: 7.0.0-38-generic (x86_64)\n" +
+	"dpkg: error processing package amneziawg-dkms (--configure):\n" +
+	"E: Sub-process /usr/bin/dpkg returned an error code (1)\n"
+
+const purgeModule = "apt-get -o DPkg::Lock::Timeout=1800 purge -y amneziawg amneziawg-dkms"
+
+func TestRunUndoesAModuleThatDoesNotBuild(t *testing.T) {
+	for _, tc := range []struct {
+		name, failing string // the install step whose apt run configures the module
+		undoFails     bool
+		want          string
+	}{
+		{name: "the install of amneziawg", failing: aptOpts + "amneziawg", want: "its packages were removed again"},
+		// a retry after an earlier run that left the package: apt configures it again while installing the headers
+		{name: "the headers, over an earlier run's package", failing: aptOpts + "linux-headers", want: "its packages were removed again"},
+		{name: "the removal fails too", failing: aptOpts + "amneziawg", undoFails: true, want: "apt-get purge amneziawg amneziawg-dkms"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &recRun{fail: tc.failing, out: map[string]string{tc.failing: dkmsBuildOutput}}
+			if tc.undoFails {
+				r.failToo = purgeModule
+			}
+			var wrote string
+			err := Run(context.Background(), io.Discard, ubuntuPlanFor(t, "7.0.0-38-generic"), "/tmp/src", r.run, goodSys(&wrote), JobTimeout, nil) // the build that fails is for the running kernel
+			code, detail := Short(err)
+			if code != CodeBuildFailed || !strings.Contains(detail, tc.want) || strings.Contains(detail, "Bad return status") {
+				t.Fatalf("short = %q %q (err %v)", code, detail, err)
+			}
+			if last := r.ran[len(r.ran)-1]; last != purgeModule {
+				t.Errorf("the module's packages were not removed after the failed build: %v", r.ran)
+			}
+			if strings.HasPrefix(wrote, modulesLoadFile+"\n") { // the PPA step writes files too; this is the verify
+				t.Error("verified after a failure")
+			}
+		})
+	}
+}
+
+func TestRunADebianBuildThatFailsIsABuildFailure(t *testing.T) {
+	r := &recRun{fail: "make -C", out: map[string]string{"git -C": pinnedModuleCommit + "\n"}}
+	var wrote string
+	err := Run(context.Background(), io.Discard, debianPlan(t), "/tmp/src", r.run, goodSys(&wrote), JobTimeout, nil)
+	if codeOf(t, err) != CodeBuildFailed || !strings.Contains(err.Error(), "nothing else is rolled back") {
+		t.Fatalf("err = %v", err)
+	}
+	for _, line := range r.ran {
+		if strings.Contains(line, "purge") {
+			t.Errorf("the source build removed packages: %v", r.ran)
+		}
 	}
 }
 
@@ -286,7 +350,7 @@ func jobFor(t *testing.T, env Env, r *recRun, wrote *string) (Job, string) {
 var okEnv = Env{OSRelease: osr("debian", ""), Kernel: "6.1.0-18-amd64", CPUs: 1, Systemd: true}
 
 func TestJobWritesAStatusFromRunningToDone(t *testing.T) {
-	r := &recRun{out: map[string]string{"git -C": pinnedModuleCommit + "00\n"}}
+	r := &recRun{out: map[string]string{"git -C": pinnedModuleCommit + "\n"}}
 	var wrote string
 	job, path := jobFor(t, okEnv, r, &wrote)
 	var states []string
@@ -310,6 +374,21 @@ func TestJobWritesAStatusFromRunningToDone(t *testing.T) {
 	}
 	if wrote == "" {
 		t.Error("the module was not verified")
+	}
+}
+
+func TestPrepareJobStopsWhenTheSharedModuleLockIsHeld(t *testing.T) {
+	r := &recRun{out: map[string]string{"git -C": pinnedModuleCommit + "\n"}}
+	var wrote string
+	job, path := jobFor(t, okEnv, r, &wrote)
+	job.Sys.TryBuilderLock = func() (func(), bool, error) { return nil, false, nil }
+	err := job.Do(context.Background())
+	if codeOf(t, err) != CodeBusy || len(r.ran) != 0 {
+		t.Fatalf("prepare lock result = %v, commands = %v", err, r.ran)
+	}
+	st, ok, readErr := ReadStatus(path)
+	if readErr != nil || !ok || st.State != StateFailed || st.Code != CodeBusy {
+		t.Fatalf("prepare status = %+v, ok=%v err=%v", st, ok, readErr)
 	}
 }
 
@@ -378,7 +457,7 @@ func TestJobOnAContainerAndOnAnotherDistro(t *testing.T) {
 }
 
 func TestJobWaitsForAForeignAptLockBeforeTheFirstCommand(t *testing.T) {
-	r := &recRun{out: map[string]string{"git -C": pinnedModuleCommit + "00\n"}}
+	r := &recRun{out: map[string]string{"git -C": pinnedModuleCommit + "\n"}}
 	var wrote string
 	job, _ := jobFor(t, okEnv, r, &wrote)
 	busy := 2
@@ -400,7 +479,7 @@ func TestJobWaitsForAForeignAptLockBeforeTheFirstCommand(t *testing.T) {
 }
 
 func TestJobWaitsForAptLockLongerThanTheOldFiveMinuteLimit(t *testing.T) {
-	r := &recRun{out: map[string]string{"git -C": pinnedModuleCommit + "00\n"}}
+	r := &recRun{out: map[string]string{"git -C": pinnedModuleCommit + "\n"}}
 	var wrote string
 	job, _ := jobFor(t, okEnv, r, &wrote)
 	var checks int
@@ -433,5 +512,54 @@ func TestStatusFile(t *testing.T) {
 	}
 	if _, ok, _ := ReadStatus(path); ok {
 		t.Error("an unknown state counts as nothing")
+	}
+}
+
+// apt installing the module (or its headers) may configure, on the side, the headers of a NEWER kernel that an earlier run or an
+// upgrade left unconfigured; the module's DKMS build then fails for that kernel while the module of the running kernel is
+// installed and serves. Removing the module's packages then would take a working module away: nothing is removed.
+func TestRunLeavesTheModuleAloneWhenTheBuildThatFailedWasForAnotherKernel(t *testing.T) {
+	const running = "6.8.0-142-generic"
+	for _, tc := range []struct {
+		name, failing, out, want string
+	}{
+		{name: "the new kernel's headers configured on the side", failing: aptOpts + "amneziawg", out: dkmsBuildOutput, want: "the module for the running kernel (" + running + ") was not touched"},
+		{name: "the same while installing the headers", failing: aptOpts + "linux-headers", out: dkmsBuildOutput, want: "7.0.0-38-generic"},
+		{name: "not the module's own build at all", failing: aptOpts + "amneziawg",
+			out:  "Building module: amneziawg/3.1 ... done.\nError! Bad return status for module build on kernel: " + running + " (x86_64)\nConsult /var/lib/dkms/xtables-addons/3.25/build/make.log\n",
+			want: "not clearly the module's own build"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &recRun{fail: tc.failing, out: map[string]string{tc.failing: tc.out}}
+			var wrote string
+			err := Run(context.Background(), io.Discard, ubuntuPlanFor(t, running), "/tmp/src", r.run, goodSys(&wrote), JobTimeout, nil)
+			code, detail := Short(err)
+			if code != CodeBuildFailed || !strings.Contains(detail, tc.want) {
+				t.Fatalf("short = %q %q (err %v)", code, detail, err)
+			}
+			for _, line := range r.ran {
+				if strings.Contains(line, " purge ") {
+					t.Fatalf("the module's packages were removed: %v", r.ran)
+				}
+			}
+		})
+	}
+}
+
+func TestDKMSFailureHelpers(t *testing.T) {
+	if !OwnDKMSFailure(dkmsBuildOutput) || !OwnDKMSFailure("Consult /var/lib/dkms/amneziawg/3.1/build/make.log for more information.\n") {
+		t.Error("the module's own failure was not recognized")
+	}
+	if OwnDKMSFailure("Consult /var/lib/dkms/zfs/2.2/build/make.log\nbuilding amneziawg ... done\n") {
+		t.Error("another module's failure was taken for ours")
+	}
+	for out, want := range map[string]string{
+		dkmsBuildOutput: "7.0.0-38-generic",
+		" * dkms: running auto installation service for kernel 6.8.0-1-generic\n": "6.8.0-1-generic",
+		"nothing named\n": "",
+	} {
+		if got := DKMSFailureKernel(out); got != want {
+			t.Errorf("DKMSFailureKernel(%q) = %q, want %q", out, got, want)
+		}
 	}
 }

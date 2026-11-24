@@ -1,10 +1,16 @@
 package vless
 
 import (
+	"encoding/binary"
 	"errors"
 	"net"
+	"net/netip"
 	"sync"
+	"sync/atomic"
+	"time"
 
+	"github.com/mistgate/mistgate/internal/node/nets"
+	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/transport/internet/finalmask"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
@@ -34,6 +40,21 @@ type tcpConnTrackerKey struct {
 
 type tcpConnTracker struct {
 	key tcpConnTrackerKey
+
+	// links/3 (links.go): the inbound's counters; reality says Xray runs REALITY on these connections (their closes before a
+	// key are kept for its verdict, and their first bytes are the client's ClientHello); stalls says a connection's key
+	// gets the TCP stall it ended with (REALITY over RAW: the connection is the client's TCP connection and one session).
+	counters *inboundCounters
+	nets     *nets.Aggregator
+	reality  bool
+	stalls   bool
+	// byAddr finds the connection under an XHTTP request, which carries the TCP peer's address and not the connection (the
+	// dispatch of an XHTTP session; kexOfAddr). It lives in this process's memory only, like recentCloses. nil when the inbound
+	// is not REALITY over XHTTP.
+	byAddr map[netip.AddrPort]*trackedTCPConn
+	// shared is the inbound's route on a TCP port the agent shares between services (Env.SharedListener). Set, Xray
+	// accepts from it through sharedMaskConfig instead of from a socket of its own.
+	shared net.Listener
 
 	mu     sync.Mutex
 	conns  map[*trackedTCPConn]struct{}
@@ -72,6 +93,13 @@ func (t *tcpConnTracker) stop() {
 
 func (t *tcpConnTracker) track(conn net.Conn) net.Conn {
 	tracked := &trackedTCPConn{Conn: conn, tracker: t}
+	if t.stalls && t.nets != nil && t.nets.Enabled() {
+		tracked.asn = nets.LookupAddr(t.nets, conn.RemoteAddr())
+		t.nets.Add(t.key.inboundID, tracked.asn, nets.Attempt, "", "")
+	}
+	if !t.reality {
+		tracked.peeked.Store(true) // only a REALITY connection starts with the client's ClientHello
+	}
 	t.mu.Lock()
 	if t.closed {
 		t.mu.Unlock()
@@ -79,6 +107,12 @@ func (t *tcpConnTracker) track(conn net.Conn) net.Conn {
 		return tracked
 	}
 	t.conns[tracked] = struct{}{}
+	if t.byAddr != nil {
+		if ap, ok := addrPortOf(conn.RemoteAddr()); ok {
+			tracked.addr = ap
+			t.byAddr[ap] = tracked
+		}
+	}
 	t.mu.Unlock()
 	return tracked
 }
@@ -86,19 +120,167 @@ func (t *tcpConnTracker) track(conn net.Conn) net.Conn {
 func (t *tcpConnTracker) remove(conn *trackedTCPConn) {
 	t.mu.Lock()
 	delete(t.conns, conn)
+	if t.byAddr != nil && t.byAddr[conn.addr] == conn {
+		delete(t.byAddr, conn.addr)
+	}
 	t.mu.Unlock()
+}
+
+// kexOfAddr is the hello classification of the live connection from addr, and claims it for one key: the first session of an
+// XHTTP connection counts (an h2 connection carries many sessions, a TCP connection has one ClientHello). found is false
+// when no live connection has that address (a forwarded address, or the connection is gone).
+func (t *tcpConnTracker) kexOfAddr(addr netip.AddrPort) (kex helloKex, first, found bool) {
+	t.mu.Lock()
+	c := t.byAddr[addr]
+	t.mu.Unlock()
+	if c == nil {
+		return kexUnknown, false, false
+	}
+	return c.kexKind(), c.kexClaimed.CompareAndSwap(false, true), true
+}
+
+// addrPortOf reads a TCP peer address without allocating.
+func addrPortOf(a net.Addr) (netip.AddrPort, bool) {
+	if tcp, ok := a.(*net.TCPAddr); ok {
+		ap := tcp.AddrPort()
+		return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()), ap.IsValid()
+	}
+	return netip.AddrPort{}, false
 }
 
 type trackedTCPConn struct {
 	net.Conn
 	tracker *tcpConnTracker
+	asn     uint32
 	once    sync.Once
+	addr    netip.AddrPort // the key in tracker.byAddr, when it has one
+
+	// links/3. The start of the connection (hello), read by one reader at a time (REALITY, then the VLESS handler) until
+	// peeked; session is the key of the first request on the connection (dispatch). kex is the ClientHello classification
+	// (hellokex.go), final once peeked; kexClaimed says a key has counted it.
+	hello      *helloBuf
+	peeked     atomic.Bool
+	kex        atomic.Uint32
+	kexClaimed atomic.Bool
+	session    atomic.Pointer[credState]
+}
+
+// kexKind is the classification of the connection's ClientHello: unknown for a connection that is not (or not yet) read.
+func (c *trackedTCPConn) kexKind() helloKex {
+	if k := helloKex(c.kex.Load()); k != kexPending {
+		return k
+	}
+	return kexUnknown
+}
+
+// Read passes through; until the connection's first TLS record is in it notes whether the connection opened with a ClientHello
+// and which key exchange it offers. Vision reads the raw socket past the handshake (RawConn), so this costs one atomic load per
+// read of the handshake at most.
+func (c *trackedTCPConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if n > 0 && !c.peeked.Load() {
+		c.peek(b[:n])
+	}
+	return n, err
+}
+
+// peek copies the bytes REALITY has just read (never more, never earlier) until the first record is whole or hellokexCap is
+// full, counts the hello at its sixth byte, and classifies it.
+func (c *trackedTCPConn) peek(b []byte) {
+	if c.hello == nil {
+		if b[0] != 0x16 {
+			c.finishPeek(kexUnknown) // not TLS
+			return
+		}
+		h := helloBufs.Get().(*helloBuf)
+		h.n, h.counted = 0, false
+		c.hello = h
+	}
+	h := c.hello
+	h.n += copy(h.b[h.n:], b)
+	if h.n < 6 {
+		return
+	}
+	if !h.counted {
+		h.counted = true
+		if !isClientHello([6]byte(h.b[:6])) {
+			c.finishPeek(kexUnknown) // TLS, but no ClientHello
+			return
+		}
+		if c.tracker.reality && c.tracker.counters != nil {
+			c.tracker.counters.hellos.Add(1)
+		}
+	}
+	want := min(tlsRecordHeaderLen+int(binary.BigEndian.Uint16(h.b[3:5])), len(h.b))
+	if h.n < want {
+		return
+	}
+	c.finishPeek(classifyHello(h.b[:want]))
+}
+
+func (c *trackedTCPConn) finishPeek(k helloKex) {
+	if h := c.hello; h != nil {
+		c.hello = nil
+		helloBufs.Put(h)
+	}
+	c.kex.Store(uint32(k))
+	c.peeked.Store(true)
+}
+
+// countKex adds the connection's hello classification to the key that has just claimed it.
+func (cs *credState) countKex(k helloKex) {
+	switch k {
+	case kexPQ:
+		cs.helloPQ.Add(1)
+	case kexClassic:
+		cs.helloClassic.Add(1)
+	default:
+		cs.helloUnknown.Add(1)
+	}
+}
+
+// markSession records the key of the connection's first request; it reports whether this was the first.
+func (c *trackedTCPConn) markSession(cs *credState) bool {
+	if !c.session.CompareAndSwap(nil, cs) {
+		return false
+	}
+	if c.tracker.reality && c.kexClaimed.CompareAndSwap(false, true) {
+		cs.countKex(c.kexKind())
+	}
+	if c.tracker.stalls && c.tracker.nets != nil {
+		userID := ""
+		if owner := cs.owner.Load(); owner != nil {
+			userID = owner.userID
+		}
+		c.tracker.nets.Add(c.tracker.key.inboundID, c.asn, nets.Connect, cs.id, userID)
+	}
+	return true
 }
 
 func (c *trackedTCPConn) Close() error {
 	var err error
 	c.once.Do(func() {
 		c.tracker.remove(c)
+		if cs := c.session.Load(); cs != nil {
+			if c.tracker.stalls {
+				stalled, first16K := tcpStall(c.Conn)
+				cs.stall(stalled, first16K)
+				if stalled && first16K && c.tracker.nets != nil {
+					userID := ""
+					if owner := cs.owner.Load(); owner != nil {
+						userID = owner.userID
+					}
+					c.tracker.nets.Add(c.tracker.key.inboundID, c.asn, nets.Broken, cs.id, userID)
+				}
+			}
+		} else if addr := c.Conn.RemoteAddr(); addr != nil && c.tracker.reality && c.tracker.counters != nil {
+			// no key reached the engine: REALITY may be about to log why (links.go, realityVerdict)
+			agg := c.tracker.nets
+			if !c.tracker.stalls {
+				agg = nil
+			}
+			rememberNetworkClose(addr.String(), c.tracker.counters, c.asn, c.tracker.key.inboundID, agg, time.Now())
+		}
 		err = c.Conn.Close()
 	})
 	return err
@@ -133,12 +315,10 @@ func (c *tcpConnMaskConfig) ProtoReflect() protoreflect.Message {
 	if c == nil || c.message == nil {
 		return nil
 	}
-	return &tcpConnMaskReflection{Message: c.message, owner: c}
+	return &maskReflection{Message: c.message, owner: c, typ: tcpConnMaskType}
 }
 
-func (*tcpConnMaskConfig) TCP() {}
-
-func (c *tcpConnMaskConfig) WrapConnClient(conn net.Conn) (net.Conn, error) {
+func (c *tcpConnMaskConfig) WrapConnClient(conn net.Conn, _ *xnet.Destination, _ *finalmask.Dialer) (net.Conn, error) {
 	return conn, nil
 }
 
@@ -161,34 +341,26 @@ func (c *tcpConnMaskConfig) WrapConnServer(conn net.Conn) (net.Conn, error) {
 	return tracker.track(conn), nil
 }
 
-type tcpConnMaskMessageType struct{}
-
-func (tcpConnMaskMessageType) New() protoreflect.Message {
-	return newTCPConnMaskConfig("", 0).ProtoReflect()
+// maskMessageType and maskReflection make a dynamic message of one of the two masks a proto message Xray can build from a
+// TypedMessage and hand back as the mask itself.
+type maskMessageType struct {
+	desc protoreflect.MessageDescriptor
+	zero func() protoreflect.ProtoMessage
 }
 
-func (tcpConnMaskMessageType) Zero() protoreflect.Message {
-	return newTCPConnMaskConfig("", 0).ProtoReflect()
-}
+func (t maskMessageType) New() protoreflect.Message                  { return t.zero().ProtoReflect() }
+func (t maskMessageType) Zero() protoreflect.Message                 { return t.zero().ProtoReflect() }
+func (t maskMessageType) Descriptor() protoreflect.MessageDescriptor { return t.desc }
 
-func (tcpConnMaskMessageType) Descriptor() protoreflect.MessageDescriptor {
-	return tcpConnMaskDescriptor
-}
-
-type tcpConnMaskReflection struct {
+type maskReflection struct {
 	protoreflect.Message
-	owner *tcpConnMaskConfig
+	owner protoreflect.ProtoMessage
+	typ   protoreflect.MessageType
 }
 
-func (m *tcpConnMaskReflection) Type() protoreflect.MessageType {
-	return tcpConnMaskType
-}
-
-func (m *tcpConnMaskReflection) New() protoreflect.Message {
-	return tcpConnMaskType.New()
-}
-
-func (m *tcpConnMaskReflection) Interface() protoreflect.ProtoMessage {
+func (m *maskReflection) Type() protoreflect.MessageType { return m.typ }
+func (m *maskReflection) New() protoreflect.Message      { return m.typ.New() }
+func (m *maskReflection) Interface() protoreflect.ProtoMessage {
 	return m.owner
 }
 
@@ -196,17 +368,20 @@ func init() {
 	optional := descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL
 	stringType := descriptorpb.FieldDescriptorProto_TYPE_STRING
 	uint64Type := descriptorpb.FieldDescriptorProto_TYPE_UINT64
+	keyFields := func() []*descriptorpb.FieldDescriptorProto {
+		return []*descriptorpb.FieldDescriptorProto{
+			{Name: proto.String("inbound_id"), JsonName: proto.String("inboundId"), Number: proto.Int32(1), Label: &optional, Type: &stringType},
+			{Name: proto.String("generation"), Number: proto.Int32(2), Label: &optional, Type: &uint64Type},
+		}
+	}
 	file, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{
 		Name:    proto.String("internal/node/vless/tcpmask.proto"),
 		Package: proto.String("mistgate.node.vless"),
 		Syntax:  proto.String("proto3"),
-		MessageType: []*descriptorpb.DescriptorProto{{
-			Name: proto.String("ConnectionTracker"),
-			Field: []*descriptorpb.FieldDescriptorProto{
-				{Name: proto.String("inbound_id"), JsonName: proto.String("inboundId"), Number: proto.Int32(1), Label: &optional, Type: &stringType},
-				{Name: proto.String("generation"), Number: proto.Int32(2), Label: &optional, Type: &uint64Type},
-			},
-		}},
+		MessageType: []*descriptorpb.DescriptorProto{
+			{Name: proto.String("ConnectionTracker"), Field: keyFields()},
+			{Name: proto.String(sharedMaskMessageName), Field: keyFields()},
+		},
 	}, nil)
 	if err != nil {
 		panic(err)
@@ -214,13 +389,97 @@ func init() {
 	tcpConnMaskDescriptor = file.Messages().ByName("ConnectionTracker")
 	tcpConnMaskFields.inboundID = tcpConnMaskDescriptor.Fields().ByName("inbound_id")
 	tcpConnMaskFields.generation = tcpConnMaskDescriptor.Fields().ByName("generation")
-	tcpConnMaskType = tcpConnMaskMessageType{}
-	if err := protoregistry.GlobalTypes.RegisterMessage(tcpConnMaskType); err != nil {
-		panic(err)
+	tcpConnMaskType = maskMessageType{desc: tcpConnMaskDescriptor, zero: func() protoreflect.ProtoMessage { return newTCPConnMaskConfig("", 0) }}
+	sharedMaskDescriptor = file.Messages().ByName(sharedMaskMessageName)
+	sharedMaskType = maskMessageType{desc: sharedMaskDescriptor, zero: func() protoreflect.ProtoMessage { return newSharedMaskConfig("", 0) }}
+	for _, t := range []protoreflect.MessageType{tcpConnMaskType, sharedMaskType} {
+		if err := protoregistry.GlobalTypes.RegisterMessage(t); err != nil {
+			panic(err)
+		}
 	}
 }
 
 var (
-	_ finalmask.Tcpmask     = (*tcpConnMaskConfig)(nil)
+	_ finalmask.TCPMask     = (*tcpConnMaskConfig)(nil)
+	_ finalmask.TCPMask     = (*sharedMaskConfig)(nil)
 	_ finalmask.TcpMaskConn = (*trackedTCPConn)(nil)
 )
+
+// sharedMaskConfig is the mask of an inbound whose TCP port the agent shares: FinalMask.Listen asks it for the listener
+// instead of binding the one it opened for the inbound, which is a private abstract Unix socket (config.go) that closes
+// with the listener. It names the inbound's tracker the way the tracker mask does. It stands after the tracker in the
+// config's list, which Xray reverses: it takes the listener first, and the tracker still wraps every connection accepted.
+type sharedMaskConfig struct {
+	message *dynamicpb.Message
+}
+
+const sharedMaskMessageName = "SharedListener"
+
+var (
+	sharedMaskDescriptor protoreflect.MessageDescriptor
+	sharedMaskType       protoreflect.MessageType
+)
+
+func newSharedMaskConfig(inboundID string, generation uint64) *sharedMaskConfig {
+	message := dynamicpb.NewMessage(sharedMaskDescriptor)
+	message.Set(sharedMaskDescriptor.Fields().ByName("inbound_id"), protoreflect.ValueOfString(inboundID))
+	message.Set(sharedMaskDescriptor.Fields().ByName("generation"), protoreflect.ValueOfUint64(generation))
+	return &sharedMaskConfig{message: message}
+}
+
+func (c *sharedMaskConfig) ProtoReflect() protoreflect.Message {
+	if c == nil || c.message == nil {
+		return nil
+	}
+	return &maskReflection{Message: c.message, owner: c, typ: sharedMaskType}
+}
+
+func (c *sharedMaskConfig) WrapConnClient(conn net.Conn, _ *xnet.Destination, _ *finalmask.Dialer) (net.Conn, error) {
+	return conn, nil
+}
+
+// WrapConnServer is not called: FinalMask.Listen leaves a mask that has Listen out of the connection wrappers.
+func (c *sharedMaskConfig) WrapConnServer(conn net.Conn) (net.Conn, error) { return conn, nil }
+
+func (c *sharedMaskConfig) Listen(private net.Listener) (net.Listener, error) {
+	key := tcpConnTrackerKey{
+		inboundID:  c.message.Get(sharedMaskDescriptor.Fields().ByName("inbound_id")).String(),
+		generation: c.message.Get(sharedMaskDescriptor.Fields().ByName("generation")).Uint(),
+	}
+	tcpConnTrackersMu.Lock()
+	tracker := tcpConnTrackers[key]
+	tcpConnTrackersMu.Unlock()
+	if tracker == nil || tracker.shared == nil {
+		return nil, errors.New("no shared listener for the inbound")
+	}
+	return &sharedListener{Listener: tracker.shared, private: private}, nil
+}
+
+// sharedListener accepts from the shared port's route; closing it ends this inbound's Accept (the route stays) and frees
+// the private socket Xray opened.
+type sharedListener struct {
+	net.Listener
+	private net.Listener
+}
+
+func (l *sharedListener) Close() error {
+	_ = l.private.Close()
+	return l.Listener.Close()
+}
+
+// sessionKex counts the ClientHello of the XHTTP request that opened a session for its key: the request's source is the TCP
+// peer (the engine never sets trustedXForwardedFor, so a forwarded address has port 0 and finds nothing: unknown).
+func (t *tcpConnTracker) sessionKex(cs *credState, src xnet.Destination) {
+	var ap netip.AddrPort
+	if src.Address != nil && src.Address.Family().IsIP() {
+		if ip, ok := netip.AddrFromSlice(src.Address.IP()); ok {
+			ap = netip.AddrPortFrom(ip.Unmap(), uint16(src.Port))
+		}
+	}
+	kex, first, found := t.kexOfAddr(ap)
+	if !found {
+		cs.countKex(kexUnknown)
+	} else if first {
+		cs.countKex(kex)
+	}
+}

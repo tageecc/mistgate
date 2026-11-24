@@ -2,7 +2,6 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { create } from "@bufbuild/protobuf";
 import { useState } from "react";
 import { ThemeToggle, LangToggle } from "@/components/prefs";
-import { AccentPicker } from "@/components/accent-picker";
 import { Button } from "@/components/ui/button";
 import { MeResponseSchema, Role } from "@/gen/mistgate/admin/v1/auth_pb";
 import { cloudAccountsQuery, cloudMonths, cloudUsageQuery, type CloudUsage } from "@/lib/cloud-usage";
@@ -32,7 +31,7 @@ export function CloudUsageKit() {
     return c;
   });
   return <QueryClientProvider client={qc}>
-    <div className="flex flex-wrap items-center gap-2"><LangToggle /><ThemeToggle /><AccentPicker /><Button onClick={() => setNarrow(!narrow)}>{narrow ? "Desktop" : "390 px"}</Button></div>
+    <div className="flex flex-wrap items-center gap-2"><LangToggle /><ThemeToggle /><Button onClick={() => setNarrow(!narrow)}>{narrow ? "Desktop" : "390 px"}</Button></div>
     <div className="flex flex-wrap gap-2">{["normal", "lightsail", "zero", "partial", "threshold", "empty"].map((v) => <Button key={v} onClick={() => setState(v)} variant={state === v ? "primary" : "ghost"}>{v}</Button>)}</div>
     <div className="mx-auto flex w-full flex-col gap-4" style={{ maxWidth: narrow ? 390 : 960 }}>
       <CloudUsageCard data={data} month={month} onMonthChange={setMonth} />

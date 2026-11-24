@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { foldDays, niceCeil, protocolName, protocolShort, smoothPath, sortProtocols, tail, toSeries } from "./series";
+import { foldDays, niceCeil, protocolName, protocolShort, sortProtocols, tail, toSeries } from "./series";
 
 describe("protocolShort", () => {
   it("writes the tags the owner uses, never a cut word", () => {
@@ -63,18 +63,6 @@ describe("niceCeil", () => {
   });
 });
 
-describe("smoothPath", () => {
-  it("starts at the first point and ends at the last, with one cubic per step", () => {
-    const d = smoothPath([0, 10, 20], [5, 1, 3]);
-    expect(d.startsWith("M0,5 ")).toBe(true);
-    expect(d.endsWith("20,3")).toBe(true);
-    expect(d.match(/C/g)).toHaveLength(2);
-  });
-  it("is empty for no points", () => {
-    expect(smoothPath([], [])).toBe("");
-  });
-});
-
 describe("sortProtocols", () => {
   it("knows Hysteria2, VLESS and AmneziaWG, then alphabetical", () => {
     expect(sortProtocols(["zeta", "awg", "vless", "alpha", "hysteria2", "awg"])).toEqual(["hysteria2", "vless", "awg", "alpha", "zeta"]);
@@ -82,6 +70,5 @@ describe("sortProtocols", () => {
   });
   it("names VLESS like its plugin does", () => {
     expect(protocolName("vless")).toBe("VLESS");
-    expect(protocolShort("vless")).toBe("VLESS");
   });
 });

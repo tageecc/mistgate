@@ -1,5 +1,6 @@
 ---
 title: AmneziaWG
+seoTitle: "AmneziaWG server panel: 2.0 and 3.1, a key per device — Mistgate"
 description: AmneziaWG 3.1 and 2.0 profiles, their parameters and mimicry looks, the userspace and kernel backends of a node, and the per-device keys people import into AmneziaVPN.
 ---
 
@@ -25,16 +26,20 @@ The editor shows the **Oldest client that works** for the chosen version. An old
 
 | Version | Oldest client |
 |:--|:--|
-| 3.1 | AmneziaVPN 5.0.1.5, AmneziaWG Android v3.1.20260814, AmneziaWG Windows 3.1.0, AmneziaWG Apple v3.1.3, Mihomo v1.19.30 |
-| 2.0 | AmneziaVPN 4.8.12.9, AmneziaWG 2.0.0, Mihomo v1.19.14 |
+| 3.1 | AmneziaVPN 5.0.1.5, AmneziaWG Android v3.1.20260814, AmneziaWG Windows 3.1.0, AmneziaWG Apple v3.1.3, Mihomo v1.19.30, WG Tunnel 5.6.0, FlClash 0.8.97, Throne 1.4.0, ZedSecure 3.1.8, Keenetic 5.2 alpha 11, GL.iNet (2.0 only), Hiddify (2.0 only) |
+| 2.0 | AmneziaVPN 4.8.12.9, AmneziaWG 2.0.0, Mihomo v1.19.14, Keenetic stable 5.1, GL.iNet firmware 4.9, Hiddify (2.0 only) |
 
 The same list is shown next to every config a person gets.
 
+This list follows a community compatibility matrix dated 2026-11-05 and will age. Throne 1.3.x strips padding; ZedSecure versions before 3.1.8 do not understand the header protection key. Stable Keenetic 5.1 and GL.iNet firmware 4.9 support only 2.0; Keenetic 3.1 support starts at 5.2 alpha 11. Hiddify does not read the header protection key or content padding, so use 2.0. sing-box-extended fails when ContentPaddingAddition is above 16.
+
 ## The profile editor
 
-Above the usual form, an AmneziaWG profile has two cards of its own.
+The settings of an AmneziaWG profile are three cards: **Basics** (the name, the protocol version as two cards, the UDP port), **Masquerade and bypass** (the look of the first packets, the domain, a signature of its own for every device, and a fold with the whole block of keys) and **Network** (the exit, the MTU, and a fold with the keepalive and the client networks). The oldest clients that understand the chosen version are under **Apps** on the right. Every setting of the schema is in one of the cards.
 
-**Protocol version** holds the version choice, the oldest clients, and **Paste .conf**: paste a config from AmneziaVPN or another AmneziaWG client, and the form takes its version, MTU and obfuscation values. This happens in the browser; the keys of the pasted config are neither used nor stored. A 1.5 or 1.0 config switches the form to 2.0; a plain WireGuard config has nothing to take.
+**Protocol version** is two cards, 3.1 and 2.0. Picking the other one builds the whole block again for it.
+
+**Fill from .conf** (at the foot of the fold of the block): paste a config from AmneziaVPN or another AmneziaWG client, and the form takes its version, MTU and obfuscation values. This happens in the browser; the keys of the pasted config are neither used nor stored. A 1.5 or 1.0 config switches the form to 2.0; a plain WireGuard config has nothing to take.
 
 **Look of the first packets** decides what a handshake looks like to an observer:
 
@@ -54,10 +59,11 @@ Above the usual form, an AmneziaWG profile has two cards of its own.
 
 A look on a port where that traffic is not normal stands out, and the editor says so. Picking a look changes only the signature packets I1–I5, which the client sends before a handshake and the node ignores: no issued config breaks.
 
-- **Domain in the packets**: the host name that QUIC, DNS and SIP packets carry. Empty: every device draws its own from a built-in list (**Random**, **List**).
+- **Domain in the packets**: the host name that QUIC, DNS and SIP packets carry. Empty: every device draws its own from a built-in list (**Random**; the built-in list is offered as you type).
 - **A signature of its own for every device**: each device gets different signature packets of the look, the same every time its config is shown. Off: all devices share one set. STUN, WebRTC and DTLS are the same bytes for everyone, so the switch changes nothing for them.
 - **New values for the whole block** replaces junk, S, H, timers and the header protection key with fresh random values. Clients then need new parameters, so saving reissues the configs of the devices.
-- **Disguise N/100** rates the settings, not a censor: a high number means no known tell is left in them. A click shows the starting point of the version and each reason it lost or gained points.
+- **Disguise N/100**, a pill in the head of the card, rates the settings, not a censor: a high number means no known tell is left in them. A click opens the card **What the score is made of** over the form: the starting point of the version and each reason it lost or gained points, each with a way to its field.
+- **Advanced: junk, S, H, I1–I5, key, timers**: the whole block of the node and the clients in cards of three, in the groups junk, sizes, headers, signature and timers. The values are dots until **Show values**, so they stay out of a screen share. A remark of the editor can bring a button: **Set 25** for a keepalive over the NAT timeout, **Port 53** for the DNS look on another port.
 
 ## Settings
 
@@ -68,7 +74,7 @@ Critical settings must match on the node and in every client; changing them make
 | Setting | Range and default | Critical | What it does |
 |:--|:--|:--|:--|
 | **UDP port** | 1–65535; a new profile gets a random one in 10000–60000 (never 51820, 51821 or 55424) | yes | The node listens here. **Random port** draws another. |
-| **MTU** | 1200–1420, default 1280 | no | Tunnel MTU on the node and in the `.conf`. MTU + S4 + 80 must fit in 1500. |
+| **MTU** | 1200–1420, default 1280 | no | Tunnel MTU on the node and in the `.conf`. MTU + S4 + 80 must fit in 1500. Below 1280 the editor warns: client configs route IPv6 (`::/0`) through the tunnel, and IPv6 needs at least 1280. |
 | **Exit** | **Direct** or **WARP** | no | See [WARP](warp.md). |
 | **Client network (IPv4)** | a private /16–/24 network | yes | The node is .1, each device gets one address. Cannot change once the profile is on a node or has devices. |
 | **Client network (IPv6)** | a /64 from fc00::/7, or empty | yes | Empty means no IPv6 inside the tunnel. Fixed like the IPv4 network. |
@@ -77,10 +83,10 @@ Critical settings must match on the node and in every client; changing them make
 
 | Setting | Range | Critical | What it does |
 |:--|:--|:--|:--|
-| **Junk packets (Jc)** | 0–128 | no | Sent by the client before each handshake; 4–12 is usual. |
+| **Junk packets (Jc)** | 0–128 | no | Sent by the client before each handshake; 4–12 is usual. Jc + non-empty I1–I5 packets + one handshake packet must be at most 128. |
 | **Junk size, min (Jmin)** / **max (Jmax)** | 0–1280 bytes | no | Keep Jmax below the MTU. |
 | **Init padding (S1)**, **Response padding (S2)** | 0–150 bytes | yes | Bytes added to the handshake messages. |
-| **Cookie padding (S3)**, **Data padding (S4)** | 0–64 bytes | yes | S4 is added to every data packet: keep it small. |
+| **Cookie padding (S3)**, **Data padding (S4)** | 0–64 bytes | yes | S4 is added to every data packet: keep it small. In 2.0, avoid 16: it can make the packet length a multiple of 16 and look like plain WireGuard. |
 | **Init header (H1)** … **Data header (H4)** | a number or a range lo-hi | yes | Message type values. 1, 2, 3, 4 are plain WireGuard. The four ranges must not overlap. |
 | **Signature packet 1 (I1)** … **(I5)** | up to 3500 characters each | no | Tags b, r, rc, rd, t. Filled by the look; typing here makes the look **Custom**. I1 is here, I2–I5 are under **Advanced**. |
 
@@ -90,13 +96,13 @@ Critical settings must match on the node and in every client; changing them make
 |:--|:--|:--|
 | **Signature seed** | no | Not a secret. With the device id it makes the per-device packets reproducible; a new seed changes them the next time a config is shown. |
 | **Header protection key** | yes | 3.1 only. The same 32 bytes on the node and in every client. Stored encrypted. |
-| **Random trailers** | yes | 3.1 only. Must match on both sides. |
+| **Random trailers** | yes | 3.1 only. Must match on both sides. Unequal S1–S4 is a warning. Without a header protection key, use single H1–H4 values; wider ranges can lose packets. |
 | **Turn off cookie replies** | no | 3.1 only, node side. On removes the protection against handshake floods. |
 | **Extra padding** | no | 3.1 only. A range of random bytes added to data packets. |
 | **Rekey after**, **Rekey timeout**, **Reject after**, **Keepalive timeout**, **Handshake attempts** | no | 3.1 only. Timers, a number or a range. |
 | **Persistent keepalive** | no | Written into the client; keep it under 30 s, the UDP timeout of many NATs. 2.0 takes one number; Mihomo uses the first one. |
 
-While you edit, the editor warns about legal but risky values: too many junk packets, Jmax not below the MTU, S4 that does not fit 1500 at this MTU (with the MTU that would fit), H values of plain WireGuard, a narrow H range, cookie replies turned off, a keepalive longer than a NAT timeout, a look on an unusual port.
+While you edit, the editor warns about legal but risky values: too many junk packets, Jmax not below the MTU, S4 that does not fit 1500 at this MTU (with the MTU that would fit), an MTU below the 1280 minimum of IPv6, S4 = 16 in 2.0, H values of plain WireGuard, a narrow H range, cookie replies turned off, a keepalive longer than a NAT timeout, a look on an unusual port.
 
 ## Client networks and addresses
 
@@ -111,10 +117,20 @@ A node runs AmneziaWG in one of two ways, one setting for all its AmneziaWG prof
 | Backend | What it is |
 |:--|:--|
 | **Auto** | The kernel module when it is already loaded, else userspace. The node installs nothing. |
-| **Kernel module** | Faster. Needs the `amneziawg` module on the host; without it the AmneziaWG profiles of the node do not start. |
+| **Kernel module** | Faster. Needs the `amneziawg` module on the host. If it does not load (a kernel update left it behind), an up-to-date agent serves the profiles in userspace meanwhile; an older agent does not start them. |
 | **Userspace** | `amneziawg-go` inside the agent. Works anywhere with `/dev/net/tun`, a bit slower. |
 
+On Ubuntu with `amneziawg-dkms`, the agent repairs a missing running-kernel module at startup, and an apt hook patches known source incompatibilities before package builds and schedules a sync after package changes. Hosts using a non-DKMS build still need to run `mistgate-node awg prepare-kernel` after installing a kernel.
+
 A change applies at once; connected devices reconnect. **Running now** shows what the node reports, for example "userspace · amneziawg-go v3.1…".
+
+### When the module does not load
+
+An up-to-date agent does not leave a node set to **Kernel module** without AmneziaWG. When the module does not load for the running kernel, it serves the profiles in userspace, raises the event "AmneziaWG runs in userspace for now" and the doctor's **AmneziaWG backend** check shows a warning, not a failure. Devices stay connected; the node uses more memory per device (about 26 KiB each). A node with so many devices that userspace would not fit in a third of the agent's memory limit (about 8,000 on a 1 GiB server) does not fall back: the profiles stay down and the check says "too many devices for userspace on this RAM".
+
+The node does not move back to the module by itself while people are connected. Once the module is built and loaded, press **Switch back to the module** in the doctor: the profiles are rebuilt on the module and connected devices pause for up to about 20 seconds. The next start of the agent also picks the module up. A system update that reboots the node does not insist on the module while the node serves userspace.
+
+An agent that predates this behaviour stays strict: with the module missing its AmneziaWG profiles do not start, and the doctor card offers **Switch this node to auto** (module when it loads, else userspace). The same setting can be changed through the MCP tool `node_awg_backend`, always with the owner's approval.
 
 ### Preparing the kernel module
 
@@ -126,10 +142,10 @@ The module is built from source on the node, which installs packages as root. Th
 - it can be built: the window **Build the kernel module on …?** explains what happens. The node installs what the build needs (the running kernel's headers and amneziawg from the Amnezia PPA on Ubuntu; make, gcc and those headers on Debian: a few hundred MB), builds and loads the module. The build usually takes 1–5 minutes. If a system package update is already running, Mistgate waits up to 30 minutes for apt to release its lock. The whole job has a 45-minute limit. AmneziaWG keeps running as before the whole time. When the module is ready, the node switches to it and connected devices reconnect once;
 - it cannot be built here: the card says why and shows the manual command.
 
-The card follows the build: "Preparing the module… (running N min)", then **Module ready**, or **Failed** with the reason and **Retry**. A failed build changes nothing: the node keeps the backend it had. The build's log is on the node:
+The card follows the build: "Preparing the module… (running N min)", then **Module ready**, or **Failed** with the reason and **Retry**. A failed build changes nothing: the node keeps the backend it had. If the module does not compile for the node's kernel (a kernel newer than the module supports), the node also removes the module packages it installed, so apt on the host stays usable; the card says **the AmneziaWG module does not build for this node's kernel yet**. The build's log is on the node (`-e` shows the latest run):
 
 ```sh
-journalctl -u mistgate-awg-prepare
+journalctl -u mistgate-awg-prepare -e
 ```
 
 **By hand**, on the node as root. The card shows the command with `--yes`: for an agent too old to build the module by itself, and under **Do it by hand** for the rest. Without `--yes` the command only prints its plan:
@@ -176,6 +192,8 @@ In the user card, under **Devices** → **AmneziaVPN keys**, **Add device** open
 
 Opening a config marks the device as having the current one: an **outdated** badge (after a critical change of the profile, or a new port or address of a node) goes away once the person has imported the new config.
 
+A device also gets a separate key for each entry that passes the server on through a [relay](relays.md#amneziawg-through-a-relay). Its config is another item of the **Node** list ("de1 · via RU"); import it into AmneziaVPN as a new server. It takes no place in the device limit. **Replace key** and **Delete** cover these keys too.
+
 > **Warning:** a config holds the device's private key. Send it only to its owner, and never paste it into a shared chat.
 
 ## vpn:// keys and .conf files
@@ -188,6 +206,8 @@ Opening a config marks the device as having the current one: an **outdated** bad
 
 On a computer, import the file, not the key: with the key the MTU can be wrong and the connection may not work.
 
+Both keep the node address they were issued with, and only that: the node's [IPv6 entry](nodes.md#ipv6-entry) never changes them, because a key does not update itself and a new address would break it silently.
+
 The config carries `AllowedIPs = 0.0.0.0/0, ::/0` (everything through the tunnel) and two DNS servers. They are the first two plain IPv4 servers of the DNS that applies to the person on that node (their per-server choice when the owner allows it, else the DNS preset); when it has none, the built-in 1.1.1.1 and 8.8.8.8 are written and the window says so. AmneziaWG cannot split DNS: the main servers are used for every domain. The DNS is written into the key: after the person picks another DNS for a server on their page, the key itself stays the same, but they have to press **Get a new key** to get the new DNS (until then the device says "new key needed"). See [DNS](dns.md).
 
 ## The AmneziaVPN app
@@ -196,4 +216,4 @@ On a phone: open AmneziaVPN, tap "+", paste the key (or scan the QR code), tap "
 
 ## AmneziaWG through the subscription
 
-Apps on the mihomo core can carry AmneziaWG too. When a person has AmneziaVPN switched on and their app gets the Mihomo format, the subscription includes their AmneziaWG servers. A Mihomo app has no device identity, so all Mihomo apps of one person share one key per profile, made at the first fetch, and they count as the one subscription device in the limit. See [Subscriptions](subscriptions.md).
+Apps on the mihomo core can carry AmneziaWG too. When a person has AmneziaVPN switched on and their app gets the Mihomo format, the subscription includes their AmneziaWG servers. A Mihomo app has no device identity, so all Mihomo apps of one person share one key per profile, made at the first fetch, and they count as the one subscription device in the limit. When the node has an [IPv6 entry](nodes.md#ipv6-entry), the Mihomo subscription also carries an IPv6 proxy of each AmneziaWG server, listed right after it. It has a key and a tunnel address of its own: with one key on both servers the node's record of the peer's address jumps between them, and apps that held both at once lost packets. People get the new key when their app refreshes the subscription. When a [relay](relays.md#amneziawg-through-a-relay) passes the server on, the server through the entry has a key of its own too. See [Subscriptions](subscriptions.md).

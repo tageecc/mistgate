@@ -27,6 +27,38 @@ func settingsSpec(transport, security string) plugin.InboundSpec {
 	}
 }
 
+func TestParseSpecRealityTargetLoop(t *testing.T) {
+	for _, tc := range []struct {
+		name, target string
+		listenPort   uint16
+		wantErr      bool
+	}{
+		{"loopback on listen port", "127.0.0.1:443", 443, true},
+		{"localhost on listen port", "localhost:443", 443, true},
+		{"IPv6 loopback on listen port", "[::1]:443", 443, true},
+		{"unspecified IPv4 on listen port", "0.0.0.0:443", 443, true},
+		{"unspecified IPv6 on listen port", "[::]:443", 443, true},
+		{"loopback on another port", "127.0.0.1:8443", 28443, false},
+		{"localhost on another port", "localhost:8443", 28443, false},
+		{"IPv6 loopback on another port", "[::1]:8443", 28443, false},
+		{"unspecified on another port", "0.0.0.0:8443", 28443, false},
+		{"external site on the listen port", "de1.example.com:443", 443, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := settingsSpec("tcp", "reality")
+			spec.Listen.Port = tc.listenPort
+			spec.Settings = json.RawMessage(strings.Replace(string(spec.Settings), `"de1.example.com:443"`, `"`+tc.target+`"`, 1))
+			_, err := parseSpec(spec)
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("parseSpec error = %v, want error %v", err, tc.wantErr)
+			}
+			if err != nil && !strings.Contains(err.Error(), "own listen port") {
+				t.Fatalf("parseSpec error = %v, want the loop reason", err)
+			}
+		})
+	}
+}
+
 func TestTLSCoreConfigUsesUnixWithoutReality(t *testing.T) {
 	for _, transport := range []string{"xhttp", "ws"} {
 		t.Run(transport, func(t *testing.T) {
@@ -75,7 +107,7 @@ func TestTLSCoreConfigUsesUnixWithoutReality(t *testing.T) {
 	}
 }
 
-func TestSniffingUsesRouteOnly(t *testing.T) {
+func TestSniffingIsOff(t *testing.T) {
 	spec := settingsSpec("tcp", "reality")
 	cfg, err := parseSpec(spec)
 	if err != nil {
@@ -86,12 +118,9 @@ func TestSniffingUsesRouteOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	receiver := message.(*proxyman.ReceiverConfig)
-	if receiver.SniffingSettings == nil || !receiver.SniffingSettings.Enabled || !receiver.SniffingSettings.RouteOnly {
-		t.Fatalf("sniffing settings must stay enabled and route-only: %+v", receiver.SniffingSettings)
-	}
-	if !reflect.DeepEqual(receiver.SniffingSettings.DestinationOverride, []string{"http", "tls", "quic"}) {
-		t.Fatalf("sniffing protocols = %v, want HTTP, TLS and QUIC", receiver.SniffingSettings.DestinationOverride)
+	// xray-core's sniffer holds the first bytes of every flow for up to 200 ms; the node routes by nothing it could find.
+	if receiver := message.(*proxyman.ReceiverConfig); receiver.SniffingSettings != nil && receiver.SniffingSettings.Enabled {
+		t.Fatalf("sniffing must stay off: %+v", receiver.SniffingSettings)
 	}
 }
 
@@ -130,9 +159,9 @@ func TestSettingsSchemaToEngineAndOrder(t *testing.T) {
 		t.Fatalf("parsed derived/legacy fields: flow=%q ws=%q %q", got.flow, got.wsPath, got.wsHost)
 	}
 
-	creds, err := buildIndex(first.ID, nil, []plugin.UserCred{{CredID: "alice", Data: json.RawMessage(`{"id":"66ad4540-b58c-4ad2-9926-ea63445a9b57"}`)}}, time.Now, func(d time.Duration, f func()) stoppable { return time.AfterFunc(d, f) }, nil)
-	if err != nil {
-		t.Fatal(err)
+	creds, skipped := buildIndex(first.ID, nil, []plugin.UserCred{{CredID: "alice", Data: json.RawMessage(`{"id":"66ad4540-b58c-4ad2-9926-ea63445a9b57"}`)}}, time.Now, func(d time.Duration, f func()) stoppable { return time.AfterFunc(d, f) }, nil)
+	if len(skipped) != 0 {
+		t.Fatal(skipped)
 	}
 	coreConfig := buildCoreConfig(first, got, creds, nil, "")
 	receiverMessage, err := coreConfig.Inbound[0].ReceiverSettings.GetInstance()
@@ -251,6 +280,38 @@ func TestSettingsValidationAndTLSR3(t *testing.T) {
 			}
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("parseSpec error=%v, want containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// A target set on the node (agent capability vless-target/1): the other site's name rides in the TLS block with no certificate (mode 0)
+// and is the one REALITY server name; anything else in that block, or another name, is refused.
+func TestParseSpecTargetOfTheNode(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		tls     plugin.TLS
+		names   string
+		wantErr string
+	}{
+		{"no name in the TLS block", plugin.TLS{}, `["de1.example.com"]`, ""},
+		{"the one name of the target", plugin.TLS{ServerName: "Shop.Example.com."}, `["shop.example.com"]`, ""},
+		{"another name than the one server name", plugin.TLS{ServerName: "shop.example.com"}, `["de1.example.com"]`, "exactly the tls server name"},
+		{"one of two names", plugin.TLS{ServerName: "shop.example.com"}, `["shop.example.com","www.example.com"]`, "exactly the tls server name"},
+		{"a certificate mode", plugin.TLS{Mode: plugin.TLSAcmeDomain, ServerName: "shop.example.com"}, `["shop.example.com"]`, "TLS fields are only supported"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := settingsSpec("tcp", "reality")
+			spec.TLS = tc.tls
+			spec.Settings = json.RawMessage(strings.Replace(string(spec.Settings), `["de1.example.com"]`, tc.names, 1))
+			cfg, err := parseSpec(spec)
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Fatalf("parseSpec: %v", err)
+			case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+				t.Fatalf("parseSpec error = %v, want it to say %q", err, tc.wantErr)
+			case err == nil && cfg.reality.self:
+				t.Fatal("a target set on the node is not the node's own site")
 			}
 		})
 	}

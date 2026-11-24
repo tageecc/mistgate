@@ -267,108 +267,11 @@ edge_release_serve() {
   #   redirect  every download answers 302 to /cdn/<the same path> on this host, as GitHub's does. Off for the SSH steps: their
   #             Go client refuses a redirect that does not stay on GitHub.
   #   cut       one shot: the next full download of the agent sends 1 MiB, stays silent for 10 s, then closes the connection short.
-  cat >"$WORK/fake-release.py" <<'PY'
-import http.server, os, re, sys, time, urllib.parse
+  #   slow      flush each chunk, then pause 20 ms; this makes the agent move to a faster offered source.
 
-root, port, log, flags = os.path.realpath(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4]
-CUT, HOLD = 1 << 20, 10
-
-
-def flag(name):
-    return os.path.exists(os.path.join(flags, name))
-
-
-def take(name):  # a one-shot flag: true for exactly one caller
-    try:
-        os.remove(os.path.join(flags, name))
-        return True
-    except OSError:
-        return False
-
-
-class H(http.server.BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, fmt, *args):
-        pass
-
-    def note(self, text):
-        with open(log, "a") as f:
-            f.write("%d %s\n" % (int(time.time()), text))
-
-    def answer(self, code, extra, headers=()):
-        self.note('"%s" %d -%s' % (self.requestline, code, extra))
-        self.send_response(code)
-        for k, v in headers:
-            self.send_header(k, v)
-        if code >= 300 and code != 304 and code != 206:
-            self.send_header("Content-Length", "0")
-        self.end_headers()
-
-    def do_HEAD(self):
-        self.serve(False)
-
-    def do_GET(self):
-        self.serve(True)
-
-    def serve(self, with_body):
-        path = urllib.parse.unquote(urllib.parse.urlsplit(self.path).path)
-        rng = self.headers.get("Range", "")
-        extra = (" range=" + rng if rng else "") + "".join(" %s=present" % h.lower() for h in ("Authorization", "Cookie") if self.headers.get(h))
-        cdn = path.startswith("/cdn/")
-        if cdn:
-            path = path[len("/cdn"):]
-        full = os.path.realpath(os.path.join(root, path.lstrip("/")))
-        if not full.startswith(root + os.sep) or not os.path.isfile(full):
-            return self.answer(404, extra)
-        if not cdn and flag("redirect"):
-            return self.answer(302, extra, [("Location", "http://%s/cdn%s" % (self.headers.get("Host", "127.0.0.1:%d" % port), path))])
-        size = os.path.getsize(full)
-        start, end, code = 0, size - 1, 200
-        if rng:
-            m = re.fullmatch(r"bytes=(\d+)-(\d*)", rng)
-            if not m or int(m.group(1)) >= size:
-                return self.answer(416, extra, [("Content-Range", "bytes */%d" % size)])
-            start, code = int(m.group(1)), 206
-            end = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
-        n = end - start + 1
-        kind = "application/json" if full.endswith(".json") else "application/octet-stream"
-        hdr = [("Content-Type", kind), ("Accept-Ranges", "bytes"), ("Content-Length", str(n))]
-        if code == 206:
-            hdr.append(("Content-Range", "bytes %d-%d/%d" % (start, end, size)))
-        cut = with_body and start == 0 and os.path.basename(full).startswith("mistgate-node-") and flag("cut") and take("cut")
-        self.answer(code, extra, hdr)
-        if not with_body:
-            return
-        with open(full, "rb") as f:
-            f.seek(start)
-            if cut:
-                self.wfile.write(f.read(CUT))
-                self.wfile.flush()
-                self.note("cut %s after %d of %d bytes (silent for %d s first)" % (path, CUT, n, HOLD))
-                time.sleep(HOLD)
-                self.close_connection = True
-                return
-            left = n
-            while left > 0:
-                b = f.read(min(left, 1 << 16))
-                if not b:
-                    break
-                self.wfile.write(b)
-                left -= len(b)
-
-
-class S(http.server.ThreadingHTTPServer):
-    def handle_error(self, request, client_address):  # a client that gives up mid-download (a cancelled install) is not an error
-        if not isinstance(sys.exc_info()[1], ConnectionError):
-            super().handle_error(request, client_address)
-
-
-S(("127.0.0.1", port), H).serve_forever()
-PY
   REL_FLAGS=$WORK/fake-release.flags
   mkdir -p "$REL_FLAGS"
-  spawn python3 "$WORK/fake-release.py" "$d" "$REL_PORT" "$WORK/fake-release.log" "$REL_FLAGS"
+  spawn python3 "$REPO/scripts/e2e/fake-release.py" "$d" "$REL_PORT" "$WORK/fake-release.log" "$REL_FLAGS"
   wait_for 10 "the fake release to answer" curl -sf -o /dev/null "http://127.0.0.1:$REL_PORT/$SSHN_TAG/manifest.json" || die "the fake release server did not start"
   : >"$WORK/fake-release.log"
 }
@@ -1027,6 +930,7 @@ PY
   [ "$(edge_do_rows)" -gt 0 ] || die "precondition: the NodeLink object has no stored rows before the retire (_cf_KV is empty)"
   [ -n "$(edge_sql "SELECT 1 FROM node_live WHERE node_id = ?" "$NODE_ID")" ] || die "precondition: node_live has no row before the retire"
   nft list table inet "$NFT_TABLE" >/dev/null 2>&1 || die "precondition: the nft table is gone before the retire"
+  sshn_scn_attach "$NODE_ID"
   RET=$(api NodeService/RetireNode "{\"nodeId\":\"$NODE_ID\",\"confirmName\":\"$NODE_NAME\"}")
   jq -e '.agentNotified == true' <<<"$RET" >/dev/null || die "RetireNode: the connected agent was not notified"
   wait_for 30 "the agent to exit" not_alive "$NODE_PID" || die "the node agent kept running after the retire"
@@ -1036,6 +940,8 @@ PY
   ! nft list table inet "$NFT_TABLE" >/dev/null 2>&1 || die "nft table $NFT_TABLE is still there after the retire"
   [ ! -e "$SYSCTL_FILE" ] && [ ! -e "$JOURNALD_FILE" ] || die "the agent's sysctl or journald drop-in is still there after the retire"
   [ "$(node_status)" = NODE_STATUS_RETIRED ] || die "node status after the retire: $(node_status)"
+  mutate ProvisioningService/ForgetNodeServerAccess "$(jq -nc --arg id "$NODE_ID" '{nodeId:$id}')" >/dev/null \
+    || die "could not forget the attach-scenario SSH access after retiring the node"
   no_do_rows() { [ "$(edge_do_rows)" = 0 ]; }
   wait_for 30 "the object's stored session to be deleted" no_do_rows || die "the NodeLink object still has $(edge_do_rows) stored row(s) after the retire"
   [ -z "$(edge_sql "SELECT 1 FROM node_live WHERE node_id = ?" "$NODE_ID")" ] || die "node_live still has a row for the retired node"
@@ -1046,6 +952,9 @@ PY
   sshn_scn_truncated sshn-trunc
   sshn_scn_full sshn-full
   sshn_scn_full sshn-reload reload
+  sshn_scn_panel_key sshn-panel-key
+  sshn_scn_own_key sshn-owner-key
+  sshn_scn_keys
   sshn_scan_state "$WORK/wrangler-state"
   pass "the stored state (D1 and the Durable Object files) holds no plaintext SSH password"
   FETCHES=$(grep -c "GET /$SSHN_TAG/mistgate-node-linux-" "$WORK/fake-release.log" || true)

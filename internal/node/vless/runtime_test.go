@@ -255,15 +255,21 @@ func fakeNodeDNS(t *testing.T, zone map[string]string) string {
 
 func startTCPDestinationPair(t *testing.T, serve func(string, net.Conn)) string {
 	t.Helper()
-	a, err := net.Listen("tcp", "127.0.0.2:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := strconv.Itoa(a.Addr().(*net.TCPAddr).Port)
-	b, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", port))
-	if err != nil {
+	// The port the kernel hands out at 127.0.0.2 can be held at 127.0.0.1 by another test's socket: then take another.
+	var a, b net.Listener
+	for attempt := 1; ; attempt++ {
+		var err error
+		if a, err = net.Listen("tcp", "127.0.0.2:0"); err != nil {
+			t.Fatal(err)
+		}
+		port := strconv.Itoa(a.Addr().(*net.TCPAddr).Port)
+		if b, err = net.Listen("tcp", net.JoinHostPort("127.0.0.1", port)); err == nil {
+			break
+		}
 		_ = a.Close()
-		t.Fatal(err)
+		if attempt == 20 {
+			t.Fatal(err)
+		}
 	}
 	t.Cleanup(func() {
 		_ = a.Close()
@@ -353,6 +359,23 @@ func newXrayClientWithOptions(t *testing.T, serverPort uint16, transport, credID
 // newXrayClientSNI is the in-process client with the REALITY server name of its choice.
 func newXrayClientSNI(t *testing.T, serverName string, serverPort uint16, transport, credID, userID, flow string, mux bool) *xrayClient {
 	t.Helper()
+	return newXrayClientShortID(t, serverName, "6ba85179", serverPort, transport, credID, userID, flow, mux)
+}
+
+// newXrayClientShortID is newXrayClientSNI with the REALITY short id of its choice (one the inbound does not hold fails
+// REALITY authentication).
+func newXrayClientShortID(t *testing.T, serverName, shortIDHex string, serverPort uint16, transport, credID, userID, flow string, mux bool) *xrayClient {
+	return newXrayClientShortIDFrom(t, serverName, shortIDHex, serverPort, transport, credID, userID, flow, mux, "")
+}
+
+func newXrayClientShortIDFrom(t *testing.T, serverName, shortIDHex string, serverPort uint16, transport, credID, userID, flow string, mux bool, sourceIP string) *xrayClient {
+	t.Helper()
+	return newXrayClientFingerprint(t, "chrome", serverName, shortIDHex, serverPort, transport, credID, userID, flow, mux, sourceIP)
+}
+
+// newXrayClientFingerprint is the in-process client with the uTLS fingerprint of its choice.
+func newXrayClientFingerprint(t *testing.T, fingerprint, serverName, shortIDHex string, serverPort uint16, transport, credID, userID, flow string, mux bool, sourceIP string) *xrayClient {
+	t.Helper()
 	socksPort := reservePort(t)
 	transportName := "tcp"
 	var transportSettings []*internet.TransportConfig
@@ -368,7 +391,7 @@ func newXrayClientSNI(t *testing.T, serverName string, serverPort uint16, transp
 	if err != nil {
 		t.Fatal(err)
 	}
-	shortID, err := hex.DecodeString("6ba85179")
+	shortID, err := hex.DecodeString(shortIDHex)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -378,10 +401,13 @@ func newXrayClientSNI(t *testing.T, serverName string, serverPort uint16, transp
 		TransportSettings: transportSettings,
 		SecurityType:      serial.GetMessageType(&reality.Config{}),
 		SecuritySettings: []*serial.TypedMessage{serial.ToTypedMessage(&reality.Config{
-			Fingerprint: "chrome", ServerName: serverName, PublicKey: publicKey, ShortId: shortID, SpiderX: "/",
+			Fingerprint: fingerprint, ServerName: serverName, PublicKey: publicKey, ShortId: shortID, SpiderX: "/",
 		})},
 	}
 	sender := &proxyman.SenderConfig{StreamSettings: stream}
+	if sourceIP != "" {
+		sender.Via = xnet.NewIPOrDomain(xnet.IPAddress(net.ParseIP(sourceIP)))
+	}
 	if mux {
 		sender.MultiplexSettings = &proxyman.MultiplexingConfig{Enabled: true, Concurrency: 8}
 	}
@@ -399,7 +425,7 @@ func newXrayClientSNI(t *testing.T, serverName string, serverPort uint16, transp
 				Listen:         xnet.NewIPOrDomain(xnet.IPAddress(net.ParseIP("127.0.0.1"))),
 				StreamSettings: &internet.StreamConfig{ProtocolName: "tcp"},
 			}),
-			ProxySettings: serial.ToTypedMessage(&xraysocks.ServerConfig{AuthType: xraysocks.AuthType_NO_AUTH}),
+			ProxySettings: serial.ToTypedMessage(&xraysocks.ServerConfig{AuthType: xraysocks.AuthType_NO_AUTH, UdpEnabled: true, Address: xnet.NewIPOrDomain(xnet.IPAddress(net.ParseIP("127.0.0.1")))}),
 		}},
 		Outbound: []*xraycore.OutboundHandlerConfig{{
 			Tag: "vless-out",
@@ -743,6 +769,41 @@ func TestApplyUsersOnlyKeepsAndRemovesSessions(t *testing.T) {
 	if conn, err := removedClient.tryDial(echo.Addr().String()); err == nil {
 		defer conn.Close()
 		assertConnectionEnds(t, conn)
+	}
+}
+
+func TestApplySkipsBadCredentialAndStillRevokesOthers(t *testing.T) {
+	f := newRuntimeFixture(t, false)
+	spec := f.spec("node-a", "xhttp")
+	kept := testCredential("alice", "66ad4540-b58c-4ad2-9926-ea63445a9b57")
+	revoked := testCredential("revoked", "66ad4540-b58c-4ad2-9926-ea63445a9b59")
+	if _, err := f.engine.Apply(context.Background(), spec, []plugin.UserCred{kept, revoked}); err != nil {
+		t.Fatal(err)
+	}
+	bad := testCredential("broken", "not-a-uuid")
+	report, err := f.engine.Apply(context.Background(), spec, []plugin.UserCred{kept, bad})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.CredCount != 1 || len(report.Warnings) != 1 || !strings.Contains(report.Warnings[0], "broken") {
+		t.Fatalf("apply report = %+v", report)
+	}
+	observed := f.engine.Observed()
+	if len(observed) != 1 || len(observed[0].Creds) != 1 || observed[0].Creds[0].CredID != kept.CredID {
+		t.Fatalf("observed credentials = %+v", observed)
+	}
+
+	duplicate := testCredential("z", stringID(kept))
+	report, err = f.engine.Apply(context.Background(), spec, []plugin.UserCred{duplicate, kept})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.CredCount != 1 || len(report.Warnings) != 1 || !strings.Contains(report.Warnings[0], "alice and z share one UUID") {
+		t.Fatalf("duplicate UUID report = %+v", report)
+	}
+	observed = f.engine.Observed()
+	if len(observed) != 1 || len(observed[0].Creds) != 1 || observed[0].Creds[0].CredID != kept.CredID {
+		t.Fatalf("duplicate UUID winner = %+v; want %s", observed, kept.CredID)
 	}
 }
 

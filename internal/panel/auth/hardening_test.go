@@ -21,6 +21,7 @@ import (
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
 	"github.com/mistgate/mistgate/gen/mistgate/admin/v1/adminv1connect"
+	_ "github.com/mistgate/mistgate/gen/mistgate/ops/v1"
 	"github.com/mistgate/mistgate/internal/panel/store"
 )
 
@@ -302,7 +303,7 @@ func TestConcurrentCeremonyFinishesConsumeOnce(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					got, err := s.vault.Open(pw.TOTPSecret, totpAAD(adminID))
+					got, err := s.vault.Open(pw.TOTPSecret, TOTPSecretAAD(adminID))
 					if err != nil || !bytes.Equal(got, newSecret) || countAuditResult(t, st, "totp_rebind", "ok") != 1 {
 						t.Fatalf("TOTP enrollment state: secret updated=%v err=%v", bytes.Equal(got, newSecret), err)
 					}
@@ -341,7 +342,7 @@ func TestConcurrentCeremonyFinishesConsumeOnce(t *testing.T) {
 	}
 }
 
-func TestCeremonyConsumeFailuresUseAuthenticationFailureResponses(t *testing.T) {
+func TestCeremonyConsumeFailuresUseProtocolSpecificResponses(t *testing.T) {
 	t.Run("login", func(t *testing.T) {
 		s, st, _ := newTestService(t)
 		_, _, _ = passkeyAdmin(t, s, st)
@@ -383,15 +384,15 @@ func TestCeremonyConsumeFailuresUseAuthenticationFailureResponses(t *testing.T) 
 			t.Fatal(err)
 		}
 		_, err = s.FinishStepUp(authed(t, s, cookie), cookieReq(&adminv1.FinishStepUpRequest{CeremonyId: begin.Msg.CeremonyId}, cookie))
-		if codeOf(err) != connect.CodeUnauthenticated {
-			t.Fatalf("failed ceremony consume returned %v; want step-up failure", err)
+		if codeOf(err) != connect.CodeInternal {
+			t.Fatalf("failed ceremony consume returned %v; want an internal error", err)
 		}
-		if countAuditResult(t, st, "stepup", "fail") != 1 {
-			t.Fatal("failed step-up consume was not audited")
+		if countAuditResult(t, st, "stepup", "fail") != 0 {
+			t.Fatal("a ceremony store error was audited as a wrong proof")
 		}
 		failure, err := st.LoginFailures(context.Background(), stepUpLockKey+admin.ID, *clock, FailureWindow)
-		if err != nil || failure.Failures != 1 {
-			t.Fatalf("step-up failures = %+v, err=%v; want one", failure, err)
+		if err != nil || failure.Failures != 0 {
+			t.Fatalf("step-up failures = %+v, err=%v; want no reserved failure", failure, err)
 		}
 	})
 }
@@ -411,15 +412,21 @@ func insertAdmin(t *testing.T, st *store.Store, role string) store.Admin {
 // otherwise be owner-only by default, and a stale entry would hide that an RPC was removed.
 func TestEveryProcedureHasAPolicy(t *testing.T) {
 	registered := map[string]bool{}
-	protoregistry.GlobalFiles.RangeFilesByPackage("mistgate.admin.v1", func(fd protoreflect.FileDescriptor) bool {
-		for i := 0; i < fd.Services().Len(); i++ {
-			svc := fd.Services().Get(i)
-			for j := 0; j < svc.Methods().Len(); j++ {
-				registered["/"+string(svc.FullName())+"/"+string(svc.Methods().Get(j).Name())] = true
+	// mistgate.probe.v1 (ProbeService), mistgate.ops.v1 (OpsService, policy_ops.go), mistgate.ownprobe.v1 (OwnProbeService,
+	// policy_ownprobe.go), mistgate.tasks.v1 (TasksService, policy_tasks.go), mistgate.trusttunnel.v1 (TrustTunnelService,
+	// policy_trusttunnel.go) mistgate.decoysite.v1 (DecoySiteService, policy_decoysite.go) and mistgate.warpreach.v1 (WarpReachService, policy_warpreach.go) are the VPS edition's own service packages, kept out of the Cloudflare Workers; their procedures
+	// need a level too.
+	for _, pkg := range []protoreflect.FullName{"mistgate.admin.v1", "mistgate.probe.v1", "mistgate.ops.v1", "mistgate.tasks.v1", "mistgate.ownprobe.v1", "mistgate.trusttunnel.v1", "mistgate.decoysite.v1", "mistgate.warpreach.v1"} {
+		protoregistry.GlobalFiles.RangeFilesByPackage(pkg, func(fd protoreflect.FileDescriptor) bool {
+			for i := 0; i < fd.Services().Len(); i++ {
+				svc := fd.Services().Get(i)
+				for j := 0; j < svc.Methods().Len(); j++ {
+					registered["/"+string(svc.FullName())+"/"+string(svc.Methods().Get(j).Name())] = true
+				}
 			}
-		}
-		return true
-	})
+			return true
+		})
+	}
 	if len(registered) < 40 {
 		t.Fatalf("found only %d procedures: the walk is broken", len(registered))
 	}
@@ -481,11 +488,14 @@ func TestRolePolicyIsEnforcedBySessionMiddleware(t *testing.T) {
 		{adminv1connect.UserServiceListUsersProcedure, 200, 200, 200},
 		{adminv1connect.NodeServiceGetNodeProcedure, 200, 200, 200},
 		{adminv1connect.NodeServiceCheckPortsProcedure, 200, 200, 403},
+		{adminv1connect.NodeServiceCheckIpv6Procedure, 200, 403, 403},
+		{adminv1connect.NodeServiceUpdateIpv6EntryProcedure, 200, 403, 403},
 		{adminv1connect.AuthServiceMeProcedure, 200, 200, 200},
 		{adminv1connect.UserServiceCreateUserProcedure, 200, 200, 403},
 		{adminv1connect.UserServiceDeleteUsersProcedure, 200, 200, 403},
 		{adminv1connect.UserServiceGetSubscriptionLinkProcedure, 200, 200, 403},
 		{adminv1connect.GroupServiceUpdateGroupProcedure, 200, 200, 403},
+		{adminv1connect.GroupServiceSetNodeSharingProcedure, 200, 200, 403},
 		{adminv1connect.NodeServiceRetireNodeProcedure, 200, 403, 403},
 		{adminv1connect.NodeServiceCreateEnrollmentProcedure, 200, 403, 403},
 		{adminv1connect.ProfileServiceUpdateProfileProcedure, 200, 403, 403},
@@ -861,5 +871,64 @@ func TestSessionUserAgentIsClipped(t *testing.T) {
 	}
 	if _, err := proto.Marshal(resp.Msg); err != nil {
 		t.Errorf("ListSessions does not marshal: %v", err)
+	}
+}
+
+// Adding a passkey is bound to the session that passed the step-up and began it, like step-up and TOTP enrollment: a
+// ceremony id that leaks to another session of the same admin cannot be finished there, and the attempt burns it.
+func TestAddPasskeyCeremonyIsBoundToItsSession(t *testing.T) {
+	s, st, _ := newTestService(t)
+	admin, cookie, _ := passkeyAdmin(t, s, st)
+	other, err := s.newSession(context.Background(), admin.ID, "198.51.100.9", "other browser")
+	if err != nil {
+		t.Fatal(err)
+	}
+	attest := func(optionsJSON string) string {
+		t.Helper()
+		opts, err := virtualwebauthn.ParseAttestationOptions(optionsJSON)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dev, cred := virtualwebauthn.NewAuthenticator(), virtualwebauthn.NewCredential(virtualwebauthn.KeyTypeEC2)
+		dev.Options.UserHandle = []byte(opts.UserID)
+		return virtualwebauthn.CreateAttestationResponse(virtualwebauthn.RelyingParty{Name: "Mistgate", ID: "localhost", Origin: "http://localhost:8081"}, dev, cred, *opts)
+	}
+	finish := func(sessionCookie, ceremonyID, credentialJSON string) error {
+		_, err := s.FinishAddPasskey(authed(t, s, sessionCookie), cookieReq(&adminv1.FinishAddPasskeyRequest{CeremonyId: ceremonyID, CredentialJson: credentialJSON}, sessionCookie))
+		return err
+	}
+	passkeys := func() int {
+		t.Helper()
+		pks, err := st.PasskeysByAdmin(context.Background(), admin.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(pks)
+	}
+
+	begin, err := s.BeginAddPasskey(authed(t, s, cookie), cookieReq(&adminv1.BeginAddPasskeyRequest{}, cookie))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cj := attest(begin.Msg.OptionsJson)
+	if err := finish(other.Value, begin.Msg.CeremonyId, cj); codeOf(err) != connect.CodeInvalidArgument {
+		t.Fatalf("another session of the same admin finished the ceremony: %v", err)
+	}
+	if err := finish(cookie, begin.Msg.CeremonyId, cj); codeOf(err) != connect.CodeInvalidArgument {
+		t.Fatalf("a ceremony tried from another session still worked: %v", err)
+	}
+	if n := passkeys(); n != 1 {
+		t.Fatalf("passkeys after refused finishes = %d, want 1", n)
+	}
+
+	begin, err = s.BeginAddPasskey(authed(t, s, cookie), cookieReq(&adminv1.BeginAddPasskeyRequest{}, cookie))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := finish(cookie, begin.Msg.CeremonyId, attest(begin.Msg.OptionsJson)); err != nil {
+		t.Fatalf("the session that began it: %v", err)
+	}
+	if n := passkeys(); n != 2 {
+		t.Fatalf("passkeys after the finish = %d, want 2", n)
 	}
 }

@@ -99,7 +99,7 @@ func TestLinkDeviceWithAWGCredentialsIsNotAKey(t *testing.T) {
 	if per, err := s.Access().AWGDevicesPerProfile(ctx, "", u.ID); err != nil || per[profile] != 1 {
 		t.Fatalf("AWGDevicesPerProfile = %v, %v; want 1", per, err)
 	}
-	data, err := s.Access().SubscriptionData(ctx, u.ID, "grp_k", time.Unix(0, 0), true, time.Now(), nil)
+	data, err := s.Access().SubscriptionData(ctx, u.ID, time.Unix(0, 0), true, time.Now(), nil)
 	if err != nil || len(data.AWG) != 1 || data.AWG[0].ID != "dev_key" {
 		t.Fatalf("SubscriptionData.AWG = %+v, %v; want only dev_key", data.AWG, err)
 	}
@@ -108,7 +108,7 @@ func TestLinkDeviceWithAWGCredentialsIsNotAKey(t *testing.T) {
 		t.Fatalf("health AWG signals = %+v, %v; want only dev_key", signals.AWGDevices, err)
 	}
 	// Both are devices of the user, and the kinds read back.
-	devices, err := s.Access().Devices(ctx, u.ID)
+	devices, err := s.Access().Devices(ctx, u.ID, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}

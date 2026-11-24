@@ -17,6 +17,7 @@ import (
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
 	"github.com/mistgate/mistgate/internal/panel/countryreach"
 	"github.com/mistgate/mistgate/internal/panel/store"
+	"github.com/mistgate/mistgate/internal/plugin"
 )
 
 // The country check: "does the node answer from inside a country". The panel's server is not in that country, so its own
@@ -47,7 +48,7 @@ const (
 	countryRoundTime   = 60 * time.Second // the whole round, controls and polling included
 	countryHoldSetting = "health.country_check.hold_until"
 	familyV4           = 4 // the address families of country-check rows. IPv6 rows are measured by Globalping alone; they are read by the
-	familyV6           = 6 // nested CountryCheck.ipv6, the IPv6 history and the IPv6 alert of a node with the IPv6 entry
+	familyV6           = 6 // nested CountryCheck.ipv6 and the IPv6 history; an IPv6 alert exists only for a node with the IPv6 entry
 )
 
 // countryControls is the site every probe must reach, per country: big, domestic and never blocked there. Other countries
@@ -57,6 +58,9 @@ var countryControls = map[string]string{
 }
 
 func countryControl(country string) (string, uint16) {
+	if host, port, ok := censorSimCountryControl(country); ok {
+		return host, port
+	}
 	if host, ok := countryControls[country]; ok {
 		return host, 443
 	}
@@ -66,6 +70,9 @@ func countryControl(country string) (string, uint16) {
 // countryControl6 is the control site of an IPv6 round: a name that has an IPv6 address and is never blocked. Only Russia's is
 // domestic; every other country uses Cloudflare's, and no other country's site is guessed to have an AAAA record.
 func countryControl6(country string) (string, uint16) {
+	if host, port, ok := censorSimCountryControl(country); ok {
+		return host, port
+	}
 	if country == "RU" {
 		return "ya.ru", 443
 	}
@@ -77,20 +84,21 @@ func countryControl6(country string) (string, uint16) {
 
 // countryNode is an online node that takes part in a round.
 type countryNode struct {
-	node      store.NodeRow
-	ports     []uint16
-	preferred uint16 // the TLS endpoint a paid source tests: see countryPreferredPort
-	ipv6      ipv6Facts
+	node       store.NodeRow
+	ports      []uint16
+	preferred  uint16 // the TLS endpoint a paid source tests: see countryPreferredPort
+	ipv6       ipv6Facts
+	ipv6Member bool // the entry is on, or the newest IPv4 verdict in this country says IPv6 could help
 }
 
 // countryCost is the tests of the rounds of one interval with k probes: per family a control, then per node one ICMP and one
-// per TCP port, each run by every probe. The IPv4 round has every node; the IPv6 round only the nodes whose IPv6 works, and
-// only exists when there is one.
+// per TCP port, each run by every probe. The IPv4 round has every node; the IPv6 round has only its members with a usable IPv6
+// address, and only exists when there is one.
 func countryCost(nodes []countryNode, k int) int {
 	n, n6 := 1, 0
 	for _, c := range nodes {
 		n += 1 + len(c.ports)
-		if c.ipv6.state == ipv6OK {
+		if _, state := nodeIPv6(c); c.ipv6Member && state == ipv6OK {
 			n6 += 1 + len(c.ports)
 		}
 	}
@@ -101,8 +109,8 @@ func countryCost(nodes []countryNode, k int) int {
 }
 
 // countryPlan chooses the probes per measurement and the interval so that the rounds of an hour (one IPv4 round and, while the
-// IPv6 checks are on, one IPv6 round per interval) stay within 80 % of the source's limit: 3 probes if that fits, else 2, else
-// 2 and a longer interval. limit 0 = unlimited.
+// IPv6 checks are on and have members, one IPv6 round per interval) stay within 80 % of the source's limit: 3 probes if that
+// fits, else 2, else 2 and a longer interval. limit 0 = unlimited.
 func countryPlan(nodes []countryNode, interval time.Duration, limit int) (probes int, effective time.Duration, perHour int) {
 	hourly := func(k int, every time.Duration) int {
 		return int((int64(countryCost(nodes, k))*int64(time.Hour) + int64(every) - 1) / int64(every))
@@ -118,6 +126,11 @@ func countryPlan(nodes []countryNode, interval time.Duration, limit int) (probes
 	return countryMinProbes, every, hourly(countryMinProbes, every)
 }
 
+// countryIPv4NeedsIPv6 reports the IPv4 verdicts where an IPv6 route could restore access to the node's TCP services.
+func countryIPv4NeedsIPv6(verdict string) bool {
+	return verdict == verdictPartial || countryBad(verdict)
+}
+
 // ---------------------------------------------------------------------------------------------------
 // Verdict
 
@@ -129,6 +142,8 @@ type countryDetail struct {
 	Ports   []uint16             `json:"ports,omitempty"` // the TCP ports that were tried
 	NoProbe []string             `json:"no_probe,omitempty"`
 	Asked   []string             `json:"asked,omitempty"`
+	// Manual: the round was asked out of turn (country_now.go); the schedule does not count it.
+	Manual bool `json:"manual,omitempty"`
 }
 
 type countryProbeDetail struct {
@@ -239,32 +254,9 @@ func countryReached(obs CountryObserved, targets []CountryTarget, icmpOnly bool)
 // ---------------------------------------------------------------------------------------------------
 // Targets
 
-// hy2DecoyPort is the TCP port of a Hysteria2 inbound's HTTPS decoy (443 unless the profile says otherwise, 0 = none), the
-// same rule as the agent's doctor.
-func hy2DecoyPort(t *target) uint16 {
-	if t.spec.TLS.Mode == 0 {
-		return 0
-	}
-	var j struct {
-		Masquerade struct {
-			Type    string `json:"type"`
-			TCPPort *int   `json:"tcp_port"`
-		} `json:"masquerade"`
-	}
-	if len(t.settings) > 0 && json.Unmarshal(t.settings, &j) != nil {
-		return 0
-	}
-	if strings.EqualFold(j.Masquerade.Type, "none") {
-		return 0
-	}
-	if p := j.Masquerade.TCPPort; p != nil {
-		return uint16(max(0, min(*p, 65535)))
-	}
-	return 443
-}
-
 // countryPorts are the distinct TCP ports a node answers on: the ports of its active TCP inbounds (VLESS) and the HTTPS
-// decoy of its Hysteria2 ones. A node with only UDP inbounds and no decoy has none and is checked by ICMP alone.
+// site of its Hysteria2 ones (the decoy page, or the plain 404 of masquerade type none). A node with only UDP inbounds and no site has
+// none and is checked by ICMP alone.
 func countryPorts(ts []*target) []uint16 {
 	var ports []uint16
 	add := func(p uint16) {
@@ -280,7 +272,7 @@ func countryPorts(ts []*target) []uint16 {
 		case t.spec.Listen.Network == "tcp":
 			add(t.spec.Listen.Port)
 		case t.in.Protocol == "hysteria2":
-			add(hy2DecoyPort(t))
+			add(plugin.Hy2SitePort(t.spec))
 		}
 	}
 	slices.Sort(ports)
@@ -299,7 +291,7 @@ func countryPreferredPort(ts []*target) uint16 {
 		var p uint16
 		switch {
 		case t.in.Protocol == "hysteria2":
-			p = hy2DecoyPort(t)
+			p = plugin.Hy2SitePort(t.spec)
 		case t.in.Protocol == "vless" && t.spec.Listen.Network == "tcp":
 			var settings struct {
 				Security string `json:"security"`
@@ -380,11 +372,11 @@ func (s *Service) countryAddress(ctx context.Context, n store.NodeRow) (string, 
 
 // The IPv6 state of a node, from its doctor's ipv6 check: whether it can be measured over IPv6 at all.
 const (
-	ipv6OK       = "ok"        // outbound IPv6 works, so the node has a working IPv6 uplink
-	ipv6None     = "none"      // no global IPv6 address
-	ipv6Broken   = "broken"    // an address, but outbound IPv6 fails (so does the inbound one): nothing to test
-	ipv6AgentOld = "agent_old" // IPv6 works, but the agent does not say which address
-	ipv6Unknown  = "unknown"   // the doctor has not reported yet
+	ipv6OK       = store.IPv6OK       // outbound IPv6 works, so the node has a working IPv6 uplink
+	ipv6None     = store.IPv6None     // no global IPv6 address
+	ipv6Broken   = store.IPv6Broken   // an address, but outbound IPv6 fails (so does the inbound one): nothing to test
+	ipv6AgentOld = store.IPv6AgentOld // IPv6 works, but the agent does not say which address
+	ipv6Unknown  = store.IPv6Unknown  // the doctor has not reported yet
 )
 
 // ipv6Reasons are the reasons of the unknown rows of the nodes that are not measured over IPv6 (CountryCheck.ipv6.reason).
@@ -395,39 +387,15 @@ var ipv6Reasons = map[string]string{ipv6None: "no_ipv6", ipv6Broken: "ipv6_broke
 type ipv6Facts struct{ state, src string }
 
 // usableIPv6 is s as a global unicast IPv6 address (not a unique-local, link-local or mapped IPv4 one).
-func usableIPv6(s string) (string, bool) {
-	a, ok := parseAddr(s)
-	if !ok || !a.Is6() || !a.IsGlobalUnicast() || a.IsPrivate() {
-		return "", false
-	}
-	return a.String(), true
-}
+func usableIPv6(s string) (string, bool) { return store.UsableIPv6(s) }
 
-// ipv6FactsOf reads the params of the doctor's ipv6 check (internal/node/doctor checkIPv6): ipv6=no|yes, connect=ok|failed,
-// and from agents that know the uplink src and addrs ("addr/plen,..."). nil = no report.
+// ipv6FactsOf reads the params of the doctor's ipv6 check (store.DoctorIPv6). nil = no report.
 func ipv6FactsOf(row *store.DoctorRow) ipv6Facts {
-	if row == nil {
-		return ipv6Facts{state: ipv6Unknown}
+	d := store.DoctorIPv6(row)
+	if d.State != ipv6OK {
+		return ipv6Facts{state: d.State}
 	}
-	p := row.Params
-	switch {
-	case p["ipv6"] == "no":
-		return ipv6Facts{state: ipv6None}
-	case p["ipv6"] == "yes" && p["connect"] == "failed":
-		return ipv6Facts{state: ipv6Broken}
-	case p["ipv6"] != "yes" || p["connect"] != "ok":
-		return ipv6Facts{state: ipv6Unknown}
-	}
-	f := ipv6Facts{state: ipv6OK}
-	if f.src, _ = usableIPv6(p["src"]); f.src == "" {
-		for _, x := range strings.Split(p["addrs"], ",") {
-			addr, _, _ := strings.Cut(strings.TrimSpace(x), "/")
-			if f.src, _ = usableIPv6(addr); f.src != "" {
-				break
-			}
-		}
-	}
-	return f
+	return ipv6Facts{state: ipv6OK, src: d.FirstAddr()}
 }
 
 // countryIPv6Facts reads the doctor's ipv6 check of every node into the nodes. A read that fails leaves them unknown.
@@ -447,15 +415,48 @@ func (s *Service) countryIPv6Facts(ctx context.Context, nodes []countryNode) {
 	}
 }
 
+// countryIPv6Members sets which nodes may be measured over IPv6. An IPv6 entry is always measured; without one, the latest
+// IPv4 verdict must be from this country and blocked (including TCP-only) or partial. A failed read leaves only entries as
+// members, so unknown IPv4 state never adds probes or Globalping cost.
+func (s *Service) countryIPv6Members(ctx context.Context, country string, nodes []countryNode) {
+	ids := make([]string, len(nodes))
+	for i := range nodes {
+		ids[i] = nodes[i].node.ID
+	}
+	latest, err := s.st.RecentCountryChecks(ctx, familyV4, 1, ids...)
+	if err != nil {
+		s.log.Warn("health: country check IPv6 membership", "err", err)
+		latest = nil
+	}
+	verdicts := make(map[string]store.CountryCheck, len(latest))
+	for _, r := range latest {
+		verdicts[r.NodeID] = r
+	}
+	for i := range nodes {
+		n := &nodes[i]
+		n.ipv6Member = ipv6Entry(n.node)
+		if n.ipv6Member {
+			continue
+		}
+		if r, ok := verdicts[n.node.ID]; ok && r.Country == country {
+			n.ipv6Member = countryIPv4NeedsIPv6(r.Verdict)
+		}
+	}
+}
+
 // nodeIPv6 is the IPv6 address a node is measured on and its state. Only a node whose doctor says that outbound IPv6 works is
 // measured (state ok): an address that the host has but the hoster does not route would read as "blocked". The address is the
-// node's own when its Address is an IPv6 literal, else the uplink's src from the doctor. An agent that predates the IPv6
+// IPv6 entry's when it is on (it is the address people use), else the node's own when its Address is an IPv6 literal, else the
+// uplink's src from the doctor. An agent that predates the IPv6
 // facts names none: agent_old.
 // ponytail: the AAAA record of the node's name is not consulted - the panel's resolvers (system, DNS over HTTPS) ask for A
 // only, and a second lookup per node would burn the edge's subrequests; add it when an owner points an AAAA elsewhere.
 func nodeIPv6(n countryNode) (addr, state string) {
 	if n.ipv6.state != ipv6OK {
 		return "", cmp.Or(n.ipv6.state, ipv6Unknown)
+	}
+	if ip, ok := usableIPv6(n.node.IPv6Entry); ok { // the address people connect to
+		return ip, ipv6OK
 	}
 	if ip, ok := usableIPv6(n.node.Address); ok {
 		return ip, ipv6OK
@@ -513,8 +514,9 @@ func (s *Service) CountryTick(ctx context.Context) bool {
 	}
 	if cc.IPv6 {
 		s.countryIPv6Facts(ctx, nodes)
+		s.countryIPv6Members(ctx, cc.Country, nodes)
 	}
-	probes, every, _ := countryPlan(nodes, cc.Interval, src.HourlyLimit())
+	probes, every, _ := countryPlan(nodes, censorSimCountryInterval(cc.Interval), censorSimCountryHourlyLimit(src.HourlyLimit()))
 	s.countryNoteStretch(cc.Interval, every)
 	now := s.now()
 	families := []int{familyV4} // in this order: IPv4 goes first when both are due
@@ -547,7 +549,7 @@ func (s *Service) CountryTick(ctx context.Context) bool {
 	if family == familyV4 {
 		wants = s.countryRoundWants(ctx, cc.Country)
 	}
-	s.countryRound(ctx, cc, src, nodes, probes, now, wants, family)
+	s.countryRound(ctx, cc, src, nodes, probes, now, wants, family, false)
 	return true
 }
 
@@ -561,7 +563,10 @@ func (s *Service) countryNoteStretch(chosen, effective time.Duration) {
 	s.countryStretched = stretched
 }
 
-func (s *Service) countryRound(ctx context.Context, cc CountryConfig, src CountrySource, nodes []countryNode, probes int, now time.Time, wants []CountryWant, family int) {
+// countryRound measures the nodes once and stores a row each. manual marks the rows of a round asked out of turn (country_now.go):
+// the schedule does not count them (LastCountryCheckAt), so such a round never pushes the planned one back. It returns why the
+// source could not measure ("" when it did).
+func (s *Service) countryRound(ctx context.Context, cc CountryConfig, src CountrySource, nodes []countryNode, probes int, now time.Time, wants []CountryWant, family int, manual bool) (failed string) {
 	timeout := s.cfg.CountryRoundTimeout
 	if timeout <= 0 {
 		timeout = countryRoundTime
@@ -576,7 +581,7 @@ func (s *Service) countryRound(ctx context.Context, cc CountryConfig, src Countr
 	}
 	var rows []store.CountryCheck
 	unknown := func(n countryNode, reason string, asked []string) {
-		b, _ := json.Marshal(countryDetail{Reason: reason, Ports: n.ports, Asked: asked})
+		b, _ := json.Marshal(countryDetail{Reason: reason, Ports: n.ports, Asked: asked, Manual: manual})
 		rows = append(rows, store.CountryCheck{NodeID: n.node.ID, At: now, Country: cc.Country, Family: family, Verdict: verdictUnknown, Detail: string(b)})
 	}
 	targets := map[string]countryNode{}
@@ -586,6 +591,9 @@ func (s *Service) countryRound(ctx context.Context, cc CountryConfig, src Countr
 			var state string
 			if ip, state = nodeIPv6(n); state != ipv6OK {
 				reason = ipv6Reasons[state]
+			} else if !n.ipv6Member {
+				ip = ""
+				reason = "entry_off"
 			}
 		} else if addr, ok := s.countryAddress(rctx, n.node); ok {
 			ip = addr
@@ -619,6 +627,7 @@ func (s *Service) countryRound(ctx context.Context, cc CountryConfig, src Countr
 				verdict, d := countryJudge(t, obs, reached)
 				d.NoProbe = obs.NoProbe
 				d.Asked = obs.Asked
+				d.Manual = manual
 				b, _ := json.Marshal(d)
 				rows = append(rows, store.CountryCheck{NodeID: t.Key, At: now, Country: cc.Country, Family: family, Verdict: verdict, Detail: string(b)})
 			}
@@ -626,7 +635,9 @@ func (s *Service) countryRound(ctx context.Context, cc CountryConfig, src Countr
 	}
 	if err := s.st.InsertCountryChecks(ctx, rows); err != nil {
 		s.log.Warn("health: store country check", "err", err)
+		return "error"
 	}
+	return failed
 }
 
 // countryFailure maps a failed round to the reason stored on its unknown rows, and starts the hold of a rate limit.
@@ -779,22 +790,36 @@ func (s *Service) activeExternalStates(ctx context.Context) []ExternalState {
 }
 
 func externalSourcePath(source string) bool {
-	return source == countryreach.SourceCheburcheck || source == countryreach.SourceCheburcheckOwn
+	info, _ := countryreach.Info(source)
+	return info.Path
 }
 
-func externalSourceEyeball(source string) bool {
-	switch source {
-	case countryreach.SourceCheburcheck, countryreach.SourceCheburcheckOwn, countryreach.SourceBsbord,
-		countryreach.SourceBsbordTunnel, countryreach.SourceBsbordGeo:
-		return true
-	default:
-		return false
+func externalSourceEyeball(source string, kinds ...string) bool {
+	if source == countryreach.SourceProbes { // the own probes are as eyeball as the point is
+		return len(kinds) > 0 && (kinds[0] == countryreach.VantageKindHome || kinds[0] == countryreach.VantageKindMobile)
 	}
+	info, _ := countryreach.Info(source)
+	return info.Eyeball
+}
+
+func externalVantagesEyeball(source string, vantages []countryreach.Vantage) bool {
+	if source != countryreach.SourceProbes {
+		return externalSourceEyeball(source)
+	}
+	for _, vantage := range vantages {
+		if externalSourceEyeball(source, vantage.Kind) {
+			return true
+		}
+	}
+	return false
 }
 
 func countryVantageProto(source string, at time.Time, v countryreach.Vantage) *adminv1.CountryVantage {
+	if v.At != 0 {
+		at = time.Unix(v.At, 0).UTC()
+	}
 	return &adminv1.CountryVantage{Source: source, Key: v.Key, Network: v.Network, Region: v.Region, Asn: v.ASN, Kind: v.Kind, State: v.State,
-		AtUnix: at.Unix(), DpiHop: uint32(max(v.DPIHop, 0)), IcmpOk: v.ICMPOK, TcpOk: v.TCPOK}
+		AtUnix: at.Unix(), DpiHop: uint32(max(v.DPIHop, 0)), IcmpOk: v.ICMPOK, TcpOk: v.TCPOK, Why: v.Why, ProbeName: v.ProbeName, Port: uint32(v.Port)}
 }
 
 func globalpingVantages(detail countryDetail) []countryreach.Vantage {
@@ -1010,13 +1035,20 @@ func (s *Service) countryChecks(ctx context.Context, nodeID string) ([]*adminv1.
 			}
 			var detail countryreach.ExtDetail
 			_ = json.Unmarshal([]byte(r.DetailJSON), &detail)
-			live = append(live, countryreach.Live{Source: r.Source, Verdict: r.Verdict, Reason: detail.Reason, Eyeball: externalSourceEyeball(r.Source),
-				Path: externalSourcePath(r.Source), At: r.At})
-			for _, v := range detail.Vantages {
-				m.Vantages = append(m.Vantages, countryVantageProto(r.Source, r.At, v))
+			verdict, reason, sourceAt := r.Verdict, detail.Reason, r.At
+			if r.Source == countryreach.SourceProbes {
+				detail, verdict, reason, sourceAt = currentProbeDetail(r, state.MaxAge, now)
+				if len(detail.Vantages) == 0 {
+					continue
+				}
 			}
-			if r.At.After(at) {
-				at = r.At
+			live = append(live, countryreach.Live{Source: r.Source, Verdict: verdict, Reason: reason, Eyeball: externalVantagesEyeball(r.Source, detail.Vantages),
+				Path: externalSourcePath(r.Source), At: sourceAt})
+			for _, v := range detail.Vantages {
+				m.Vantages = append(m.Vantages, countryVantageProto(r.Source, sourceAt, v))
+			}
+			if sourceAt.After(at) {
+				at = sourceAt
 			}
 		}
 		var b *store.BlocklistCheck
@@ -1066,7 +1098,7 @@ func countryBad(verdict string) bool {
 // Partial observations are keyed by source and network. Unknown rows shadow older source state but do not create events; a
 // disagreement is neutral and holds the full alert. Each source event combines with the newest fresh row from every other source
 // (countryEvents). A block list never counts. While a node is disconnected both alerts are held; with all sources off they are
-// let go. The IPv6 rounds (Globalping alone) do the same for a node that has the IPv6 entry for clients (ipv6Entry), under the
+// let go. The IPv6 rounds (Globalping alone) do the same for a node that has the IPv6 entry (ipv6Entry), under the
 // keys "ipv6" and "ipv6/partial"; for every other node they only put the ipv6 parameter on its IPv4 alert (countryIPv6Word),
 // which refreshes the alert without announcing it again (reconcile: TouchAlert).
 func (s *Service) addCountryConds(ctx context.Context, sn *snapshot, live map[string]store.NodeLiveRow, activeAlerts map[key]store.HealthAlert, d *derived, add func(cond)) {
@@ -1075,6 +1107,17 @@ func (s *Service) addCountryConds(ctx context.Context, sn *snapshot, live map[st
 	external := s.activeExternalStates(ctx)
 	if !liveOn && !tspu.On && len(external) == 0 {
 		return
+	}
+	now := s.now()
+	// Read only when a node has a full alert to judge, and once for all of them.
+	var relayReach store.RelayReachability
+	var relayReachOK, relayReachRead bool
+	relayReachability := func() (store.RelayReachability, bool) {
+		if !relayReachRead {
+			relayReachRead = true
+			relayReach, relayReachOK = s.countryRelayReachability(ctx, sn, now)
+		}
+		return relayReach, relayReachOK
 	}
 	hold := func() {
 		for k := range activeAlerts {
@@ -1164,44 +1207,64 @@ func (s *Service) addCountryConds(ctx context.Context, sn *snapshot, live map[st
 		}
 	}
 	for _, r := range externalRows {
-		signals = append(signals, countryExternalSignal(r, externalBySource[r.Source]))
+		signals = append(signals, countryExternalSignalFor(r, externalBySource[r.Source], cc.Country, now))
 	}
 
 	ages6 := countryRoundMaxAges(cc.Interval, rows6)
-	now := s.now()
 	for _, n := range sn.nodes {
 		var ipv6Word string // what the IPv6 rounds say of a node that has no IPv6 alert of its own: a parameter of its IPv4 alert
-		entry := ipv6On && s.ipv6Entry(n)
-		if ipv6On && !entry {
-			ipv6Word = "unknown"
-			if rounds := byNode6[n.ID]; len(rounds) > 0 && !v6Failed {
-				r := rounds[0]
-				ipv6Word = countryIPv6Word(&r, r.Country == cc.Country && now.Sub(r.At) <= ages6[n.ID])
+		entry := ipv6On && ipv6Entry(n)
+		rounds6 := byNode6[n.ID]
+		if entry && n.IPv6().EnabledAt > 0 {
+			enabledAt := n.IPv6().EnabledAt
+			filtered := make([]store.CountryCheck, 0, len(rounds6))
+			for _, r := range rounds6 {
+				if r.At.Unix() >= enabledAt {
+					filtered = append(filtered, r)
+				}
+			}
+			rounds6 = filtered
+		}
+		age6 := ages6[n.ID]
+		if entry && n.IPv6().EnabledAt > 0 {
+			age6 = countryRoundMaxAges(cc.Interval, rounds6)[n.ID]
+		}
+		if ipv6On {
+			word := "unknown"
+			if len(rounds6) > 0 && !v6Failed {
+				r := rounds6[0]
+				word = countryIPv6Word(&r, r.Country == cc.Country && now.Sub(r.At) <= age6)
+			}
+			ipv6Word = word
+			if entry {
+				// the IPv6 alert speaks for IPv6 itself; the IPv4 one only says where people with IPv6 connect
+				if ipv6Word = ""; word == "open" {
+					ipv6Word = "entry"
+				}
 			}
 		}
-		s.countryNodeConds(n, live[n.ID].Connected, signals, activeAlerts, d, add, countryFamilyAlerts{family: familyV4, ipv6: ipv6Word})
+		s.countryNodeConds(n, live[n.ID].Connected, signals, activeAlerts, d, add, relayReachability, countryFamilyAlerts{family: familyV4, ipv6: ipv6Word})
 		if ipv6On {
-			// An IPv6 alert exists only for a node whose IPv6 entry for clients is on: the people on it depend on it. Without
+			// An IPv6 alert exists only for a node whose IPv6 entry is on: the people on it depend on it. Without
 			// the entry the keys are let go, as those of a source that is off.
 			var signals6 []countryAlertSignal
 			if entry {
-				rounds := byNode6[n.ID]
-				for _, r := range rounds {
-					if r.Country != rounds[0].Country { // a country change starts the history over
+				for _, r := range rounds6 {
+					if r.Country != rounds6[0].Country { // a country change starts the history over
 						break
 					}
-					signals6 = append(signals6, countryGlobalpingSignal(r, ages6[n.ID]))
+					signals6 = append(signals6, countryGlobalpingSignal(r, age6))
 				}
 			}
-			s.countryNodeConds(n, live[n.ID].Connected, signals6, activeAlerts, d, add, countryFamilyAlerts{family: familyV6, off: !entry, hold: v6Failed})
+			s.countryNodeConds(n, live[n.ID].Connected, signals6, activeAlerts, d, add, relayReachability, countryFamilyAlerts{family: familyV6, off: !entry, hold: v6Failed})
 		}
 	}
 }
 
-// ipv6Entry says whether a node's IPv6 entry for clients is on, which is what gives its IPv6 country alert a reason to exist.
-// The entry is step 7 of the IPv6 plan; until it exists no node has one.
-func (s *Service) ipv6Entry(n store.NodeRow) bool {
-	return s.entry6 != nil && s.entry6(n)
+// ipv6Entry says whether a node's IPv6 entry is on, which is what gives its IPv6 country alert a reason to exist.
+func ipv6Entry(n store.NodeRow) bool {
+	_, ok := usableIPv6(n.IPv6Entry)
+	return ok
 }
 
 // countryFamilyAlerts is one address family's side of the COUNTRY_BLOCKED alerts of a node.
@@ -1245,7 +1308,8 @@ func (f countryFamilyAlerts) subject(v4 string) string {
 
 // countryNodeConds is the COUNTRY_BLOCKED logic of one node and one address family over the signals of that family (see
 // addCountryConds). Nothing of it depends on the family but the keys, the signals and the parameters.
-func (s *Service) countryNodeConds(n store.NodeRow, connected bool, signals []countryAlertSignal, activeAlerts map[key]store.HealthAlert, d *derived, add func(cond), f countryFamilyAlerts) {
+func (s *Service) countryNodeConds(n store.NodeRow, connected bool, signals []countryAlertSignal, activeAlerts map[key]store.HealthAlert, d *derived, add func(cond),
+	relayReachability func() (store.RelayReachability, bool), f countryFamilyAlerts) {
 	full, partial := f.subjects()
 	k := key{kCountryBlocked, n.ID, full}
 	partialKey := key{kCountryBlocked, n.ID, partial}
@@ -1261,7 +1325,15 @@ func (s *Service) countryNodeConds(n store.NodeRow, connected bool, signals []co
 	counted := countryCountedEvents(events)
 	seen := counted[:min(len(counted), countryAlertRounds)]
 	if len(seen) == countryAlertRounds && seen[0].bad() && seen[1].bad() {
-		add(f.decorate(countryCond(n, seen[0])))
+		c := countryCond(n, seen[0])
+		if rr, ok := relayReachability(); ok {
+			if rr.NodeReachedThroughRelays(n.ID, countryBlockedDirectPaths(rr.Input.Inbounds, n.ID, c.params["verdict"])) {
+				c = countryRelayCond(c)
+			}
+		} else if activeAlerts[k].Params["why"] == "reached_through_relays" {
+			c = countryRelayCond(c) // the access state could not be read: do not flip an alert on a failed read
+		}
+		add(f.decorate(c))
 		d.superseded[partialKey] = true
 		return
 	}
@@ -1343,15 +1415,29 @@ func countryTSPUSignal(r tspuRound, maxAge time.Duration, name string) countryAl
 }
 
 func countryExternalSignal(r store.ExtCheck, maxAge time.Duration) countryAlertSignal {
+	return countryExternalSignalFor(r, maxAge, countryreach.TSPUCountry, time.Now())
+}
+
+// countryExternalSignalFor is countryExternalSignal for the country the owner chose. Only the own probes look from the chosen
+// country; the other external sources are Russian by construction and keep the constant they always had.
+func countryExternalSignalFor(r store.ExtCheck, maxAge time.Duration, country string, now time.Time) countryAlertSignal {
 	var detail countryreach.ExtDetail
 	_ = json.Unmarshal([]byte(r.DetailJSON), &detail)
+	verdict, reason := r.Verdict, detail.Reason
+	signalCountry := countryreach.TSPUCountry
+	if r.Source == countryreach.SourceProbes {
+		detail, verdict, reason, _ = currentProbeDetail(r, maxAge, now)
+		if country != "" {
+			signalCountry = country
+		}
+	}
 	vantages := make([]countryAlertVantage, 0, len(detail.Vantages))
 	for _, v := range detail.Vantages {
-		vantages = append(vantages, countryAlertVantage{vantage: v, eyeball: externalSourceEyeball(r.Source)})
+		vantages = append(vantages, countryAlertVantage{vantage: v, eyeball: externalSourceEyeball(r.Source, v.Kind)})
 	}
-	return countryAlertSignal{nodeID: r.NodeID, source: r.Source, verdict: r.Verdict, reason: detail.Reason,
-		country: countryreach.TSPUCountry, at: r.At, maxAge: maxAge, interval: maxAge / 3,
-		eyeball: externalSourceEyeball(r.Source), path: externalSourcePath(r.Source), vantages: vantages}
+	return countryAlertSignal{nodeID: r.NodeID, source: r.Source, verdict: verdict, reason: reason,
+		country: signalCountry, at: r.At, maxAge: maxAge, interval: maxAge / 3,
+		eyeball: externalVantagesEyeball(r.Source, detail.Vantages), path: externalSourcePath(r.Source), vantages: vantages}
 }
 
 func blockedTSPUPorts(ports []countryreach.TSPUPort) []uint16 {
@@ -1423,8 +1509,8 @@ func countryEvents(signals []countryAlertSignal, nodeID string) []countryEvent {
 }
 
 // The shared list Combine supplies the verdict. A full result is demoted to partial for alerts unless a country-wide source
-// says it: Globalping, public cheburcheck or the TSPU probe. The owner's cheburcheck probe and bsbord select regions or single
-// networks, so even several of them agreeing raise only the partial alert, naming their networks.
+// says it (Broad in countryreach.Sources). The owner's cheburcheck probe and bsbord select regions or single networks, so even
+// several of them agreeing raise only the partial alert, naming their networks.
 func countryAlertCombine(live []countryreach.Live) countryreach.Combined {
 	c := countryreach.Combine(live, nil)
 	if countryBad(c.Verdict) && !countryAlertHasBroadBlock(live) {
@@ -1438,8 +1524,7 @@ func countryAlertHasBroadBlock(live []countryreach.Live) bool {
 		if !countryBad(row.Verdict) {
 			continue
 		}
-		switch row.Source {
-		case countryreach.SourceTSPU, countryreach.SourceCheburcheck, countryreach.SourceGlobalping:
+		if info, _ := countryreach.Info(row.Source); info.Broad {
 			return true
 		}
 	}
@@ -1481,10 +1566,26 @@ type countryObservation struct {
 // partial and that same vantage reached another fleet node. A full block, whitelist unit, or source outage is not a D/R.
 func countryObservations(events []countryEvent, signals []countryAlertSignal) map[string][]countryObservation {
 	observations := map[string][]countryObservation{}
-	for _, event := range events {
+	// A row of the own probes keeps the points of the probes that did not report this time, so one measurement sits in several
+	// rows. It counts once, in the oldest row that has it: the row it was made for.
+	probeOwner := map[string]int{}
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].signal.source != countryreach.SourceProbes {
+			continue
+		}
+		for _, item := range events[i].signal.vantages {
+			if m := probeMeasurement(events[i].signal, item.vantage); probeOwner[m] == 0 {
+				probeOwner[m] = i + 1
+			}
+		}
+	}
+	for i, event := range events {
 		byKey := map[string]countryObservation{}
 		for _, item := range event.signal.vantages {
 			v := item.vantage
+			if event.signal.source == countryreach.SourceProbes && probeOwner[probeMeasurement(event.signal, v)] != i+1 {
+				continue
+			}
 			if v.State == countryreach.VantageStateWhitelist || v.State == countryreach.VantageStateUncertain ||
 				(event.signal.source == countryreach.SourceGlobalping && !item.eyeball) {
 				continue
@@ -1540,7 +1641,8 @@ func countryVantageReachedAnother(signal countryAlertSignal, item countryAlertVa
 		}
 		delta := signal.at.Sub(other.at)
 		switch signal.source {
-		case countryreach.SourceTSPU, countryreach.SourceBsbord, countryreach.SourceBsbordTunnel, countryreach.SourceBsbordGeo:
+		case countryreach.SourceTSPU, countryreach.SourceBsbord, countryreach.SourceBsbordTunnel, countryreach.SourceBsbordGeo,
+			countryreach.SourceProbes:
 			if delta != 0 {
 				continue
 			}
@@ -1596,6 +1698,9 @@ func countryVantageName(source string, v countryreach.Vantage) string {
 	if v.Region != "" {
 		details = append(details, v.Region)
 	}
+	if v.ProbeName != "" { // an own probe's name rides in quotes after its network: the alert text names no language
+		name += " · “" + v.ProbeName + "”"
+	}
 	if source != countryreach.SourceGlobalping {
 		details = append(details, source)
 	}
@@ -1636,7 +1741,8 @@ func countryPartialCond(n store.NodeRow, events []countryEvent, signals []countr
 		latest := seen[0]
 		networks = append(networks, countryVantageName(latest.source, latest.vantage))
 		sources[latest.source] = true
-		if latest.source != countryreach.SourceTSPU {
+		if latest.source != countryreach.SourceTSPU &&
+			(latest.source != countryreach.SourceProbes || externalSourceEyeball(latest.source, latest.vantage.Kind)) {
 			confidence = countryreach.ConfidenceEyeball
 		}
 	}
@@ -1688,8 +1794,8 @@ func countryCond(n store.NodeRow, e countryEvent) cond {
 }
 
 // ReconcileCountry brings the COUNTRY_BLOCKED alerts up to date without the full evaluator, which the Cloudflare edition
-// does not run on the admin isolate. The edge calls it when the integration is switched off (globalping.Config.OnChange);
-// the cron tick's evaluator (EvaluateOnce) derives these alerts itself. Alerts of other kinds are left alone.
+// does not run on the admin isolate. Every source of the country check calls it (its Config.OnChange) when its settings change
+// or it stored a result; the cron tick's evaluator (EvaluateOnce) derives these alerts itself. Alerts of other kinds are left alone.
 func (s *Service) ReconcileCountry(ctx context.Context) {
 	s.evalMu.Lock()
 	defer s.evalMu.Unlock()

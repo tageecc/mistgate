@@ -28,8 +28,13 @@ One subscription link serves every app. The panel picks the format by the app's 
 | v2rayNG, v2rayN and other apps on the Xray core | Link list (base64), or Xray JSON by a rule of yours | Hysteria2 and VLESS servers. In the link list, whether the app reads `hysteria2://` and `vless://` (REALITY, XHTTP) links depends on its version. In Xray JSON, one config per server; no AmneziaWG, no Hysteria2 with Gecko. |
 | sing-box apps (SFA, SFI, SFM) | sing-box JSON: their User-Agent starts with `SFA (sing-box …`, `SFI (sing-box …` or `SFM (sing-box …`, which the default rule `sing-box` takes | One switch with Hysteria2 (Let's Encrypt, no Gecko) and VLESS (TCP or WebSocket) servers and the person's DNS. See [sing-box](#sing-box). |
 | AmneziaVPN, AmneziaWG apps | No subscription: a key per device (`vpn://`, a `.conf` file or a QR code) from the person's page | AmneziaWG only. |
+| Telegram | No subscription: a `tg://proxy` link from the person's page or the admin | The MTProto servers only, with one key per person. See [Telegram](#telegram). |
 
 The AmneziaWG servers reach an app on the mihomo core only when the person has the AmneziaVPN way switched on (**Apps in the subscription** on the user card or the group) and the group has an AmneziaWG profile on a node. The first fetch by such an app gives its device the AmneziaWG keys. The core must be new enough: the panel lists Mihomo 1.19.30 or newer for AmneziaWG 3.1 and 1.19.14 for 2.0, next to every key ([AmneziaWG](amneziawg.md)).
+
+**TrustTunnel.** The [TrustTunnel profile](trusttunnel.md) is read by the **official TrustTunnel apps** (iOS, Android, Windows, macOS, Linux and routers; the list is in the Clients section of <https://github.com/TrustTunnel/TrustTunnel>) and by the Mistgate app. The official apps read no subscription: the person gets one `tt://` link per server, or a QR code, and opens it in the app. The links come from the **TrustTunnel** block of the person's page ([User page](user-page.md#telegram-proxy)) and of the person in the admin, never from a subscription. A `tt://` link is always HTTP/2, and it needs a server with a public certificate.
+
+The apps are not in the apps list of **Subscriptions → User page**. The person needs the switch **TrustTunnel** on ([Users and groups](users-and-groups.md#trusttunnel)). The protocol is experimental.
 
 ## Which apps send a device ID
 
@@ -71,6 +76,12 @@ These are the templates of the known apps. Each scheme is confirmed by the app's
 - Happ's own documentation does not describe `happ://add/`. It is the form subscription pages of other panels use, and the one Mistgate has shipped by default. If the button does nothing on a phone, the person copies the link instead.
 - Not offered in the picker, because their schemes are not confirmed: Streisand and Shadowrocket (leave the template empty and people paste the link).
 - The `clash://` scheme is claimed by several Clash apps, so the system may open another one. Use the app's own scheme, as above.
+
+## Telegram
+
+The Telegram app is a client of the [MTProto profile](mtproto.md), and it is the only app that uses it. It reads no subscription: a person gets one `tg://proxy` link per server, and Telegram offers to add it as a proxy. The links come from the **Telegram proxy** block of the person's page ([User page](user-page.md#telegram-proxy)) and of the person in the admin. They are never put into a subscription, so Happ, kl!ck and the other apps never see them.
+
+The Telegram app is not in the apps list of **Subscriptions → User page**: there is nothing to download or to add by a template. The person only needs the switch **Telegram proxy** on, which is in addition to the link apps or AmneziaVPN ([Users and groups](users-and-groups.md#telegram-proxy)). The protocol is experimental.
 
 ## kl!ck
 
@@ -122,4 +133,4 @@ The defaults are only what an unsaved panel shows. Once you have saved the setti
 
 ## Through MCP
 
-An agent with Operator access or higher manages the same list with `subscription_settings_get`, `subscription_app_upsert_plan` / `subscription_app_upsert_apply` and `subscription_app_remove_plan` / `subscription_app_remove_apply`. Every change to the page waits for the owner: the owner approves it in **Integrations → Waiting for you**, and the card shows each field in full. A worked example that adds kl!ck for Windows and macOS is in [MCP](../reference/mcp.md#example-add-klck-for-windows-and-macos). The prompt of the [AI agent guide](../getting-started/ai-agents.md) includes the step.
+An agent with Operator access or higher manages the same list with `subscription_settings_get`, `subscription_app_upsert_plan` / `subscription_app_upsert_apply` and `subscription_app_remove_plan` / `subscription_app_remove_apply`. Every change to the page waits for the owner: the owner approves it in **AI → Waiting for you**, and the card shows each field in full. A worked example that adds kl!ck for Windows and macOS is in [MCP](../reference/mcp.md#example-add-klck-for-windows-and-macos). The prompt of the [AI agent guide](../getting-started/ai-agents.md) includes the step.

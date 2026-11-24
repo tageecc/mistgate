@@ -1,14 +1,12 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useState, type ReactNode } from "react";
-import { AddNodeProvider, InstallSteps, useAddNode } from "@/components/add-node";
+import { AddNodeProvider, AddNodeWindow, useAddNode } from "@/components/add-node";
 import { SectionLabel } from "@/components/ui/bits";
 import { Button } from "@/components/ui/button";
-import { Modal } from "@/components/ui/modal";
 import { Role } from "@/gen/mistgate/admin/v1/auth_pb";
 import { NodeStatus } from "@/gen/mistgate/admin/v1/common_pb";
 import { EventSeverity, OverviewRange } from "@/gen/mistgate/admin/v1/fleet_pb";
 import { AlertKind, AlertSeverity } from "@/gen/mistgate/admin/v1/health_pb";
-import { useT } from "@/i18n";
 import { alertsQuery, checksQuery } from "@/lib/health";
 import { nodeQuery, nodesQuery, overviewQuery, userCountQuery } from "@/lib/queries";
 import { meQuery } from "@/lib/session";
@@ -154,6 +152,11 @@ const nodeEvents = [
   event("agent_started", 19_970, { params: { version: "0.3.0", prev_version: "0.3.1", reason: "update" } }),
   event("agent_started", 20_300, { params: { version: "0.3.1", prev_version: "0.3.0", reason: "update" } }),
   event("port_lossy", 1800, { severity: EventSeverity.WARNING, params: { inbound: "inb_2", profile: "hy2 · WARP · 8443", port: "8443", sent: "300", got: "189", sender: "de2" }, profileName: "hy2 · WARP · 8443", inboundId: "inb_2", source: "panel" }),
+  // checked again from a second sender: lost from both (the port), and this node's own packets lost on the way to nl1
+  event("port_lossy", 1500, { severity: EventSeverity.WARNING, params: { inbound: "inb_1", profile: "Hysteria2 · 443", port: "443", sent: "300", got: "241", sender: "minsk1", confirm_sender: "fi1", confirm_sent: "300", confirm_got: "238" }, profileName: "Hysteria2 · 443", inboundId: "inb_1", source: "panel" }),
+  event("path_lossy", 1200, { severity: EventSeverity.WARNING, params: { target: "nl1", target_id: "nod_nl1", ports: "2053, 2083", sent: "300", got: "236", other: "fi1", other_got: "299", region: "other", other_region: "other" }, source: "panel" }),
+  // a filter on the way, not a lossy line: only 443 got through to fi1, the other ports nothing
+  event("path_lossy", 1100, { severity: EventSeverity.WARNING, params: { target: "fi1", target_id: "nod_fi1", ports: "2053, 8443", open: "443", sent: "300", got: "0", other: "msk1", other_got: "300", region: "other", other_region: "cis" }, source: "panel" }),
   event("node_blip", 30_000, { params: { minutes: "3", rebooted: "true" }, source: "panel" }),
   event("clock_skew", 40_000, { severity: EventSeverity.WARNING, params: { offset_s: "4" } }),
   event("engine_failed", 50_000, { severity: EventSeverity.ERROR, params: { error: "listen udp :8443: bind: address already in use" }, profileName: "hy2 · WARP · 8443", inboundId: "inb_2" }),
@@ -166,7 +169,8 @@ const nodeEvents = [
 function EventsDemo() {
   const [qc] = useState(() => {
     const c = client(empty);
-    c.setQueryData(["node-events", "nod_demo", "all"], { pages: [{ events: nodeEvents, hasMore: false }], pageParams: [0] });
+    // EventsTab's key: filter, cursor (0 = newest page), page size
+    c.setQueryData(["node-events", "nod_demo", "all", 0, 50], { events: nodeEvents, hasMore: false });
     return c;
   });
   return (
@@ -188,7 +192,6 @@ const issued = (over: Over = {}) =>
   }) as never;
 
 function InstallDemo({ variant, onClose }: { variant: "scp" | "manual" | "connected"; onClose: () => void }) {
-  const t = useT();
   const [qc] = useState(() => {
     const c = client(empty);
     c.setQueryData(nodeQuery("nod_demo").queryKey, {
@@ -199,9 +202,12 @@ function InstallDemo({ variant, onClose }: { variant: "scp" | "manual" | "connec
   });
   return (
     <QueryClientProvider client={qc}>
-      <Modal open onOpenChange={(o) => !o && onClose()} title={t("node.add.commandTitle", { name: "de1" })} description={t("node.add.commandBody")}>
-        <InstallSteps issued={issued(variant === "manual" ? { copyCommand: "" } : {})} onClose={onClose} />
-      </Modal>
+      <AddNodeWindow
+        open
+        initialMode="cmd"
+        onClose={onClose}
+        seed={{ draft: { name: "de1", address: "de1.example.com" }, issued: issued(variant === "manual" ? { copyCommand: "" } : {}) }}
+      />
     </QueryClientProvider>
   );
 }

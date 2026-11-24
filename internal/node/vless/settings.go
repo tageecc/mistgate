@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 
@@ -52,6 +53,9 @@ type settings struct {
 
 type realitySettings struct {
 	self bool // target "self": the node's own site behind REALITY
+	// nodeTarget: the target was set on the node (vless-target/1), not in the profile. A profile's target may be a site next to the
+	// node (127.0.0.1:8443); one set on a node must be a site of the internet (checkTargetPublic).
+	nodeTarget bool
 	// dialNet and dialAddr are where REALITY forwards non-clients: the target for a site, the inbound's own site socket for
 	// self (filled in when the inbound starts).
 	dialNet, dialAddr string
@@ -157,10 +161,16 @@ func parseSpec(spec plugin.InboundSpec) (settings, error) {
 			}
 			out.reality.serverNames = []string{name}
 		} else {
-			if spec.TLS.Mode != 0 || spec.TLS.ServerName != "" {
+			if spec.TLS.Mode != 0 {
 				return out, errors.New("TLS fields are only supported with security tls or reality target self")
 			}
-			if err := validateTarget(out.reality.target); err != nil {
+			// A target set on this node (vless-target/1) names the one server name in the TLS block, without a certificate.
+			ownName := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(spec.TLS.ServerName), "."))
+			if ownName != "" && (len(raw.Reality.ServerNames) != 1 || !strings.EqualFold(strings.TrimSuffix(strings.TrimSpace(raw.Reality.ServerNames[0]), "."), ownName)) {
+				return out, errors.New("reality.server_names must be exactly the tls server name for a target set on the node")
+			}
+			out.reality.nodeTarget = ownName != ""
+			if err := validateTarget(out.reality.target, spec.Listen.Port); err != nil {
 				return settings{}, fmt.Errorf("reality.target: %w", err)
 			}
 			if len(raw.Reality.ServerNames) == 0 || len(raw.Reality.ServerNames) > 8 {
@@ -259,7 +269,7 @@ func validateWSPath(path string) error {
 	return nil
 }
 
-func validateTarget(target string) error {
+func validateTarget(target string, listenPort uint16) error {
 	host, portText, err := net.SplitHostPort(target)
 	if err != nil || strings.TrimSpace(host) == "" {
 		return errors.New("must be a host:port")
@@ -268,7 +278,26 @@ func validateTarget(target string) error {
 	if err != nil || port == 0 {
 		return errors.New("port must be 1-65535")
 	}
+	// A local target on another port is a site next to the node and works; only the inbound's own port is a loop.
+	if port == uint64(listenPort) && localTargetHost(host) {
+		return errors.New("target points at this inbound's own listen port; use target self for the node's own site")
+	}
 	return nil
+}
+
+// localTargetHost uses only the host text; validation must not resolve names. Dialing an unspecified address
+// reaches the local host on Linux, so it counts as local.
+func localTargetHost(host string) bool {
+	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(strings.Trim(host, "[]")), "."))
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	addr = addr.Unmap()
+	return addr.IsLoopback() || addr.IsUnspecified()
 }
 
 func validServerName(name string) bool {

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"connectrpc.com/connect"
@@ -96,7 +97,8 @@ func (s *Service) BeginAddPasskey(ctx context.Context, req *connect.Request[admi
 	if err != nil {
 		return nil, errInternal(err)
 	}
-	id, err := s.putCeremony(ctx, &ceremony{kind: ceremonyAddPasskey, src: SourceKey(s.clientIP(req)), data: *data, admin: admin, name: name})
+	// bound to this session, like step-up and TOTP enrollment: the step-up above was this session's
+	id, err := s.putCeremony(ctx, &ceremony{kind: ceremonyAddPasskey, src: SourceKey(s.clientIP(req)), data: *data, admin: admin, name: name, tokenHash: s.currentHash(req)})
 	if err != nil {
 		return nil, ceremonyPutError(err)
 	}
@@ -109,8 +111,10 @@ func (s *Service) FinishAddPasskey(ctx context.Context, req *connect.Request[adm
 	if err != nil {
 		return nil, err
 	}
-	// another admin's ceremony is as good as unknown
-	c, err := s.takeCeremony(ctx, req.Msg.CeremonyId, ceremonyAddPasskey, func(c *ceremony) bool { return c.admin.ID == admin.ID })
+	// another admin's ceremony, or one begun in another session of the same admin, is as good as unknown
+	c, err := s.takeCeremony(ctx, req.Msg.CeremonyId, ceremonyAddPasskey, func(c *ceremony) bool {
+		return c.admin.ID == admin.ID && bytes.Equal(c.tokenHash, s.currentHash(req))
+	})
 	if errors.Is(err, errCeremonyGone) {
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("registration expired, start again"))
 	}
@@ -162,14 +166,20 @@ func (s *Service) RemovePasskey(ctx context.Context, req *connect.Request[adminv
 		s.log.Error("delete passkey", "err", err)
 		return nil, errInternal(err)
 	}
+	// A removed passkey is what the owner does after losing a device: sessions it opened must not outlive it.
+	ended, err := s.st.DeleteOtherSessions(ctx, admin.ID, s.currentHash(req))
+	if err != nil {
+		s.log.Error("end other sessions", "code", "passkey_remove_end_sessions_failed", "err", err)
+		return nil, errInternal(err)
+	}
 	ip := s.clientIP(req)
-	s.audit(ctx, admin.ID, "passkey_remove", "ok", ip, map[string]any{"passkey": req.Msg.Id})
+	s.audit(ctx, admin.ID, "passkey_remove", "ok", ip, map[string]any{"passkey": req.Msg.Id, "sessions_ended": ended})
 	s.emit(Event{Kind: EventPasskeyRemoved, AdminID: admin.ID, Method: "passkey", IP: ip.String()})
 	return connect.NewResponse(&adminv1.RemovePasskeyResponse{}), nil
 }
 
-func currentHash(req connect.AnyRequest) []byte {
-	if tok := sessionToken(req.Header()); tok != "" {
+func (s *Service) currentHash(req connect.AnyRequest) []byte {
+	if tok := s.sessionToken(req.Header()); tok != "" {
 		return hashToken(tok)
 	}
 	return nil
@@ -186,7 +196,7 @@ func (s *Service) ListSessions(ctx context.Context, req *connect.Request[adminv1
 		s.log.Error("list sessions", "err", err)
 		return nil, errInternal(err)
 	}
-	cur, now := currentHash(req), s.now()
+	cur, now := s.currentHash(req), s.now()
 	resp := &adminv1.ListSessionsResponse{}
 	for _, sess := range all {
 		if !now.Before(sess.ExpiresAt) || now.Sub(sess.LastSeenAt) >= SessionIdleTTL {
@@ -210,7 +220,7 @@ func (s *Service) EndSession(ctx context.Context, req *connect.Request[adminv1.E
 	if err != nil || len(h) != len(hashToken("")) {
 		return nil, connect.NewError(connect.CodeNotFound, errors.New("no such session"))
 	}
-	if !bytes.Equal(h, currentHash(req)) { // ending the current session is a logout; ending another one needs a step-up
+	if !bytes.Equal(h, s.currentHash(req)) { // ending the current session is a logout; ending another one needs a step-up
 		if err := s.RequireStepUp(ctx); err != nil {
 			return nil, err
 		}
@@ -225,8 +235,8 @@ func (s *Service) EndSession(ctx context.Context, req *connect.Request[adminv1.E
 	}
 	s.audit(ctx, admin.ID, "session_end", "ok", s.clientIP(req), nil)
 	resp := connect.NewResponse(&adminv1.EndSessionResponse{})
-	if bytes.Equal(h, currentHash(req)) {
-		resp.Header().Add("Set-Cookie", clearedCookie().String())
+	if bytes.Equal(h, s.currentHash(req)) {
+		resp.Header().Add("Set-Cookie", s.clearedCookie().String())
 	}
 	return resp, nil
 }
@@ -240,7 +250,7 @@ func (s *Service) EndOtherSessions(ctx context.Context, req *connect.Request[adm
 	if err := s.RequireStepUp(ctx); err != nil {
 		return nil, err
 	}
-	n, err := s.st.DeleteOtherSessions(ctx, admin.ID, currentHash(req))
+	n, err := s.st.DeleteOtherSessions(ctx, admin.ID, s.currentHash(req))
 	if err != nil {
 		s.log.Error("delete other sessions", "err", err)
 		return nil, errInternal(err)
@@ -263,10 +273,11 @@ var (
 )
 
 var auditSources = map[adminv1.AuditSource]string{
-	adminv1.AuditSource_AUDIT_SOURCE_PANEL: store.AuditPanel,
-	adminv1.AuditSource_AUDIT_SOURCE_BOT:   store.AuditBot,
-	adminv1.AuditSource_AUDIT_SOURCE_MCP:   store.AuditMCP,
-	adminv1.AuditSource_AUDIT_SOURCE_API:   store.AuditAPI,
+	adminv1.AuditSource_AUDIT_SOURCE_PANEL:     store.AuditPanel,
+	adminv1.AuditSource_AUDIT_SOURCE_BOT:       store.AuditBot,
+	adminv1.AuditSource_AUDIT_SOURCE_MCP:       store.AuditMCP,
+	adminv1.AuditSource_AUDIT_SOURCE_API:       store.AuditAPI,
+	adminv1.AuditSource_AUDIT_SOURCE_ASSISTANT: store.AuditAssistant,
 }
 
 // ListAudit pages through the audit log (owner only), optionally for one source.
@@ -298,6 +309,16 @@ func (s *Service) ListAudit(ctx context.Context, req *connect.Request[adminv1.Li
 	default:
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("unknown audit kind"))
 	}
+	if req.Msg.FailedOnly {
+		q.Failed = true
+	}
+	if req.Msg.Hours > 0 {
+		q.Since = s.now().Add(-time.Duration(min(req.Msg.Hours, 8760)) * time.Hour)
+	}
+	if len(req.Msg.ActionContains) > 100 || len(req.Msg.ActorContains) > 100 {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("action_contains and actor_contains are at most 100 characters"))
+	}
+	q.Contains, q.Actor = req.Msg.ActionContains, req.Msg.ActorContains
 	rows, err := s.st.ListAuditQuery(ctx, q)
 	if err != nil {
 		s.log.Error("list audit", "err", err)

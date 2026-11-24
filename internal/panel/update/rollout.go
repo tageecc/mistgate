@@ -2,10 +2,12 @@ package update
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"regexp"
 	"slices"
 	"sort"
@@ -16,6 +18,7 @@ import (
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
 	agentv1 "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/internal/agentcap"
 	"github.com/mistgate/mistgate/internal/panel/store"
 	"github.com/mistgate/mistgate/internal/release"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -69,7 +72,7 @@ func notFound(what string) error {
 var errInternal = connect.NewError(connect.CodeInternal, errors.New("internal error"))
 
 func (s *Service) internal(what string, err error) error {
-	s.log.Error("update: "+what, "err", err)
+	s.log.Error("update: "+what, "code", "update_internal_error", "err", err)
 	return errInternal
 }
 
@@ -100,6 +103,24 @@ func defaultBatch(nodes int) int {
 		return 1
 	}
 	return 2
+}
+
+// SortRolloutCandidates applies the canary order used by StartRollout and returns its default batch size.
+func SortRolloutCandidates(nodes []*adminv1.NodeUpdate) int {
+	byID := make(map[string]*adminv1.NodeUpdate, len(nodes))
+	views := make([]nodeView, 0, len(nodes))
+	for _, n := range nodes {
+		byID[n.GetNodeId()] = n
+		views = append(views, nodeView{
+			row:    store.NodeRow{ID: n.GetNodeId(), Name: n.GetName()},
+			online: int(n.GetOnlineUsers()), inbounds: int(n.GetInbounds()),
+		})
+	}
+	canaryOrder(views)
+	for i, view := range views {
+		nodes[i] = byID[view.row.ID]
+	}
+	return defaultBatch(len(nodes))
 }
 
 // canaryOrder puts the node with the fewest online users first, then the fewest inbounds, then by name.
@@ -147,6 +168,11 @@ func (s *Service) beginPanelUpdate(ctx context.Context) error {
 		return precondition("finish or cancel the active node rollout before updating the panel")
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return s.internal("check active rollout before panel update", err)
+	}
+	if active, err := s.osRolloutRunning(ctx); err != nil {
+		return s.internal("check OS rollout before panel update", err)
+	} else if active {
+		return precondition("an OS update of a node is running; wait for it to finish before updating the panel")
 	}
 	s.panelInstalling = true
 	return nil
@@ -201,7 +227,7 @@ func (s *Service) startWithActorAndSchedule(ctx context.Context, nodeIDs []strin
 		return store.RolloutRow{}, precondition("a panel update is being installed")
 	}
 	if !s.cfg.Edge {
-		b = s.rescan() // what is on disk now is what ships
+		b = s.rescanForRequest() // what is on disk now is what ships; ASN parsing stays off the request path
 	}
 	if !b.trusted {
 		return store.RolloutRow{}, precondition("no trusted bundle")
@@ -211,6 +237,11 @@ func (s *Service) startWithActorAndSchedule(ctx context.Context, nodeIDs []strin
 	}
 	if pin != nil && (pin.version != b.manifest.Version || pin.built != b.manifest.Built) {
 		return store.RolloutRow{}, precondition("the update bundle changed; review the new version")
+	}
+	if active, err := s.osRolloutRunning(ctx); err != nil {
+		return store.RolloutRow{}, s.internal("check OS rollout", err)
+	} else if active {
+		return store.RolloutRow{}, precondition("an OS update of a node is running; wait for it to finish")
 	}
 	active, activeErr := s.st.ActiveRollout(ctx)
 	if activeErr == nil {
@@ -416,6 +447,9 @@ func (s *Service) resume(ctx context.Context, id string) (store.RolloutRow, erro
 	if ro.Status != store.RolloutPaused {
 		return ro, precondition("rollout is not paused")
 	}
+	if isCancelWait(ro.PauseKey, nil) {
+		return ro, precondition("rollout cancellation is waiting for a node to finish")
+	}
 	steps, err := s.st.RolloutSteps(ctx, ro.ID)
 	if err != nil {
 		return ro, s.internal("load steps", err)
@@ -442,16 +476,23 @@ func (s *Service) cancel(ctx context.Context, id string) (store.RolloutRow, erro
 		return ro, s.internal("cancel rollout", err)
 	}
 	s.audit(ctx, "update_rollout_cancel", map[string]string{"rollout_id": ro.ID})
-	if ro.Status == store.RolloutPaused {
-		// finishIfDone ends a PAUSED rollout only when this cancel skipped a step. With nothing pending (a fleet of one,
-		// or the last step failed) it would stay paused for ever, with its alert: a cancelled rollout waits for nobody.
-		if _, err := s.st.SetRolloutStatus(ctx, ro.ID, []string{store.RolloutPaused}, store.RolloutRunning, "", nil, time.Time{}); err != nil {
+	steps, err := s.st.RolloutSteps(ctx, ro.ID)
+	if err != nil {
+		return ro, s.internal("load steps", err)
+	}
+	if cancelMustWaitForStep(steps, func(x store.StepRow) bool { return x.State == store.StepSent || x.State == store.StepGating }) {
+		if _, err := s.st.SetRolloutStatus(ctx, ro.ID, []string{ro.Status}, store.RolloutPaused, pauseCancelWait, nil, time.Time{}); err != nil {
 			return ro, s.internal("cancel rollout", err)
 		}
-		ro.Status = store.RolloutRunning
-	}
-	if steps, err := s.st.RolloutSteps(ctx, ro.ID); err == nil {
-		s.finishIfDone(ctx, ro, steps) // nothing in flight: ends now; else when the steps in flight are decided
+		ro.Status, ro.PauseKey = store.RolloutPaused, pauseCancelWait
+	} else {
+		ok, err := s.st.SetRolloutStatus(ctx, ro.ID, []string{ro.Status}, store.RolloutCancelled, "", nil, s.now())
+		if err != nil {
+			return ro, s.internal("cancel rollout", err)
+		}
+		if ok {
+			s.startNodeBundleSyncLocked()
+		}
 	}
 	s.loadUpdating(ctx)
 	return s.reload(ctx, ro.ID)
@@ -469,7 +510,7 @@ func (s *Service) reload(ctx context.Context, id string) (store.RolloutRow, erro
 // CANCELLED (the owner cancelled). A PAUSED rollout is only ended this way after a cancel: otherwise the pause (and
 // its alert) waits for the owner.
 func (s *Service) finishIfDone(ctx context.Context, ro store.RolloutRow, steps []store.StepRow) bool {
-	cancelled, bad := false, false
+	cancelled, bad := ro.Status == store.RolloutPaused && isCancelWait(ro.PauseKey, nil), false
 	for _, x := range steps {
 		switch {
 		case !x.Decided():
@@ -485,15 +526,18 @@ func (s *Service) finishIfDone(ctx context.Context, ro store.RolloutRow, steps [
 	}
 	status := store.RolloutDone
 	switch {
-	case bad:
-		status = store.RolloutFailed
 	case cancelled:
 		status = store.RolloutCancelled
+	case bad:
+		status = store.RolloutFailed
 	}
 	ok, err := s.st.SetRolloutStatus(ctx, ro.ID, []string{store.RolloutRunning, store.RolloutPaused}, status, "", nil, s.now())
 	if err != nil {
 		s.log.Warn("update: finish rollout", "rollout", ro.ID, "err", err)
 		return false
+	}
+	if ok {
+		s.startNodeBundleSyncLocked() // the bundle the rollout kept waiting is fetched now, not at the next poll
 	}
 	return ok
 }
@@ -509,6 +553,10 @@ type pass struct {
 	steps []store.StepRow
 	live  map[string]store.NodeLiveRow
 	now   time.Time
+	// downloadWait is loaded once per worker pass so an in-flight edge step and
+	// the command deadline use the same panel setting without one database read
+	// per node.
+	downloadWait time.Duration
 }
 
 func (s *Service) tick(ctx context.Context) {
@@ -538,7 +586,7 @@ func (s *Service) tick(ctx context.Context) {
 	for _, row := range liveRows {
 		live[row.NodeID] = row
 	}
-	p := &pass{s: s, ctx: ctx, ro: ro, steps: steps, live: live, now: now}
+	p := &pass{s: s, ctx: ctx, ro: ro, steps: steps, live: live, now: now, downloadWait: s.downloadTimeoutOrDefault(ctx)}
 	for i := range p.steps {
 		switch p.steps[i].State {
 		case store.StepSent:
@@ -571,11 +619,13 @@ func (p *pass) save(x *store.StepRow) bool {
 func (p *pass) finish(x *store.StepRow, state, key string, params map[string]string) bool {
 	updated := *x
 	updated.State, updated.ErrorKey, updated.Params, updated.FinishedAt = state, key, params, p.now
-	updated.RequestID, updated.RequestAt, updated.Answer, updated.DownloadSHA = "", time.Time{}, "", ""
+	updated.RequestID, updated.RequestAt, updated.Answer, updated.DownloadSHA, updated.AnswerWait = "", time.Time{}, "", "", 0
+	updated.ProgressPhase, updated.ProgressRank, updated.ProgressDownloaded, updated.ProgressTotal, updated.ProgressSpeed, updated.ProgressUpdatedUnix, updated.ProgressError, updated.ProgressSource = "", -1, 0, 0, 0, 0, "", ""
 	if !p.save(&updated) {
 		return false
 	}
 	*x = updated
+	p.s.clearProgress(x.NodeID)
 	delete(p.s.failing, x.NodeID)
 	p.event(x, state, key)
 	if state == store.StepPassed {
@@ -589,9 +639,10 @@ func (p *pass) finish(x *store.StepRow, state, key string, params map[string]str
 	return true
 }
 
-// finishAndPause keeps the VPS handler's historical pause behavior, while an edge pass pauses only after it wins the step CAS.
+// finishAndPause ends a step and pauses the rollout for it. A pass that did not win the write of its step (the step was
+// decided meanwhile) pauses nothing.
 func (p *pass) finishAndPause(x *store.StepRow, state, key string, params map[string]string, pauseCode, reason string) {
-	if p.finish(x, state, key, params) || !p.s.cfg.Edge {
+	if p.finish(x, state, key, params) {
 		p.pause(pauseCode, x, reason)
 	}
 }
@@ -613,6 +664,7 @@ func (p *pass) event(x *store.StepRow, state, key string) {
 	if key != "" {
 		params["reason"] = key
 	}
+	maps.Copy(params, failedProfileNotes(x.Params))
 	if err := p.s.st.InsertEvent(p.ctx, store.EventRow{Time: p.now, Severity: sev, Code: code, Source: "panel", NodeID: x.NodeID, Params: params}); err != nil {
 		p.s.log.Warn("update: step event", "node", x.NodeID, "err", err)
 	}
@@ -620,15 +672,18 @@ func (p *pass) event(x *store.StepRow, state, key string) {
 
 // pause stops the rollout because of a step; a pause by the owner gives way to a failure, a failure stays as the first said it.
 func (p *pass) pause(code string, x *store.StepRow, reason string) {
-	if p.ro.Status != store.RolloutRunning && p.ro.PauseKey != pauseOwner {
+	if p.ro.Status != store.RolloutRunning && !(p.ro.Status == store.RolloutPaused && p.ro.PauseKey == pauseOwner) {
 		return
 	}
 	params := map[string]string{"node": x.NodeName, "node_id": x.NodeID, "reason": reason}
-	ok, err := p.s.st.SetRolloutStatus(p.ctx, p.ro.ID, []string{store.RolloutRunning, store.RolloutPaused}, store.RolloutPaused, code, params, time.Time{})
+	maps.Copy(params, failedProfileNotes(x.Params)) // the profiles that did not pass: the owner reads them on the pause too
+	// A second writer must keep a pause it recorded unless an owner resumed after this pass read the old one.
+	ro, ok, err := pauseOverRead(p.ctx, p.ro.ID, p.ro, code, params, rolloutPauseState, rolloutPauseCAS{p.s.st})
 	if err != nil {
 		p.s.log.Warn("update: pause rollout", "rollout", p.ro.ID, "err", err)
 		return
 	}
+	p.ro = ro
 	if ok {
 		p.ro.Status, p.ro.PauseKey, p.ro.PauseParams = store.RolloutPaused, code, params
 		p.s.log.Warn("update: rollout paused", "rollout", p.ro.ID, "reason", code, "node", x.NodeName, "detail", reason)
@@ -665,9 +720,10 @@ func (p *pass) advanceSent(i int) {
 	if connected && n.AgentBuilt >= p.ro.ToBuilt {
 		updated := *x
 		updated.State, updated.ReconnectedAt = store.StepGating, p.now
-		updated.RequestID, updated.RequestAt, updated.Answer, updated.DownloadSHA = "", time.Time{}, "", ""
+		updated.RequestID, updated.RequestAt, updated.Answer, updated.DownloadSHA, updated.AnswerWait = "", time.Time{}, "", "", 0
 		if p.save(&updated) {
 			*x = updated
+			p.s.clearProgress(x.NodeID)
 		}
 		return
 	}
@@ -700,7 +756,7 @@ func (p *pass) advanceSent(i int) {
 		if p.now.After(x.AckedAt.Add(cfg.ReconnectWait)) {
 			p.finishAndPause(x, store.StepFailed, errNotReconnected, nil, pauseGateFailed, errNotReconnected)
 		}
-	case p.now.After(x.SentAt.Add(cfg.AnswerWait + cfg.ReconnectWait)):
+	case p.now.After(x.SentAt.Add(p.stepAnswerWait(x) + cfg.ReconnectWait)):
 		pauseCode := pauseGateFailed
 		if p.s.orphans[x.NodeID] { // nobody has been waiting for this answer since the panel restarted
 			pauseCode = pausePanelRestart
@@ -709,24 +765,46 @@ func (p *pass) advanceSent(i int) {
 	}
 }
 
+func (p *pass) configuredAnswerWait(n store.NodeRow) time.Duration {
+	wait := p.s.cfg.AnswerWait
+	if p.downloadTimeoutFor(n) > 0 && wait < p.downloadWait+time.Minute {
+		wait = p.downloadWait + time.Minute
+	}
+	return wait
+}
+
+func (p *pass) downloadTimeoutFor(n store.NodeRow) time.Duration {
+	if !slices.Contains(n.AgentCaps, agentcap.UpdateTimeout) {
+		return 0
+	}
+	return p.downloadWait
+}
+
+func (p *pass) stepAnswerWait(x *store.StepRow) time.Duration {
+	if x.AnswerWait > 0 {
+		return x.AnswerWait
+	}
+	// Steps created before answer_wait_seconds was introduced have no snapshot.
+	// Keep their historical behavior while all newly sent steps persist one.
+	return p.s.cfg.AnswerWait
+}
+
 // gateResult is the outcome of one evaluation of the gate.
 type gateResult struct {
 	pass bool
 	hard string // a failure that ends the gate now
 	soft string // what is still missing; it fails the gate only at the deadline
 	with map[string]string
+	wait bool // the second vantage runs: do not fail at the deadline yet (it ends within its own timeout)
+	// waiting are the names of the profiles that have not passed yet (failed since the start, or without an OK round of the
+	// checker): the OS update shows them while it waits.
+	waiting []string
 }
 
-// gate evaluates the rollout gate for a node that is back with the new build.
+// gate evaluates the rollout gate for a node that is back with the new build: the new build confirmed itself (update_committed),
+// and the node is healthy (healthGate).
 func (p *pass) gate(x *store.StepRow, n store.NodeRow, drift bool) gateResult {
 	s := p.s
-	var soft string
-	with := map[string]string{}
-	miss := func(key string) {
-		if soft == "" {
-			soft = key
-		}
-	}
 	committed := false
 	if lu, ok := p.recentLast(n, x); ok && lu.Outcome == "ok" {
 		committed = true
@@ -738,19 +816,38 @@ func (p *pass) gate(x *store.StepRow, n store.NodeRow, drift bool) gateResult {
 			committed = true
 		}
 	}
-	if !committed {
-		miss(errNotCommitted)
+	g := s.healthGate(p.ctx, x.NodeID, n, drift, x.ReconnectedAt, x.PreFailed, p.now, committed)
+	if g.hard == "" && !committed { // the first thing missing is what the owner reads
+		g.pass, g.soft = false, errNotCommitted
+	}
+	return g
+}
+
+// healthGate is the part of the gate that looks at what the node does, shared by the agent rollout and the OS rollout: the
+// desired state is applied, no profile that worked before is failed (30 s of grace), WARP is up where a profile leaves through
+// it, and the synthetic probes have run since `since` (the node was back). preFailed are the profiles that were already failed
+// before the change. settled: the node's own word that the job is done (the OS job) or the update committed; with it the probes may
+// pass on the relaxed rule of vantage.go when only the panel's own path is lossy.
+func (s *Service) healthGate(ctx context.Context, nodeID string, n store.NodeRow, drift bool, since time.Time, preFailed []string, now time.Time, settled bool) gateResult {
+	var soft string
+	with := map[string]string{}
+	miss := func(key string) {
+		if soft == "" {
+			soft = key
+		}
 	}
 	if drift || (n.DesiredHash != "" && n.AppliedHash != n.DesiredHash) {
 		miss(errStateNotApplied)
 	}
-	inbounds, err := s.st.FleetInbounds(p.ctx, x.NodeID, true)
+	inbounds, err := s.st.FleetInbounds(ctx, nodeID, true)
 	if err != nil {
 		miss(errInboundsUnread)
 	}
-	var newlyFailed []string
+	var newlyFailed, pending []string
+	label := map[string]string{} // inbound id -> the name of its profile
 	warpEgress := false
 	for _, in := range inbounds {
+		label[in.ID] = cmp.Or(in.ProfileName, in.Protocol)
 		var settings struct {
 			Egress string `json:"egress"`
 		}
@@ -758,37 +855,75 @@ func (p *pass) gate(x *store.StepRow, n store.NodeRow, drift bool) gateResult {
 		if json.Unmarshal([]byte(in.Settings), &settings) == nil && in.Enabled && settings.Egress == "warp" {
 			warpEgress = true
 		}
-		if in.State == "failed" && !slices.Contains(x.PreFailed, in.ID) {
+		if in.State == "failed" && !slices.Contains(preFailed, in.ID) {
 			newlyFailed = append(newlyFailed, in.ID)
 		}
 	}
-	if warpEgress && !s.warpUpSince(p.ctx, x.NodeID, x.ReconnectedAt) {
+	if warpEgress && !s.warpUpSince(ctx, nodeID, since) {
 		miss(errWarpDown)
 	}
 	if len(newlyFailed) > 0 {
 		with["inbound"] = newlyFailed[0]
-		first, seen := s.failing[x.NodeID]
+		first, seen := s.failing[nodeID]
 		if !seen {
-			s.failing[x.NodeID] = p.now
-		} else if p.now.Sub(first) >= s.cfg.InboundGrace {
+			s.failing[nodeID] = now
+		} else if now.Sub(first) >= s.cfg.InboundGrace {
 			return gateResult{hard: errInboundFailed, with: with}
 		}
 		miss(errInboundFailed)
 	} else {
-		delete(s.failing, x.NodeID)
+		delete(s.failing, nodeID)
 	}
+	pathLooksLossy := false // T of vantage.go
 	if s.hl != nil {
-		probeable, ok, _, err := s.hl.NodeChecksSince(p.ctx, x.NodeID, x.ReconnectedAt)
+		probeable, ok, failed, timeoutsOnly, failedFor, err := s.hl.NodeChecksSince(ctx, nodeID, since)
 		if err != nil {
 			miss(errProbeFailed)
 		} else if probeable > 0 && ok < probeable {
-			miss(errProbeFailed)
-			if _, _, _, err := s.hl.RunChecksNow(p.ctx, x.NodeID); err != nil {
-				s.log.Warn("update: run checks", "node", x.NodeID, "err", err)
+			listed := false
+			if ids, err := s.hl.NodeChecksPending(ctx, nodeID, since); err == nil {
+				pending, listed = ids, true
+			}
+			// A profile whose check was already failing when the step was sent is not what this update broke: it is left out of the
+			// count, and when nothing else fails the step passes and says which profiles it did not hold against the update.
+			var skipped []string
+			pending, skipped = withoutProbeSick(pending, preFailed)
+			if listed && len(pending) == 0 && len(skipped) > 0 {
+				skippedProfileParams(with, skipped, label)
+			} else {
+				miss(errProbeFailed)
+				pathLooksLossy = ok+failed == probeable && timeoutsOnly && failedFor >= vantageMinFailing
+				if _, _, _, err := s.hl.RunChecksNow(ctx, nodeID); err != nil {
+					s.log.Warn("update: run checks", "node", nodeID, "err", err)
+				}
 			}
 		}
 	}
-	return gateResult{pass: soft == "", soft: soft, with: with}
+	wait := false
+	// P: probe_failed is the last thing checked above, so when it is the first miss it is the only one.
+	if soft == errProbeFailed && pathLooksLossy && settled && s.nodeSelfGood(ctx, nodeID, inbounds, since) {
+		v := s.vantageOf(nodeID, since)
+		for k, val := range v.params() {
+			with[k] = val
+		}
+		wait = v.verdict == ""
+		if v.verdict == vantageOK {
+			soft = ""
+		}
+	}
+	if soft == errProbeFailed { // what the owner reads: which profiles did not pass, and the error of the last round of each
+		for k, v := range s.failedProfileParams(ctx, nodeID, pending, label, since) {
+			with[k] = v
+		}
+	}
+	var waiting []string
+	for _, id := range append(newlyFailed, pending...) {
+		if name := label[id]; name != "" && !slices.Contains(waiting, name) {
+			waiting = append(waiting, name)
+		}
+	}
+	slices.Sort(waiting)
+	return gateResult{pass: soft == "", soft: soft, with: with, wait: wait, waiting: waiting}
 }
 
 // warpUpSince requires a WARP health report from this connection and a usable tunnel. Without a report, or while it is
@@ -873,7 +1008,7 @@ func (p *pass) advanceGate(i int) {
 		return
 	}
 	g := p.gate(x, n, live.Drift)
-	if !g.pass && g.hard == "" && deadline {
+	if !g.pass && g.hard == "" && deadline && !g.wait {
 		// The node and its live row were read when this pass began; a Hello or an ApplyResult that landed since may have put
 		// the node in order. Look once more before undoing anything: a failed look decides nothing (the next pass looks
 		// again), and a node that is gone by now is not sent a rollback.
@@ -889,10 +1024,14 @@ func (p *pass) advanceGate(i int) {
 	}
 	switch {
 	case g.pass:
-		p.finish(x, store.StepPassed, "", nil)
+		var note map[string]string // the second vantage's words, when the pass needed it
+		if len(g.with) > 0 {
+			note = g.with
+		}
+		p.finish(x, store.StepPassed, "", note)
 	case g.hard != "":
 		p.failGate(x, g.hard, g.with)
-	case deadline:
+	case deadline && !g.wait:
 		p.failGate(x, g.soft, g.with)
 	}
 }
@@ -1088,22 +1227,70 @@ func (p *pass) launch() {
 // send marks the step SENT (with the inbounds that are FAILED right now) and hands the command to its goroutine.
 func (p *pass) send(x *store.StepRow, n store.NodeRow) {
 	s := p.s
-	preFailed := p.preFailed(x)
 	if s.cfg.Edge {
-		p.sendLink(x, n, preFailed)
+		p.sendLink(x, n, p.preFailed(x))
 		return
 	}
+	if slices.Contains(n.AgentCaps, agentcap.UpdateSources) {
+		if s.preparing[x.NodeID] == p.ro.ID {
+			return
+		}
+		s.preparing[x.NodeID] = p.ro.ID
+		rolloutID, nodeID, manifest, runCtx := p.ro.ID, x.NodeID, p.ro.Manifest, s.runCtx
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			sources := s.sourcesForStep(runCtx, manifest, true)
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if s.preparing[nodeID] != rolloutID {
+				return
+			}
+			delete(s.preparing, nodeID)
+			prepared, step := s.stepPass(runCtx, rolloutID, nodeID)
+			if prepared == nil || prepared.ro.Status != store.RolloutRunning || step.State != store.StepPending {
+				return
+			}
+			currentNode, err := s.st.Node(runCtx, nodeID)
+			if err != nil {
+				return
+			}
+			if !slices.Contains(currentNode.AgentCaps, agentcap.UpdateSources) {
+				sources = nil
+			}
+			prepared.sendPrepared(step, currentNode, sources)
+		}()
+		return
+	}
+	p.sendPrepared(x, n, nil)
+}
+
+func (p *pass) sendPrepared(x *store.StepRow, n store.NodeRow, sources []string) {
+	s := p.s
+	preFailed := p.preFailed(x)
 	x.PreFailed = preFailed
+	s.clearProgress(x.NodeID)
 	x.State, x.SentAt, x.FromVersion, x.FromBuilt = store.StepSent, p.now, n.AgentVersion, n.AgentBuilt
-	p.save(x)
+	x.RequestID, x.RequestAt = store.NewID("req_"), p.now
+	x.AnswerWait = p.configuredAnswerWait(n)
+	x.ProgressPhase, x.ProgressRank, x.ProgressDownloaded, x.ProgressTotal, x.ProgressSpeed, x.ProgressUpdatedUnix, x.ProgressError, x.ProgressSource = "", -1, 0, 0, 0, 0, "", ""
+	if !p.save(x) {
+		return
+	}
 	delete(s.orphans, x.NodeID)
 	s.inflight[x.NodeID] = true
+	s.beginProgress(x.NodeID, x.RequestID, x.SentAt)
 	s.setUpdatingAdd(x.NodeID) // before the agent re-executes: its dropped stream must not look like an outage
 	rolloutID, nodeID, manifest, sig, runCtx := p.ro.ID, x.NodeID, p.ro.Manifest, p.ro.Signature, s.runCtx
+	downloadTimeout := p.downloadTimeoutFor(n)
+	answerWait := x.AnswerWait
+	requestID := x.RequestID
+	sources = slices.Clone(sources)
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		res, err := s.fl.UpdateAgent(runCtx, nodeID, manifest, sig, s.cfg.AnswerWait)
+		res, err := s.fl.UpdateAgentWithRequestID(runCtx, nodeID, requestID, manifest, sig, answerWait, downloadTimeout,
+			UpdateAgentOptions{Sources: sources})
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		delete(s.inflight, nodeID)
@@ -1112,17 +1299,7 @@ func (p *pass) send(x *store.StepRow, n store.NodeRow) {
 }
 
 func (p *pass) preFailed(x *store.StepRow) []string {
-	in, err := p.s.st.FleetInbounds(p.ctx, x.NodeID, true)
-	if err != nil {
-		return x.PreFailed
-	}
-	var preFailed []string
-	for _, inbound := range in {
-		if inbound.State == "failed" {
-			preFailed = append(preFailed, inbound.ID)
-		}
-	}
-	return preFailed
+	return p.s.preFailedOf(p.ctx, x.NodeID, p.now, x.PreFailed)
 }
 
 func (p *pass) sendLink(x *store.StepRow, n store.NodeRow, preFailed []string) {
@@ -1134,8 +1311,11 @@ func (p *pass) sendLink(x *store.StepRow, n store.NodeRow, preFailed []string) {
 	}
 	updated := *x
 	updated.PreFailed = preFailed
+	s.clearProgress(x.NodeID)
 	updated.State, updated.SentAt, updated.FromVersion, updated.FromBuilt = store.StepSent, p.now, n.AgentVersion, n.AgentBuilt
 	updated.RequestID, updated.RequestAt, updated.Answer, updated.DownloadSHA = store.NewID("req_"), p.now, "", digest
+	updated.AnswerWait = p.configuredAnswerWait(n)
+	updated.ProgressPhase, updated.ProgressRank, updated.ProgressDownloaded, updated.ProgressTotal, updated.ProgressSpeed, updated.ProgressUpdatedUnix, updated.ProgressError, updated.ProgressSource = "", -1, 0, 0, 0, 0, "", ""
 	ok, err := s.st.MarkStepSent(p.ctx, &updated)
 	if err != nil {
 		s.log.Warn("update: mark link update sent", "node", x.NodeID, "err", err)
@@ -1145,9 +1325,12 @@ func (p *pass) sendLink(x *store.StepRow, n store.NodeRow, preFailed []string) {
 		return // the rollout was cancelled or another tick already changed the pending row
 	}
 	*x = updated
+	s.beginProgress(x.NodeID, x.RequestID, x.SentAt)
 	s.setUpdatingAdd(x.NodeID)
-	deadline := p.now.Add(s.cfg.AnswerWait + s.cfg.ReconnectWait)
-	if err := s.fl.SendUpdateAgent(p.ctx, x.NodeID, x.RequestID, p.ro.Manifest, p.ro.Signature, token, deadline); err != nil {
+	downloadTimeout := p.downloadTimeoutFor(n)
+	answerWait := x.AnswerWait
+	deadline := p.now.Add(answerWait + s.cfg.ReconnectWait)
+	if err := s.fl.SendUpdateAgent(p.ctx, x.NodeID, x.RequestID, p.ro.Manifest, p.ro.Signature, token, deadline, downloadTimeout); err != nil {
 		if !p.finish(x, store.StepSkipped, errOffline, nil) {
 			return // a recorded answer or another tick won the step CAS
 		}
@@ -1174,6 +1357,9 @@ func (s *Service) onUpdateAnswer(rolloutID, nodeID string, res *agentv1.CommandR
 
 // applyUpdateAnswer contains the shared outcome handling for the VPS reply goroutine and an edge tick's recorded reply.
 func (s *Service) applyUpdateAnswer(p *pass, x *store.StepRow, res *agentv1.CommandResult, err error) {
+	if res != nil && !s.cfg.Edge {
+		p.recordDownloadSourceEvent(x, res)
+	}
 	switch {
 	case err != nil:
 		switch connect.CodeOf(err) {
@@ -1203,6 +1389,11 @@ func (s *Service) applyUpdateAnswer(p *pass, x *store.StepRow, res *agentv1.Comm
 	case !res.Ok:
 		code := agentCode(res.Error)
 		params := map[string]string{}
+		if code == "download_failed" {
+			if failed := safeSourcesFailed(res.GetParams()["sources_failed"]); failed != "" {
+				params["sources_failed"] = failed
+			}
+		}
 		if code == "failed" && res.Error != "" {
 			params["detail"] = store.Clip(res.Error, 200)
 		}
@@ -1212,6 +1403,19 @@ func (s *Service) applyUpdateAnswer(p *pass, x *store.StepRow, res *agentv1.Comm
 	default:
 		x.AckedAt = p.now
 		p.save(x)
+	}
+}
+
+func (p *pass) recordDownloadSourceEvent(x *store.StepRow, result *agentv1.CommandResult) {
+	used := safeSourcesUsed(result.GetParams()["sources_used"])
+	if used == "" || used == "panel" {
+		return
+	}
+	if err := p.s.st.InsertEvent(p.ctx, store.EventRow{
+		Time: p.now, Severity: 1, Code: "update_download_source", Source: "panel", NodeID: x.NodeID,
+		Params: map[string]string{"to_version": store.Clip(p.ro.ToVersion, 60), "sources_used": used},
+	}); err != nil {
+		p.s.log.Warn("update: download source event", "code", "update_download_source_event_failed", "node", x.NodeID, "err", err)
 	}
 }
 
@@ -1236,6 +1440,7 @@ func (s *Service) recover(ctx context.Context) {
 		switch steps[i].State {
 		case store.StepSent:
 			s.orphans[steps[i].NodeID] = true
+			s.beginProgress(steps[i].NodeID, steps[i].RequestID, steps[i].SentAt)
 		case store.StepGating:
 			steps[i].ReconnectedAt = now
 			if err := s.st.SaveStep(ctx, &steps[i]); err != nil {
@@ -1259,6 +1464,17 @@ func (s *Service) rollbackNode(ctx context.Context, nodeID string) (nodeView, er
 	if s.inflight[nodeID] {
 		s.mu.Unlock()
 		return nodeView{}, precondition("a command is already running on this node")
+	}
+	if s.osInflight[nodeID] {
+		s.mu.Unlock()
+		return nodeView{}, precondition("node_updating")
+	}
+	s.updMu.RLock()
+	osBusy := s.osUpdating[nodeID]
+	s.updMu.RUnlock()
+	if osBusy { // an OS job is on this node: the agent does not restart under it
+		s.mu.Unlock()
+		return nodeView{}, precondition("node_updating")
 	}
 	s.inflight[nodeID] = true // the pass leaves the step of this node alone meanwhile
 	s.mu.Unlock()

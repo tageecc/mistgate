@@ -1,11 +1,18 @@
+//go:build !js
+
 package mcp
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -39,6 +46,53 @@ func applyError(t *testing.T, s *sdk.ClientSession, tool, confirm string) string
 	out := mustFail(t, s, tool+"_apply", map[string]any{"confirm_token": confirm})
 	noCanary(t, tool+"_apply", out)
 	return out
+}
+
+func retryApplyHarness(t *testing.T, needsApproval bool) (*testEnv, *env, *call, string, Plan) {
+	t.Helper()
+	e := newTestEnv(t)
+	tokenID, _ := e.token(ProfileAdmin)
+	confirm := "cf_retryable_plan_confirm"
+	status := StatusPlanned
+	if needsApproval {
+		status = StatusAwaiting
+	}
+	pl := Plan{
+		ID: newPlanID(), TokenID: tokenID, Tool: "retry_test", ParamsJSON: "{}", ParamsHash: hashOf("{}"),
+		ConfirmHash: hashOf(confirm), NeedsApproval: needsApproval, Status: status,
+		CreatedAt: e.now(), ExpiresAt: e.now().Add(planTTL),
+	}
+	if err := e.plans.CreateMCPPlan(context.Background(), pl, maxOpenPerToken, maxAwaiting); err != nil {
+		t.Fatal(err)
+	}
+	if needsApproval {
+		if err := e.plans.decide(pl.ID, true); err != nil {
+			t.Fatal(err)
+		}
+		pl.Status = StatusApproved
+	}
+	applyEnv := &env{cfg: Config{Plans: e.plans, Auth: e.auth, Log: slog.Default(), Audit: func(_ context.Context, a AuditEntry) {
+		e.mu.Lock()
+		e.audit = append(e.audit, a)
+		e.mu.Unlock()
+	}}, now: e.now}
+	return e, applyEnv, &call{ctx: context.Background(), tokenID: tokenID}, confirm, pl
+}
+
+type planReadBarrier struct {
+	Plans
+	reads   atomic.Int32
+	ready   chan struct{}
+	release chan struct{}
+}
+
+func (b *planReadBarrier) MCPPlanByConfirm(ctx context.Context, tokenID string, confirmHash []byte) (Plan, error) {
+	pl, err := b.Plans.MCPPlanByConfirm(ctx, tokenID, confirmHash)
+	if b.reads.Add(1) == 2 {
+		close(b.ready)
+	}
+	<-b.release
+	return pl, err
 }
 
 func TestPlanApplyUserUpdate(t *testing.T) {
@@ -108,6 +162,178 @@ func TestPlanApplyUserUpdate(t *testing.T) {
 	}
 	if b, _ := json.Marshal(append(pl, ap...)); strings.Contains(string(b), "cf_") || strings.Contains(string(b), p.ConfirmToken) {
 		t.Error("an audit row carries a confirm token")
+	}
+}
+
+func TestRetryableApplyReleasesAndReusesConfirmTokenOnce(t *testing.T) {
+	e, applyEnv, c, confirm, pl := retryApplyHarness(t, false)
+	runs := 0
+	run := func(_ *call, _ Plan) (done, error) {
+		runs++
+		if runs == 1 {
+			return done{}, retryLater("rollout_active", "an agent rollout is active now", 10*time.Second)
+		}
+		return doneWith("changed", "change applied"), nil
+	}
+	if _, err := applyEnv.apply(c, pl.Tool, confirm, run); err == nil ||
+		!strings.Contains(err.Error(), "busy (rollout_active)") || !strings.Contains(err.Error(), "retry the same confirm_token after 10 s") {
+		t.Fatalf("busy apply error = %v", err)
+	}
+	stored := e.plans.only()
+	if stored.Status != StatusPlanned || !stored.ExpiresAt.Equal(pl.ExpiresAt) {
+		t.Fatalf("released plan = %+v, want planned with original expiry %s", stored, pl.ExpiresAt)
+	}
+	busyAudit := e.audits("mcp_apply")
+	if len(busyAudit) != 1 || busyAudit[0].Result != "busy" || busyAudit[0].Params["reason_code"] != "rollout_active" {
+		t.Fatalf("busy apply audit = %+v", busyAudit)
+	}
+
+	out, err := applyEnv.apply(c, pl.Tool, confirm, run)
+	if err != nil || out.Status != StatusApplied || runs != 2 {
+		t.Fatalf("retry apply = %+v, %v; callback runs=%d", out, err, runs)
+	}
+	// a replay after success returns the stored result and runs nothing
+	if again, err := applyEnv.apply(c, pl.Tool, confirm, run); err != nil || again.Status != StatusApplied {
+		t.Fatalf("replay after success = %+v, %v", again, err)
+	}
+	if runs != 2 {
+		t.Fatalf("second apply ran callback: %d runs", runs)
+	}
+}
+
+func TestRetryableApplyDoesNotExtendExpiry(t *testing.T) {
+	e, applyEnv, c, confirm, pl := retryApplyHarness(t, false)
+	if _, err := applyEnv.apply(c, pl.Tool, confirm, func(_ *call, _ Plan) (done, error) {
+		return done{}, retryLater("panel_busy", "a panel update is being installed", retryLaterDelay)
+	}); err == nil {
+		t.Fatal("busy apply succeeded")
+	}
+	if got := e.plans.only(); !got.ExpiresAt.Equal(pl.ExpiresAt) || got.Status != StatusPlanned {
+		t.Fatalf("release changed plan expiry or state: %+v", got)
+	}
+	e.advance(planTTL)
+	if _, err := applyEnv.apply(c, pl.Tool, confirm, func(_ *call, _ Plan) (done, error) {
+		t.Fatal("expired retry ran")
+		return done{}, nil
+	}); err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("apply after original expiry = %v", err)
+	}
+}
+
+func TestConcurrentRetriesOfReleasedPlanRunOnce(t *testing.T) {
+	_, applyEnv, c, confirm, pl := retryApplyHarness(t, false)
+	if _, err := applyEnv.apply(c, pl.Tool, confirm, func(_ *call, _ Plan) (done, error) {
+		return done{}, retryLater("rollout_active", "an agent rollout is active now", retryLaterDelay)
+	}); err == nil {
+		t.Fatal("initial apply was not refused")
+	}
+
+	barrier := &planReadBarrier{Plans: applyEnv.cfg.Plans, ready: make(chan struct{}), release: make(chan struct{})}
+	applyEnv.cfg.Plans = barrier
+	var runs atomic.Int32
+	started := make(chan struct{})
+	finish := make(chan struct{})
+	var finishOnce sync.Once
+	finishApply := func() { finishOnce.Do(func() { close(finish) }) }
+	defer finishApply()
+	results := make(chan error, 2)
+	run := func(_ *call, _ Plan) (done, error) {
+		if runs.Add(1) == 1 {
+			close(started)
+			<-finish
+		}
+		return doneWith("changed", "change applied"), nil
+	}
+	apply := func() {
+		_, err := applyEnv.apply(c, pl.Tool, confirm, run)
+		results <- err
+	}
+	go apply()
+	go apply()
+	select {
+	case <-barrier.ready:
+	case <-time.After(time.Second):
+		t.Fatal("both retries did not read the released plan")
+	}
+	close(barrier.release)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("no retry entered apply")
+	}
+	select {
+	case err := <-results:
+		if err == nil || !strings.Contains(err.Error(), "already running") {
+			t.Errorf("concurrent retry error = %v, want already running", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("losing retry did not return while the other was applying")
+	}
+	finishApply()
+	if err := <-results; err != nil {
+		t.Fatalf("first retry = %v", err)
+	}
+	if got := runs.Load(); got != 1 {
+		t.Fatalf("released plan ran %d times, want once", got)
+	}
+}
+
+func TestNonRetryableApplyFailureStillFailsPlan(t *testing.T) {
+	e, applyEnv, c, confirm, pl := retryApplyHarness(t, false)
+	if _, err := applyEnv.apply(c, pl.Tool, confirm, func(_ *call, _ Plan) (done, error) {
+		return done{}, errors.New("ordinary failure")
+	}); err == nil || !strings.Contains(err.Error(), "ordinary failure") {
+		t.Fatalf("apply error = %v", err)
+	}
+	if got := e.plans.only(); got.Status != StatusFailed || got.Error != "ordinary failure" {
+		t.Fatalf("non-retryable failure left plan %+v", got)
+	}
+}
+
+func TestRetryableApplyRestoresPlannedOrApprovedStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		needsApproval bool
+		wantStatus    string
+	}{
+		{name: "planned", wantStatus: StatusPlanned},
+		{name: "approved", needsApproval: true, wantStatus: StatusApproved},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e, applyEnv, c, confirm, pl := retryApplyHarness(t, tc.needsApproval)
+			if _, err := applyEnv.apply(c, pl.Tool, confirm, func(_ *call, _ Plan) (done, error) {
+				return done{}, retryLater("panel_busy", "a panel update is being installed", retryLaterDelay)
+			}); err == nil {
+				t.Fatal("busy apply succeeded")
+			}
+			if got := e.plans.only(); got.Status != tc.wantStatus {
+				t.Fatalf("released status = %s, want %s", got.Status, tc.wantStatus)
+			}
+		})
+	}
+}
+
+func TestRolloutRetryClassificationIsNarrow(t *testing.T) {
+	for message, code := range map[string]string{
+		"a rollout is already active":                                                      "rollout_active",
+		"the active rollout is paused; resume or cancel it before adding a node":           "rollout_active",
+		"the active rollout uses a different release; finish it before updating this node": "rollout_active",
+		"an OS update of a node is running; wait for it to finish":                         "rollout_active",
+		"the GitHub node bundle is being installed":                                        "node_bundle_busy",
+		"a panel update is being installed":                                                "panel_busy",
+	} {
+		err := connect.NewError(connect.CodeFailedPrecondition, errors.New(message))
+		retry := retryRolloutStart(err)
+		var typed *retryLaterFailure
+		if !errors.As(retry, &typed) || typed.code != code {
+			t.Errorf("%q classified as %v, want retry code %q", message, retry, code)
+		}
+	}
+	if retry := retryRolloutStart(connect.NewError(connect.CodeFailedPrecondition, errors.New("the update bundle changed; review the new version"))); retry != nil {
+		t.Errorf("bundle change was classified as retryable: %v", retry)
+	}
+	if retry := retryRolloutStart(connect.NewError(connect.CodeInternal, errors.New("a panel update is being installed"))); retry != nil {
+		t.Errorf("non-precondition was classified as retryable: %v", retry)
 	}
 }
 
@@ -335,20 +561,23 @@ func TestUserDisableBulkNeedsTheOwner(t *testing.T) {
 	if !many.NeedsApproval || len(many.Danger) != 1 || many.Danger[0] != "bulk" {
 		t.Errorf("4 users need the owner: %+v", many)
 	}
-	var names Fact
+	var names []string
 	for _, f := range many.Facts {
 		if f.Key == "users" {
-			names = f
+			if !f.Untrusted {
+				t.Errorf("user name fact is not marked untrusted: %+v", f)
+			}
+			names = append(names, f.Value)
 		}
 	}
-	if !names.Untrusted || names.Value != "n0, n1, n2, n3" {
+	if strings.Join(names, ",") != "n0,n1,n2,n3" {
 		t.Errorf("users fact: %+v", names)
 	}
 	applyError(t, s, "user_disable", many.ConfirmToken)
 	if len(e.w.disableReq) != 1 {
 		t.Error("a bulk disable ran without the owner")
 	}
-	// the operator profile has no step-up procedure to approve with: the grant would only matter for tokenApproved ones,
+	// the operator profile has no step-up procedure to approve with: the grant would only matter for the procedures that need the owner's approval,
 	// and SetUsersEnabled is a plain procedure, so after the owner's click the apply runs as an ordinary call
 	e.plans.decide(many.PlanID, true)
 	applyOf(t, s, "user_disable", many.ConfirmToken)
@@ -438,6 +667,14 @@ func TestRolloutFlow(t *testing.T) {
 	}
 	applyError(t, s, "rollout_start", p.ConfirmToken)
 	e.plans.decide(p.PlanID, true)
+	e.w.rolloutStat = adminv1.RolloutStatus_ROLLOUT_STATUS_RUNNING
+	if got := applyError(t, s, "rollout_start", p.ConfirmToken); !strings.Contains(got, "busy (rollout_active)") {
+		t.Fatalf("apply while an agent rollout is active: %q", got)
+	}
+	if got, _ := e.plans.GetMCPPlan(context.Background(), p.PlanID); got.Status != StatusApproved {
+		t.Fatalf("retryable rollout refusal left plan %s", got.Status)
+	}
+	e.w.rolloutStat = 3
 	applyOf(t, s, "rollout_start", p.ConfirmToken)
 	if len(e.w.startReq) != 1 || len(e.w.startReq[0].GetNodeIds()) != 1 || e.w.startReq[0].GetNodeIds()[0] != nodeA || e.w.startReq[0].GetBatchSize() != 0 ||
 		e.w.startReq[0].GetExpectedVersion() != "v2" || e.w.startReq[0].GetExpectedBuilt() != 1700000200 {
@@ -457,6 +694,154 @@ func TestRolloutFlow(t *testing.T) {
 	}
 	if len(e.w.startReq) != 1 {
 		t.Errorf("StartRollout ran for a changed bundle: %+v", e.w.startReq)
+	}
+}
+
+func TestRolloutStartMultiNodeCanaryFactsAndPins(t *testing.T) {
+	e := newTestEnv(t)
+	_, secret := e.token(ProfileAdmin)
+	s := e.session(secret)
+	e.w.mu.Lock()
+	e.w.updateNodes = []*adminv1.NodeUpdate{
+		{NodeId: nodeA, Name: "de1", Version: "v1", Built: 1700000100, SupportsUpdate: true, State: adminv1.NodeUpdateState_NODE_UPDATE_STATE_OUTDATED, OnlineUsers: 2, Inbounds: 1},
+		{NodeId: nodeB, Name: "nl1", Version: "v1.1", Built: 1700000100, SupportsUpdate: true, State: adminv1.NodeUpdateState_NODE_UPDATE_STATE_FAILED, OnlineUsers: 1, Inbounds: 4},
+		{NodeId: nodeC, Name: "fi1", Version: "v0.9", Built: 1700000090, SupportsUpdate: true, State: adminv1.NodeUpdateState_NODE_UPDATE_STATE_ROLLED_BACK, OnlineUsers: 1, Inbounds: 2},
+		{NodeId: nodeD, Name: "msk1", Version: "v1", Built: 1700000100, SupportsUpdate: true, State: adminv1.NodeUpdateState_NODE_UPDATE_STATE_OUTDATED, OnlineUsers: 0, Inbounds: 5},
+	}
+	e.w.mu.Unlock()
+	args := map[string]any{"nodes": []any{nodeA, nodeB, nodeC, nodeD}}
+	p := planOf(t, s, "rollout_start", args)
+	if !p.NeedsApproval || !slices.Contains(p.Danger, dangerBulk) {
+		t.Fatalf("multi-node plan did not require approval and carry the bulk marker: %+v", p)
+	}
+	var names, positions, versions, online []string
+	for _, fact := range p.Facts {
+		switch fact.Key {
+		case "version":
+			if fact.Value != "v2" {
+				t.Errorf("bundle version fact = %q", fact.Value)
+			}
+		case "batch_size":
+			if fact.Value != "1" {
+				t.Errorf("batch size fact = %q, want the panel's one-node batch for four targets", fact.Value)
+			}
+		case "node":
+			names = append(names, fact.Value)
+			if !fact.Untrusted {
+				t.Errorf("node name is not marked untrusted: %+v", fact)
+			}
+		case "canary_position":
+			positions = append(positions, fact.Value)
+		case "agent_version":
+			versions = append(versions, fact.Value)
+		case "people_online":
+			online = append(online, fact.Value)
+		}
+	}
+	if strings.Join(names, ",") != "msk1,fi1,nl1,de1" || strings.Join(positions, ",") != "1,2,3,4" ||
+		strings.Join(versions, ",") != "v1,v0.9,v1.1,v1" || strings.Join(online, ",") != "0,1,1,2" {
+		t.Fatalf("rollout facts are not in canary order: names=%v positions=%v versions=%v online=%v", names, positions, versions, online)
+	}
+	stored, err := e.plans.GetMCPPlan(context.Background(), p.PlanID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pinned rolloutStartArgs
+	if err := json.Unmarshal([]byte(stored.ParamsJSON), &pinned); err != nil || strings.Join(pinned.NodeIDs, ",") != nodeD+","+nodeC+","+nodeB+","+nodeA {
+		t.Fatalf("plan did not pin the ordered exact node set: %+v (%v)", pinned, err)
+	}
+	e.plans.decide(p.PlanID, true)
+	e.w.mu.Lock()
+	e.w.updateNodes[0].State = adminv1.NodeUpdateState_NODE_UPDATE_STATE_UP_TO_DATE
+	e.w.mu.Unlock()
+	if got := applyError(t, s, "rollout_start", p.ConfirmToken); !strings.Contains(got, "selected node set changed after planning") {
+		t.Fatalf("apply after a selected node changed: %q", got)
+	}
+	if failed := storedPlan(t, e, p.PlanID); failed.Status != StatusFailed || failed.OutcomeCode != "changed_since_plan" || len(e.w.startReq) != 0 {
+		t.Fatalf("changed node set reached StartRollout or was not recorded: plan=%+v requests=%v", failed, e.w.startReq)
+	}
+	e.w.mu.Lock()
+	e.w.updateNodes[0].State = adminv1.NodeUpdateState_NODE_UPDATE_STATE_OUTDATED
+	e.w.mu.Unlock()
+	p = planOf(t, s, "rollout_start", args)
+	e.plans.decide(p.PlanID, true)
+	applyOf(t, s, "rollout_start", p.ConfirmToken)
+	if len(e.w.startReq) != 1 || strings.Join(e.w.startReq[0].GetNodeIds(), ",") != nodeD+","+nodeC+","+nodeB+","+nodeA || e.w.startReq[0].GetExpectedVersion() != "v2" {
+		t.Fatalf("multi-node StartRollout request did not match the approved set and bundle: %+v", e.w.startReq)
+	}
+	p = planOf(t, s, "rollout_start", args)
+	e.plans.decide(p.PlanID, true)
+	e.w.bundleBuilt = 1700000300
+	if got := applyError(t, s, "rollout_start", p.ConfirmToken); !strings.Contains(got, "release changed after planning") {
+		t.Fatalf("apply after bundle drift: %q", got)
+	}
+	if len(e.w.startReq) != 1 || storedPlan(t, e, p.PlanID).OutcomeCode != "changed_since_plan" {
+		t.Fatalf("changed bundle reached StartRollout or was not recorded: requests=%v plan=%+v", e.w.startReq, storedPlan(t, e, p.PlanID))
+	}
+}
+
+func TestRolloutStartNodeListCompatibilityAndLimits(t *testing.T) {
+	e := newTestEnv(t)
+	_, secret := e.token(ProfileAdmin)
+	s := e.session(secret)
+	if got := mustFail(t, s, "rollout_start_plan", map[string]any{"node_ids": []any{nodeA}, "nodes": []any{nodeA}}); !strings.Contains(got, "not both") {
+		t.Fatalf("both rollout node fields were accepted: %s", got)
+	}
+	if got := mustFail(t, s, "rollout_start_plan", map[string]any{"nodes": []any{nodeA, nodeA}}); !strings.Contains(got, "duplicate node id") {
+		t.Fatalf("duplicate rollout node id was accepted: %s", got)
+	}
+	if got := mustFail(t, s, "rollout_start_plan", map[string]any{"nodes": []any{"nod_unknown00000000000000000000"}}); !strings.Contains(got, "not a node of this panel") {
+		t.Fatalf("unknown rollout node id was accepted: %s", got)
+	}
+	tooMany := make([]any, maxMCPNodeTargets+1)
+	for i := range tooMany {
+		tooMany[i] = fmt.Sprintf("mcp_bulk_%02d", i)
+	}
+	if got := mustFail(t, s, "rollout_start_plan", map[string]any{"nodes": tooMany}); !strings.Contains(got, "at most 20") {
+		t.Fatalf("more than 20 rollout nodes were accepted: %s", got)
+	}
+	if got := mustFail(t, s, "rollout_start_plan", map[string]any{"nodes": []any{}}); !strings.Contains(got, "at least one node id") {
+		t.Fatalf("empty rollout node list was accepted: %s", got)
+	}
+
+	names := []string{"de1", "nl1", "fi1", "msk1"}
+	ids := make([]any, 0, maxMCPNodeTargets)
+	nodes := make([]*adminv1.NodeUpdate, 0, maxMCPNodeTargets)
+	for i := 0; i < maxMCPNodeTargets; i++ {
+		id := fmt.Sprintf("mcp_bulk_%02d", i)
+		ids = append(ids, id)
+		nodes = append(nodes, &adminv1.NodeUpdate{NodeId: id, Name: names[i%len(names)], Version: "v1", Built: 1700000100,
+			SupportsUpdate: true, State: adminv1.NodeUpdateState_NODE_UPDATE_STATE_OUTDATED})
+	}
+	e.w.mu.Lock()
+	e.w.updateNodes = nodes
+	e.w.mu.Unlock()
+	p := planOf(t, s, "rollout_start", map[string]any{"nodes": ids})
+	if len(p.Facts) != 3+4*maxMCPNodeTargets || !slices.ContainsFunc(p.Facts, func(f Fact) bool { return f.Key == "batch_size" && f.Value == "2" }) {
+		t.Fatalf("20-node rollout plan facts or batch size: facts=%d", len(p.Facts))
+	}
+}
+
+func TestRolloutStartBusyAPIFailureCanRetrySameApproval(t *testing.T) {
+	e := newTestEnv(t)
+	_, secret := e.token(ProfileAdmin)
+	s := e.session(secret)
+	p := planOf(t, s, "rollout_start", map[string]any{"node_ids": []any{nodeA}})
+	e.plans.decide(p.PlanID, true)
+	e.w.mu.Lock()
+	e.w.startErr = connect.NewError(connect.CodeFailedPrecondition, errors.New("the GitHub node bundle is being installed"))
+	e.w.mu.Unlock()
+	if got := applyError(t, s, "rollout_start", p.ConfirmToken); !strings.Contains(got, "busy (node_bundle_busy)") {
+		t.Fatalf("bundle sync refusal = %q", got)
+	}
+	if got, _ := e.plans.GetMCPPlan(context.Background(), p.PlanID); got.Status != StatusApproved {
+		t.Fatalf("retryable refusal left plan %s", got.Status)
+	}
+	e.w.mu.Lock()
+	e.w.startErr = nil
+	e.w.mu.Unlock()
+	if out := applyOf(t, s, "rollout_start", p.ConfirmToken); out.Status != StatusApplied {
+		t.Fatalf("retry with same approved plan = %+v", out)
 	}
 }
 
@@ -530,6 +915,33 @@ func TestUpdateTimezoneChangeUsesOwnerApproval(t *testing.T) {
 	}
 }
 
+func TestUpdateDownloadTimeoutChangeUsesOwnerApproval(t *testing.T) {
+	e := newTestEnv(t)
+	_, secret := e.token(ProfileAdmin)
+	s := e.session(secret)
+
+	p := planOf(t, s, "update_download_timeout", map[string]any{"timeout_seconds": float64(3600)})
+	from, to := factOf(t, p, "from"), factOf(t, p, "to")
+	if !p.NeedsApproval || from.Code != "seconds" || from.Params["n"] != "1800" || to.Code != "seconds" || to.Params["n"] != "3600" {
+		t.Fatalf("download timeout plan: %+v", p)
+	}
+	if len(e.w.timeoutReq) != 0 {
+		t.Fatal("planning changed the download timeout")
+	}
+	if got := mustFail(t, s, "update_download_timeout_plan", map[string]any{"timeout_seconds": float64(299)}); !strings.Contains(got, "from 300 to 7200") {
+		t.Errorf("invalid download timeout accepted: %q", got)
+	}
+
+	e.plans.decide(p.PlanID, true)
+	applyOf(t, s, "update_download_timeout", p.ConfirmToken)
+	if len(e.w.timeoutReq) != 1 || e.w.timeoutReq[0].GetTimeoutSeconds() != 3600 {
+		t.Fatalf("SetUpdateDownloadTimeout calls: %+v", e.w.timeoutReq)
+	}
+	if calls := e.w.calls("/mistgate.admin.v1.UpdateService/SetUpdateDownloadTimeout"); len(calls) != 1 || calls[0].Approved != p.PlanID || calls[0].Planning {
+		t.Fatalf("download timeout approval grant: %+v", calls)
+	}
+}
+
 func TestRolloutPauseNeedsRunning(t *testing.T) {
 	e := newTestEnv(t)
 	_, secret := e.token(ProfileAdmin)
@@ -548,6 +960,17 @@ func TestRolloutPauseNeedsRunning(t *testing.T) {
 	}
 	if len(e.w.pauseReq) != 0 {
 		t.Error("paused a finished rollout")
+	}
+}
+
+func TestRolloutCancelPlanExplainsInFlightWait(t *testing.T) {
+	e := newTestEnv(t)
+	_, secret := e.token(ProfileAdmin)
+	s := e.session(secret)
+	e.w.rolloutStat = adminv1.RolloutStatus_ROLLOUT_STATUS_RUNNING
+	p := planOf(t, s, "rollout_cancel", map[string]any{"rollout_id": "rol_1"})
+	if !p.NeedsApproval || !strings.Contains(p.Summary, "step already in progress finishes and is checked") || !strings.Contains(p.Summary, "steps that have not started are skipped") {
+		t.Fatalf("cancel plan does not describe the in-flight rule: %+v", p)
 	}
 }
 
@@ -579,6 +1002,13 @@ func TestNodeRollbackAndOtherChanges(t *testing.T) {
 	}
 	mustFail(t, s, "alert_mute_plan", map[string]any{"alert_id": "alr_none", "duration_s": 60})
 	mustFail(t, s, "alert_mute_plan", map[string]any{"alert_id": "alr_1", "duration_s": 999999})
+
+	cl := planOf(t, s, "alert_close", map[string]any{"alert_id": "alr_1"})
+	applyOf(t, s, "alert_close", cl.ConfirmToken)
+	if len(e.w.dismissReq) != 1 || e.w.dismissReq[0].GetAlertId() != "alr_1" || e.w.dismissReq[0].GetReopen() {
+		t.Errorf("close: %+v", e.w.dismissReq)
+	}
+	mustFail(t, s, "alert_close_plan", map[string]any{"alert_id": "alr_none"})
 
 	d := planOf(t, s, "device_revoke", map[string]any{"user_id": "usr_alice", "device_id": "dev_1"})
 	applyOf(t, s, "device_revoke", d.ConfirmToken)
@@ -683,6 +1113,13 @@ func TestDeviceRevokeCanBlock(t *testing.T) {
 // user_devices says what each device is and where it is online, with the nodes by name, and lists the blocked ones apart.
 func TestUserDevicesShowsKindTrafficOnlineNodesAndBlocked(t *testing.T) {
 	e := newTestEnv(t)
+	e.w.users["usr_alice"].User.DevicesUsed = 4
+	e.w.users["usr_alice"].User.DevicesIdle = 1
+	for _, d := range e.w.users["usr_alice"].Devices {
+		if d.Id == "dev_app_old" {
+			d.Idle, d.IdleSinceUnix = true, 1699990000
+		}
+	}
 	_, secret := e.token(ProfileReadonly)
 	s := e.session(secret)
 	var got UserDevicesV
@@ -698,8 +1135,14 @@ func TestUserDevicesShowsKindTrafficOnlineNodesAndBlocked(t *testing.T) {
 		len(link.OnlineNodes) != 2 || link.OnlineNodes[0].Name != "de1" || link.OnlineNodes[1].ID != "nod_gone" || link.OnlineNodes[1].Name != "" {
 		t.Errorf("link device = %+v", link)
 	}
+	if got.DevicesUsed != 4 || got.DevicesIdle != 1 || !byID["dev_app_old"].Idle || byID["dev_app_old"].IdleSince != 1699990000 {
+		t.Errorf("idle count/device fields: used=%d idle=%d device=%+v", got.DevicesUsed, got.DevicesIdle, byID["dev_app_old"])
+	}
 	if byID["dev_shared"].Kind != "link_shared" {
 		t.Errorf("shared device = %+v", byID["dev_shared"])
+	}
+	if link.Enrolled || link.EnrolLinkStale || !byID["dev_app"].Enrolled || byID["dev_app"].EnrolLinkStale || !byID["dev_app_old"].Enrolled || !byID["dev_app_old"].EnrolLinkStale {
+		t.Errorf("enrolled flags: link %+v, app %+v, app after a link change %+v", link, byID["dev_app"], byID["dev_app_old"])
 	}
 	if len(got.Blocked) != 1 || got.Blocked[0].ID != "dev_blocked" || got.Blocked[0].Fingerprint != "d4e5f6" || got.Blocked[0].BlockedUnix != 1700000000 || got.Blocked[0].Client != "mihomo/1.19.31" {
 		t.Errorf("blocked = %+v", got.Blocked)

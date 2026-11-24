@@ -6,8 +6,10 @@
 #
 # Needs: go (GOTOOLCHAIN=auto fetches the pinned one), curl, jq, python3, openssl, nft, ip, internet access.
 # --keep (or KEEP=1 where the environment reaches the script; wsl.exe does not pass it) keeps the work directory
-# with the logs and configs. Secrets (admin password, session cookie, enrollment token, subscription token,
-# Hysteria2 credentials) are never printed, and every log is grepped for them at the end.
+# with the logs and configs. --hold (VPS edition; implies --keep) leaves the panel and the node running after the last
+# step and writes owner.env into the work directory (mode 0600): with it scripts/e2e/mcp-token.sh makes an MCP token, so
+# a coding agent can drive this panel over MCP; Ctrl-C ends the run and removes owner.env.
+# Secrets (admin password, session cookie, enrollment token, subscription token, Hysteria2 credentials) are never printed, and every log is grepped for them at the end.
 #
 # Panel: `mistgate setup` + `serve` with a self-signed certificate on the public listener; the node agent dials
 # that listener with the secret SNI name (the production path; no --agent-listen).
@@ -31,6 +33,14 @@
 # subscription lists its inbound, a Hysteria2 client downloads through it). --edge runs the same on the Cloudflare edition.
 # Needs openssh-server installed (its system service stays masked); skipped by --m3-only and --old-node.
 #
+# --tt: the TrustTunnel stand (scripts/e2e/trusttunnel.sh): the official client, v1.1.12 from scripts/e2e/tt-fetch.sh, goes through a node
+# that serves TrustTunnel over HTTP/2 and HTTP/3, in network namespaces without a way to the internet; their reference endpoint
+# v1.1.0 is the oracle for the cases where our server and their client disagree. Checks E1-E20 of plans/trusttunnel-plan.md and a
+# table of PASS/FAIL/SKIP at the end. --tt-only runs it without the base steps (like --m3-only); with --hold the panel and the node
+# stay up with a test person, a device and its client configuration (the stand's tt-dev.env), for a developer of a client. --tt-dev
+# is that without the checks: the panel and the node with a TrustTunnel inbound (HTTP/2 and HTTP/3), two people, a device each, then it
+# waits for Ctrl-C and prints where everything is (work directory kept).
+#
 # The tunnel steps (AmneziaWG, WARP, Mihomo, VLESS, JSON; they are in scripts/e2e/m3.sh) are opt in: --m3, or --awg,
 # --warp, --mihomo, --vless, --json one by one, run after step 9 and before the retire; --m3-only runs them without the base and
 # self-update steps between. Clients and a fake internet sit in anonymous namespaces inside the run's namespace (`unshare -n`, a veth
@@ -49,7 +59,7 @@
 #
 # --json: the Xray JSON and sing-box documents of the subscription (?format=xray-json, ?format=sing-box, and sing-box by its UA)
 # run in real clients, one server at a time, each in its own namespace: Xray (the version of go.mod) and sing-box 1.12.25 and
-# 1.14.3 (built from source with go install into the cache; with_quic, with_utls). A fixture user's group holds the Hysteria2
+# 1.14.4 (built from source with go install into the cache; with_quic, with_utls). A fixture user's group holds the Hysteria2
 # inbound of step 2, the VLESS inbounds of --vless (so --json turns it on) and, with --warp, a WARP twin of each of Hysteria2
 # and VLESS REALITY. The step asserts the matrix of present and absent servers (sing-box has no self-signed Hysteria2 and no
 # XHTTP), headers and gzip, that every server connects, that a WARP twin leaves through the WARP address, that a preset DNS
@@ -63,6 +73,19 @@
 # path, an object reset (--edge --ssh-only skips the traffic steps 4-8, for work on the SSH steps), and the SSH installs through the Provisioner Worker (the agent streamed from a fake, signed GitHub
 # release; the Provisioner's script reloaded in the middle of an upload). It needs node 22 and pnpm, and builds into the work
 # directory only.
+# --probes runs the own-probe lab (scripts/e2e/probe.sh): the real panel, the real probe script installed with the command the panel
+# prints, four fake nodes behind a "TSPU" made of nft; it asserts the points and their reasons, the network change, the revocation.
+# --censor runs the isolated real-measurement censorship lab and asserts block_diagnosis/access_report; --mcp-fleet brings
+# up the throwaway dev fleet, sweeps every MCP read tool with the no-secrets scan, then tears it down.
+# --bridge [options] runs the reverse-relay ("bridge") lab alone (scripts/e2e/bridge.sh, which takes the rest of the arguments:
+# --only, --quick, --long-return, --keep): a real panel, four real agents, real Xray clients and a filter that cuts the direct
+# way towards the exits by direction, one scenario per rule of the reverse-relay plan, checked on a matrix of protocols.
+#
+# --sni443 [options] (alias --sni443-only) runs the shared-443 lab alone (scripts/e2e/sni443.sh, which takes the rest of the arguments: --only,
+# --quick, --keep): a real panel, three real agents, a real Xray, the official TrustTunnel client and a Telegram-proxy client, five services
+# on one TCP 443 of a node told apart by SNI, and a probe that holds what a stranger sees there against the same service alone on a
+# reference node; the flood, the transitions between one service and a shared port, and the relay and the bridge through an entry. Plan
+# plans/tcp443-sni-plan.md, "Стенд"; isolated like --bridge (`unshare -n -m`, documentation addresses, nothing leaves).
 #
 # ISOLATION. A node agent owns things that exist once per host: TCP 443 (masquerade), the nft table
 # mistgate_node, /etc/sysctl.d/90-mistgate.conf and the journald drop-in. So the whole run happens in a private
@@ -73,6 +96,16 @@
 
 set -Eeuo pipefail
 
+if [ "${1:-}" = --bridge ]; then
+  shift
+  exec bash "$(cd "$(dirname "$0")" && pwd)/e2e/bridge.sh" "$@"
+fi
+
+if [ "${1:-}" = --sni443 ] || [ "${1:-}" = --sni443-only ]; then
+  shift
+  exec bash "$(cd "$(dirname "$0")" && pwd)/e2e/sni443.sh" "$@"
+fi
+
 # --old-node <abs path>: run the whole scenario with that mistgate-node binary (built from an older commit) in
 # place of the one built from this tree. The panel is always the new one; the health steps then expect an agent
 # without the doctor (compatibility check). The path must be reachable from WSL (/mnt/...).
@@ -81,11 +114,12 @@ OLD_NODE=""
 # scenario and takes what it always took.
 # --decoy runs the decoy-site step alone (scripts/e2e/decoy.sh; --m3 includes it). --m3 is all four; --vless is independent of the others; --awg also runs the self-service calls of the user's page; --mihomo needs the AWG profiles of --awg
 # and turns it on. --m3-only skips every base step after the node is up (development of the tunnel steps: ~5 minutes).
-M3_AWG="" M3_WARP="" M3_MIHOMO="" M3_VLESS="" M3_JSON="" M3_DECOY="" M3_ONLY="" EDGE="" SSH_ONLY=""
+M3_AWG="" M3_WARP="" M3_MIHOMO="" M3_VLESS="" M3_JSON="" M3_DECOY="" M3_ONLY="" EDGE="" SSH_ONLY="" CENSOR="" MCP_FLEET="" PROBES="" TT="" TT_HOLD_DEV=""
 ARGS=("$@")
 while [ $# -gt 0 ]; do
   case $1 in
     --keep) KEEP=1 ;;
+    --hold) KEEP=1 HOLD=1 ;;
     --m3) M3_AWG=1 M3_WARP=1 M3_MIHOMO=1 M3_VLESS=1 M3_JSON=1 M3_DECOY=1 ;;
     --awg) M3_AWG=1 ;;
     --warp) M3_WARP=1 ;;
@@ -94,21 +128,34 @@ while [ $# -gt 0 ]; do
     --json) M3_JSON=1 M3_VLESS=1 ;;
     --decoy) M3_DECOY=1 ;;
     --m3-only) M3_ONLY=1 ;;
+    --tt) TT=1 ;;
+    --tt-only) TT=1 M3_ONLY=1 ;;
+    --tt-dev) TT=1 M3_ONLY=1 TT_HOLD_DEV=1 KEEP=1 ;;
     --edge) EDGE=1 ;;
     --ssh-only) SSH_ONLY=1 ;;
+    --censor) CENSOR=1 ;;
+    --mcp-fleet) MCP_FLEET=1 ;;
+    --probes) PROBES=1 ;;
     --old-node) OLD_NODE=${2:?--old-node needs a path}; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
 done
 set -- "${ARGS[@]}"
+[ -z "$CENSOR$MCP_FLEET$PROBES" ] || [ "$#" = 1 ] || { echo "--censor, --probes and --mcp-fleet run alone (the own-probe lab takes its own flags: run scripts/e2e/probe.sh)" >&2; exit 2; }
+if [ -n "$CENSOR$MCP_FLEET$PROBES" ]; then
+  SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+  if [ -n "$CENSOR" ]; then exec bash "$SCRIPT_DIR/e2e/censor.sh"; fi
+  if [ -n "$PROBES" ]; then exec bash "$SCRIPT_DIR/e2e/probe.sh"; fi
+  exec bash "$SCRIPT_DIR/dev-fleet.sh" --mcp-e2e
+fi
 [ -z "$OLD_NODE" ] || [ -x "$OLD_NODE" ] || [ -f "$OLD_NODE" ] || { echo "--old-node: no such file: $OLD_NODE" >&2; exit 2; }
-[ -z "$M3_ONLY" ] || [ -n "$M3_AWG$M3_WARP$M3_MIHOMO$M3_VLESS$M3_JSON$M3_DECOY$OLD_NODE" ] || { M3_AWG=1 M3_WARP=1 M3_MIHOMO=1 M3_VLESS=1 M3_JSON=1 M3_DECOY=1; }
+[ -z "$M3_ONLY" ] || [ -n "$M3_AWG$M3_WARP$M3_MIHOMO$M3_VLESS$M3_JSON$M3_DECOY$OLD_NODE$TT" ] || { M3_AWG=1 M3_WARP=1 M3_MIHOMO=1 M3_VLESS=1 M3_JSON=1 M3_DECOY=1; }
 M3_LIVE="$M3_AWG$M3_WARP$M3_MIHOMO$M3_VLESS$M3_JSON"
 # An old node cannot run what the tunnel steps add: the live steps would only fail, the compatibility step is what it needs.
 [ -z "$OLD_NODE" ] || M3_LIVE=""
 [ -z "$OLD_NODE" ] || M3_DECOY=""
-[ -z "$EDGE" ] || [ -z "$M3_LIVE$M3_DECOY$M3_ONLY$OLD_NODE" ] || { echo "--edge cannot be combined with the tunnel steps or --old-node" >&2; exit 2; }
+[ -z "$EDGE" ] || [ -z "$M3_LIVE$M3_DECOY$M3_ONLY$OLD_NODE$TT" ] || { echo "--edge cannot be combined with the tunnel steps or --old-node" >&2; exit 2; }
 [ -z "$SSH_ONLY" ] || [ -n "$EDGE" ] || { echo "--ssh-only goes with --edge (it skips the traffic steps 4-8 of the edge scenario; the VPS edition's SSH step needs the bundle of the base steps)" >&2; exit 2; }
 [ "$(id -u)" = 0 ] || { echo "run as root (wsl -d Ubuntu -u root)" >&2; exit 2; }
 for tool in go curl jq python3 openssl nft ip mount; do
@@ -124,6 +171,11 @@ if [ -n "$EDGE" ] || { [ -z "$M3_ONLY" ] && [ -z "$OLD_NODE" ]; }; then # the SS
   [ -x /usr/sbin/sshd ] || { echo "the SSH install steps need openssh-server (/usr/sbin/sshd): apt-get install openssh-server (the system service stays masked)" >&2; exit 2; }
   for tool in nsenter unshare ss ssh-keygen; do
     command -v "$tool" >/dev/null || { echo "missing tool for the SSH install steps: $tool" >&2; exit 2; }
+  done
+fi
+if [ -n "$TT" ]; then
+  for tool in nsenter unshare ss ping base64 setpriv prlimit nft openssl; do
+    command -v "$tool" >/dev/null || { echo "missing tool for --tt: $tool" >&2; exit 2; }
   done
 fi
 if [ -n "$M3_LIVE" ]; then
@@ -171,7 +223,7 @@ PY
   # --edge: the Worker answers on de1.example.com, a name that exists only inside this namespace
   [ -z "$EDGE" ] || printf '127.0.0.1 localhost\n127.0.0.1 de1.example.com\n' >"/etc/netns/$NS/hosts"
   echo "network namespace $NS: $nic $addr via $dev, gateway $gw"
-  MG_E2E_INNER=1 ip netns exec "$NS" bash "${BASH_SOURCE[0]}" "$@" || rc=$?
+  MG_E2E_INNER=1 MG_E2E_NS="$NS" ip netns exec "$NS" bash "${BASH_SOURCE[0]}" "$@" || rc=$?
   return "$rc"
 }
 
@@ -194,6 +246,8 @@ export GOTOOLCHAIN=${GOTOOLCHAIN:-auto} CGO_ENABLED=0 GOFLAGS=-buildvcs=false
 . "$REPO/scripts/e2e/m3.sh" # the tunnel steps (functions only; the calls are below)
 # shellcheck source=e2e/decoy.sh
 . "$REPO/scripts/e2e/decoy.sh" # the decoy site per node (functions only; the call is below)
+# shellcheck source=e2e/trusttunnel.sh
+. "$REPO/scripts/e2e/trusttunnel.sh" # the TrustTunnel stand (functions only; the call is below)
 # shellcheck source=e2e/sshnode.sh
 . "$REPO/scripts/e2e/sshnode.sh" # the SSH install on a real OpenSSH host (functions only; both editions call it)
 
@@ -207,7 +261,7 @@ SYSCTL_FILE=/etc/sysctl.d/90-mistgate.conf
 JOURNALD_FILE=/etc/systemd/journald.conf.d/90-mistgate.conf
 
 RESULTS=() SECRETS=() PIDS=()
-STEP=start PANEL_PID="" NODE_PID="" COOKIE="" LAST_PID=""
+STEP=start PANEL_PID="" NODE_PID="" COOKIE="" LAST_PID="" GH_PROGRESS_PID=""
 DL_BYTES=0 USED_BYTES=0
 
 # ---------------------------------------------------------------- output helpers
@@ -273,8 +327,11 @@ cleanup() {
     tail_logs
   fi
   [ -e "$WORK/sampling" ] && rm -f "$WORK/sampling"
+  rm -f "$WORK/owner.env" # --hold: the owner session and authenticator secret never outlive the run
+  if [ -n "$GH_PROGRESS_PID" ]; then stop_pid "$GH_PROGRESS_PID"; GH_PROGRESS_PID=""; fi
   for ((p = ${#PIDS[@]} - 1; p >= 0; p--)); do stop_pid "${PIDS[$p]}"; done
   ! declare -F edge_reap >/dev/null || edge_reap # workerd and the wrangler processes that outlived their parent
+  ! declare -F tt_reap >/dev/null || tt_reap # the TrustTunnel stand: its guard table and its world-readable directory
   sshn_reap # the agent an SSH install started on the test host, and its sshd sessions
   # Nothing to undo on the host: the nft table lives in the namespace and the agent's files on private tmpfs
   # mounts, both gone when the last process here exits.
@@ -282,6 +339,8 @@ cleanup() {
   echo
   echo "================ summary"
   printf '%s\n' "${RESULTS[@]}"
+  # exit 0 before the last step ran (a stray signal, an exit inside a step) is not a pass
+  if [ "$rc" = 0 ] && [ -z "${FINISHED:-}" ]; then rc=1; echo "E2E INTERRUPTED: the script exited before its last step"; fi
   if [ "$rc" = 0 ]; then echo "E2E PASSED in $(($(date +%s) - T0)) s"; else echo "E2E FAILED (exit $rc)"; fi
   exit "$rc"
 }
@@ -511,7 +570,7 @@ burst() {
 # build_hysteria: the Hysteria2 client, built from source, never downloaded. `go install ...app/v2@version` is refused
 # (the app module's go.mod has replace directives pointing at ../core and ../extras), so build it from a scratch
 # module that requires the app and pins core and extras to the same published tag.
-HYV=v2.12.3 HYM=github.com/apernet/hysteria
+HYV=${HYV:-v2.13.0} HYM=github.com/apernet/hysteria # HYV=<tag> bash scripts/e2e-wsl.sh ... runs another client against the node (an older one checks compatibility)
 build_hysteria() {
   mkdir "$WORK/hy"
   (
@@ -572,6 +631,7 @@ if [ -n "$EDGE" ]; then
   # shellcheck source=e2e/edge.sh
   . "$REPO/scripts/e2e/edge.sh"
   edge_run
+  FINISHED=1
   exit 0
 fi
 
@@ -582,8 +642,13 @@ cd "$REPO"
 # Release keys for the self-update steps: two throwaway keys of this run (A trusted by the builds under test, B
 # "someone else's"), and build times that order the releases. See step 2d.
 BI=github.com/mistgate/mistgate/internal/buildinfo
+PANEL_UPDATE_PKG=github.com/mistgate/mistgate/internal/panel/update
+NODE_AGENT_PKG=github.com/mistgate/mistgate/internal/node/agent
 ARCH=$(go env GOARCH)
 B1=1780000000 B2=1781000000 B3A=1782000000 B3A_MANIFEST=1782500000 B3B=1783000000 B5=1784000000
+GH_TAG=v0.0.90-dev.1 GH_BUILT=1785000000
+REL_PORT=$(free_port tcp)
+NODE_RELEASE_BASE="https://127.0.0.1:$REL_PORT/"
 go build -trimpath -o "$BIN/mistgate-tool" ./cmd/mistgate # keygen only
 go build -trimpath -o "$BIN/signbundle" ./scripts/e2e/signbundle
 keygen() { "$BIN/mistgate-tool" release keygen --out "$1" | sed -n 's/^public key: //p'; }
@@ -593,10 +658,12 @@ SECRETS+=("$(cat "$WORK/release-a.key")" "$(cat "$WORK/release-b.key")")
 ldf() { echo "-X $BI.Version=$1 -X $BI.Built=$2 -X $BI.ReleaseKey=$3"; } # <version> <built> <public key>
 # node_build <release dir> <version> <built> <public key> [go build args]: $WORK/rel/<dir>/mistgate-node-linux-<arch>
 node_build() {
-  local d=$WORK/rel/$1 v=$2 b=$3 k=$4
+  local d=$WORK/rel/$1 v=$2 b=$3 k=$4 flags
   shift 4
   mkdir -p "$d"
-  go build -trimpath -ldflags "$(ldf "$v" "$b" "$k")" "$@" -o "$d/mistgate-node-linux-$ARCH" ./cmd/mistgate-node
+  flags=$(ldf "$v" "$b" "$k")
+  [ -z "$NODE_RELEASE_BASE" ] || flags+=" -X $NODE_AGENT_PKG.githubReleaseBase=$NODE_RELEASE_BASE"
+  go build -trimpath -ldflags "$flags" "$@" -o "$d/mistgate-node-linux-$ARCH" ./cmd/mistgate-node
 }
 # the panel under test trusts key A, a second panel binary (step 2d, the foreign signature) trusts key B
 go build -trimpath -ldflags "$(ldf 0.1.0-e2e-v2 "$B2" "$KEY_A")" -o "$BIN/mistgate" ./cmd/mistgate
@@ -625,10 +692,82 @@ sed '/^func (a \*Agent) observedHash/,/^}/ s/return statehash\./return "00drift"
 ! cmp -s "$OVL/apply.go" "$REPO/internal/node/agent/apply.go" || die "e2e overlay: the wrong-hash patch did not apply (observedHash changed?)"
 jq -nc --arg a "$REPO/internal/node/agent/apply.go" --arg b "$OVL/apply.go" '{Replace: {($a): $b}}' >"$OVL/drift.json"
 node_build v1d 0.1.0-e2e-v1d "$B1" "$KEY_A" -overlay "$OVL/drift.json"
+
+if [ -z "$OLD_NODE" ]; then
+  # The tag-shaped release is the same signed directory installed as the panel bundle and served by the local fake release.
+  node_build github "$GH_TAG" "$GH_BUILT" "$KEY_A"
+  mkdir -p "$WORK/fake-release" "$WORK/bundles"
+  "$BIN/signbundle" --key "$WORK/release-a.key" --version "$GH_TAG" --built "$GH_BUILT" \
+    --out "$WORK/fake-release/$GH_TAG" "$WORK/rel/github/mistgate-node-linux-$ARCH" >>"$WORK/release.log" \
+    || die "signing the fake GitHub fallback release failed"
+  mkdir -p "$WORK/bundles/github"
+  cp -a "$WORK/fake-release/$GH_TAG/." "$WORK/bundles/github/"
+
+  # Only this test build cuts the panel stream after 1 MiB while the flag exists.
+  python3 - "$REPO/internal/panel/update/bundle.go" "$OVL/panel-bundle.go" <<'PY'
+import pathlib, sys
+
+source = pathlib.Path(sys.argv[1]).read_text()
+source = source.replace("type writeDeadlineContextKey struct{}", "type writeDeadlineContextKey struct{}\n\nvar e2ePanelCutFlag string", 1)
+needle = "\tbuf := make([]byte, chunkSize)\n\tsent := false\n\tfor {"
+replacement = "\tbuf := make([]byte, chunkSize)\n\tcutAfter := int64(-1)\n\tif e2ePanelCutFlag != \"\" && strings.HasPrefix(name, \"mistgate-node-\") {\n\t\tif _, err := os.Stat(e2ePanelCutFlag); err == nil {\n\t\t\tcutAfter = (1 << 20) - int64(offset)\n\t\t\tif cutAfter <= 0 {\n\t\t\t\treturn connect.NewError(connect.CodeUnavailable, errors.New(\"temporary update source interruption\"))\n\t\t\t}\n\t\t}\n\t}\n\tsentBytes := int64(0)\n\tsent := false\n\tfor {"
+if source.count(needle) != 1:
+    raise SystemExit("panel e2e overlay: Serve loop marker changed")
+source = source.replace(needle, replacement, 1)
+needle = "\t\tif n > 0 {\n\t\t\tif err := s.sendBundleChunk(ctx, setWriteDeadline, send, buf[:n], total); err != nil {\n\t\t\t\treturn err\n\t\t\t}\n\t\t\tsent = true\n\t\t}"
+replacement = "\t\tif n > 0 {\n\t\t\tif cutAfter >= 0 && int64(n) > cutAfter-sentBytes {\n\t\t\t\tn = int(cutAfter - sentBytes)\n\t\t\t}\n\t\t\tif n > 0 {\n\t\t\t\tif err := s.sendBundleChunk(ctx, setWriteDeadline, send, buf[:n], total); err != nil {\n\t\t\t\t\treturn err\n\t\t\t\t}\n\t\t\t\tsentBytes += int64(n)\n\t\t\t\tsent = true\n\t\t\t}\n\t\t\tif cutAfter >= 0 && sentBytes >= cutAfter {\n\t\t\t\treturn connect.NewError(connect.CodeUnavailable, errors.New(\"temporary update source interruption\"))\n\t\t\t}\n\t\t}"
+if source.count(needle) != 1:
+    raise SystemExit("panel e2e overlay: Serve send marker changed")
+source = source.replace(needle, replacement, 1)
+pathlib.Path(sys.argv[2]).write_text(source)
+PY
+  jq -nc --arg a "$REPO/internal/panel/update/bundle.go" --arg b "$OVL/panel-bundle.go" '{Replace: {($a): $b}}' >"$OVL/panel.json"
+  PANEL_CUT_FLAG=$WORK/panel-cut
+  # $REL_FLAGS/slow flushes each fake release chunk, then pauses 20 ms to make the agent move to a faster source.
+  go build -trimpath -overlay "$OVL/panel.json" \
+    -ldflags "$(ldf 0.1.0-e2e-v2 "$B2" "$KEY_A") -X $PANEL_UPDATE_PKG.releaseDownloadBase=$NODE_RELEASE_BASE -X $PANEL_UPDATE_PKG.e2ePanelCutFlag=$PANEL_CUT_FLAG" \
+    -o "$BIN/mistgate-github" ./cmd/mistgate
+
+  REL_FLAGS=$WORK/fake-release.flags
+  mkdir -p "$REL_FLAGS"
+  : >"$WORK/fake-release.log"
+  GH_RELEASE_CA=$WORK/fake-release-ca.pem GH_RELEASE_KEY=$WORK/fake-release-key.pem
+  spawn python3 "$REPO/scripts/e2e/fake-release.py" "$WORK/fake-release" "$REL_PORT" "$WORK/fake-release.log" "$REL_FLAGS" "$GH_RELEASE_CA" "$GH_RELEASE_KEY"
+  fake_release_tls_up() {
+    [ -s "$GH_RELEASE_CA" ] && [ -s "$GH_RELEASE_KEY" ] && \
+      curl --cacert "$GH_RELEASE_CA" -sf -o /dev/null "https://127.0.0.1:$REL_PORT/$GH_TAG/manifest.json"
+  }
+  wait_for 10 "the fake release to answer over TLS" fake_release_tls_up || die "the fake release server did not start"
+  merge_release_ca() {
+    python3 - "$1" "$GH_RELEASE_CA" "$2" <<'PY'
+import ssl, sys
+
+source, extra, destination = sys.argv[1:]
+try:
+    base = source or ssl.get_default_verify_paths().cafile
+    if not base:
+        raise OSError
+    with open(base, "rb") as f:
+        bundle = f.read()
+    with open(extra, "rb") as f:
+        cert = f.read()
+    with open(destination, "wb") as f:
+        f.write(bundle.rstrip() + b"\n" + cert)
+except OSError:
+    raise SystemExit("cannot prepare the fake release trust bundle")
+PY
+  }
+  merge_release_ca "${NODE_SSL_CERT_FILE:-}" "$WORK/node-release-trust.pem"
+  merge_release_ca "${PANEL_SSL_CERT_FILE:-}" "$WORK/panel-release-trust.pem"
+  NODE_SSL_CERT_FILE=$WORK/node-release-trust.pem
+  PANEL_SSL_CERT_FILE=$WORK/panel-release-trust.pem
+  : >"$WORK/fake-release.log"
+fi
 fi
 cp "$WORK/rel/v1/mistgate-node-linux-$ARCH" "$BIN/mistgate-node"
 go build -trimpath -o "$BIN/h3get" ./scripts/e2e/h3get
 [ -z "$M3_LIVE" ] || m3_build
+[ -z "$TT" ] || tt_build
 NODE_BIN=$BIN/mistgate-node
 cp "$NODE_BIN" "$WORK/node-v1.bin"
 if [ -n "$OLD_NODE" ]; then
@@ -637,7 +776,7 @@ if [ -n "$OLD_NODE" ]; then
   say "COMPATIBILITY RUN: the node agent is the older build $("$NODE_BIN" version 2>&1 | head -1)"
 fi
 build_hysteria
-pass "built mistgate, mistgate-node, h3get and hysteria v2.12.3 ($(du -h "$BIN/mistgate" | cut -f1) panel, $(du -h "$BIN/mistgate-node" | cut -f1) node)"
+pass "built mistgate, mistgate-node, h3get and hysteria $HYV ($(du -h "$BIN/mistgate" | cut -f1) panel, $(du -h "$BIN/mistgate-node" | cut -f1) node)"
 
 PUB=$(free_port tcp) ADM=$(free_port tcp) HY2=$(free_port udp) HY2_PLAIN=$(free_port udp)
 SOCKS=$(free_port tcp)
@@ -914,10 +1053,68 @@ else
   wait_for 60 "the agent to commit the second update" test ! -e "$NODE_STATE/update.pending" || die "the second update never committed"
   pass "a rolled-back node takes the bundle again: rollout DONE, built $B2"
 
+  # ---- 2d.1: the panel stops after 1 MiB; the node resumes from the local fake GitHub release.
+  step "2d.1. updates: panel download falls back to GitHub"
+  stop_pid "$PANEL_PID"
+  PANEL_BIN=$BIN/mistgate-github
+  start_panel
+  wait_for 90 "node ONLINE after the fallback panel restart" node_online || die "2d.1: node did not reconnect"
+  install_bundle github
+  [ "$(bundle_status)" = BUNDLE_STATUS_TRUSTED ] || die "2d.1: tag-shaped bundle is not TRUSTED: $(upd | jq -c .bundle)"
+  upd | jq -e '.updateDownloadSources | index("github") != null' >/dev/null || die "2d.1: GitHub fallback is not enabled by default"
+
+  : >"$WORK/fake-release.log"
+  : >"$WORK/github-progress"
+  touch "$PANEL_CUT_FLAG" "$REL_FLAGS/slow"
+  EVENT_MARK_GH=$(api FleetService/ListEvents "{\"nodeId\":\"$NODE_ID\",\"limit\":1}" | jq -r '(.events[0].id // "0") | tonumber')
+  RID=$(start_rollout "{\"nodeIds\":[\"$NODE_ID\"]}")
+  (
+    for ((i = 0; i < 300; i++)); do
+      if upd | jq -e --arg v "$GH_TAG" '.rollout.toVersion == $v and any(.rollout.steps[]?; .downloadSource == "github")' >/dev/null 2>&1; then
+        printf 'github\n' >"$WORK/github-progress"
+        exit 0
+      fi
+      sleep 0.2
+    done
+  ) &
+  GH_PROGRESS_PID=$!
+  wait_for 300 "the GitHub fallback rollout to settle" ro_settled || die "2d.1: rollout did not settle: $(ro_brief)"
+  [ "$(ro_status)" = ROLLOUT_STATUS_DONE ] || die "2d.1: rollout ended as $(ro_status): $(ro_brief)"
+  ro_step | jq -e '.state == "STEP_STATE_PASSED"' >/dev/null || die "2d.1: step did not pass: $(ro_step)"
+  node_built_is "$GH_BUILT" || die "2d.1: node reports built $(node_built), want $GH_BUILT"
+  wait_for 60 "the agent to commit the GitHub update" test ! -e "$NODE_STATE/update.pending" || die "2d.1: update.pending did not clear"
+  GH_PROGRESS_REAP=$GH_PROGRESS_PID
+  GH_PROGRESS_PID=""
+  wait "$GH_PROGRESS_REAP" || true
+  [ "$(cat "$WORK/github-progress")" = github ] || die "2d.1: GetUpdates never showed GitHub download progress"
+  grep -F "GET /$GH_TAG/mistgate-node-linux-$ARCH HTTP" "$WORK/fake-release.log" | grep -Fq 'range=bytes=1048576-' \
+    || die "2d.1: fake release did not receive the resumed Range request: $(cat "$WORK/fake-release.log")"
+  ! grep -Eq 'authorization=present|cookie=present' "$WORK/fake-release.log" \
+    || die "2d.1: the node sent credentials to the fake release host"
+  api FleetService/ListEvents "{\"nodeId\":\"$NODE_ID\",\"limit\":200}" \
+    | jq -e --arg v "$GH_TAG" --argjson mark "$EVENT_MARK_GH" \
+      '[.events[] | select((.id | tonumber) > $mark and .code == "update_download_source" and .params.to_version == $v and .params.sources_used == "panel,github")] | length > 0' \
+    >/dev/null || die "2d.1: no update_download_source event for panel,github"
+  pass "panel transfer stopped at 1 MiB; the node resumed at byte 1048576 from GitHub without credentials, progress showed github, the step PASSED and the source event recorded panel,github"
+
+  rm -f "$PANEL_CUT_FLAG" "$REL_FLAGS/slow"
+  mutate UpdateService/RollbackNode "{\"nodeId\":\"$NODE_ID\"}" >/dev/null || die "2d.1: RollbackNode refused the test update"
+  wait_for 90 "node restored to built $B2" node_built_is "$B2" || die "2d.1: rollback left built $(node_built)"
+  wait_for 60 "node ONLINE after the fallback rollback" node_online || die "2d.1: node did not reconnect after rollback"
+  install_bundle v2
+  [ "$(bundle_status)" = BUNDLE_STATUS_TRUSTED ] || die "2d.1: v2 bundle did not restore"
+  stop_pid "$PANEL_PID"
+  PANEL_BIN=$BIN/mistgate
+  start_panel
+  wait_for 90 "node ONLINE at the regular panel" node_online || die "2d.1: node did not reconnect to the regular panel"
+  [ "$(node_ustate)" = NODE_UPDATE_STATE_UP_TO_DATE ] || die "2d.1: restored node is $(node_ustate), want UP_TO_DATE"
+
   # ---- v3a: a manifest that claims a later build time than the binary has; the agent notices at once and goes back
   publish_bundle v3a "$WORK/release-a.key" 0.1.0-e2e-v3a "$B3A_MANIFEST" "$WORK/rel/v3a/mistgate-node-linux-$ARCH"
   install_bundle v3a
-  upd_node | jq -e '.state == "NODE_UPDATE_STATE_OUTDATED"' >/dev/null || die "v3a: node should be OUTDATED: $(upd_node)"
+  # 2d.1 ended with a manual rollback, so a node that is behind the bundle reads ROLLED_BACK here, not OUTDATED; both
+  # mean "not on the bundle" and both take a rollout (the rolled-back case is exercised in 2d above).
+  upd_node | jq -e '.state == "NODE_UPDATE_STATE_OUTDATED" or .state == "NODE_UPDATE_STATE_ROLLED_BACK"' >/dev/null || die "v3a: node should be behind the bundle: $(upd_node)"
   RID=$(start_rollout "{\"nodeIds\":[\"$NODE_ID\"]}")
   wait_for 240 "the rollout v3a to settle" ro_settled || die "rollout v3a did not settle: $(ro_brief)"
   [ "$(ro_status)" = ROLLOUT_STATUS_PAUSED ] || die "rollout v3a: expected PAUSED, got: $(ro_brief)"
@@ -1081,7 +1278,7 @@ have_line() {
 wait_for 40 "hysteria2:// line in the subscription" have_line || die "subscription has no hysteria2:// line"
 
 BODY_HAPP=$(fetch_sub 'Happ/3.0' "$WORK/sub-happ.hdr")
-BODY_MIHOMO=$(fetch_sub 'mihomo/1.19.31' "$WORK/sub-mihomo.hdr")
+BODY_MIHOMO=$(fetch_sub 'mihomo/1.19.33' "$WORK/sub-mihomo.hdr")
 hdr() { tr -d '\r' <"$1" | sed -n "s/^$2: *//Ip" | head -1; }
 for ua in happ mihomo; do
   f=$WORK/sub-$ua.hdr
@@ -1339,10 +1536,18 @@ if [ -n "$M3_LIVE" ]; then
   [ -z "$M3_JSON" ] || m3_json # after the WARP step: it uses the WARP twin and the VLESS inbounds the steps above left on the node
 fi
 
+# ================================================================ TrustTunnel stand (--tt), sources in scripts/e2e/trusttunnel.sh
+[ -z "$TT" ] || tt_main
+
 # ================================================================ 10. retire
 step "10. retire the node: the agent removes its nft table and files"
 nft list table inet "$NFT_TABLE" >/dev/null 2>&1 || die "precondition: the nft table is gone before the retire"
 [ -f "$SYSCTL_FILE" ] || note "precondition: $SYSCTL_FILE was not there before the retire (agent baseline not applied?)"
+if [ -z "$M3_ONLY" ] && [ -z "$OLD_NODE" ]; then
+  SSHN_SQL=sshn_sql_vps
+  sshn_up
+  sshn_scn_attach "$NODE_ID"
+fi
 RET=$(api NodeService/RetireNode "{\"nodeId\":\"$NODE_ID\",\"confirmName\":\"$NODE_NAME\"}")
 jq -e '.agentNotified == true' <<<"$RET" >/dev/null || die "RetireNode: the connected agent was not notified"
 wait_for 30 "the agent to exit" not_alive "$NODE_PID" || die "the node agent kept running after the retire"
@@ -1353,6 +1558,10 @@ wait "$NODE_PID" || NODE_RC=$?
 [ ! -e "$SYSCTL_FILE" ] || die "$SYSCTL_FILE is still there after the retire"
 [ ! -e "$JOURNALD_FILE" ] || die "$JOURNALD_FILE is still there after the retire"
 [ "$(node_status)" = NODE_STATUS_RETIRED ] || die "node status after the retire: $(node_status)"
+if [ -z "$M3_ONLY" ] && [ -z "$OLD_NODE" ]; then
+  mutate ProvisioningService/ForgetNodeServerAccess "$(jq -nc --arg id "$NODE_ID" '{nodeId:$id}')" >/dev/null \
+    || die "could not forget the attach-scenario SSH access after retiring the node"
+fi
 # What the tunnel protocols add to a host: AWG and WARP links, their nft tables, the policy rules and the
 # routes of the WARP table. All of it lives in this run's namespace, and none of it may outlive the node.
 ip -o link show | awk -F': ' '{print $2}' | grep -E '^(mgawg|mgwarp)' && die "a link of the node (mgawg*/mgwarp) is still there after the retire"
@@ -1381,3 +1590,17 @@ for s in "${SECRETS[@]}"; do
 done
 [ "$LEAKS" = 0 ] || die "$LEAKS secret(s) found in logs"
 pass "no secret (admin password, TOTP, cookie, enrollment token, SNI, subscription tokens, hysteria credentials, the SSH passwords of the test host (in the panel, sshd and installed agent logs too), and with the tunnel steps the AWG client and preshared keys, header protection keys, WARP keys, Mihomo credentials, VLESS user ids) in any log"
+
+FINISHED=1 # every step has run
+# ================================================================ 12. hold (--hold)
+if [ -n "${HOLD:-}" ]; then
+  [ -z "$EDGE" ] || die "--hold is for the VPS edition"
+  ( umask 077
+    printf 'MG_ADMIN_URL=%s/\nMG_OWNER_COOKIE=%s\nMG_TOTP_SECRET=%s\nMG_NETNS=%s\n' \
+      "$ADMIN" "${COOKIE#__Host-sid=}" "$TOTP_SECRET" "${MG_E2E_NS:-}" >"$WORK/owner.env" )
+  step "12. holding: the test panel stays up until Ctrl-C"
+  say "admin $ADMIN/ (in network namespace ${MG_E2E_NS:-none}), owner session and authenticator secret in $WORK/owner.env"
+  say "make an MCP token (from another shell):  bash scripts/e2e/mcp-token.sh $WORK/owner.env"
+  trap 'exit 0' INT TERM
+  while :; do sleep 3600 & wait $!; done
+fi

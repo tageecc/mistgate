@@ -3,18 +3,26 @@ on:
   push:
     branches: [main]
   pull_request:
+  # by hand (gh workflow run ci.yml --ref main): GitHub can drop a push event, and then nothing else starts the run
+  workflow_dispatch:
 
 jobs:
   race:
-    # The agent session (panel and node) is concurrent by design; the race detector guards it.
+    # The agent session (panel and node) is concurrent by design; the race detector guards it. Each fleet test opens a
+    # migrated store; migrating a new file takes 4.3 s under -race, which with four hundred tests and 116 migrations pushed
+    # the job past 50 min in November 2026. The tests now open a copy of a database migrated once per binary
+    # (internal/panel/store/storetest): fleet takes 137 s under -race on a workstation (was 1790 s), agent 150 s. The limit
+    # keeps a wide margin for hosted runners, which are about 1.7 times slower; a package that needs more is a finding.
+    # internal/node/vless is in: the one race it used to report, in xray-core's Vision TrafficState (shared by both copy
+    # directions), is fixed in our fork of xray-core that go.mod's replace points to (github.com/Mistgate/Xray-core; upstream
+    # declined the fix). The XHTTP races and the checkptr reports of earlier cores are gone too.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
-      # fleet takes 12-20 min under -race on a hosted runner (700-1200 s on the same code, by runner), so 20 min cut it twice
-      - run: go test -race -count=1 -timeout 35m ./internal/panel/fleet/ ./internal/node/agent/
+      - run: go test -race -count=1 -timeout 50m ./internal/panel/fleet/ ./internal/node/agent/ ./internal/node/vless/
   edge-store:
     runs-on: ubuntu-24.04
     steps:
@@ -51,8 +59,17 @@ jobs:
           cache-dependency-path: web/pnpm-lock.yaml
       - run: cd web && pnpm install --frozen-lockfile && pnpm build # the panel embeds web/dist
       - run: go vet ./...
-      - run: go test ./...
+      # The own-probe script (internal/panel/ownprobe/mistgate-probe.sh) is tested under busybox ash, the shell of the routers it
+      # runs on, and under dash. busybox-static is the distribution package; MGP_REQUIRE_BUSYBOX turns a missing busybox into a failure.
+      - name: busybox for the probe script tests
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends busybox-static
+      # the site generator's package alone takes six to ten minutes on a slow shared runner: the default limit of ten cut it off
+      - run: go test -timeout 20m ./...
+        env:
+          MGP_REQUIRE_BUSYBOX: "1"
       - run: shellcheck scripts/install.sh
+      - run: shellcheck -s sh -o all internal/panel/ownprobe/mistgate-probe.sh
+      - run: shellcheck internal/panel/ownprobe/testdata/fakecurl.sh scripts/e2e/probe.sh
       # Debian trixie exercises the OpenSSL fallback, including releases without panel-manifest.sshsig.
       - name: Installer tests (Debian trixie OpenSSL fallback)
         env:
@@ -125,6 +142,44 @@ jobs:
       - run: pnpm --dir site install --frozen-lockfile
       - run: pnpm --dir site build
       - run: pnpm --dir site test
+
+  site:
+    # mistgate.app as one folder: the docs (site/build.mjs) and the landing (landing/pipeline, then the Rust page generator
+    # landing/gen) merged by site/merge.mjs, which stops on a path two sides write, a broken link in either direction, a page
+    # without its content security policy, or a sitemap that disagrees with the pages. The stand with headless Chrome
+    # (landing/pipeline `pnpm check`) is not run here. Nothing is deployed from CI.
+    runs-on: ubuntu-24.04
+    env:
+      MG_STARS: "" # the docs build asks GitHub for the star count; none here
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          package_json_file: site/package.json
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: |
+            site/pnpm-lock.yaml
+            site/landing/pipeline/pnpm-lock.yaml
+      - run: pnpm --dir site install --frozen-lockfile
+      - run: pnpm --dir site/landing/pipeline install --frozen-lockfile
+      # the toolchain is the one site/landing/gen/rust-toolchain.toml names; the runner's rustup installs it
+      - name: Rust toolchain of the page generator
+        working-directory: site/landing/gen
+        run: rustup show active-toolchain || rustup toolchain install --profile minimal
+      - run: cargo test --release --locked
+        working-directory: site/landing/gen
+      - run: pnpm --dir site build:all
+      - run: pnpm --dir site/landing/pipeline test # after the build: its output tests run only when build/ exists
+      - name: Private names in the built site
+        # the pattern is a repository secret, not a line of this public file (a variable would be printed in the public log); without it the step only says so
+        env:
+          PRIVATE_NAMES_PATTERN: ${{ secrets.PRIVATE_NAMES_PATTERN }}
+        run: |
+          if [ -z "$PRIVATE_NAMES_PATTERN" ]; then echo "::notice::secrets.PRIVATE_NAMES_PATTERN is not set: the private-names scan did not run"; exit 0; fi
+          if grep -rIilE "$PRIVATE_NAMES_PATTERN" site/public; then echo "private names in the built site" >&2; exit 1; fi
 
   watcher-worker:
     runs-on: ubuntu-24.04

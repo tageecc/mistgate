@@ -1,0 +1,224 @@
+package doctor
+
+import (
+	"context"
+	"fmt"
+	"path/filepath"
+	"strings"
+
+	"github.com/mistgate/mistgate/internal/node/awgprep"
+	"github.com/mistgate/mistgate/internal/node/secupdates"
+)
+
+var aptDailyTimers = []string{"apt-daily.timer", "apt-daily-upgrade.timer"}
+
+type aptTimerState struct {
+	name   string
+	state  string // systemctl is-enabled: enabled, disabled, masked, ...
+	active string // systemctl is-active: active, inactive, ...
+}
+
+// off says what keeps the timer from running, "" when it is enabled and running. A stopped timer that is enabled runs
+// again only after a reboot.
+func (t aptTimerState) off() string {
+	switch {
+	case t.state != "enabled":
+		return t.state
+	case t.active != "active":
+		return t.active
+	}
+	return ""
+}
+
+type securityUpdatesSnapshot struct {
+	supported bool
+	skip      Result
+	canFix    bool // this agent can launch the job (Env.LaunchSecurityUpdates): only then is the fix offered
+	installed bool
+	periodic  secupdates.Periodic
+	configErr error
+	timers    []aptTimerState
+	status    awgprep.Status
+	hasStatus bool
+	// autoRebootAwg: unattended-upgrades may reboot the host by itself (Automatic-Reboot) while AmneziaWG runs on the kernel module.
+	autoRebootAwg bool
+	// The transient unit of the job as systemd sees it (LoadState, ActiveState); "" when systemctl did not say. A unit
+	// that does not exist is LoadState "not-found" with ActiveState "inactive".
+	loadState   string
+	activeState string
+}
+
+// jobRunning: systemd runs the job's unit right now, whatever its status file says yet (the job writes "running" only
+// once it has started, so right after the launch the file may still hold the previous run).
+func (s securityUpdatesSnapshot) jobRunning() bool { return jobUnitActive(s.activeState) }
+
+// jobUnitActive: the ActiveState of a transient job unit says it is working (the security updates and nftables jobs).
+func jobUnitActive(activeState string) bool {
+	switch activeState {
+	case "active", "activating", "deactivating", "reloading", "refreshing":
+		return true
+	}
+	return false
+}
+
+// jobLoaded: systemd still holds a unit of that name, so systemd-run would refuse a new one ("Unit ... already exists").
+func (s securityUpdatesSnapshot) jobLoaded() bool { return jobUnitLoaded(s.loadState) }
+
+func jobUnitLoaded(loadState string) bool { return loadState != "" && loadState != "not-found" }
+
+// parseUnitShow reads LoadState and ActiveState from `systemctl show` output (Key=Value lines, in any order).
+func parseUnitShow(out string) (load, active string) {
+	for _, line := range strings.Split(out, "\n") {
+		k, v, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok {
+			continue
+		}
+		switch k {
+		case "LoadState":
+			load = strings.ToLower(strings.TrimSpace(v))
+		case "ActiveState":
+			active = strings.ToLower(strings.TrimSpace(v))
+		}
+	}
+	return load, active
+}
+
+func inspectSecurityUpdates(ctx context.Context, e *Env) securityUpdatesSnapshot {
+	osRelease, err := e.read("/etc/os-release")
+	if err != nil || !isDebianOrUbuntu(osRelease) || !e.has(secupdates.AptConfigCommand) {
+		return securityUpdatesSnapshot{skip: skip(CodeSecurityUpdatesNotAPT, "not a Debian or Ubuntu host: only apt is checked")}
+	}
+	if _, err := e.stat("/run/systemd/system"); err != nil {
+		return securityUpdatesSnapshot{skip: skip(CodeSecurityUpdatesNoSystemd, "systemd is not PID 1: the apt timers cannot run here")}
+	}
+
+	s := securityUpdatesSnapshot{supported: true, canFix: e.LaunchSecurityUpdates != nil}
+	if e.StateDir != "" {
+		s.status, s.hasStatus, _ = awgprep.ReadStatus(filepath.Join(e.StateDir, secupdates.StatusFileName))
+	}
+	shown, _ := e.Run(ctx, "systemctl", "show", "--property=LoadState,ActiveState", secupdates.UnitName+".service")
+	s.loadState, s.activeState = parseUnitShow(string(shown))
+
+	packageStatus, packageErr := e.Run(ctx, "dpkg-query", "-W", "-f=${Status}", "unattended-upgrades")
+	s.installed = packageErr == nil && strings.TrimSpace(string(packageStatus)) == "install ok installed"
+
+	config, configErr := e.Run(ctx, secupdates.AptConfigCommand, strings.Fields(secupdates.AptPeriodicArgs)...)
+	s.periodic, s.configErr = secupdates.ParsePeriodicShell(string(config)), configErr
+	enabled, _ := e.Run(ctx, "systemctl", append([]string{"is-enabled"}, aptDailyTimers...)...)
+	active, _ := e.Run(ctx, "systemctl", append([]string{"is-active"}, aptDailyTimers...)...)
+	s.timers = parseAptTimerStates(string(enabled), string(active))
+	// Only a node on the AmneziaWG kernel module cares: unattended-upgrades reboots without the agent's checks (osupdate's reboot guard).
+	if awgInboundCount(e) > 0 && e.AwgBackend != nil {
+		if b := e.AwgBackend(); b.Available && b.Name == "kernel" {
+			out, _ := e.Run(ctx, secupdates.AptConfigCommand, "shell", "R", "Unattended-Upgrade::Automatic-Reboot/b")
+			s.autoRebootAwg = strings.Contains(strings.NewReplacer("'", "", `"`, "").Replace(string(out)), "R=true")
+		}
+	}
+	return s
+}
+
+func checkSecurityUpdates(ctx context.Context, e *Env) Result {
+	return checkSecurityUpdatesResult(inspectSecurityUpdates(ctx, e))
+}
+
+func checkSecurityUpdatesResult(s securityUpdatesSnapshot) Result {
+	if !s.supported {
+		return s.skip
+	}
+	if s.jobRunning() {
+		return Result{Status: Warn, Code: CodeSecurityUpdatesEnabling, Detail: "turning automatic security updates on"}
+	}
+	fix := ""
+	if s.canFix {
+		fix = FixEnableSecurityUpdates
+	}
+	off := securityUpdatesOffDetails(s)
+	// What the host holds decides; the status file only explains a host that still needs changes (a job that stopped
+	// after its last step but before it wrote "done" leaves the updates on).
+	if needsChanges := !s.installed || len(off) > 0; needsChanges && s.hasStatus {
+		switch s.status.State {
+		case awgprep.StateRunning:
+			return securityUpdatesEnableFailed("the background task was interrupted before it finished", fix)
+		case awgprep.StateFailed:
+			reason := strings.TrimSpace(s.status.Reason)
+			if reason == "" {
+				reason = "the background task failed"
+			}
+			return securityUpdatesEnableFailed(reason, fix)
+		}
+	}
+	if !s.installed {
+		return Result{Status: Warn, Code: CodeSecurityUpdatesNotInstalled,
+			Detail: "unattended-upgrades is not installed: security fixes arrive only when someone runs apt by hand",
+			FixID:  fix}
+	}
+	if len(off) > 0 {
+		return Result{Status: Warn, Code: CodeSecurityUpdatesOff,
+			Detail: "automatic updates are off: " + strings.Join(off, ", "),
+			Params: p("off", strings.Join(off, ", ")), FixID: fix}
+	}
+	if s.autoRebootAwg {
+		return Result{Status: Warn, Code: CodeSecurityUpdatesAutoReboot,
+			Detail: "unattended-upgrades may reboot this node by itself (Automatic-Reboot) into a kernel without the AmneziaWG module; this reboot is outside the agent's guard, turn Automatic-Reboot off"}
+	}
+	return Result{Status: OK, Code: CodeSecurityUpdatesOn, Detail: "automatic security updates are on"}
+}
+
+func securityUpdatesOffDetails(s securityUpdatesSnapshot) []string {
+	off := s.periodic.OffDetails()
+	if s.configErr != nil && len(off) == 0 {
+		off = append(off, "apt-config failed")
+	}
+	for _, timer := range s.timers {
+		if why := timer.off(); why != "" {
+			off = append(off, fmt.Sprintf("%s %s", timer.name, why))
+		}
+	}
+	return off
+}
+
+func securityUpdatesEnableFailed(reason, fix string) Result {
+	reason = clip(strings.TrimSpace(reason), 150)
+	return Result{Status: Warn, Code: CodeSecurityUpdatesEnableFailed,
+		Detail: "turning updates on failed: " + reason, Params: p("reason", reason), FixID: fix}
+}
+
+// parseAptTimerStates pairs the lines of `systemctl is-enabled` and `systemctl is-active` (one per timer, in order) with
+// the timers; a missing line is "unknown".
+func parseAptTimerStates(enabled, active string) []aptTimerState {
+	es, as := strings.Fields(strings.TrimSpace(enabled)), strings.Fields(strings.TrimSpace(active))
+	at := func(states []string, i int) string {
+		if i < len(states) {
+			return strings.ToLower(states[i])
+		}
+		return "unknown"
+	}
+	timers := make([]aptTimerState, len(aptDailyTimers))
+	for i, name := range aptDailyTimers {
+		timers[i] = aptTimerState{name: name, state: at(es, i), active: at(as, i)}
+	}
+	return timers
+}
+
+func isDebianOrUbuntu(osRelease string) bool {
+	var id, idLike string
+	for _, line := range strings.Split(osRelease, "\n") {
+		name, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok {
+			continue
+		}
+		value = strings.Trim(strings.TrimSpace(value), `"'`)
+		switch strings.TrimSpace(name) {
+		case "ID":
+			id = strings.ToLower(value)
+		case "ID_LIKE":
+			idLike = strings.ToLower(value)
+		}
+	}
+	for _, candidate := range append([]string{id}, strings.Fields(idLike)...) {
+		if candidate == "debian" || candidate == "ubuntu" {
+			return true
+		}
+	}
+	return false
+}

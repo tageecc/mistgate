@@ -12,6 +12,8 @@ import (
 	"github.com/mistgate/mistgate/internal/node/egress"
 	"github.com/mistgate/mistgate/internal/node/engine"
 	"github.com/mistgate/mistgate/internal/node/hysteria2"
+	"github.com/mistgate/mistgate/internal/node/mtproto"
+	ttengine "github.com/mistgate/mistgate/internal/node/trusttunnel"
 	"github.com/mistgate/mistgate/internal/node/vless"
 	"github.com/mistgate/mistgate/internal/node/warp"
 )
@@ -21,6 +23,7 @@ import (
 type agentHooks struct {
 	dns      func() []string
 	awgMode  func() string
+	awgPeers func() int // the AmneziaWG devices of the node (the userspace fallback's memory ceiling)
 	warpEmit func(warp.Event)
 	// noClientV6 says "IPv6 for clients" is off (NodeSettings.client_ipv6_disabled): the direct egress dials IPv4 only.
 	noClientV6 func() bool
@@ -72,8 +75,10 @@ func wire(stateDir string, log *slog.Logger, hooks *agentHooks) (agent.Config, m
 				return nil, fmt.Errorf("egress %q is not available on this node", name)
 			},
 		}, map[string]engine.Factory{
-			"hysteria2": hysteria2.Factory,
-			"vless":     vless.Factory,
+			"hysteria2":       hysteria2.Factory,
+			"vless":           vless.Factory,
+			ttengine.Protocol: ttengine.Factory,
+			mtproto.Protocol:  mtproto.Factory,
 			awg.Protocol: func(env engine.Env) (engine.Engine, error) {
 				mode := func() string {
 					if hooks.awgMode == nil {
@@ -81,7 +86,14 @@ func wire(stateDir string, log *slog.Logger, hooks *agentHooks) (agent.Config, m
 					}
 					return hooks.awgMode()
 				}
-				return newAwgEngine(env, mode), nil
+				w := newAwgEngine(env, mode)
+				w.peers = func() int {
+					if hooks.awgPeers == nil {
+						return 0
+					}
+					return hooks.awgPeers()
+				}
+				return w, nil
 			},
 		}, nil
 }

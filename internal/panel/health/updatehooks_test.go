@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -65,6 +66,80 @@ func TestExtConditionSourceOpensAndClearsAnAlert(t *testing.T) {
 	want(t, e.active())
 }
 
+// The scheduled tasks (internal/panel/tasks) raise their two alerts through a condition source too: one per task, no node,
+// and they close when the task's condition goes.
+func TestScheduledTaskConditionsOpenAlerts(t *testing.T) {
+	e := newEnv(t)
+	var mu sync.Mutex
+	var conds []ExtCond
+	e.s.AddConditionSource(func(context.Context) []ExtCond {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]ExtCond(nil), conds...)
+	})
+	set := func(c ...ExtCond) {
+		mu.Lock()
+		conds = c
+		mu.Unlock()
+		e.evaluate()
+	}
+	problem := ExtCond{Kind: "scheduled_check", Subject: "tsk_1", Severity: sevWarning, Why: "health.alert.scheduled_check.why",
+		Params: map[string]string{"task": "Morning check", "task_id": "tsk_1", "summary": "fleet_digest: totals.nodes_problem_now = 2", "telegram": "1"}}
+	failing := ExtCond{Kind: "scheduled_task_failing", Subject: "tsk_1", Severity: sevWarning, Why: "health.alert.scheduled_task_failing.why",
+		Params: map[string]string{"task": "Morning check", "task_id": "tsk_1", "count": "3", "reason": "tool_failed", "telegram": "0"}}
+	set(problem, failing)
+	got := e.active()
+	want(t, got, "scheduled_check//tsk_1", "scheduled_task_failing//tsk_1")
+	for key, kind := range map[string]adminv1.AlertKind{"scheduled_check//tsk_1": adminv1.AlertKind_ALERT_KIND_SCHEDULED_CHECK, "scheduled_task_failing//tsk_1": adminv1.AlertKind_ALERT_KIND_SCHEDULED_TASK_FAILING} {
+		a := got[key]
+		if msg := alertMsg(a, nil, func(store.HealthAlert) string { return "" }); msg.Kind != kind || msg.TitleKey != "health.alert."+a.Kind+".title" {
+			t.Errorf("%s: %+v", key, msg)
+		}
+	}
+	set(failing)
+	want(t, e.active(), "scheduled_task_failing//tsk_1")
+	set()
+	want(t, e.active())
+}
+
+// The WARP module raises WARP_REACH per node and site through the same source: it survives the node being offline (a stored
+// result, not a link fact), carries the words of its Telegram message and the button that opens the WARP card, and closes when
+// the module stops returning it.
+func TestWarpReachConditionOpensAnAlertOnTheNode(t *testing.T) {
+	e := newEnv(t)
+	e.node("de1", "hetzner", false) // offline
+	var mu sync.Mutex
+	var conds []ExtCond
+	e.s.AddConditionSource(func(context.Context) []ExtCond {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]ExtCond(nil), conds...)
+	})
+	set := func(c ...ExtCond) {
+		mu.Lock()
+		conds = c
+		mu.Unlock()
+		e.evaluate()
+	}
+	c := ExtCond{Kind: "warp_reach", NodeID: "de1", Subject: "notes.example.com", Severity: sevWarning, Why: "health.alert.warp_reach.why",
+		Params: map[string]string{"domain": "notes.example.com", "colo": "FRA", "http_status": "403", "streak": "2"}}
+	set(c)
+	got := e.active()["warp_reach/de1/notes.example.com"]
+	if got.Kind != "warp_reach" || got.Params["colo"] != "FRA" || got.WhyKey != "health.alert.warp_reach.why" {
+		t.Fatalf("alert = %+v", got)
+	}
+	if msg := alertMsg(got, nil, func(store.HealthAlert) string { return "" }); msg.Kind != adminv1.AlertKind_ALERT_KIND_WARP_REACH ||
+		msg.TitleKey != "health.alert.warp_reach.title" || !slices.Contains(msg.Actions, "open_warp") {
+		t.Fatalf("message = %+v", msg)
+	}
+	set(c) // again: nothing new
+	if len(e.active()) != 1 {
+		t.Fatalf("active %v", e.active())
+	}
+	set()
+	want(t, e.active())
+}
+
 // NodeChecksSince counts what the rollout gate needs: the probeable inbounds and the rounds that ended after the reconnect.
 func TestNodeChecksSince(t *testing.T) {
 	e := newEnv(t)
@@ -74,37 +149,146 @@ func TestNodeChecksSince(t *testing.T) {
 	e.pass(b)
 
 	since := e.clock.Now()
-	if p, ok, f, err := e.s.NodeChecksSince(e.ctx, "de1", since); err != nil || p != 2 || ok != 0 || f != 0 {
+	if p, ok, f, _, _, err := e.s.NodeChecksSince(e.ctx, "de1", since); err != nil || p != 2 || ok != 0 || f != 0 {
 		t.Fatalf("before any new round: probeable %d ok %d failed %d", p, ok, f)
 	}
 	e.pass(a)
-	if p, ok, f, err := e.s.NodeChecksSince(e.ctx, "de1", since); err != nil || p != 2 || ok != 1 || f != 0 {
+	if p, ok, f, _, _, err := e.s.NodeChecksSince(e.ctx, "de1", since); err != nil || p != 2 || ok != 1 || f != 0 {
 		t.Fatalf("one round ok: %d %d %d", p, ok, f)
 	}
 	e.fail(b, "timeout")
-	if p, ok, f, err := e.s.NodeChecksSince(e.ctx, "de1", since); err != nil || p != 2 || ok != 1 || f != 1 {
+	if p, ok, f, _, _, err := e.s.NodeChecksSince(e.ctx, "de1", since); err != nil || p != 2 || ok != 1 || f != 1 {
 		t.Fatalf("one failed: %d %d %d", p, ok, f)
 	}
 	e.round(b, cDeg, "http_status") // a degraded round is not an ok round
-	if p, ok, f, err := e.s.NodeChecksSince(e.ctx, "de1", since); err != nil || p != 2 || ok != 1 || f != 1 {
+	if p, ok, f, _, _, err := e.s.NodeChecksSince(e.ctx, "de1", since); err != nil || p != 2 || ok != 1 || f != 1 {
 		t.Fatalf("one degraded: %d %d %d", p, ok, f)
 	}
 	e.pass(b)
-	if p, ok, f, err := e.s.NodeChecksSince(e.ctx, "de1", since); err != nil || p != 2 || ok != 2 || f != 0 {
+	if p, ok, f, _, _, err := e.s.NodeChecksSince(e.ctx, "de1", since); err != nil || p != 2 || ok != 2 || f != 0 {
 		t.Fatalf("both ok: %d %d %d", p, ok, f)
 	}
 	// an inbound that is not active is not probeable; a node that is away has nothing to probe
 	e.exec(`UPDATE inbound SET state = 'pending' WHERE id = ?`, b)
 	e.s.invalidateSnapshot()
-	if p, ok, _, err := e.s.NodeChecksSince(e.ctx, "de1", since); err != nil || p != 1 || ok != 1 {
+	if p, ok, _, _, _, err := e.s.NodeChecksSince(e.ctx, "de1", since); err != nil || p != 1 || ok != 1 {
 		t.Fatalf("one inbound pending: %d %d", p, ok)
 	}
 	e.fl.set("de1", liveState{up: false})
 	e.s.invalidateSnapshot()
-	if p, _, _, err := e.s.NodeChecksSince(e.ctx, "de1", since.Add(-time.Hour)); err != nil || p != 0 {
+	if p, _, _, _, _, err := e.s.NodeChecksSince(e.ctx, "de1", since.Add(-time.Hour)); err != nil || p != 0 {
 		t.Fatalf("an offline node is probeable: %d", p)
 	}
-	if p, _, _, err := e.s.NodeChecksSince(e.ctx, "nod_nope", since); err != nil || p != 0 {
+	if p, _, _, _, _, err := e.s.NodeChecksSince(e.ctx, "nod_nope", since); err != nil || p != 0 {
 		t.Fatal("unknown node")
+	}
+}
+
+// The gate's second opinion needs to know whether the failures look like a lossy path: timeouts only, for how long.
+func TestNodeChecksSinceTimeouts(t *testing.T) {
+	e := newEnv(t)
+	e.node("de1", "hetzner", true)
+	a, b := e.inbound("de1", 443), e.inbound("de1", 8443)
+	since := e.clock.Now()
+	check := func(wantOnly bool, wantFor time.Duration) {
+		t.Helper()
+		_, _, f, only, span, err := e.s.NodeChecksSince(e.ctx, "de1", since)
+		if err != nil || only != wantOnly || span != wantFor {
+			t.Fatalf("failed %d timeoutsOnly %v span %v err %v, want %v %v", f, only, span, err, wantOnly, wantFor)
+		}
+	}
+	check(false, 0) // nothing failed: not a path problem
+	e.fail(a, "timeout")
+	e.pass(b)
+	check(true, 0) // one round has no duration yet
+	e.clock.Advance(58 * time.Second)
+	e.fail(a, "timeout")
+	check(true, 60*time.Second)
+	e.fail(b, "tls") // a protocol fault of the other inbound
+	check(false, 0)
+	e.pass(b)
+	e.fail(b, "timeout") // the tls round is still a round since: it stays against the rule
+	check(false, 0)
+	e.round(b, cDeg, "http_status")
+	e.pass(a)
+	check(false, time.Second)
+	_, ok, f, _, _, _ := e.s.NodeChecksSince(e.ctx, "de1", since)
+	if ok != 1 || f != 1 {
+		t.Fatalf("ok %d failed %d", ok, f)
+	}
+}
+
+// An OS update that stopped (internal/panel/update, os_rollout.go) raises os_update_failed through the same hook: a fact about
+// the rollout, not about the node's link, so it stays while the node is away (the reboot that did not come back) and clears
+// when the owner closes the rollout.
+func TestOsUpdateFailedConditionOpensAndClearsAnAlert(t *testing.T) {
+	e := newEnv(t)
+	e.node("de1", "hetzner", true)
+	var mu sync.Mutex
+	var conds []ExtCond
+	e.s.AddConditionSource(func(context.Context) []ExtCond {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]ExtCond(nil), conds...)
+	})
+	set := func(c ...ExtCond) {
+		mu.Lock()
+		conds = c
+		mu.Unlock()
+		e.evaluate()
+	}
+	notBack := ExtCond{Kind: "os_update_failed", NodeID: "de1", Subject: "osr_1", Severity: sevCritical,
+		Why: "health.alert.os_update_failed.why.not_back", Params: map[string]string{"rollout_id": "osr_1", "node": "de1", "reason": "not_back", "code": ""}}
+	set(notBack)
+	got := e.active()
+	want(t, got, "os_update_failed/de1/osr_1")
+	a := got["os_update_failed/de1/osr_1"]
+	if a.Severity != sevCritical || a.WhyKey != notBack.Why || a.TitleKey != "health.alert.os_update_failed.title" {
+		t.Fatalf("alert %+v", a)
+	}
+	if kindProto["os_update_failed"] != adminv1.AlertKind_ALERT_KIND_OS_UPDATE_FAILED {
+		t.Fatal("kind is not mapped")
+	}
+	e.fl.set("de1", liveState{up: false})
+	e.evaluate()
+	want(t, e.active(), "os_update_failed/de1/osr_1")
+	set()
+	want(t, e.active())
+	if h := e.history(); len(h) != 1 || h[0].Kind != "os_update_failed" || h[0].Resolution != "cleared" {
+		t.Fatalf("history %+v", h)
+	}
+}
+
+// NodeLastRounds gives the rollout the newest round of each probeable inbound (what the baseline before an update and the names
+// of the failed profiles after it are read from); an inbound with no round yet and one that is not probeable have none.
+func TestNodeLastRounds(t *testing.T) {
+	e := newEnv(t)
+	e.node("de1", "hetzner", true)
+	a, b, c := e.inbound("de1", 443), e.inbound("de1", 8443), e.inbound("de1", 9443)
+	e.pass(a)
+	e.fail(b, "timeout")
+	e.pass(b)
+	e.fail(b, "refused") // the newest round of b
+	got, err := e.s.NodeLastRounds(e.ctx, "de1")
+	if err != nil || len(got) != 2 {
+		t.Fatalf("rounds %+v, err %v", got, err)
+	}
+	by := map[string]store.CheckSample{}
+	for _, r := range got {
+		by[r.InboundID] = r
+	}
+	if r := by[a]; r.Status != int(adminv1.CheckStatus_CHECK_STATUS_OK) || r.ErrorCode != "" {
+		t.Fatalf("round of the healthy inbound %+v", r)
+	}
+	if r := by[b]; r.Status != int(adminv1.CheckStatus_CHECK_STATUS_FAILED) || r.ErrorCode != "refused" {
+		t.Fatalf("round of the failing inbound %+v", r)
+	}
+	if _, has := by[c]; has {
+		t.Fatal("an inbound that was never probed has a round")
+	}
+	e.exec(`UPDATE inbound SET state = 'pending' WHERE id = ?`, b)
+	e.s.invalidateSnapshot()
+	if got, err := e.s.NodeLastRounds(e.ctx, "de1"); err != nil || len(got) != 1 || got[0].InboundID != a {
+		t.Fatalf("an inbound that is not active is listed: %+v, %v", got, err)
 	}
 }

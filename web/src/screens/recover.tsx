@@ -1,8 +1,8 @@
 import { Link } from "@tanstack/react-router";
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { AuthFrame, Heading, TotpEnroll } from "@/components/auth-parts";
+import { AuthFrame, GoButton, Heading, TotpEnroll } from "@/components/auth-parts";
 import { CopyButton } from "@/components/copy-button";
-import { Button, buttonClass } from "@/components/ui/button";
+import { buttonClass } from "@/components/ui/button";
 import { Notice } from "@/components/ui/notice";
 import { TextField } from "@/components/ui/text-field";
 import { useT } from "@/i18n";
@@ -30,7 +30,7 @@ function CopyBox({ value, big }: { value: string; big?: boolean }) {
   );
 }
 
-const eyebrow = "text-[11px] font-bold tracking-[0.1em] text-muted uppercase";
+const eyebrow = "text-[13px] text-sec";
 
 /**
  * The page behind the link of `mistgate edge reset-login`. The one-time token (and the login, when the panel has several
@@ -99,17 +99,17 @@ export function RecoverScreen() {
           <span className={eyebrow}>{t("auth.recover.password")}</span>
           <CopyBox value={result.password} big />
         </div>
-        {result.totpUri && result.totpSecret && <TotpEnroll uri={result.totpUri} secret={result.totpSecret} caption={t("auth.setup.totpScan")} />}
+        {result.totpUri && result.totpSecret && <TotpEnroll qr={result.totpQr} secret={result.totpSecret} caption={t("auth.setup.totpScan")} />}
         <Notice title={t("auth.recover.onceTitle")}>{t("auth.recover.onceBody")}</Notice>
         <div className="flex flex-col gap-1.5 rounded-card border border-line bg-surface p-4">
           <b className="text-[15px]">{t("auth.recover.nextTitle")}</b>
-          <ol className="flex list-decimal flex-col gap-1 pl-5 text-[13px] leading-snug text-pretty text-muted">
+          <ol className="flex list-decimal flex-col gap-1 ps-5 text-[13px] leading-snug text-pretty text-muted">
             <li>{t("auth.recover.nextSignIn")}</li>
             <li>{t("auth.recover.nextPasskey")}</li>
           </ol>
           <span className="text-xs leading-snug text-muted">{t.n("auth.recover.sessions", result.sessionsEnded)}</span>
         </div>
-        <Link to="/login" className={buttonClass("primary", "lg", true)}>
+        <Link to="/login" className={cx(buttonClass("primary", "lg", true), "h-12! rounded-xl! text-[15px]!")}>
           {t("auth.toLogin")}
         </Link>
       </AuthFrame>
@@ -154,9 +154,9 @@ export function RecoverScreen() {
             {refusal}
           </Notice>
         )}
-        <Button type="submit" variant="primary" size="lg" full disabled={busy || !!loginError}>
+        <GoButton type="submit" busy={busy} disabled={!!loginError}>
           {busy ? t("auth.checking") : t("auth.recover.submit")}
-        </Button>
+        </GoButton>
       </form>
     </AuthFrame>
   );

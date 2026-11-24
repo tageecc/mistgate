@@ -1,0 +1,287 @@
+package update
+
+import (
+	"context"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	agentv1 "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/internal/node/osupdate"
+	"github.com/mistgate/mistgate/internal/panel/store"
+)
+
+// Two kinds of "not now" of an OS job, both known to the panel before it asks:
+//
+//   - when a reboot becomes possible again (osRebootWait): the node refuses a reboot soon after its boot (too_soon) and a reboot
+//     the panel asked for more than once an hour or three times in 24 hours (reboot_limit); the screen turns the Reboot action
+//     off until then instead of letting the owner click into a refusal;
+//   - a refusal that only asks to wait (osRetryLater): nothing was changed on the node and nothing is wrong with it, so the step
+//     stays pending and retries until the wait ends or its two-hour ceiling is reached.
+
+const (
+	blockRebootWait = "reboot_wait"
+	osErrTryLater   = "try_later"
+	osWaitPhase     = "waiting_retry"
+	osRetryAfter    = "retry_after_unix"
+	osRetryCode     = "retry_code"
+	osRetrySince    = "retry_since_unix" // when the first wait began: kept across the resends, so the two hours are one budget
+	osRetryCount    = "retry_count"
+)
+
+const (
+	osRetryLimit    = 2 * time.Hour
+	osRetryInterval = 30 * time.Second
+)
+
+// osRetryLater are the codes of a refusal that only says "not now": a job of another kind is running (busy), another package
+// manager holds the lock (apt_lock), the host booted a moment ago (too_soon), the reboot limit is spent (reboot_limit).
+// Every other code needs a look at the node and pauses the rollout.
+var osRetryLater = []string{osupdate.CodeBusy, osupdate.CodeAptLock, osupdate.CodeTooSoon, osupdate.CodeRebootLimit}
+
+// osJobAskedToWait: the job of the snapshot failed only because the node asked to wait, with nothing installed or rebooted.
+func osJobAskedToWait(j *agentv1.OsJob) bool {
+	return j.GetUpgraded() == 0 && j.GetReboot() != osupdate.RebootDone &&
+		slices.Contains(osRetryLater, j.GetCode()) && (j.GetHeldReason() == "" || slices.Contains(osRetryLater, j.GetHeldReason()))
+}
+
+// osRebootWait is the time from which a reboot of the node is possible again, and the code of the limit that holds it longest;
+// the zero time when it is possible now.
+//
+//	too_soon      bootAt + osupdate.MinUptime (the panel's record of the node's last boot stands for the agent's uptime)
+//	reboot_limit  of the panel's reboots of the last 24 hours (newest last): the newest + 1 hour (MaxRebootsHour of them within
+//	              an hour block), and the MaxRebootsDay-th newest + 24 hours once there are that many
+//
+// Both limits are "less than": a reboot is possible exactly at the time returned.
+func osRebootWait(bootAt time.Time, reboots []time.Time, now time.Time) (time.Time, string) {
+	var at time.Time
+	var code string
+	hold := func(t time.Time, c string) {
+		if t.After(now) && t.After(at) {
+			at, code = t, c
+		}
+	}
+	if !bootAt.IsZero() {
+		hold(notAfter(bootAt, now).Add(osupdate.MinUptime), osupdate.CodeTooSoon) // a boot "in the future" is a skewed clock: no longer than the limit itself
+	}
+	var recent []time.Time // newest first
+	for _, r := range reboots {
+		if d := now.Sub(r); d < 24*time.Hour {
+			recent = append(recent, notAfter(r, now))
+		}
+	}
+	slices.SortFunc(recent, func(a, b time.Time) int { return b.Compare(a) })
+	if len(recent) >= osupdate.MaxRebootsHour {
+		hold(recent[osupdate.MaxRebootsHour-1].Add(time.Hour), osupdate.CodeRebootLimit)
+	}
+	if len(recent) >= osupdate.MaxRebootsDay {
+		hold(recent[osupdate.MaxRebootsDay-1].Add(24*time.Hour), osupdate.CodeRebootLimit)
+	}
+	return at, code
+}
+
+func notAfter(t, limit time.Time) time.Time {
+	if t.After(limit) {
+		return limit
+	}
+	return t
+}
+
+// osRebootsOf lists when the panel's OS jobs rebooted the node in the last 24 hours. A read that fails counts as none: the node
+// still refuses a reboot that is too soon, and the screen only shows the reason one click late.
+func (s *Service) osRebootsOf(ctx context.Context, nodeID string, now time.Time) []time.Time {
+	all, err := s.osReboots(ctx, now)
+	if err != nil {
+		return nil
+	}
+	return all[nodeID]
+}
+
+func (s *Service) osReboots(ctx context.Context, now time.Time) (map[string][]time.Time, error) {
+	all, err := s.st.OsRebootsSince(ctx, now.Add(-24*time.Hour))
+	if err != nil {
+		s.log.Warn("update: read OS reboot times", "code", "update_os_read_reboot_times", "err", err)
+	}
+	return all, err
+}
+
+// osNothingChanged: the failed or held job only asked to wait, so its step returns to its durable retry wait. A reboot_only run installs nothing,
+// so for it the node's code alone decides. A run that installs counts only when the node's own record says that no package was
+// installed and no reboot done (the snapshot of the job; the events carry no package count), and the failure came before the
+// reboot step.
+func (p *osPass) osNothingChanged(v osJobView) (string, bool) {
+	if v.reboot == osupdate.RebootDone {
+		return "", false
+	}
+	codes := []string{v.code}
+	if v.reasons != "" {
+		codes = strings.Split(v.reasons, ",")
+	} else if v.code == "" {
+		codes = []string{v.heldReason}
+	}
+	for _, c := range codes {
+		if !slices.Contains(osRetryLater, c) {
+			return "", false
+		}
+	}
+	if p.ro.Mode != store.OsModeRebootOnly {
+		if n, err := strconv.ParseUint(v.upgraded, 10, 32); !v.snapshot || err != nil || n > 0 || v.reboot == osupdate.RebootHeld {
+			return "", false
+		}
+	}
+	return codes[0], true
+}
+
+// waitTryLater returns a self-closing refusal to PENDING. The initial wait time and next retry time are stored in the existing
+// step row, so the two-hour ceiling survives a panel restart.
+func (p *osPass) waitTryLater(x *store.OsStepRow, code string, retryAt time.Time, extra ...map[string]string) {
+	code = osCode(code)
+	if !slices.Contains(osRetryLater, code) {
+		p.finishAndPause(x, osErrAgentRefused, map[string]string{"code": code}, pauseStepFailed)
+		return
+	}
+	params := map[string]string{}
+	for _, values := range extra {
+		params = mergeParams(params, values)
+	}
+	if p.cancelRequested() { // the answer came after the owner's cancel: the step must not go back to the queue
+		p.finish(x, store.OsStepSkipped, errCancelled, params)
+		return
+	}
+	started := retryStart(x, p.now)
+	deadline := started.Add(osRetryLimit)
+	if !p.now.Before(deadline) {
+		params["code"] = code
+		p.finish(x, store.OsStepSkipped, osErrTryLater, params)
+		return
+	}
+	if retryAt.IsZero() || !retryAt.After(p.now) {
+		retryAt = p.now.Add(osRetryInterval)
+	}
+	if retryAt.After(deadline) {
+		retryAt = deadline
+	}
+	updated := *x
+	updated.State, updated.Phase, updated.PhaseAt = store.OsStepPending, osWaitPhase, started
+	updated.ErrorKey = ""
+	updated.Params = mergeParams(updated.Params, params)
+	updated.Params = mergeParams(updated.Params, map[string]string{
+		osRetryAfter: strconv.FormatInt(retryAt.Unix(), 10),
+		osRetryCode:  code,
+		osRetrySince: strconv.FormatInt(started.Unix(), 10),
+	})
+	if p.save(&updated) {
+		*x = updated
+	}
+}
+
+// cancelRequested: the owner cancelled while a job was still running, so nothing may be queued again.
+func (p *osPass) cancelRequested() bool {
+	return isCancelWait(p.ro.PauseKey, p.ro.PauseParams) ||
+		slices.ContainsFunc(p.steps, func(x store.OsStepRow) bool { return x.State == store.OsStepSkipped && x.ErrorKey == errCancelled })
+}
+
+func (p *osPass) retryWait(x *store.OsStepRow) (time.Time, bool) {
+	if x.Phase != osWaitPhase {
+		return time.Time{}, false
+	}
+	deadline := retryStart(x, p.now).Add(osRetryLimit)
+	if !p.now.Before(deadline) {
+		return deadline, true
+	}
+	unix, _ := strconv.ParseInt(x.Params[osRetryAfter], 10, 64)
+	return time.Unix(unix, 0), false
+}
+
+// retryStart is when the step began to wait. A resend (the step went to SENT and the node refused again) clears the phase but
+// not osRetrySince, so a node that keeps answering "busy" cannot extend the two hours.
+func retryStart(x *store.OsStepRow, now time.Time) time.Time {
+	if x.Phase == osWaitPhase && !x.PhaseAt.IsZero() {
+		return x.PhaseAt
+	}
+	if unix, err := strconv.ParseInt(x.Params[osRetrySince], 10, 64); err == nil && unix > 0 {
+		return time.Unix(unix, 0)
+	}
+	return now
+}
+
+// clearOsRetryWait ends the wait for good (the step is decided or is retried by the owner).
+func clearOsRetryWait(params map[string]string) map[string]string {
+	delete(params, osRetryAfter)
+	delete(params, osRetryCode)
+	delete(params, osRetrySince)
+	return params
+}
+
+// ---------------------------------------------------------------------------------------------------
+// What the check after the job still waits for
+
+// gate_* params of a GATING step (admin update.proto OsStep.params).
+const (
+	gateFor   = "gate_for"
+	gateNames = "gate_names"
+	gateMore  = "gate_more"
+	gateMaxS  = "gate_max_s"
+)
+
+var gateKeys = []string{gateFor, gateNames, gateMore, gateMaxS}
+
+// gateWaitParams says what the check waits for: the profiles that have not passed yet (names; at most GateShown of them), else
+// the kind of thing it lacks, and how long the check may take. The same values give no write.
+func (s *Service) gateWaitParams(g gateResult) map[string]string {
+	out := map[string]string{gateMaxS: strconv.Itoa(int(s.cfg.OsGateWait / time.Second))}
+	switch {
+	case len(g.waiting) > 0:
+		names := make([]string, 0, GateShown)
+		for _, n := range g.waiting[:min(len(g.waiting), GateShown)] {
+			names = append(names, truncateRunes(n, gateNameLn))
+		}
+		out[gateFor], out[gateNames] = "profiles", jsonStringList(names)
+		if more := len(g.waiting) - len(names); more > 0 {
+			out[gateMore] = strconv.Itoa(more)
+		}
+	case g.soft == errWarpDown:
+		out[gateFor] = "warp"
+	case g.soft == osErrJobNotSettled:
+		out[gateFor] = "job"
+	case g.soft != "":
+		out[gateFor] = "settings"
+	}
+	return out
+}
+
+// noteGateWait stores what the check waits for on the GATING step, when it changed.
+func (p *osPass) noteGateWait(x *store.OsStepRow, g gateResult) {
+	want := p.s.gateWaitParams(g)
+	same := true
+	for _, k := range gateKeys {
+		if x.Params[k] != want[k] {
+			same = false
+		}
+	}
+	if same {
+		return
+	}
+	updated := *x
+	updated.Params = make(map[string]string, len(x.Params)+len(want))
+	for k, v := range x.Params {
+		if !slices.Contains(gateKeys, k) {
+			updated.Params[k] = v
+		}
+	}
+	for k, v := range want {
+		updated.Params[k] = v
+	}
+	if p.save(&updated) {
+		*x = updated
+	}
+}
+
+// withoutGateWait is the params of a finished step: the wait is over, whatever it was.
+func withoutGateWait(params map[string]string) map[string]string {
+	for _, k := range gateKeys {
+		delete(params, k)
+	}
+	return params
+}

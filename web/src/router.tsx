@@ -18,9 +18,12 @@ import { validatePaging, type PagingSearch } from "@/lib/paging";
 import { validateSort, type SortSearch } from "@/screens/users/sort";
 import { goToSignIn, meQuery, queryClient, setSignedOutHandler } from "@/lib/session";
 import { validateHealthSearch } from "@/screens/health/tabs";
+import { validateUpdatesSearch } from "@/screens/updates/tabs";
 import { upgradeNodeLink, validateNodeSearch } from "@/screens/node/tabs";
 import { validateReachSearch } from "@/screens/reachability/search";
+import { validateNewProfileSearch, validateProfileSearch, validateProfilesSearch } from "@/screens/profiles/search";
 import { validateSubsSearch } from "@/screens/subscriptions/tabs";
+import { validateAiSearch } from "@/screens/ai/tabs";
 
 // Every screen is its own chunk: the first paint only needs the router, the session check and the
 // chunk of the screen it lands on (sign-in, or the shell and the section).
@@ -116,6 +119,11 @@ const overview = createRoute({
 const nodes = createRoute({
   getParentRoute: () => app,
   path: "/nodes",
+  // ?view=ways is the ways out of the country (the owner's), ?view=map the fleet map, ?view=load the fleet's load, ?focus=<node id> the node the map selects and centres
+  validateSearch: (s: Record<string, unknown>): { view?: "ways" | "map" | "load"; focus?: string } => ({
+    ...(s.view === "ways" || s.view === "map" || s.view === "load" ? { view: s.view } : {}),
+    ...(typeof s.focus === "string" && /^[\w-]{1,64}$/.test(s.focus) ? { focus: s.focus } : {}),
+  }),
   component: lazyRouteComponent(() => import("@/screens/nodes"), "NodesScreen"),
 });
 const node = createRoute({
@@ -141,31 +149,61 @@ const users = createRoute({
     ...(typeof s.group === "string" && s.group !== "" ? { group: s.group } : {}),
     ...(s.tab === "groups" ? { tab: "groups" as const } : { ...validatePaging(s), ...validateSort(s) }),
   }),
+  // a link made for the group's old window ("?tab=groups&group=<id>") goes to the group's page
+  beforeLoad: ({ search }) => {
+    if (search.tab === "groups" && search.group) throw redirect({ to: "/users/groups/$id", params: { id: search.group }, replace: true });
+  },
   component: lazyRouteComponent(() => import("@/screens/users"), "UsersScreen"),
 });
-// "?add=device" opens "Add device" (the link window sends the owner here when self-service is off).
+// The page of a group; "?tab=access|settings" is its tab (the people are the first), "?page=" and "?size=" page its people.
+const group = createRoute({
+  getParentRoute: () => app,
+  path: "/users/groups/$id",
+  validateSearch: (s: Record<string, unknown>): { tab?: "access" | "settings" } & PagingSearch => ({
+    ...(s.tab === "access" || s.tab === "settings" ? { tab: s.tab } : {}),
+    ...validatePaging(s),
+  }),
+  component: lazyRouteComponent(() => import("@/screens/users"), "GroupScreen"),
+});
+// "?add=device" opens "Add device" (the link window sends the owner here when self-service is off); "?tab=" is the tab of the page
+// (the Overview has none), and "#client-logs" lands on the Logs tab.
+const userTabs = ["devices", "access", "logs", "settings"] as const;
 const user = createRoute({
   getParentRoute: () => app,
   path: "/users/$id",
-  validateSearch: (s: Record<string, unknown>): { add?: "device" } => (s.add === "device" ? { add: "device" } : {}),
+  validateSearch: (s: Record<string, unknown>): { add?: "device"; tab?: (typeof userTabs)[number] } => ({
+    ...(s.add === "device" ? { add: "device" as const } : {}),
+    ...(userTabs.includes(s.tab as never) ? { tab: s.tab as (typeof userTabs)[number] } : {}),
+  }),
   component: lazyRouteComponent(() => import("@/screens/users"), "UserScreen"),
+});
+
+// The Telegram proxy had a tab of its own; its profiles are the MTProto ones of Profiles, its people on their own pages.
+const telegramProxy = createRoute({
+  getParentRoute: () => app,
+  path: "/telegram",
+  beforeLoad: () => {
+    throw redirect({ to: "/profiles", search: { protocol: "mtproto" }, replace: true });
+  },
 });
 
 const profiles = createRoute({
   getParentRoute: () => app,
   path: "/profiles",
+  validateSearch: validateProfilesSearch,
   component: lazyRouteComponent(() => import("@/screens/profiles"), "ProfilesScreen"),
 });
-// "?node=<id>": made from that node's page; the new profile goes on it and the editor returns there.
+// "?node=<id>": made from that node's page; the new profile goes on it and the wizard returns there. "?protocol=": skips the task, the settings step.
 const profileNew = createRoute({
   getParentRoute: () => app,
   path: "/profiles/new",
-  validateSearch: (s: Record<string, unknown>): { node?: string } => (typeof s.node === "string" && s.node !== "" ? { node: s.node } : {}),
-  component: lazyRouteComponent(() => import("@/screens/profiles"), "ProfileEditorScreen"),
+  validateSearch: validateNewProfileSearch,
+  component: lazyRouteComponent(() => import("@/screens/profiles"), "ProfileNewScreen"),
 });
 const profile = createRoute({
   getParentRoute: () => app,
   path: "/profiles/$id",
+  validateSearch: validateProfileSearch,
   component: lazyRouteComponent(() => import("@/screens/profiles"), "ProfileEditorScreen"),
 });
 
@@ -174,6 +212,18 @@ const subscriptions = createRoute({
   path: "/subscriptions",
   validateSearch: validateSubsSearch,
   component: lazyRouteComponent(() => import("@/screens/subscriptions"), "SubscriptionsScreen"),
+});
+
+// The library of decoy sites and one site of it ("builtin" and "panel_dir" are its two built-in entries).
+const decoys = createRoute({
+  getParentRoute: () => app,
+  path: "/decoys",
+  component: lazyRouteComponent(() => import("@/screens/decoys"), "DecoysScreen"),
+});
+const decoy = createRoute({
+  getParentRoute: () => app,
+  path: "/decoys/$id",
+  component: lazyRouteComponent(() => import("@/screens/decoys"), "DecoySiteScreen"),
 });
 
 // Settings has sub-pages (/settings/interface, ...); the sections without a backend yet are one calm screen each.
@@ -214,7 +264,17 @@ const reachability = createRoute({
 const updates = createRoute({
   getParentRoute: () => app,
   path: "/updates",
+  // the open tab (the node agents, or the servers' operating system), so a reload or a link keeps it
+  validateSearch: validateUpdatesSearch,
   component: lazyRouteComponent(() => import("@/screens/updates"), "UpdatesScreen"),
+});
+
+const ai = createRoute({
+  getParentRoute: () => app,
+  path: "/ai",
+  // the tab, and the page of the approvals history
+  validateSearch: validateAiSearch,
+  component: lazyRouteComponent(() => import("@/screens/ai"), "AiScreen"),
 });
 
 const integrations = createRoute({
@@ -225,7 +285,7 @@ const integrations = createRoute({
   component: lazyRouteComponent(() => import("@/screens/integrations"), "IntegrationsScreen"),
 });
 
-const built = new Set(["overview", "nodes", "users", "profiles", "subscriptions", "health", "reachability", "updates", "integrations", "settings"]);
+const built = new Set(["overview", "nodes", "users", "profiles", "subscriptions", "decoys", "health", "reachability", "updates", "ai", "integrations", "settings"]);
 const placeholderRoutes = sections
   .filter((s) => !built.has(s.id))
   .map((s) => createRoute({ getParentRoute: () => app, path: s.to, component: () => <SectionScreen id={s.id} /> }));
@@ -240,14 +300,19 @@ const routeTree = root.addChildren([
     nodes,
     node,
     users,
+    group,
     user,
+    telegramProxy,
     profiles,
     profileNew,
     profile,
     subscriptions,
+    decoys,
+    decoy,
     health,
     reachability,
     updates,
+    ai,
     integrations,
     ...placeholderRoutes,
     settings.addChildren([settingsIndex, settingsPage]),

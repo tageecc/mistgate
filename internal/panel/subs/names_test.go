@@ -100,6 +100,12 @@ func TestSubscriptionPageLanguage(t *testing.T) {
 		{"ru-RU,zh-CN;q=0.8", "en", "ru"},
 		{"fr-FR", "zh", "zh"},
 		{"", "", "en"},
+		{"fa-IR,fa;q=0.9,en-US;q=0.8", "ru", "fa"},
+		{"fa", "en", "fa"},
+		{"tr-TR,tr;q=0.9,en-US;q=0.8", "ru", "tr"},
+		{"de-DE,tr;q=0.7", "en", "tr"},
+		{"ar-SA", "fa", "fa"}, // the owner's default (Persian) where the browser speaks none of the page's languages
+		{"ar-SA", "tr", "tr"},
 	} {
 		r := httptest.NewRequest("GET", "https://example.com/", nil)
 		r.Header.Set("Accept-Language", c.accept)
@@ -310,6 +316,22 @@ func TestServerLoads(t *testing.T) {
 	}
 }
 
+// Each server's host is its node's own address, as its links and keys give it; the node's name is never the host.
+func TestServerHostIsTheNodesAddress(t *testing.T) {
+	v := access.SubView{Nodes: []access.SubNode{
+		{ID: "id-de1", Name: "de1", CountryCode: "DE", Address: "de1.example.com"},
+		{ID: "id-x1", Name: "x1", Address: "203.0.113.24"},
+	}}
+	servers := pageServers(v, &adminv1.SubscriptionSettings{}, "en")
+	if len(servers) != 2 || servers[0].Host != "de1.example.com" || servers[1].Host != "203.0.113.24" {
+		t.Errorf("hosts = %+v", servers)
+	}
+	b, _ := json.Marshal(servers[0])
+	if !strings.Contains(string(b), `"host":"de1.example.com"`) {
+		t.Errorf("page row = %s", b)
+	}
+}
+
 // A subscription that does not work says why in the words of the user page, in the instance language.
 func TestStateNote(t *testing.T) {
 	now := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
@@ -493,6 +515,8 @@ func TestRemarksOfATwinThroughARelay(t *testing.T) {
 		"en": "\U0001F1E9\U0001F1EA DE · Hysteria2 · via FI",
 		"ru": "\U0001F1E9\U0001F1EA DE · Hysteria2 · через FI",
 		"zh": "\U0001F1E9\U0001F1EA DE · Hysteria2 · 经 FI",
+		"fa": "\U0001F1E9\U0001F1EA DE · Hysteria2 · از طریق FI",
+		"tr": "\U0001F1E9\U0001F1EA DE · Hysteria2 · FI üzerinden",
 	} {
 		got := remarks([]access.SubServer{exit, twin}, "", lang)
 		if got[0] != "\U0001F1E9\U0001F1EA DE · Hysteria2" || got[1] != want {
@@ -520,7 +544,7 @@ func TestHappNameOfATwinStaysInTheLimitAndKeepsItsLabel(t *testing.T) {
 	long.Mark, long.LoadPercent = access.ViaMark("FI"), &load
 	short := srv("de1", "DE", "VLESS")
 	short.Mark, short.LoadPercent = access.ViaMark("FI"), &load
-	for _, lang := range []string{"en", "ru", "zh"} {
+	for _, lang := range []string{"en", "ru", "zh", "fa", "tr"} {
 		for _, s := range []access.SubServer{long, short} {
 			got := happRemarks([]access.SubServer{s}, "", lang, true)[0]
 			label := markText(s.Mark, lang)
@@ -539,5 +563,41 @@ func TestHappNameOfATwinStaysInTheLimitAndKeepsItsLabel(t *testing.T) {
 	// Not both: the label outranks the load.
 	if got := happRemarks([]access.SubServer{short}, "", "ru", true)[0]; strings.Contains(got, "％") || !strings.HasSuffix(got, " · через FI") {
 		t.Errorf("ru: %q", got)
+	}
+}
+
+// The IPv6 twin of a server is told apart by " · IPv6" after its name, the same in every language, and keeps the Happ limit.
+func TestRemarksOfTheIPv6Twin(t *testing.T) {
+	server := srv("de1", "DE", "Hysteria2")
+	twin := server
+	twin.Mark = access.MarkIPv6
+	for _, lang := range []string{"en", "ru", "zh", "fa", "tr"} {
+		got := remarks([]access.SubServer{server, twin}, "", lang)
+		if got[0] != "\U0001F1E9\U0001F1EA DE · Hysteria2" || got[1] != "\U0001F1E9\U0001F1EA DE · Hysteria2 · IPv6" {
+			t.Errorf("%s: %q", lang, got)
+		}
+	}
+	// the number tells two of them apart, as for any name; the relay's twin is a name of its own
+	via := server
+	via.Mark = access.ViaMark("fi")
+	if got := remarks([]access.SubServer{server, twin, via, twin}, "", "en"); got[3] != got[1]+" 2" || got[2] != "\U0001F1E9\U0001F1EA DE · Hysteria2 · via FI" {
+		t.Errorf("names: %q", got)
+	}
+	// Happ: 30 units at most, the label before the profile's name and the load
+	load := 74
+	for _, profile := range []string{"Hysteria2 premium", "VLESS", "Hysteria2"} {
+		s := srv("de1", "DE", profile)
+		s.Mark, s.LoadPercent = access.MarkIPv6, &load
+		for _, lang := range []string{"en", "ru", "zh", "fa", "tr"} {
+			got := happRemarks([]access.SubServer{s}, "", lang, true)[0]
+			if n := len(utf16.Encode([]rune(got))); n > 30 || !strings.Contains(got, " · IPv6") {
+				t.Errorf("%s %s: %q is %d units or lost the label", lang, profile, got, n)
+			}
+		}
+	}
+	long := srv("de1", "DE", "Hysteria2 premium")
+	long.Mark = access.MarkIPv6
+	if got := happRemarks([]access.SubServer{long}, "", "en", false)[0]; got != "\U0001F1E9\U0001F1EA DE · HY2 premium · IPv6" {
+		t.Errorf("long profile: %q", got)
 	}
 }

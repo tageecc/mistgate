@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package mistgate.admin.v1;
 
+import "mistgate/agent/v1/agent.proto";
+
 // Updates screen: the panel release, the release bundle it holds, what every node runs, and explicit
 // per-node agent updates (with the rollout gate and automatic rollback of a failed node).
 // Conventions: common.proto.
@@ -22,6 +24,22 @@ service UpdateService {
   // The whole page in one call: this panel, the bundle, every node and the active or last rollout. Never
   // contacts a node and never rescans the bundle directory (RescanBundle does).
   rpc GetUpdates(GetUpdatesRequest) returns (GetUpdatesResponse);
+  // Stored snapshots only: does not contact nodes, run apt, or refresh package lists.
+  rpc GetOsUpdates(GetOsUpdatesRequest) returns (GetOsUpdatesResponse);
+  // Start an OS update of 1..20 nodes (agent.proto "OS UPDATES"). The canary runs first, then batches wait for the
+  // previous batch's health gate. Owner-only with a fresh step-up. Only one rollout of any kind is active at a time.
+  // Audited.
+  rpc StartOsRollout(StartOsRolloutRequest) returns (StartOsRolloutResponse);
+  // Stop a running, queued, paused, or failed OS rollout. A job already running on a node is never interrupted and is still
+  // checked; nothing new starts. Owner-only with a fresh step-up.
+  rpc CancelOsRollout(CancelOsRolloutRequest) returns (CancelOsRolloutResponse);
+  // Pause future OS jobs. A job already running on a node is never interrupted and is still checked.
+  rpc PauseOsRollout(PauseOsRolloutRequest) returns (PauseOsRolloutResponse);
+  // Resume an OS rollout. A failed step is retried once by default; skip_failed marks it skipped and moves on.
+  rpc ResumeOsRollout(ResumeOsRolloutRequest) returns (ResumeOsRolloutResponse);
+  // Refresh the package lists of nodes (apt-get update only; nothing is installed or rebooted). At most 3 nodes at a time
+  // and once per node per 30 minutes; the answer says which were started. Owner-only, no step-up.
+  rpc RefreshOsUpdates(RefreshOsUpdatesRequest) returns (RefreshOsUpdatesResponse);
   // Force a fresh lookup of the latest stable GitHub release. The background checker also polls periodically.
   rpc CheckPanelUpdate(CheckPanelUpdateRequest) returns (CheckPanelUpdateResponse);
   // Install the latest signed panel release through the root helper (a transient systemd unit or the fixed
@@ -51,6 +69,229 @@ service UpdateService {
   rpc CancelNodeUpdateSchedule(CancelNodeUpdateScheduleRequest) returns (CancelNodeUpdateScheduleResponse);
   // Change the fixed UTC offset used to enter new scheduled updates. Existing schedules keep their original offset.
   rpc SetUpdateTimezone(SetUpdateTimezoneRequest) returns (SetUpdateTimezoneResponse);
+  // Change the release channel this panel follows. Owner-only with a fresh step-up; never available to API tokens.
+  rpc SetUpdateChannel(SetUpdateChannelRequest) returns (SetUpdateChannelResponse);
+  // Change the maximum time an agent may spend downloading one update binary. Owner-only with a fresh step-up.
+  rpc SetUpdateDownloadTimeout(SetUpdateDownloadTimeoutRequest) returns (SetUpdateDownloadTimeoutResponse);
+  // Select optional node-update download sources. The panel always remains first. Owner-only with a fresh step-up.
+  rpc SetUpdateDownloadSources(SetUpdateDownloadSourcesRequest) returns (SetUpdateDownloadSourcesResponse);
+}
+
+enum OsUpdateState {
+  OS_UPDATE_STATE_UNSPECIFIED = 0;
+  OS_UPDATE_STATE_UNSUPPORTED = 1;
+  OS_UPDATE_STATE_OFFLINE = 2;
+  OS_UPDATE_STATE_UNKNOWN = 3;
+  OS_UPDATE_STATE_BUSY = 4;
+  OS_UPDATE_STATE_FAILED = 5;
+  OS_UPDATE_STATE_REBOOT_REQUIRED = 6;
+  OS_UPDATE_STATE_UPDATES = 7;
+  OS_UPDATE_STATE_UP_TO_DATE = 8;
+}
+
+message GetOsUpdatesRequest {}
+
+message NodeOs {
+  string node_id = 1;
+  string name = 2;
+  bool connected = 3;
+  bool supported = 4;
+  uint32 online_users = 5;
+  bool on_panel_server = 6;
+  OsUpdateState state = 7;
+  mistgate.agent.v1.OsStatus status = 8;
+  // The agent lists "os-update/1": it can run an OS job. False for an agent that only reads (update the agent).
+  bool update_capable = 9;
+  // Why a security-mode StartOsRollout would be refused for this node right now, "" when it would not. One of: offline, agent_old,
+  // unsupported, panel_host, node_busy (a job is running on the node, or a refresh of its package lists was just asked for), no_status (nothing read yet), nothing_to_do
+  // (nothing to install: use a reboot), rollout_active (an OS rollout is running or paused: a paused one holds only the next OS update), agent_rollout (a node-agent
+  // rollout is active), panel_busy (the panel itself is being updated or a bundle is being installed), awg_build (the
+  // AmneziaWG module is being built on the node). The SPA resolves "os.block.<key>".
+  string update_block = 10;
+  // The same for a plain reboot (no package change), "" when allowed. Same keys, without no_status and nothing_to_do.
+  string reboot_block = 11;
+  // Unix time from which a reboot of this node is possible again, 0 when it is possible now. The later of two limits: the node
+  // refuses a reboot less than 10 minutes after it booted (too_soon), and a reboot the panel asked for at most once an hour and
+  // three times in 24 hours (reboot_limit); the panel counts the reboots of its own OS rollouts. The SPA turns the Reboot action
+  // off until then. A reboot_only StartOsRollout before that time is refused with os_blocked: reason=reboot_wait.
+  int64 reboot_possible_unix = 12 [jstype = JS_NUMBER];
+  // The same package-update blocker for mode ALL. update_block stays the security-mode field for old clients.
+  string update_block_all = 13;
+  // Number of enabled inbounds, used with online_users and name for the reproducible canary order.
+  uint32 inbounds = 14;
+}
+
+message GetOsUpdatesResponse {
+  int64 now_unix = 1 [jstype = JS_NUMBER];
+  repeated NodeOs nodes = 2;
+  mistgate.agent.v1.OsStatus panel_host = 3;
+  int32 schedule_timezone_offset_minutes = 4;
+  // The active OS rollout, else the last one; unset when there never was one.
+  OsRollout rollout = 5;
+}
+
+enum OsRolloutStatus {
+  OS_ROLLOUT_STATUS_UNSPECIFIED = 0;
+  OS_ROLLOUT_STATUS_RUNNING = 1;
+  // Something happened on the node and a step failed (the job failed, the reboot was held, the node did not come back, the check
+  // failed): the rollout waits for the owner (CancelOsRollout) and the alert os_update_failed is open. It holds only the next OS
+  // update; agent rollouts, the panel update and the bundle sync go on. A refusal where nothing happened on the node ends the
+  // rollout at once, without a pause and without an alert: FAILED when the node needs a look (unsupported system, full disk), DONE
+  // with a SKIPPED step (error_key try_later) when it only asked to wait (busy, apt_lock, too_soon, reboot_limit).
+  OS_ROLLOUT_STATUS_PAUSED = 2;
+  OS_ROLLOUT_STATUS_DONE = 3;
+  OS_ROLLOUT_STATUS_CANCELLED = 4;
+  // Finished with a FAILED step (the owner cancelled the paused rollout).
+  OS_ROLLOUT_STATUS_FAILED = 5;
+}
+
+enum OsRolloutMode {
+  OS_ROLLOUT_MODE_UNSPECIFIED = 0;
+  // unattended-upgrade: what the distribution calls a security update.
+  OS_ROLLOUT_MODE_SECURITY = 1;
+  // No package change, only the reboot.
+  OS_ROLLOUT_MODE_REBOOT_ONLY = 2;
+  // Install ordinary and security updates.
+  OS_ROLLOUT_MODE_ALL = 3;
+}
+
+enum OsRebootPolicy {
+  OS_REBOOT_POLICY_UNSPECIFIED = 0;
+  OS_REBOOT_POLICY_NEVER = 1;
+  OS_REBOOT_POLICY_IF_REQUIRED = 2;
+  // Reboot even when nothing asks for it (REBOOT_ONLY only). All the node's own checks still apply.
+  OS_REBOOT_POLICY_ALWAYS = 3;
+}
+
+enum OsStepState {
+  OS_STEP_STATE_UNSPECIFIED = 0;
+  OS_STEP_STATE_PENDING = 1;
+  // UpdateOs sent: the job runs on the node (phase says what it does).
+  OS_STEP_STATE_SENT = 2;
+  // The job reached its reboot: the node is down or coming back (15 minutes to return).
+  OS_STEP_STATE_REBOOTING = 3;
+  // The job is over and the node is checked like after an agent update (profiles up, probes pass).
+  OS_STEP_STATE_GATING = 4;
+  OS_STEP_STATE_PASSED = 5;
+  OS_STEP_STATE_FAILED = 6;
+  // Not attempted: offline, unsupported, the panel's own server, nothing to do, or cancelled.
+  OS_STEP_STATE_SKIPPED = 7;
+}
+
+message OsStep {
+  string node_id = 1;
+  string node_name = 2;
+  OsStepState state = 3;
+  // "osj_..." of the job on the node.
+  string job_id = 4;
+  // The node's phase while the job runs (agent.proto OsJob.phase): preflight, waiting_lock, repairing, refreshing,
+  // installing, awg_module, checking, rebooting; "waiting_retry" while a self-closing refusal is being retried.
+  string phase = 5;
+  int64 phase_unix = 6 [jstype = JS_NUMBER];
+  string kernel_from = 7;
+  string kernel_to = 8;
+  int64 sent_unix = 9 [jstype = JS_NUMBER];
+  int64 reboot_unix = 10 [jstype = JS_NUMBER];
+  int64 back_unix = 11 [jstype = JS_NUMBER];
+  int64 finished_unix = 12 [jstype = JS_NUMBER];
+  // "os.step.err.<error_key>" for FAILED and SKIPPED: offline, unsupported, panel_host, up_to_date, not_required,
+  // cancelled (skipped); try_later (skipped: the node asked to wait, params.code is busy, apt_lock, too_soon or reboot_limit; nothing
+  // happened on it and the rollout ended by itself), agent_refused (the node refused for another reason: params.code; nothing happened on it), job_failed (the job ended failed:
+  // params.code, params.package), reboot_held (the job installed what it could but the node refused to reboot:
+  // params.code), no_answer, not_back (15 minutes after the reboot), and the check's own: kernel_not_switched,
+  // state_not_applied, inbounds_unreadable, warp_down, inbound_failed, probe_failed, job_not_settled (the end of the job is not known
+  // after the check window), node_lost (a job without a reboot: the node dropped off while it was checked).
+  string error_key = 13;
+  // params.code is a node code (agent.proto OsJob.code; the SPA resolves "os.job.err.<code>"); also package, upgraded,
+  // reboot (done | not_required | held | not_asked), held_reason, kernel, pending and security (counts when it started), mode
+  // (security | all | reboot_only: a reboot_only run installed nothing). While GATING, what the check still waits for: gate_for
+  // (profiles | settings | warp | job: the soft miss of the check), gate_names (a JSON array of at most 5 profile names that have
+  // not passed yet; with gate_more, how many more), gate_max_s (the check window in seconds; it began at back_unix).
+  map<string, string> params = 14;
+  // Zero-based batch: the canary is stage 0, following stages contain batch_size nodes.
+  int32 stage = 15;
+  // If state is PENDING and phase is "waiting_retry", the node may be tried again at this Unix time; zero means now.
+  int64 retry_after_unix = 16 [jstype = JS_NUMBER];
+  // Typed retry details; params keeps retry_count and retry_code for older clients.
+  uint32 retry_count = 17;
+  string retry_code = 18;
+}
+
+message OsRollout {
+  // "osr_..." opaque.
+  string id = 1;
+  OsRolloutStatus status = 2;
+  OsRolloutMode mode = 3;
+  OsRebootPolicy reboot = 4;
+  int64 created_unix = 5 [jstype = JS_NUMBER];
+  int64 finished_unix = 6 [jstype = JS_NUMBER];
+  // Set while PAUSED: "os.pause.<code>": step_failed (the node refused or the job failed), reboot_held (installed, but the
+  // node would not reboot), not_back (did not return 15 minutes after the reboot), gate_failed (it returned but a check
+  // failed). pause_params {node, reason: the step's error_key, code: the node's code, mode: security | reboot_only}.
+  string pause_key = 7;
+  map<string, string> pause_params = 8;
+  repeated OsStep steps = 9;
+  // Nodes per batch after the single-node canary. Existing single-node rollouts read as 1.
+  int32 batch_size = 10;
+}
+
+message StartOsRolloutRequest {
+  // One to twenty active node ids. The panel puts the lowest-online, fewest-inbound node first.
+  repeated string node_ids = 1;
+  OsRolloutMode mode = 2;
+  OsRebootPolicy reboot = 3;
+  // One to five nodes per batch after the canary; zero means 1 for clients predating this field.
+  int32 batch_size = 4;
+}
+
+message StartOsRolloutResponse {
+  OsRollout rollout = 1;
+}
+
+message CancelOsRolloutRequest {
+  // Empty = the active rollout.
+  string rollout_id = 1;
+}
+
+message CancelOsRolloutResponse {
+  OsRollout rollout = 1;
+}
+
+message PauseOsRolloutRequest {
+  // Empty = the active rollout.
+  string rollout_id = 1;
+}
+
+message PauseOsRolloutResponse {
+  OsRollout rollout = 1;
+}
+
+message ResumeOsRolloutRequest {
+  // Empty = the active rollout.
+  string rollout_id = 1;
+  // Skip failed steps and continue. False retries a failed step once; a second failure requires skip_failed or cancel.
+  bool skip_failed = 2;
+}
+
+message ResumeOsRolloutResponse {
+  OsRollout rollout = 1;
+}
+
+message RefreshOsUpdatesRequest {
+  // Empty = every node that can.
+  repeated string node_ids = 1;
+}
+
+message OsRefreshResult {
+  string node_id = 1;
+  // started, running (a job is on the node already), recent (checked less than 30 minutes ago), limit (3 are running),
+  // offline, unsupported (no os-update/1 or not Debian/Ubuntu), refused (the node said no: code).
+  string outcome = 2;
+  string code = 3;
+}
+
+message RefreshOsUpdatesResponse {
+  repeated OsRefreshResult results = 1;
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -253,6 +494,13 @@ message RolloutStep {
   // cancelled. Before 0.1.47 state_not_applied also stood for not_committed and inbounds_unreadable.
   string error_key = 9;
   map<string, string> params = 10;
+  // Best-effort live download information while the step is SENT. Empty/zero when no progress was reported.
+  string download_phase = 11;
+  uint64 downloaded_bytes = 12 [jstype = JS_NUMBER];
+  uint64 total_bytes = 13 [jstype = JS_NUMBER];
+  uint64 bytes_per_second = 14 [jstype = JS_NUMBER];
+  // Current source supplying bytes, when the agent supports update-sources/1.
+  string download_source = 15;
 }
 
 message Rollout {
@@ -299,9 +547,22 @@ message GetUpdatesResponse {
   // bundle, when no node is behind it, or when the panel has not read the release notes (the Cloudflare edition never
   // does: it has no bundle).
   repeated ReleaseNote agent_notes = 8;
-  // The same for this panel: every stable release newer than PanelBuild.version, up to PanelUpdate.version. Only while
+  // The same for this panel: every release visible to update_channel newer than PanelBuild.version, up to PanelUpdate.version. Only while
   // PanelUpdate.available (a release whose signed panel manifest verified), else empty.
   repeated ReleaseNote panel_notes = 9;
+  // The configured channel used for panel and node-bundle discovery (stable when the setting is unset).
+  string update_channel = 10;
+  // The channel encoded by PanelBuild.version, empty for an unstamped development build.
+  string running_version_channel = 11;
+  // The channel encoded by PanelUpdate.version, empty when no release is known.
+  string offered_release_channel = 12;
+  // The signed manifest of the newest release visible to update_channel is older than this panel's build time.
+  bool running_newer_than_channel_offers = 13;
+  // Maximum time sent to new UpdateAgent commands, in seconds.
+  uint32 update_download_timeout_seconds = 14;
+  // Optional sources enabled for new VPS node updates (currently github only). The panel is always first; edge
+  // panels return an empty list.
+  repeated string update_download_sources = 15;
 }
 
 // The notes of one GitHub release, as the maintainers wrote them in the release description. They are INFORMATIONAL and
@@ -323,6 +584,8 @@ message ReleaseNote {
   // A heading "Security", "Безопасность" or "安全" (any level) is in the notes: the SPA badges the release and tells the
   // owner it is worth updating soon.
   bool security = 7;
+  // The release channel encoded by version: stable, testing or dev.
+  string channel = 8;
 }
 
 message CheckPanelUpdateRequest {}
@@ -423,4 +686,30 @@ message SetUpdateTimezoneRequest {
 
 message SetUpdateTimezoneResponse {
   int32 timezone_offset_minutes = 1;
+}
+
+message SetUpdateChannelRequest {
+  // One of stable, testing or dev.
+  string channel = 1;
+}
+
+message SetUpdateChannelResponse {
+  string channel = 1;
+}
+
+message SetUpdateDownloadTimeoutRequest {
+  uint32 timeout_seconds = 1;
+}
+
+message SetUpdateDownloadTimeoutResponse {
+  uint32 timeout_seconds = 1;
+}
+
+message SetUpdateDownloadSourcesRequest {
+  // Optional source kinds. Currently only "github" is accepted; the panel source is always enabled and first.
+  repeated string sources = 1;
+}
+
+message SetUpdateDownloadSourcesResponse {
+  repeated string sources = 1;
 }

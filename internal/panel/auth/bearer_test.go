@@ -40,6 +40,7 @@ type seen struct {
 	admin     store.Admin
 	principal Principal
 	stepUpErr error
+	approved  string // ApprovedPlanTool of the call
 	body      []byte
 }
 
@@ -57,6 +58,7 @@ func newTokenEnv(t *testing.T) *tokenEnv {
 		sn.admin, _ = AdminFrom(r.Context())
 		sn.principal = PrincipalFrom(r.Context())
 		sn.stepUpErr = s.RequireStepUp(r.Context())
+		sn.approved = ApprovedPlanTool(r.Context())
 		sn.body, _ = readAll(r)
 		// a module writing its own audit row with the request context: the source must follow the call
 		st.Audit(r.Context(), s.now(), store.AuditEntry{Actor: sn.admin.ID, Action: "module_row", Result: "ok"})
@@ -351,6 +353,7 @@ func TestBearerAllowListAndProfiles(t *testing.T) {
 		{adminv1connect.FleetServiceOverviewProcedure, 200, 200, 200}, // a read on the list
 		{pCreateUser, 403, 200, 200},                                  // a write: operator and up
 		{adminv1connect.HealthServiceMuteAlertProcedure, 403, 200, 200},
+		{adminv1connect.HealthServiceDismissAlertProcedure, 403, 200, 200},
 		{pListAudit, 403, 403, 200}, // owner level on the list: the admin profile only
 		// closed to every profile, whatever the level
 		{pDeleteUsers, 403, 403, 403},
@@ -848,6 +851,8 @@ func TestPlanningGrantOpensOnlyTheDryRun(t *testing.T) {
 		{adminv1connect.ProfileServiceCreateInboundProcedure, `{"validateOnly":true}`, `{"validateOnly":false}`},
 		{adminv1connect.ProfileServiceUpdateProfileProcedure, `{"dryRun":true}`, `{"dryRun":false}`},
 		{adminv1connect.GroupServiceUpdateGroupProcedure, `{"dryRun":true}`, `{"dryRun":false}`},
+		{adminv1connect.GroupServiceSetNodeSharingProcedure, `{"dryRun":true}`, `{"dryRun":false}`},
+		{adminv1connect.ProfileServiceUpdateInboundProcedure, `{"validateOnly":true}`, `{"validateOnly":false}`},
 	} {
 		e.seen.calls = 0
 		body := []byte(tc.ok)
@@ -891,7 +896,7 @@ func TestTokenAllowList(t *testing.T) {
 		if _, ok := procedureLevels[path]; !ok {
 			t.Errorf("the allow-list names %s, which has no level (not a procedure?)", path)
 		}
-		if access != TokenAccessDirect && access != TokenAccessApproved && access != TokenAccessPlanning {
+		if access != TokenAccessDirect && access != TokenAccessApproved && access != TokenAccessPlanning && access != TokenAccessDraft {
 			t.Errorf("%s: access %d", path, access)
 		}
 		if got, ok := TokenAccess(path); !ok || got != access {
@@ -910,18 +915,32 @@ func TestTokenAllowList(t *testing.T) {
 	// the exact set that goes through the owner's approval
 	approved := map[string]bool{}
 	for path, access := range tokenProcedures {
-		if access == TokenAccessApproved {
+		// a draft call also runs inside an approved plan (a new version of a site that stands somewhere)
+		if access == TokenAccessApproved || access == TokenAccessDraft {
 			approved[path] = true
 		}
 	}
-	if len(approved) != 23 {
-		t.Errorf("%d procedures need approval, want 23: %v", len(approved), approved)
+	// every procedure that needs the owner's approval is opened by the grant of some tool: one that no grant lists is dead, and
+	// a tool added for it gets its grant in the same change (the tool registry is held against the grants in internal/panel/mcp)
+	granted := map[string]bool{}
+	for _, procedures := range grantProcedures {
+		for _, p := range procedures {
+			granted[p] = true
+		}
+	}
+	for path := range approved {
+		if !granted[path] {
+			t.Errorf("%s needs the owner's approval and no tool's grant opens it", path)
+		}
 	}
 	if got, ok := TokenAccess(adminv1connect.WarpServiceRegisterWarpProcedure); !ok || got != TokenAccessApproved {
 		t.Errorf("RegisterWarp token access = %d, %v; want approved", got, ok)
 	}
 	if got, ok := TokenAccess(adminv1connect.WarpServiceGetWarpProcedure); !ok || got != TokenAccessPlanning {
 		t.Errorf("GetWarp token access = %d, %v; want MCP planning only", got, ok)
+	}
+	if got, ok := TokenAccess(adminv1connect.ProvisioningServiceAddNodeServerKeyProcedure); !ok || got != TokenAccessApproved || !NeedsStepUp(adminv1connect.ProvisioningServiceAddNodeServerKeyProcedure) {
+		t.Errorf("AddNodeServerKey token access = %d, %v; want owner-approved with step-up", got, ok)
 	}
 	// every grant is for a procedure that is on the list as approved
 	wantProfileGrants := map[string][]string{
@@ -944,6 +963,23 @@ func TestTokenAllowList(t *testing.T) {
 		adminv1connect.RelayServiceUpdateRelayProcedure,
 		adminv1connect.RelayServiceDeleteRelayProcedure,
 	}
+	wantProfileGrants["node_ipv6"] = []string{adminv1connect.NodeServiceUpdateIpv6EntryProcedure}
+	wantProfileGrants["node_server_keys_add"] = []string{adminv1connect.ProvisioningServiceAddNodeServerKeyProcedure}
+	wantProfileGrants["node_awg_backend"] = []string{adminv1connect.NodeServiceUpdateNodeProcedure}
+	wantProfileGrants["path_speed"] = []string{PathSpeedProcedure}
+	wantProfileGrants["node_update"] = []string{adminv1connect.NodeServiceUpdateNodeProcedure, adminv1connect.ProfileServiceUpdateInboundProcedure}
+	wantProfileGrants["group_update"] = []string{adminv1connect.GroupServiceUpdateGroupProcedure}
+	wantProfileGrants["node_sharing_set"] = []string{adminv1connect.GroupServiceSetNodeSharingProcedure}
+	wantProfileGrants["subscription_rules_set"] = []string{adminv1connect.SubscriptionServiceUpdateSubscriptionSettingsProcedure}
+	wantProfileGrants["subscription_texts_set"] = []string{adminv1connect.SubscriptionServiceUpdateSubscriptionSettingsProcedure}
+	wantProfileGrants["subscription_link_limits_set"] = []string{adminv1connect.SubscriptionServiceUpdateSubscriptionSettingsProcedure}
+	wantProfileGrants["subscription_page_set"] = []string{adminv1connect.SubscriptionServiceUpdateSubscriptionSettingsProcedure}
+	wantProfileGrants["subscription_mihomo_template_set"] = []string{adminv1connect.SubscriptionServiceUpdateSubscriptionSettingsProcedure}
+	wantProfileGrants["subscription_routing_set"] = []string{adminv1connect.SubscriptionServiceUpdateSubscriptionSettingsProcedure}
+	wantProfileGrants["dns_settings_set"] = []string{adminv1connect.SubscriptionServiceUpdateSubscriptionSettingsProcedure}
+	wantProfileGrants["dns_preset_create"] = []string{adminv1connect.DnsServiceCreateDnsPresetProcedure}
+	wantProfileGrants["dns_preset_update"] = []string{adminv1connect.DnsServiceUpdateDnsPresetProcedure}
+	wantProfileGrants["dns_preset_delete"] = []string{adminv1connect.DnsServiceDeleteDnsPresetProcedure}
 	for tool, want := range wantProfileGrants {
 		if got := grantProcedures[tool]; !slices.Equal(got, want) {
 			t.Errorf("%s grant procedures = %v, want %v", tool, got, want)
@@ -976,17 +1012,15 @@ func TestTokenAllowList(t *testing.T) {
 		adminv1connect.NodeServiceCreateEnrollmentProcedure,
 		adminv1connect.NodeServiceRetireNodeProcedure,
 		adminv1connect.NodeServiceStreamLogsProcedure,
-		adminv1connect.NodeServiceUpdateNodeProcedure,
 		adminv1connect.NodeServiceRestartInboundsProcedure,
 		adminv1connect.NodeServicePrepareAwgKernelProcedure, // installs packages on the node: never through a token or MCP
 		adminv1connect.NodeServiceMeasureBandwidthProcedure, // makes the node push up to 1 GB: owner only, never through a token or MCP
-		adminv1connect.ProfileServiceUpdateInboundProcedure,
 		adminv1connect.ProfileServiceTwinProfileProcedure,
-		adminv1connect.GroupServiceCreateGroupProcedure,
-		adminv1connect.GroupServiceDeleteGroupProcedure,
+		adminv1connect.ProfileServiceRemoveProfileFromNodesProcedure,
 		adminv1connect.UpdateServiceRescanBundleProcedure,
 		adminv1connect.InstanceServiceGetInstanceProcedure,
 		adminv1connect.InstanceServiceUpdateInstanceProcedure,
+		adminv1connect.InstanceServiceEncodeQrProcedure,
 		adminv1connect.AuthServiceGetSecuritySettingsProcedure,
 		adminv1connect.AuthServiceUpdateSecuritySettingsProcedure,
 		adminv1connect.AuthServiceMeProcedure,
@@ -999,6 +1033,7 @@ func TestTokenAllowList(t *testing.T) {
 		adminv1connect.AuthServiceBeginTotpEnrollmentProcedure,
 		adminv1connect.AuthServiceFinishTotpEnrollmentProcedure,
 		adminv1connect.ApiTokenServiceCreateApiTokenProcedure,
+		adminv1connect.ApiTokenServiceSetApiTokenBulkProcedure,
 		adminv1connect.ApiTokenServiceListApiTokensProcedure,
 		adminv1connect.ApiTokenServiceRevokeApiTokenProcedure,
 		adminv1connect.ApprovalServiceListApprovalsProcedure,
@@ -1010,9 +1045,17 @@ func TestTokenAllowList(t *testing.T) {
 		}
 	}
 	for path := range tokenProcedures {
-		for _, svc := range []string{"DeviceService", "DnsService", "InstanceService", "ApiTokenService", "ApprovalService", "AwgService"} {
+		for _, svc := range []string{"DeviceService", "InstanceService", "ApiTokenService", "ApprovalService", "AwgService"} {
 			if strings.Contains(path, "."+svc+"/") {
 				t.Errorf("%s: %s is closed to tokens as a whole", path, svc)
+			}
+		}
+		if strings.Contains(path, ".DnsService/") {
+			switch path {
+			case adminv1connect.DnsServiceListDnsPresetsProcedure, adminv1connect.DnsServiceCreateDnsPresetProcedure,
+				adminv1connect.DnsServiceUpdateDnsPresetProcedure, adminv1connect.DnsServiceDeleteDnsPresetProcedure:
+			default:
+				t.Errorf("%s: DNS is open only for DNS preset tools", path)
 			}
 		}
 		if strings.Contains(path, ".WarpService/") {
@@ -1036,8 +1079,8 @@ func TestTokenAllowList(t *testing.T) {
 	}
 	// Step-up procedures include the protected handlers, credential reveal/rotation, password changes,
 	// authenticator enrollment, login captcha, and sensitive infrastructure operations.
-	if len(stepUpProcedures) != 49 {
-		t.Errorf("%d step-up procedures, want 49", len(stepUpProcedures))
+	if len(stepUpProcedures) != 78 {
+		t.Errorf("%d step-up procedures, want 78", len(stepUpProcedures))
 	}
 }
 
@@ -1101,6 +1144,7 @@ func TestTokenServicesOwnerOnlyOverHTTP(t *testing.T) {
 	_, adminToken := e.mkToken("ad", store.ProfileAdmin, 600)
 	for _, p := range []string{
 		adminv1connect.ApiTokenServiceListApiTokensProcedure, adminv1connect.ApiTokenServiceCreateApiTokenProcedure,
+		adminv1connect.ApiTokenServiceSetApiTokenBulkProcedure,
 		adminv1connect.ApiTokenServiceRevokeApiTokenProcedure, adminv1connect.ApprovalServiceListApprovalsProcedure,
 		adminv1connect.ApprovalServiceApproveProcedure, adminv1connect.ApprovalServiceRejectProcedure,
 	} {

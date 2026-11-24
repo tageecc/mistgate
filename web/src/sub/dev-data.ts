@@ -1,10 +1,19 @@
-import type { AmneziaData, AppEntry, AwgDevice, AwgProfile, Device, DnsInfo, DnsPreset, MgData, Platform, ServerEntry } from "./types";
+import { isLang } from "./i18n";
+import type { AmneziaData, AppEntry, AwgDevice, AwgProfile, Device, DnsInfo, DnsPreset, Lang, MgData, Platform, Qr, ServerEntry } from "./types";
 
 // Sample mg-data for working on the page, one per state. Used ONLY by the dev server (vite.sub.config.ts injects it
-// in place of the <!--MG_DATA--> marker for `?case=<name>&lang=ru|en|zh`); it is not imported by the page and never
+// in place of the <!--MG_DATA--> marker for `?case=<name>&lang=ru|en|zh|fa|tr`); it is not imported by the page and never
 // ships in web/dist/sub.html. The shapes are what the server sends (subs/page.go, subs/devices.go): the link apps share
 // one device without platform or model, a device added without a name comes back as the page named it.
 //
+// The scenes (dev-scene.ts has the parameters, dev-scene.test.ts the whole list of URLs, with the width to look at each in: 1280 a computer, 390 a phone):
+//   states   ?case=return | first | soon | quota (quota-plain: no reset day) | expired | disabled | plain
+//   pieces   first (announcement) | long | nosupport | noqr | keys-only | happ | both        lists  servers-2 | -11 | -30;  dev-0 | -3 | -16 | -20 | -nolimit &tab=devices[&more=1]
+//   tabs     &tab=telegram|trusttunnel (cases telegram, trusttunnel, and -soon for none yet) [&proxy=2]
+//   key window  case=key-one | key-pair | key-many  &sheet=key|made [&profile=p20w] [&list=1]   (one profile; a profile of each version; several of one version)
+//   windows  &sheet=pick|link|conn|key|full|made   &key=d3[&country=1]   &renew=d3 (stale)   &menu=d3|l1   &rename=d3   &ask=remove:d3|rotate:d3   &stale=d3
+//            &dns=de1|link [&dnsall=0|1] [&dnsdone=1 [&dnsskip=nl1]]   (cases dns-both, dns-link, stale-dns)       password: case=locked[&lockerr=wrong|short|latin|later|net]
+//   all      &lang=en|ru|zh|fa|tr  &theme=light|dark  &as=ios|android|windows|macos|linux
 // Dev only, besides ?case: `&as=ios|android|windows|macos|linux` pretends the page is open on that device (main.ts), `&fail=<code>`
 // makes every self-service and DNS call fail with that code (dev-api.ts).
 
@@ -106,6 +115,7 @@ const fra: ServerEntry = {
   country_code: "DE",
   place: "Франкфурт",
   label: "Германия · Франкфурт",
+  host: "fra1.example.com",
   app_names: ["DE · Hysteria2", "DE · Hysteria2 WARP"],
   connections: [
     { way: "link", exit: "direct", app_name: "DE · Hysteria2", profile_id: "" },
@@ -121,6 +131,7 @@ const ams: ServerEntry = {
   country_code: "NL",
   place: "",
   label: "Нидерланды",
+  host: "ams1.example.com",
   app_names: ["NL · Hysteria2"],
   connections: [
     { way: "link", exit: "direct", app_name: "NL · Hysteria2", profile_id: "" },
@@ -130,16 +141,27 @@ const ams: ServerEntry = {
   load: "medium",
   dns: dnsOf("dns_standard", ["dns_standard", "dns_family", "dns_adblock"]),
 };
-const hel: ServerEntry = { id: "nod_hel", country_code: "FI", place: "", label: "Финляндия", app_names: ["FI · Hysteria2"], connections: [{ way: "link", exit: "direct", app_name: "FI · Hysteria2", profile_id: "" }], online: false, load: null, dns: null };
-const ber: ServerEntry = { id: "nod_ber", country_code: "DE", place: "Берлин", label: "Германия · Берлин", app_names: ["DE · Hysteria2 2"], connections: [{ way: "link", exit: "direct", app_name: "DE · Hysteria2 2", profile_id: "" }], online: true, load: null, dns: dnsOf("dns_adblock", ["dns_adblock", "dns_standard"]) };
-const mow: ServerEntry = { id: "nod_mow", country_code: "RU", place: "Москва", label: "Россия · Москва", app_names: [], connections: [{ way: "key", exit: "direct", app_name: "", profile_id: "p31" }], online: true, load: "medium", dns: dnsOf("dns_yandex", ["dns_yandex"]) };
+const hel: ServerEntry = { id: "nod_hel", country_code: "FI", place: "", label: "Финляндия", host: "hel1.example.com", app_names: ["FI · Hysteria2"], connections: [{ way: "link", exit: "direct", app_name: "FI · Hysteria2", profile_id: "" }], online: false, load: null, dns: null };
+const ber: ServerEntry = { id: "nod_ber", country_code: "DE", place: "Берлин", label: "Германия · Берлин", host: "ber1.example.com", app_names: ["DE · Hysteria2 2"], connections: [{ way: "link", exit: "direct", app_name: "DE · Hysteria2 2", profile_id: "" }], online: true, load: null, dns: dnsOf("dns_adblock", ["dns_adblock", "dns_standard"]) };
+const mow: ServerEntry = { id: "nod_mow", country_code: "RU", place: "Москва", label: "Россия · Москва", host: "msk1.example.com", app_names: [], connections: [{ way: "key", exit: "direct", app_name: "", profile_id: "p31" }], online: true, load: "medium", dns: dnsOf("dns_yandex", ["dns_yandex"]) };
 const dnsOn: DnsInfo = { enabled: true, endpoint: "dev:", refresh_hours: 12, link: { effective: "dns_adblock", choice: "", default: "dns_adblock", options: [] } };
+
+/**
+ * A real code (Mistgate's own encoder, internal/qr: a made-up link, level Q, with the logo's window) for every place the page
+ * draws one while it has no server to ask: the dev scenes and the tests. It does not read as the value next to it.
+ */
+export const sampleQr: Qr = {
+  n: 41,
+  bits: "/s4oHz/BIHyNEG6wvQ6rt1eSC+XboUChIuwXP1vpB/qqqqr+Aa5hLABXufbw9pQFgiVzVMTo2keHIsd/BWS2mUbeRmgUeaKyH8wFcKrTlKLdUFoveD2VQFIYgBnXyOcwkjqPXJviHvoT8ud8h17iNT9qVTGkDZOdErQG/5zAzfCAPoRAqjfknOO+Lq38rdscvbWLzBOrkUaDtqoUnhBSKfM1OZurhrpC+4BbojHE/6Y0mSpQUuyakeuizcKP1dafAydO6SvmiDcFWlTLov4xcgf9AA==",
+  window: 9.98,
+};
 
 const base: MgData = {
   v: 1,
   lang: "ru",
   brand: { parts: ["mist", "gate"], logo_svg: "", accent: "#b8acf2" },
   title: "Mistgate",
+  qr: sampleQr,
   subscription_url: url,
   server_count: 3,
   server_loads: [
@@ -334,21 +356,22 @@ export const cases: Record<string, MgData> = {
 };
 
 // ---- one DNS for the link apps, one per server for the keys (alice, servers de1 and nl1) ----
-// The built-in presets as the server sends them: the stock name and description in the three languages, and `name` /
+// The built-in presets as the server sends them: the stock name and description in the page's languages, and `name` /
 // `description` in the language of the browser (Accept-Language), which devPage puts in from `lang`.
-const stock = (id: string, category: string, name: [string, string, string], description: [string, string, string]): DnsPreset => ({
+type Five = [ru: string, en: string, zh: string, fa: string, tr: string];
+const stock = (id: string, category: string, name: Five, description: Five): DnsPreset => ({
   id,
   name: name[0],
   description: description[0],
   category,
-  names: { ru: name[0], en: name[1], zh: name[2] },
-  descriptions: { ru: description[0], en: description[1], zh: description[2] },
+  names: { ru: name[0], en: name[1], zh: name[2], fa: name[3], tr: name[4] },
+  descriptions: { ru: description[0], en: description[1], zh: description[2], fa: description[3], tr: description[4] },
 });
 const builtins: DnsPreset[] = [
-  stock("dns_builtin_standard", "regular", ["Cloudflare + Google", "Cloudflare + Google", "Cloudflare + Google"], ["Cloudflare и Google для всего", "Cloudflare and Google for everything", "全部使用 Cloudflare 和 Google"]),
-  stock("dns_builtin_adblock", "no_ads", ["AdGuard: без рекламы", "AdGuard: no ads", "AdGuard：无广告"], ["AdGuard DNS: без рекламы и трекеров", "AdGuard DNS: no ads, no trackers", "AdGuard DNS：无广告，无跟踪器"]),
-  stock("dns_builtin_family", "family", ["AdGuard Family: без рекламы и 18+", "AdGuard Family: no ads, no 18+", "AdGuard Family：无广告和成人内容"], ["AdGuard Family: без рекламы и сайтов для взрослых", "AdGuard Family: no ads, no adult sites", "AdGuard Family：无广告，无成人网站"]),
-  stock("dns_builtin_ru_split", "regional", ["Россия: .ru напрямую", "Russia: .ru direct", "俄罗斯：.ru 直连"], ["Российские сайты напрямую, остальное через VPN", "Russian sites direct, everything else through the VPN", "俄罗斯网站直连，其余走 VPN"]),
+  stock("dns_builtin_standard", "regular", ["Cloudflare + Google", "Cloudflare + Google", "Cloudflare + Google", "Cloudflare + Google", "Cloudflare + Google"], ["Cloudflare и Google для всего", "Cloudflare and Google for everything", "全部使用 Cloudflare 和 Google", "Cloudflare و Google برای همه‌چیز", "Her şey için Cloudflare ve Google"]),
+  stock("dns_builtin_adblock", "no_ads", ["AdGuard: без рекламы", "AdGuard: no ads", "AdGuard：无广告", "AdGuard: بدون تبلیغات", "AdGuard: reklamsız"], ["AdGuard DNS: без рекламы и трекеров", "AdGuard DNS: no ads, no trackers", "AdGuard DNS：无广告，无跟踪器", "AdGuard DNS: بدون تبلیغات و ردیاب", "AdGuard DNS: reklam yok, izleyici yok"]),
+  stock("dns_builtin_family", "family", ["AdGuard Family: без рекламы и 18+", "AdGuard Family: no ads, no 18+", "AdGuard Family：无广告和成人内容", "AdGuard Family: بدون تبلیغات و محتوای بزرگسالان", "AdGuard Family: reklamsız, 18+ yok"], ["AdGuard Family: без рекламы и сайтов для взрослых", "AdGuard Family: no ads, no adult sites", "AdGuard Family：无广告，无成人网站", "AdGuard Family: بدون تبلیغات و سایت‌های بزرگسالان", "AdGuard Family: reklam yok, yetişkin sitesi yok"]),
+  stock("dns_builtin_ru_split", "regional", ["Россия: .ru напрямую", "Russia: .ru direct", "俄罗斯：.ru 直连", "روسیه: سایت‌های روسی مستقیم", "Rusya: .ru doğrudan"], ["Российские сайты напрямую, остальное через VPN", "Russian sites direct, everything else through the VPN", "俄罗斯网站直连，其余走 VPN", "سایت‌های روسی مستقیم، بقیه از طریق VPN", "Rus siteleri doğrudan, geri kalan her şey VPN üzerinden"]),
 ];
 const keyDns = (): ServerEntry["dns"] => ({ choice: "", effective: "dns_builtin_standard", options: ["dns_builtin_standard", "dns_builtin_adblock", "dns_builtin_family"], default: "dns_builtin_standard", keys_to_refresh: [] });
 const de1: ServerEntry = {
@@ -356,6 +379,7 @@ const de1: ServerEntry = {
   country_code: "DE",
   place: "",
   label: "Германия",
+  host: "de1.example.com",
   app_names: ["DE · Hysteria2", "DE · Hysteria2 WARP"],
   connections: [
     { way: "link", exit: "direct", app_name: "DE · Hysteria2", profile_id: "" },
@@ -371,6 +395,7 @@ const nl1: ServerEntry = {
   country_code: "NL",
   place: "",
   label: "Нидерланды",
+  host: "nl1.example.com",
   app_names: ["NL · Hysteria2"],
   connections: [
     { way: "link", exit: "direct", app_name: "NL · Hysteria2", profile_id: "" },
@@ -406,11 +431,220 @@ cases["dns-link"] = { ...dnsBoth, access: { happ: true, amnezia: false }, amnezi
 // the owner offers nothing for the link apps: the note about the link apps stays, the keys keep their choice per server
 cases["dns-both-off"] = { ...dnsBoth, dns: linkDns([]) };
 
+// an AmneziaWG server that also comes through the entry in Russia: its key stays direct, the Mihomo apps get the twin "· через RU"
+// (a link, Mihomo only), and a key through the entry is another config of the same server (open the key with &open=d3, pick the
+// second country; dev-api.ts answers it for this case)
+const de1Awg: ServerEntry = {
+  ...de1,
+  app_names: ["DE · AmneziaWG", "DE · AmneziaWG · через RU"],
+  connections: [
+    { way: "key", exit: "direct", app_name: "", profile_id: "p31" },
+    { way: "link", exit: "direct", app_name: "DE · AmneziaWG · через RU", profile_id: "", mihomo_only: true, relay: true, via: "RU" },
+  ],
+};
+cases["awg-relay"] = { ...dnsBoth, servers: [de1Awg, nl1], dns: linkDns(offered) };
+
+// ---- the window "New device → key", by what the owner made: one profile, one of each version, several of a kind ----
+// Eleven servers (the second of a country is "DE-2", a place stands for the number, two have an address and no name); the keys of a
+// profile hold the servers it lists. Open: ?case=key-one | key-pair | key-many &sheet=key (the form), &sheet=made (the key just made,
+// dev-api.ts gives it one config a server of the profile). Phone: width 390; tablet: 820.
+const countryRu: Record<string, string> = { by: "Беларусь", de: "Германия", ee: "Эстония", nl: "Нидерланды", pl: "Польша", ro: "Румыния", ru: "Россия" };
+// [country, its number among twins (0: alone), place, host, how the link reaches it, whether its keys have a DNS of their own]
+const landSpecs: [string, number, string, string, "ru" | "warp" | "", boolean][] = [
+  ["by", 0, "", "by1.example.com", "ru", true],
+  ["de", 1, "", "de1.example.com", "warp", true],
+  ["de", 2, "", "de2.example.com", "warp", true],
+  ["de", 3, "", "203.0.113.24", "", false],
+  ["ee", 1, "", "est1.example.com", "ru", true],
+  ["ee", 2, "", "est2.example.com", "ru", false],
+  ["nl", 0, "", "nl1.example.com", "warp", true],
+  ["pl", 0, "", "pl1.example.com", "ru", true],
+  ["ro", 0, "Бухарест", "ro1.example.com", "warp", true],
+  ["ru", 1, "", "msk1.example.com", "", true],
+  ["ru", 2, "", "203.0.113.41", "", false],
+];
+/** The ids of the made-up servers of two countries are spelled out ("est1", "rus2"), so that none reads as the name of a real node. */
+const pre: Record<string, string> = { ee: "est", ru: "rus" };
+/** The eleven servers; `on[slug]` lists the profiles whose key holds a server ("de1", "ro1": the country and its number). */
+const keyLands = (on: Record<string, string[]>): ServerEntry[] =>
+  landSpecs.map(([cc, n, place, host, route, ownDns]) => {
+    const slug = `${pre[cc] ?? cc}${n || 1}`;
+    const name = `${cc.toUpperCase()} · Hysteria2${n > 1 ? ` ${n}` : ""}`;
+    return {
+      id: `nod_${slug}`,
+      country_code: cc.toUpperCase(),
+      place,
+      label: place ? `${countryRu[cc]} · ${place}` : countryRu[cc] + (n > 1 ? ` ${n}` : ""),
+      host,
+      app_names: [name],
+      connections: [
+        { way: "link", exit: route === "warp" ? "warp" : "direct", app_name: name, profile_id: "", ...(route === "ru" ? { relay: true, via: "RU" } : {}) },
+        ...(on[slug] ?? []).map((profile_id) => ({ way: "key" as const, exit: "direct" as const, app_name: "", profile_id })),
+      ],
+      online: true,
+      load: "low",
+      dns: ownDns ? dnsOf("dns_standard", ["dns_standard", "dns_family"]) : null,
+    };
+  });
+const slugs = landSpecs.map(([cc, n]) => `${pre[cc] ?? cc}${n || 1}`);
+/** Every server but the last (it has no key). */
+const allBut = (...ps: string[]) => (slug: string) => (slug === "rus2" ? [] : ps);
+const onProfiles = (f: (slug: string) => string[]) => Object.fromEntries(slugs.map((x) => [x, f(x)]));
+const profile = (id: string, name: string, version: "3.1" | "2.0", egress: AwgProfile["egress"] = "direct"): AwgProfile => ({ id, name, version, egress, countries: [] });
+const keyCase = (profiles: AwgProfile[], servers: ServerEntry[]): MgData => ({
+  ...base,
+  user: withUser({ device_limit: 8, devices_used: 0 }),
+  devices: [],
+  servers,
+  server_count: servers.length,
+  server_loads: [],
+  amnezia: amz([], { profiles: profiles.map((p) => ({ ...p, countries: [...new Set(servers.filter((x) => x.connections.some((c) => c.profile_id === p.id)).map((x) => x.country_code))] })) }),
+});
+const forKey = (all: ServerEntry[]) => all.filter((x) => x.connections.some((c) => c.way === "key"));
+// one profile on one server: no choice, one card
+cases["key-one"] = keyCase([profile("p31", "AWG 3.1", "3.1")], forKey(keyLands(onProfiles((s) => (s === "est1" ? ["p31"] : [])))));
+// one profile of each version: the usual good case
+cases["key-pair"] = keyCase(
+  [profile("p31", "AWG 3.1", "3.1"), profile("p20", "AWG 2.0", "2.0")],
+  forKey(keyLands(onProfiles((s) => [...(["de1", "est1", "nl1", "ro1"].includes(s) ? ["p31"] : []), ...(["de1", "nl1", "ro1"].includes(s) ? ["p20"] : [])]))),
+);
+// several profiles of one version: two new ones, three old ones (the third leaves through the spare exit)
+cases["key-many"] = keyCase(
+  [profile("p31", "AWG3.1", "3.1"), profile("p31b", "AWG 3.1 (new)", "3.1"), profile("p20", "AWG2", "2.0"), profile("p20b", "AWG 2.0 (new)", "2.0"), profile("p20w", "AWG 2.0 (new) · WARP", "2.0", "warp")],
+  keyLands(onProfiles((s) => [...allBut("p31", "p20")(s), ...(["est1", "est2"].includes(s) ? ["p31b", "p20b"] : []), ...(s === "est2" ? ["p20w"] : [])])),
+);
+
+// the Telegram proxy: one card per tg://proxy link, the twins of a server's link (its IPv6 entry, a relay in RU) marked
+const tgUrl = (host: string, port = 443) => `tg://proxy?server=${host}&port=${port}&secret=ee0123456789abcdef0123456789abcdef7777772e676f6f676c652e636f6d`;
+const tgFra = { label: "Германия · Франкфурт", country_code: "DE", place: "Франкфурт", ipv6: false, relay: false, via: "", url: tgUrl("de1.example.com"), qr: sampleQr };
+const tgLinks = [tgFra, { ...tgFra, ipv6: true, url: tgUrl("[2001:db8::7]") }, { ...tgFra, relay: true, via: "RU", url: tgUrl("198.51.100.20", 8443) }, { label: "Финляндия", country_code: "FI", place: "", ipv6: false, relay: false, via: "", url: tgUrl("fi1.example.com"), qr: sampleQr }];
+// the person's Telegram key among the devices: issued by the admin, used by Telegram two hours ago
+const tgKey = { ...dev("tg1", "", "Telegram proxy", "telegram", 2 * hour, false, "telegram"), can_remove: false, can_rename: false };
+cases.telegram = { ...returning, access: { ...returning.access, telegram: true }, telegram: { links: tgLinks }, devices: [...returning.devices, tgKey] };
+// a first visit with Telegram on: the steps first, then the servers and the proxy
+cases["telegram-first"] = { ...base, access: { ...base.access, telegram: true }, telegram: { links: tgLinks.slice(0, 2) } };
+// Telegram is on, no MTProto profile runs yet
+cases["telegram-soon"] = { ...returning, access: { ...returning.access, telegram: true }, telegram: { links: [] } };
+
+// TrustTunnel: one card per tt:// link (the secret is made up; a real one is about this long, so the QR code has the density a
+// person will see), the twins of a server marked ("IPv6" on the exit, a relay in RU), and a server with no link (a self-signed
+// certificate: only the Mistgate app trusts it) as a card that says so
+const ttUrl = (name: string) => `tt://?AAEBAQ9kZTEuZXhhbXBsZS5jb20FEHVhbGljZTIzNDU2NzIzNDUGIGFCMjM0NTY3Y0QyMzQ1NjdlRjIzNDU2N2dIMjM0NTY3AhNkZTEuZXhhbXBsZS5jb206NDQzBAEACQEBDA${name}DRYKMTkyLjAuMi41MwoxOTIuMC4yLjU0`;
+const ttDe = { label: "Германия · Франкфурт", country_code: "DE", place: "Франкфурт", has_ipv6: false, relay: false, via: "", note: "", url: ttUrl("DZGUx"), qr: sampleQr };
+const ttLinks = [
+  ttDe,
+  { ...ttDe, relay: true, via: "RU", url: ttUrl("DZGUy") },
+  { label: "Нидерланды", country_code: "NL", place: "", has_ipv6: true, relay: false, via: "", note: "", url: ttUrl("DbmwxA"), qr: sampleQr },
+  { label: "Финляндия", country_code: "FI", place: "", has_ipv6: false, relay: false, via: "", note: "self_signed", url: "", qr: null },
+];
+// the TrustTunnel key among the devices: issued by the admin, used by an app yesterday
+const ttKey = { ...dev("tt1", "", "TrustTunnel key", "trusttunnel", day, false, "trusttunnel"), can_remove: false, can_rename: false };
+cases.trusttunnel = { ...returning, access: { ...returning.access, trust_tunnel: true }, trust_tunnel: { links: ttLinks }, devices: [...returning.devices, ttKey] };
+// a first visit with it on: the steps first, then the servers and the key
+cases["trusttunnel-first"] = { ...base, access: { ...base.access, trust_tunnel: true }, trust_tunnel: { links: ttLinks.slice(0, 2) } };
+// on, but no TrustTunnel profile runs yet
+cases["trusttunnel-soon"] = { ...returning, access: { ...returning.access, trust_tunnel: true }, trust_tunnel: { links: [] } };
+// the subscription is off: the page shows the devices only, the key among them (no block, no links)
+cases["trusttunnel-disabled"] = { ...off({ status: "disabled" }), access: { happ: false, amnezia: false, trust_tunnel: true }, trust_tunnel: { links: [] }, devices: [...shared(2 * day), ttKey] };
+
+// ---- the scenes: lists of every size, and the pieces a page may lack (dev-scene.ts has the URL parameters, dev-scene.test.ts the list of URLs) ----
+// 2, 11 and 30 servers (de1, nl1, fi1, ...; every third has a WARP exit, one in four comes through the entry in Russia, the last of eleven is down)
+const lands = ["DE", "NL", "FI", "EE", "PL", "RO", "SE", "FR", "GB", "ES"];
+const crowdServer = (i: number): ServerEntry => {
+  const cc = lands[i % lands.length]!;
+  const n = Math.floor(i / lands.length) + 1;
+  const id = `${cc.toLowerCase()}${n}`;
+  const name = `${cc} · Hysteria2${n > 1 ? ` ${n}` : ""}`;
+  const key = i % 5 !== 4;
+  return {
+    id,
+    country_code: cc,
+    place: "",
+    label: n > 1 ? `${cc} ${n}` : cc,
+    host: `${id}.example.com`,
+    app_names: [name, ...(i % 3 === 1 ? [`${name} WARP`] : [])],
+    connections: [
+      { way: "link", exit: "direct", app_name: name, profile_id: "" },
+      ...(i % 3 === 1 ? [{ way: "link" as const, exit: "warp" as const, app_name: `${name} WARP`, profile_id: "" }] : []),
+      ...(i % 4 === 2 ? [{ way: "link" as const, exit: "direct" as const, app_name: `${name} · через RU`, profile_id: "", relay: true, via: "RU" }] : []),
+      ...(key ? [{ way: "key" as const, exit: "direct" as const, app_name: "", profile_id: "p31" }] : []),
+    ],
+    online: i % 11 !== 10,
+    load: (["low", "medium", "high", null] as const)[i % 4]!,
+    dns: key ? dnsOf("dns_standard", ["dns_standard", "dns_family", "dns_adblock"]) : null,
+  };
+};
+const crowdServers = (n: number): MgData => ({ ...returning, servers: Array.from({ length: n }, (_, i) => crowdServer(i)), server_count: n, server_loads: [] });
+cases["servers-2"] = crowdServers(2);
+cases["servers-11"] = crowdServers(11);
+cases["servers-30"] = crowdServers(30);
+
+// 0, 3, 16 and 20 of 20 devices on the link apps (made-up models), and a subscription without a limit
+const gadgets: [string, string][] = [
+  ["ios", "iPhone 15"], ["android", "Pixel 8"], ["windows", "DESKTOP-4F7K2LM"], ["ios", "iPad"], ["macos", "MacBook Air"], ["android", "Galaxy Tab"], ["windows", "Work laptop"], ["android", "Fold 5"],
+  ["ios", "Spare iPhone"], ["windows", "Mini PC"], ["android", "Kitchen tablet"], ["macos", "Mac mini"], ["ios", "iPhone 13"], ["windows", "Game PC"], ["android", "Travel phone"], ["linux", "Steam Deck"],
+  ["android", "Guest phone"], ["windows", "Surface"], ["ios", "iPad mini"], ["android", "Old Android"],
+];
+const crowd = (n: number): Device[] => gadgets.slice(0, n).map(([p, m], i) => dev(`c${i + 1}`, p, m, "happ", (i + 1) * 7 * hour, i === 0, "link", "18.1", "Happ/3.4.2"));
+const linkSide = { access: { happ: true, amnezia: false }, amnezia: null };
+const withDevices = (n: number, limit: number, extra: Partial<MgData> = {}): MgData => ({ ...returning, ...linkSide, user: withUser({ device_limit: limit, devices_used: n }), devices: crowd(n), ...extra });
+cases["dev-0"] = withDevices(0, 20, { announcement: "" });
+cases["dev-3"] = withDevices(3, 20);
+cases["dev-16"] = withDevices(16, 20);
+// every place taken and a new app refused (ENFORCE): "no place left" in the window "New device"
+cases["dev-20"] = withDevices(20, 20, { link_device_limit: "enforce" });
+cases["dev-nolimit"] = withDevices(5, 0);
+
+// a page without the way to the support, and one without the QR code of the page
+cases.nosupport = { ...returning, support_url: "", options: { show_announcement: true, show_support: false, show_qr: true } };
+cases.noqr = { ...base, options: { show_announcement: true, show_support: true, show_qr: false } };
+
 export function devPage(query: string): MgData {
   const p = new URLSearchParams(query);
   const c = cases[p.get("case") ?? ""] ?? base;
   const lang = p.get("lang");
-  const out: MgData = lang === "en" || lang === "zh" ? { ...c, lang } : c;
+  const out: MgData = isLang(lang) ? ownWords({ ...c, lang }) : c;
   // the server words the built-in presets in the language of the browser; the page may be switched to another one
   return { ...out, dns_presets: out.dns_presets.map((x) => (x.names ? { ...x, name: x.names[out.lang] ?? x.name, description: x.descriptions?.[out.lang] ?? x.description } : x)) };
+}
+
+// What the owner typed (places, the announcement, an app's description, their own DNS presets) is Russian in the cases above; the
+// other pages show it in the page's language, as an owner of such a page would write it. Dev only.
+const own: Record<string, Partial<Record<Lang, string>>> = {
+  "Франкфурт": { en: "Frankfurt", fa: "فرانکفورت", tr: "Frankfurt" },
+  "Германия · Франкфурт": { en: "Germany · Frankfurt", fa: "آلمان · فرانکفورت", tr: "Almanya · Frankfurt" },
+  "Берлин": { en: "Berlin", fa: "برلین", tr: "Berlin" },
+  "Германия · Берлин": { en: "Germany · Berlin", fa: "آلمان · برلین", tr: "Almanya · Berlin" },
+  "Москва": { en: "Moscow", fa: "مسکو", tr: "Moskova" },
+  "Бухарест": { en: "Bucharest", fa: "بخارست", tr: "Bükreş" },
+  "Россия · Москва": { en: "Russia · Moscow", fa: "روسیه · مسکو", tr: "Rusya · Moskova" },
+  "Нидерланды": { en: "Netherlands", fa: "هلند", tr: "Hollanda" },
+  "Финляндия": { en: "Finland", fa: "فنلاند", tr: "Finlandiya" },
+  "В субботу с 02:00 до 03:00 обновляю серверы — может моргнуть на пару минут.": {
+    en: "On Saturday from 02:00 to 03:00 I am updating the servers — the connection may drop for a couple of minutes.",
+    fa: "شنبه از ساعت 02:00 تا 03:00 سرورها را به‌روز می‌کنم — ممکن است اتصال چند دقیقه قطع و وصل شود.",
+    tr: "Cumartesi 02:00–03:00 arasında sunucuları güncelliyorum — bağlantı birkaç dakika kesilebilir.",
+  },
+  "Все ваши серверы в одном приложении, подписка обновляется сама": {
+    en: "All your servers in one app, the subscription updates itself",
+    fa: "همهٔ سرورهای شما در یک برنامه، اشتراک خودش به‌روز می‌شود",
+    tr: "Tüm sunucularınız tek uygulamada, abonelik kendiliğinden güncellenir",
+  },
+  "Несколько протоколов в одном приложении": { en: "Several protocols in one app", fa: "چند پروتکل در یک برنامه", tr: "Tek uygulamada birden çok protokol" },
+  "AdGuard — без рекламы": { en: "AdGuard — no ads", fa: "AdGuard — بدون تبلیغات", tr: "AdGuard — reklamsız" },
+  "Блокирует рекламу и трекеры": { en: "Blocks ads and trackers", fa: "تبلیغات و ردیاب‌ها را مسدود می‌کند", tr: "Reklamları ve izleyicileri engeller" },
+  "Обычный": { en: "Regular", fa: "معمولی", tr: "Standart" },
+  "Cloudflare и Google, без фильтров": { en: "Cloudflare and Google, no filtering", fa: "Cloudflare و Google، بدون فیلتر", tr: "Cloudflare ve Google, filtresiz" },
+  "Семейный": { en: "Family", fa: "خانوادگی", tr: "Aile" },
+  "Без рекламы и сайтов для взрослых": { en: "No ads, no adult sites", fa: "بدون تبلیغات و سایت‌های بزرگسالان", tr: "Reklam ve yetişkin sitesi yok" },
+  "Яндекс": { en: "Yandex", fa: "Yandex", tr: "Yandex" },
+  "российские сайты открываются надёжнее": { en: "Russian sites open more reliably", fa: "سایت‌های روسی مطمئن‌تر باز می‌شوند", tr: "Rus siteleri daha güvenilir açılır" },
+};
+function ownWords(d: MgData): MgData {
+  let json = JSON.stringify(d);
+  for (const [ru, to] of Object.entries(own)) {
+    const w = to[d.lang];
+    if (w) json = json.split(JSON.stringify(ru)).join(JSON.stringify(w));
+  }
+  return JSON.parse(json) as MgData;
 }

@@ -3,6 +3,7 @@ package protocols
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/mistgate/mistgate/internal/plugin"
@@ -65,6 +66,9 @@ type InboundInput struct {
 	Node                  NodeView
 	PortOverride          uint16 // 0 = none
 	TLSServerNameOverride string
+	// RealityTargetOverride is "host:port" of the site a VLESS REALITY inbound shows on this node instead of its profile's target
+	// ("" = the profile's); the host is the one name it accepts. Any other protocol refuses it (RealityTargetError).
+	RealityTargetOverride string
 	SpecVersion           uint64
 	Enabled               bool
 	// InboundID and PluginState/PluginPublic carry what InitInbound made for this inbound (AWG: the server
@@ -105,6 +109,16 @@ type InboundInit struct {
 // profile (several live credentials per device, one per profile), so the generic "every device gets one" pass
 // skips it. hysteria2 does not implement it.
 type PerDevice interface{ PerDevice() bool }
+
+// Experimental is an optional interface. A plugin answering true is new and not proven in the field: the protocol list marks it
+// (ProtocolInfo.experimental). hysteria2, vless and awg do not implement it.
+type Experimental interface{ Experimental() bool }
+
+// IsExperimental reports whether p is marked as experimental.
+func IsExperimental(p Protocol) bool {
+	e, ok := p.(Experimental)
+	return ok && e.Experimental()
+}
 
 // ClientReq is the minimum version of one client app for a profile's settings.
 type ClientReq struct {
@@ -160,21 +174,26 @@ type InboundView struct {
 	Node           NodeView
 	Port           uint16
 	HopFrom, HopTo uint16
+	TCPOnly        bool   // relay twin: the forward carries TCP only, even if the direct inbound also serves HTTP/3
 	TLSServerName  string // effective SNI
 	TLSMode        plugin.TLSMode
 	CertPinSHA256  string // reported by the node after apply; empty until then
 }
 
 type RenderInput struct {
-	Format      plugin.ClientFormat
-	Settings    json.RawMessage // merged, secrets in place
-	Inbound     InboundView
-	ClientPort  uint16 // alternate entry's port; takes precedence over a profile's public port
-	UserID      string
-	UserName    string
-	DeviceID    string
-	Secret      string // decrypted credential secret
-	MaskSecrets bool   // profile preview: render secrets as "••••"
+	Format       plugin.ClientFormat
+	Capabilities []string        // name=value entries from X-Mistgate-Caps; used by FormatMistgate only
+	Settings     json.RawMessage // merged, secrets in place
+	Inbound      InboundView
+	ClientPort   uint16 // public entry port; overrides the profile public port
+	UserID       string
+	UserName     string
+	DeviceID     string
+	Secret       string // decrypted credential secret
+	MaskSecrets  bool   // profile preview: render secrets as "••••"
+	// NoIPv6Egress: the client gets no IPv6 out of the exit node, so no format of an AmneziaWG server carries an IPv6 address of the tunnel (AllowedIPs keep ::/0).
+	// The other formats ignore it; false (the zero value) changes nothing.
+	NoIPv6Egress bool
 
 	// L3 protocols (awg). For FormatMihomo, Fragment.Data is ONE proxy as an element of a YAML list built
 	// from yaml.v3 nodes (never string templates: node and user names are hostile input); the assembler
@@ -185,6 +204,23 @@ type RenderInput struct {
 	InboundPublic json.RawMessage // InboundInit.Public of this inbound
 	DNS           []string        // at most 2 plain IPv4 servers (the pair an AWG client carries)
 	NodeAddr      string          // host clients connect to (Inbound.Node.Address)
+}
+
+// HasCapability reports whether the client announced value for name. Comma-separated values in the header
+// (for example awg=2.0,3.1) are treated as a set; blanks around names and values do not matter ("awg=2.0, 3.1").
+func HasCapability(caps []string, name, value string) bool {
+	for _, cap := range caps {
+		key, values, ok := strings.Cut(cap, "=")
+		if !ok || strings.TrimSpace(key) != name {
+			continue
+		}
+		for _, v := range strings.Split(values, ",") {
+			if strings.TrimSpace(v) == value {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Check is one doctor rule. The runner calls Run for every node that has an inbound of this protocol

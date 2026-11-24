@@ -8,19 +8,22 @@ import (
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
 	"github.com/mistgate/mistgate/internal/panel/access"
 	"github.com/mistgate/mistgate/internal/panel/dns"
+	"github.com/mistgate/mistgate/internal/panel/instance"
 	"github.com/mistgate/mistgate/internal/panel/subsettings"
 )
 
 // The servers of the page and the DNS of each of them (the user page's "Servers" and "DNS for each server"). Everything
-// here is data about the person's own servers: no node name, no address, no rate.
+// here is data about the person's own servers: no node name, no internal address, no rate.
 
 // pageNode is one server (one node) of the person. label is the country and the place, the name the page and the keys
 // give a server, never the panel's node name. app_names are what the apps that take the link call it (the owner's name
 // template): empty when the template has {node}, because the node name must not reach the page.
 type pageNode struct {
-	ID          string     `json:"id"`
-	CountryCode string     `json:"country_code"`
-	Place       string     `json:"place"`
+	ID          string `json:"id"`
+	CountryCode string `json:"country_code"`
+	Place       string `json:"place"`
+	// Host: the node's own public address, the one its links and keys carry (never the node's name, never a relay's entry).
+	Host        string     `json:"host"`
 	Label       string     `json:"label"`
 	AppNames    []string   `json:"app_names"`
 	Connections []pageConn `json:"connections"`
@@ -42,6 +45,8 @@ type pageConn struct {
 	// Relay: a twin of the server through a relay of an entry node, whose country code Via is ("" if it has none).
 	Relay bool   `json:"relay,omitempty"`
 	Via   string `json:"via,omitempty"`
+	// IPv6: the server at the node's IPv6 entry, listed in the apps as "<name> · IPv6".
+	IPv6 bool `json:"ipv6,omitempty"`
 }
 
 // pageNodeDNS is the DNS of one server: what the person picked ("" = nothing), what applies, what the owner offers (in
@@ -104,18 +109,18 @@ func pageServers(v access.SubView, set *adminv1.SubscriptionSettings, lang strin
 		}
 		appNames = remarks(safe, tmpl, lang)
 	}
-	label := access.ServerLabeler(lang)
+	labels := serverLabels(v, lang)
 	for _, n := range v.Nodes {
 		p := pageNode{
-			ID: n.ID, CountryCode: strings.ToUpper(strings.TrimSpace(n.CountryCode)), Place: place(n.Location),
-			Label: label(n.CountryCode, n.Location), AppNames: []string{}, Connections: []pageConn{}, Online: n.Online,
+			ID: n.ID, CountryCode: strings.ToUpper(strings.TrimSpace(n.CountryCode)), Place: place(n.Location), Host: n.Address,
+			Label: labels[n.ID], AppNames: []string{}, Connections: []pageConn{}, Online: n.Online,
 		}
 		if n.LoadPercent != nil {
 			l := loadLevel(*n.LoadPercent)
 			p.Load = &l
 		}
 		for _, c := range n.Conns {
-			pc := pageConn{Way: c.Way, Exit: c.Exit, ProfileID: c.ProfileID, MihomoOnly: c.MihomoOnly, Relay: c.Relay, Via: c.Via}
+			pc := pageConn{Way: c.Way, Exit: c.Exit, ProfileID: c.ProfileID, MihomoOnly: c.MihomoOnly, Relay: c.Relay, Via: c.Via, IPv6: c.IPv6}
 			if c.Way == "link" && !c.MihomoOnly && c.Server < len(appNames) {
 				pc.AppName = appNames[c.Server]
 				p.AppNames = append(p.AppNames, pc.AppName)
@@ -128,6 +133,50 @@ func pageServers(v access.SubView, set *adminv1.SubscriptionSettings, lang strin
 		out = append(out, p)
 	}
 	return out
+}
+
+// serverLabels names the person's servers for the page, one label per node id (access.ServerLabeler: the country and the place,
+// a number where a name repeats, never the panel's node name). The nodes of the server list come first, in order, then the
+// nodes only a Telegram link uses, so a node has the same name in both.
+func serverLabels(v access.SubView, lang string) map[string]string {
+	label := access.ServerLabeler(lang)
+	out := make(map[string]string, len(v.Nodes))
+	for _, n := range v.Nodes {
+		out[n.ID] = label(n.CountryCode, n.Location)
+	}
+	for _, t := range v.Telegram {
+		if _, named := out[t.NodeID]; !named {
+			out[t.NodeID] = label(t.CountryCode, t.Location)
+		}
+	}
+	for _, t := range v.TrustTunnel {
+		if _, named := out[t.NodeID]; !named {
+			out[t.NodeID] = label(t.CountryCode, t.Location)
+		}
+	}
+	return out
+}
+
+// pageTelegramOf is the Telegram block of the page: the links of the person's key, each named by its server and, for the
+// node's IPv6 entry and a relay's twin, by the same mark the apps show ("· IPv6", "· via RU"). Nothing of the node's or the
+// profile's own name is in it.
+func pageTelegramOf(v access.SubView, lang string) *pageTelegram {
+	tg := &pageTelegram{Links: []pageTelegramLink{}}
+	labels := serverLabels(v, lang)
+	for _, srv := range v.Telegram {
+		if srv.URI == "" {
+			continue
+		}
+		l := pageTelegramLink{
+			Label: labels[srv.NodeID] + markText(srv.Mark, lang), CountryCode: strings.ToUpper(strings.TrimSpace(srv.CountryCode)),
+			Place: place(srv.Location), IPv6: srv.Mark == access.MarkIPv6, URL: srv.URI, QR: pageQROf(srv.URI),
+		}
+		if cc, ok := strings.CutPrefix(srv.Mark, access.MarkVia); ok {
+			l.Relay, l.Via = true, cc
+		}
+		tg.Links = append(tg.Links, l)
+	}
+	return tg
 }
 
 // place is the owner's text for the location of a node: one line, at most 100 characters, "" when there is none.
@@ -178,11 +227,16 @@ func pageDNSPresets(v access.SubView, lang string) []pageDNSPreset {
 	return out
 }
 
-// inPageLangs is a text in the page's three languages; nil when it is the same in all of them.
+// inPageLangs is a text in the page's languages (instance.Languages); nil when it is the same in all of them.
 func inPageLangs(in func(lang string) string) map[string]string {
-	ru, en, zh := in("ru"), in("en"), in("zh")
-	if ru == en && en == zh {
+	out := make(map[string]string, len(instance.Languages))
+	same := true
+	for _, l := range instance.Languages {
+		out[l] = in(l)
+		same = same && out[l] == out[instance.Languages[0]]
+	}
+	if same {
 		return nil
 	}
-	return map[string]string{"ru": ru, "en": en, "zh": zh}
+	return out
 }

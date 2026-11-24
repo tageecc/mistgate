@@ -81,11 +81,95 @@ func (d *Doctor) ApplyWithRefreshAck(ctx context.Context, fixID string, dryRun b
 		return fixRefreshUnit(ctx, e, dryRun, params, beforeRefresh)
 	case FixAllowForwarding:
 		return fixAllowForwarding(ctx, e, dryRun, params)
+	case FixAwgModuleRepair:
+		return fixAwgModuleRepair(ctx, e, dryRun, params)
+	case FixEnableSecurityUpdates:
+		return fixEnableSecurityUpdates(ctx, e, dryRun, params)
+	case FixInstallNftables:
+		return fixInstallNftables(ctx, e, dryRun, params)
 	case FixSetResolver:
 		return fixResolver(ctx, e, dryRun, params)
 	default:
 		return FixOutcome{Err: ErrUnknownFix}
 	}
+}
+
+func fixEnableSecurityUpdates(ctx context.Context, e *Env, dry bool, params map[string]string) FixOutcome {
+	if !noParams(params) {
+		return FixOutcome{Err: ErrBadParams}
+	}
+	if e.LaunchSecurityUpdates == nil {
+		return FixOutcome{Err: ErrUnsupportedHost}
+	}
+
+	s := inspectSecurityUpdates(ctx, e)
+	if !s.supported {
+		return FixOutcome{Err: ErrNotApplicable}
+	}
+	if s.jobRunning() {
+		return FixOutcome{Err: ErrFixBusy}
+	}
+	if result := checkSecurityUpdatesResult(s); result.Status == OK {
+		return noop("automatic security updates are already on")
+	}
+	if s.jobLoaded() { // a finished unit systemd has not collected yet: systemd-run would refuse the name
+		return FixOutcome{Err: ErrFixBusy}
+	}
+
+	plan, detail, err := securityUpdatesPlan(s)
+	if err != nil {
+		return failed(err)
+	}
+	out := FixOutcome{OK: true, Affected: 1, Params: plan, Detail: detail}
+	if dry {
+		return out
+	}
+	if err := e.LaunchSecurityUpdates(ctx); errors.Is(err, unit.ErrBusy) {
+		return FixOutcome{Err: ErrFixBusy}
+	} else if err != nil {
+		return failed(err)
+	}
+	out.Params["started"] = "1" // the job runs on: the re-check shows enabling, the result comes with a later report
+	out.Detail = "security updates enablement started in the background"
+	return out
+}
+
+func securityUpdatesPlan(s securityUpdatesSnapshot) (map[string]string, string, error) {
+	if s.configErr != nil {
+		return nil, "", errors.New("could not read the effective APT::Periodic settings")
+	}
+	install := "0"
+	if !s.installed {
+		install = "1"
+	}
+	conf := strings.Join(s.periodic.DisabledKeys(), ",")
+	var timers, unmask []string
+	for _, timer := range s.timers {
+		if timer.off() != "" { // not enabled, or enabled but stopped: the job enables and starts it
+			timers = append(timers, timer.name)
+		}
+		if timer.state == "masked" {
+			unmask = append(unmask, timer.name)
+		}
+	}
+	plan := p("install", install, "conf", conf, "timers", strings.Join(timers, ","), "unmask", strings.Join(unmask, ","))
+	var changes []string
+	if install == "1" {
+		changes = append(changes, "install unattended-upgrades")
+	}
+	if conf != "" {
+		changes = append(changes, "enable "+strings.ReplaceAll(conf, ",", ", "))
+	}
+	if len(unmask) > 0 {
+		changes = append(changes, "unmask "+strings.Join(unmask, ", "))
+	}
+	if len(timers) > 0 {
+		changes = append(changes, "enable and start "+strings.Join(timers, ", ")+" on their schedule")
+	}
+	if len(changes) == 0 {
+		return nil, "", errors.New("no security updates change was found")
+	}
+	return plan, clip("would "+strings.Join(changes, "; "), 200), nil
 }
 
 func fixRefreshUnit(ctx context.Context, e *Env, dry bool, params map[string]string, beforeRefresh func(FixOutcome)) FixOutcome {
@@ -424,6 +508,32 @@ func fixAllowForwarding(ctx context.Context, e *Env, dry bool, params map[string
 	return FixOutcome{OK: true, Affected: affected, Params: paramsOut, Detail: fmt.Sprintf(
 		"reconciled %d Mistgate-only forwarding rule changes across %d drop-policy chain(s); unrelated forwarded traffic remains governed by the host firewall",
 		affected, plan.DropChains)}
+}
+
+// fixAwgModuleRepair starts the repair unit. The agent re-applies AWG inbounds when the unit finishes and the kernel backend is usable.
+func fixAwgModuleRepair(ctx context.Context, e *Env, dry bool, params map[string]string) FixOutcome {
+	if !noParams(params) {
+		return FixOutcome{Err: ErrBadParams}
+	}
+	if e.AwgModuleRepair == nil || e.AwgBackend == nil {
+		return FixOutcome{Err: ErrUnsupportedHost}
+	}
+	b := e.AwgBackend()
+	if !b.Fallback {
+		return noop("AmneziaWG is not running on the fallback; nothing to move back")
+	}
+	rel, _ := e.read("/proc/sys/kernel/osrelease")
+	rel = clip(strings.TrimSpace(rel), 64)
+	out := FixOutcome{OK: true, Affected: 1, Params: p("kernel", rel)}
+	if dry {
+		out.Detail = "the AmneziaWG module for kernel " + rel + " would be rebuilt and loaded"
+		return out
+	}
+	if err := e.AwgModuleRepair(ctx); err != nil {
+		return failed(err)
+	}
+	out.Detail = "repair started for the AmneziaWG module for kernel " + rel
+	return out
 }
 
 func orNone(s []string) string {

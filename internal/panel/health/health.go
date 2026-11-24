@@ -67,19 +67,14 @@ const (
 	fixResolveFor = 5 * time.Minute  // a resolve this soon after ApplyFix is "fix_applied"
 	failStreakMin = 2                // failed rounds before a synthetic alert opens
 
-	sampleKeep = 25 * time.Hour
-	dailyKeep  = 90 * 24 * time.Hour
-	alertKeep  = 90 * 24 * time.Hour
-	infoEvents = 90 * 24 * time.Hour  // 00002: events of severity info
-	warnEvents = 400 * 24 * time.Hour // warning and error
 )
 
 // Config configures Service. The zero value is production: only Actor and Log are usually set.
 type Config struct {
 	// Edge runs alert evaluation from EdgeTick and leaves one-off doctor actions to that evaluator in the jobs isolate.
 	Edge bool
-	// Dialers maps a protocol plugin id to its tunnel client. Default: hysteria2, awg and vless. A protocol without one is
-	// SKIPPED (client_unsupported).
+	// Dialers maps a protocol plugin id to its client probe. Default: hysteria2, awg, vless and mtproto. A protocol without
+	// one is SKIPPED (client_unsupported).
 	Dialers map[string]Dialer
 	// Probe URLs of the client-eye checks; hostnames go into the tunnel unresolved. A relay also downloads the bounded
 	// ProbeDownloadURL body to detect transfers that stall after the handshake.
@@ -110,6 +105,8 @@ type Config struct {
 	Actor func(context.Context) string
 	// CheckPorts runs the fleet's bounded UDP delivery check. When set, the VPS scheduler uses it every six hours.
 	CheckPorts func(context.Context, string, []uint16) ([]store.PortCheck, string, string)
+	// ControlRelay evaluates automatic relay mode after a client-eye round or an agent bridge report.
+	ControlRelay func(context.Context, string)
 	// CheckPortsUDP is the same without the TCP half, for the confirming second sample after UDP loss. nil = CheckPorts.
 	CheckPortsUDP func(context.Context, string, []uint16) ([]store.PortCheck, string, string)
 	// Country returns the owner's choice for the country check and the source that measures it (the Globalping integration),
@@ -133,6 +130,9 @@ type Config struct {
 	// RoundLease, when set, must grant a due edge pass before it runs, for ttl. The Cloudflare edition takes a D1 lease
 	// (store.TakeLease): cron ticks can overlap in two isolates, each with its own local mutex. Nil on the VPS.
 	RoundLease func(ctx context.Context, name string, ttl time.Duration) bool
+	// CountryNow are the sources besides Globalping that "Check now" of a node asks for a round of the country check out of turn
+	// (country_now.go): the TSPU probe, cheburcheck and the owner's own probes. Empty on the Cloudflare edition.
+	CountryNow []CountryNowSource
 	// OnTransition is called after an alert was opened or resolved (notifications attach here).
 	OnTransition func(Transition)
 	Log          *slog.Logger
@@ -167,6 +167,9 @@ type Service struct {
 	credMu sync.Mutex
 	creds  map[string]store.ProbeCredRow // inbound id -> credential (cache of the table)
 
+	awgProbeMu    sync.Mutex
+	awgProbeLocks map[string]chan struct{} // one client probe at a time for each inbound's shared probe credential
+
 	snapMu sync.Mutex
 	snap   *snapshot
 
@@ -180,15 +183,18 @@ type Service struct {
 
 	countryMu        sync.Mutex // one country round at a time
 	countryStretched bool       // the stretched interval was logged
-	// entry6 says whether a node's IPv6 entry for clients is on (step 7 of the IPv6 plan sets it); nil: no node has one, so no
-	// IPv6 country alert is ever opened.
-	entry6 func(store.NodeRow) bool
+
+	nowAsk     sync.Mutex           // one ask of a round at a time: the plan of a source may call out
+	nowMu      sync.Mutex           // the rounds of the country check asked out of turn (country_now.go)
+	nowRunning map[string]time.Time // node id -> when its round started
+	nowWG      sync.WaitGroup
 
 	evalMu sync.Mutex // serialises evaluate
 	kick   chan struct{}
 
 	portCheckRun      chan struct{} // one scheduled CheckPorts run at a time
 	portCheckAttempts map[string]int64
+	udpRecheckAt      map[string]time.Time // node id -> when the panel last asked for a UDP delivery check because of probe timeouts
 
 	nhMu             sync.RWMutex
 	nodeHealth       map[string]nodeHealth // computed by the last evaluation
@@ -215,7 +221,7 @@ func New(st *store.Store, v *vault.Vault, reg *protocols.Registry, fl Fleet, cfg
 		cfg.Now = time.Now
 	}
 	if cfg.Dialers == nil {
-		cfg.Dialers = map[string]Dialer{"hysteria2": dialHysteria2, "awg": dialAWG, "vless": dialVLESS}
+		cfg.Dialers = map[string]Dialer{"hysteria2": dialHysteria2, "awg": dialAWG, "vless": dialVLESS, "mtproto": dialMTProto}
 	}
 	if cfg.Probe204URL == "" {
 		cfg.Probe204URL = "https://www.gstatic.com/generate_204"
@@ -252,7 +258,8 @@ func New(st *store.Store, v *vault.Vault, reg *protocols.Registry, fl Fleet, cfg
 		st: st, v: v, reg: reg, fl: fl, cfg: cfg, log: cfg.Log, now: cfg.Now, startedAt: cfg.Now(),
 		creds: map[string]store.ProbeCredRow{}, cells: map[string]*cell{}, sched: map[string]*schedule{},
 		work: make(chan string, 1024), queued: map[string]bool{}, kick: make(chan struct{}, 1),
-		portCheckRun: make(chan struct{}, 1), portCheckAttempts: map[string]int64{},
+		portCheckRun: make(chan struct{}, 1), portCheckAttempts: map[string]int64{}, udpRecheckAt: map[string]time.Time{},
+		nowRunning: map[string]time.Time{},
 		nodeHealth: map[string]nodeHealth{}, waiters: map[string][]chan struct{}{},
 		plans: map[string]fixPlan{}, fixBusy: map[string]bool{}, recentFix: map[string]time.Time{},
 	}

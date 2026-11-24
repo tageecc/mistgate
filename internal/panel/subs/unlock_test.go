@@ -2,6 +2,7 @@ package subs_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -96,7 +97,7 @@ func TestPasswordShapeOnTheRPC(t *testing.T) {
 	if !regexp.MustCompile(`^[2-9a-km-np-z]{4}-[2-9a-km-np-z]{4}$`).MatchString(pw) {
 		t.Fatalf("password %q is not xxxx-xxxx of the unambiguous alphabet", pw)
 	}
-	if pw != pagepass.Password(pageKey(t), tok) {
+	if pw != pagepass.Password(pageKey(t), tok, 0) {
 		t.Error("the RPC's password is not the one the page checks")
 	}
 	if again := g.password(uid); again != pw {
@@ -105,7 +106,7 @@ func TestPasswordShapeOnTheRPC(t *testing.T) {
 	// the user-created dialog gets it too
 	c := must(g.svc.CreateUser(g.ctx, connect.NewRequest(&adminv1.CreateUserRequest{Name: "bob", GroupId: g.group2})))
 	bobTok := strings.TrimPrefix(c.Msg.SubscriptionUrl, "https://sub.example.com/k3xq8/")
-	if c.Msg.PagePassword == "" || c.Msg.PagePassword != pagepass.Password(pageKey(t), bobTok) {
+	if c.Msg.PagePassword == "" || c.Msg.PagePassword != pagepass.Password(pageKey(t), bobTok, 0) {
 		t.Errorf("CreateUser page password %q", c.Msg.PagePassword)
 	}
 }
@@ -226,23 +227,24 @@ func TestWrongPasswordsAreCountedPerTokenAndLimited(t *testing.T) {
 			t.Fatal("a wrong password got a cookie")
 		}
 	}
-	// locked: even the right password waits
+	// This network is locked, even when the password is right.
 	rec := g.unlock(t, tok, pw)
 	if rec.Code != 429 || rec.Header().Get("Retry-After") == "" || decodeAnswer(t, rec).Error != "locked" {
 		t.Fatalf("lockout: %d %v %s", rec.Code, rec.Header(), rec.Body.String())
 	}
-	g.ip = "203.0.113.50" // another network, same token: the token's count still holds
-	if rec := g.unlock(t, tok, pw); rec.Code != 429 {
-		t.Fatalf("another network could pass the token's lockout: %d", rec.Code)
+	g.ip = "198.51.100.8" // another network, same token
+	if rec := g.unlock(t, tok, pw); rec.Code != 200 {
+		t.Fatalf("another network was caught by the first network's lockout: %d %s", rec.Code, rec.Body.String())
 	}
 	g.now = g.now.Add(10*time.Minute + time.Second)
+	g.ip = "198.51.100.7"
 	if rec := g.unlock(t, tok, pw); rec.Code != 200 {
 		t.Fatalf("after the window: %d %s", rec.Code, rec.Body.String())
 	}
 }
 
 // Once a counter has run out, the answer comes before any lookup of the token: even a link that was rotated away since
-// (identify would say "unknown": the decoy) is told to wait, and the locked device calls need no lookup either.
+// (identify would say "unknown": the decoy) is told to wait.
 func TestALockedOutEntryIsRefusedBeforeTheTokenIsLookedUp(t *testing.T) {
 	g := newGate(t, nil)
 	uid, tok := g.newUser("alice", nil)
@@ -257,8 +259,10 @@ func TestALockedOutEntryIsRefusedBeforeTheTokenIsLookedUp(t *testing.T) {
 	if rec := g.unlock(t, "nosuchtoken0123456789", "aaaa-bbbb"); rec.Code == 429 || rec.Code == 200 {
 		t.Errorf("unknown token: %d", rec.Code)
 	}
-	if rec := (call{g.h, t, tok}).post("/devices", g.addBody("phone")); rec.Code != 401 || decodeAnswer(t, rec).Error != "locked" {
-		t.Errorf("devices without the cookie: %d %s", rec.Code, rec.Body.String())
+	// A device call without a cookie looks the person up (their password may have been removed, which only the row says), so the
+	// link that was rotated away is the decoy there, as everywhere else, not "locked".
+	if rec := (call{g.h, t, tok}).post("/devices", g.addBody("phone")); rec.Code != 404 || strings.Contains(rec.Body.String(), "locked") {
+		t.Errorf("devices without the cookie on a rotated-away link: %d %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -276,19 +280,42 @@ func TestCookieOfAPlainHTTPInstanceIsNotSecure(t *testing.T) {
 	}
 }
 
-func TestWrongPasswordsAreCountedPerClientNetworkToo(t *testing.T) {
+func TestWrongPasswordBudgetsArePerTokenAndClientNetwork(t *testing.T) {
 	g := newGate(t, nil)
 	uidA, a := g.newUser("alice", nil)
-	_, b := g.newUser("bob", nil)
-	for i := 0; i < 5; i++ { // one client network guessing at two links
-		g.unlock(t, []string{a, b}[i%2], "aaaa-bbbb")
+	uidB, b := g.newUser("bob", nil)
+	for i := 0; i < 5; i++ {
+		if rec := g.unlock(t, a, "aaaa-bbbb"); rec.Code != http.StatusUnauthorized {
+			t.Fatalf("wrong password %d: %d %s", i+1, rec.Code, rec.Body.String())
+		}
 	}
 	if rec := g.unlock(t, a, g.password(uidA)); rec.Code != 429 {
-		t.Fatalf("the client network is not limited across tokens: %d", rec.Code)
+		t.Fatalf("network X was not locked for this token: %d", rec.Code)
 	}
 	g.ip = "203.0.113.50"
 	if rec := g.unlock(t, a, g.password(uidA)); rec.Code != 200 {
-		t.Fatalf("another network was caught by someone else's guesses: %d", rec.Code)
+		t.Fatalf("network Y was caught by network X's guesses: %d %s", rec.Code, rec.Body.String())
+	}
+	g.ip = "198.51.100.7"
+	if rec := g.unlock(t, b, g.password(uidB)); rec.Code != 200 {
+		t.Fatalf("network X's guesses for alice limited bob's token: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestUnlockTokenCeilingAcrossClientNetworks(t *testing.T) {
+	g := newGate(t, nil)
+	_, tok := g.newUser("alice", nil)
+	for network := 1; network <= 10; network++ {
+		g.ip = fmt.Sprintf("203.0.113.%d", network)
+		for i := 0; i < 5; i++ {
+			if rec := g.unlock(t, tok, "aaaa-bbbb"); rec.Code != http.StatusUnauthorized {
+				t.Fatalf("network %d wrong password %d: %d %s", network, i+1, rec.Code, rec.Body.String())
+			}
+		}
+	}
+	g.ip = "203.0.113.11"
+	if rec := g.unlock(t, tok, "aaaa-bbbb"); rec.Code != http.StatusTooManyRequests || decodeAnswer(t, rec).Error != "locked" {
+		t.Fatalf("per-token password ceiling: %d %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -472,7 +499,7 @@ func TestSelfServiceRefusesADisabledUserEvenWithAFreshPageCache(t *testing.T) {
 	}
 }
 
-func TestSelfServiceRejectsARotatedLinkEvenWithAFreshPageCache(t *testing.T) {
+func TestSelfServiceRejectsARotatedLinkAndAllowsColdValidLinkWhenBlocked(t *testing.T) {
 	m := newM3Rig(t)
 	h, _ := m.handler(func(c *subs.Config) {
 		c.MissLimit, c.BlockFor = 2, time.Hour
@@ -496,7 +523,7 @@ func TestSelfServiceRejectsARotatedLinkEvenWithAFreshPageCache(t *testing.T) {
 	if rec.Code != http.StatusNotFound || rec.Code != unknown.Code || rec.Body.String() != unknown.Body.String() {
 		t.Fatalf("rotated link: %d %q; unknown token: %d %q", rec.Code, rec.Body.String(), unknown.Code, unknown.Body.String())
 	}
-	if rec := (call{h: h, t: t, token: otherToken}).post("/devices", m.addBody("phone")); rec.Code != unknown.Code || rec.Body.String() != unknown.Body.String() {
-		t.Errorf("rotated link did not count as a miss: %d %q", rec.Code, rec.Body.String())
+	if rec := (call{h: h, t: t, token: otherToken}).post("/devices", m.addBody("phone")); rec.Code != http.StatusOK {
+		t.Errorf("cold valid link behind a blocked client: %d %q", rec.Code, rec.Body.String())
 	}
 }

@@ -1,4 +1,4 @@
-import { dict, isLang, localeOf, type Dict } from "./i18n";
+import { dict, isLang, localeOf, ltr, type Dict } from "./i18n";
 import type { AddPane } from "./state";
 import type {
   AmneziaData,
@@ -23,6 +23,8 @@ import type {
   ServerLoad,
   Status,
   Theme,
+  Qr,
+  TrustTunnelLink,
 } from "./types";
 
 // Pure functions of the page data: normalisation, platform detection, the numbers in the status card, the server cards.
@@ -32,7 +34,7 @@ export const platformOrder: Platform[] = ["ios", "android", "windows", "macos", 
 const kindOrder: Kind[] = ["happ", "amnezia"];
 const statuses: Status[] = ["active", "expired", "limited", "disabled"];
 const levels: LoadLevel[] = ["low", "medium", "high"];
-const deviceKinds: Device["kind"][] = ["link", "shared", "key"];
+const deviceKinds: Device["kind"][] = ["link", "shared", "key", "telegram", "trusttunnel"];
 const linkModes: LinkMode[] = ["track", "enforce", "strict"];
 const resets = ["none", "day", "week", "month", "rolling_month"] as const;
 const day = 86400;
@@ -48,6 +50,20 @@ const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v > 
 const rec = (v: unknown): Record<string, unknown> => (v && typeof v === "object" ? (v as Record<string, unknown>) : {});
 const list = (v: unknown): Record<string, unknown>[] => (Array.isArray(v) ? v.map(rec) : []);
 const strs = (v: unknown): string[] => (Array.isArray(v) ? v.map((x) => str(x)).filter(Boolean) : []);
+
+/**
+ * A code the server drew, checked before it is drawn: a QR side (21 to 177, 4 v + 17), the bits as base64 of exactly the bytes
+ * n * n bits take, a window that fits inside. Anything else is no code (null), never a half-drawn one.
+ */
+export function qrOf(raw: unknown): Qr | null {
+  const x = rec(raw);
+  const n = x.n;
+  const bits = str(x.bits);
+  if (typeof n !== "number" || !Number.isInteger(n) || n < 21 || n > 177 || (n - 17) % 4 !== 0) return null;
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(bits) || bits.length !== 4 * Math.ceil(Math.ceil((n * n) / 8) / 3)) return null;
+  const window = typeof x.window === "number" && Number.isFinite(x.window) && x.window > 0 && x.window <= n / 2 ? x.window : 0;
+  return { n, bits, window };
+}
 
 const minClients = (v: unknown): MinClient[] => list(v).map((m) => ({ client: str(m.client), app: str(m.app), min: str(m.min) })).filter((m) => m.app !== "");
 
@@ -75,6 +91,9 @@ export function awgConfig(raw: unknown): AwgConfig {
   const c = rec(raw);
   return {
     node_id: str(c.node_id),
+    via_node_id: str(c.via_node_id),
+    via_country: str(c.via_node_id) ? str(c.via_country).trim().toUpperCase() : "",
+    ipv6: c.ipv6 === true,
     label: str(c.label),
     country_code: str(c.country_code),
     version: str(c.version),
@@ -84,6 +103,7 @@ export function awgConfig(raw: unknown): AwgConfig {
     stale: c.stale === true,
     warnings: strs(c.warnings),
     min_clients: minClients(c.min_clients),
+    qr: qrOf(c.qr),
   };
 }
 
@@ -122,6 +142,7 @@ export function serverEntry(raw: unknown): ServerEntry {
     country_code: str(s.country_code).trim().toUpperCase(),
     place: str(s.place),
     label: str(s.label),
+    host: str(s.host).trim(),
     app_names: strs(s.app_names),
     connections: list(s.connections).map(conn),
     online: s.online === true,
@@ -177,6 +198,32 @@ export function normalize(raw: unknown): MgData {
         endpoints: str(am.endpoints),
       }
     : null;
+  const tg = r.telegram && typeof r.telegram === "object" ? rec(r.telegram) : null;
+  const telegram = tg
+    ? {
+        links: list(tg.links).flatMap((l): { label: string; country_code: string; place: string; ipv6: boolean; relay: boolean; via: string; url: string; qr: Qr | null }[] => {
+          const x = rec(l);
+          const url = str(x.url);
+          return /^tg:/i.test(url)
+            ? [{ label: str(x.label), country_code: str(x.country_code), place: str(x.place), ipv6: x.ipv6 === true, relay: x.relay === true, via: str(x.via), url, qr: qrOf(x.qr) }]
+            : [];
+        }),
+      }
+    : null;
+  const tt = r.trust_tunnel && typeof r.trust_tunnel === "object" ? rec(r.trust_tunnel) : null;
+  const trust_tunnel = tt
+    ? {
+        links: list(tt.links).flatMap((l): TrustTunnelLink[] => {
+          const x = rec(l);
+          const url = safeTtUrl(str(x.url));
+          const note = str(x.note);
+          // a link the page cannot open (not tt://) and says nothing about is not a row
+          return url || note
+            ? [{ label: str(x.label), country_code: str(x.country_code), place: str(x.place), has_ipv6: x.has_ipv6 === true, relay: x.relay === true, via: str(x.via), note, url, qr: qrOf(x.qr) }]
+            : [];
+        }),
+      }
+    : null;
   return {
     v: num(r.v) || 1,
     lang: isLang(r.lang) ? r.lang : "ru",
@@ -187,6 +234,7 @@ export function normalize(raw: unknown): MgData {
     },
     title: str(r.title),
     subscription_url: str(r.subscription_url),
+    qr: qrOf(r.qr),
     server_count: num(r.server_count),
     server_loads: list(r.server_loads).flatMap((s): ServerLoad[] =>
       typeof s.name === "string" && s.name.trim() && levels.includes(s.level as LoadLevel) ? [{ name: s.name, level: s.level as LoadLevel }] : [],
@@ -213,7 +261,9 @@ export function normalize(raw: unknown): MgData {
         ? [{ platform: a.platform as Platform, kind: a.kind as Kind, name: str(a.name), download_url: str(a.download_url), add_url: str(a.add_url), description: str(a.description).trim(), recommended: a.recommended === true }]
         : [],
     ),
-    access: { happ: acc.happ === true, amnezia: acc.amnezia === true },
+    access: { happ: acc.happ === true, amnezia: acc.amnezia === true, telegram: acc.telegram === true, trust_tunnel: acc.trust_tunnel === true },
+    telegram,
+    trust_tunnel,
     devices: list(r.devices).map(
       (d): Device => ({
         id: str(d.id),
@@ -241,6 +291,10 @@ export function normalize(raw: unknown): MgData {
 /** Links the page may open: http(s), tg and mailto. Anything else (javascript:, data:, ...) becomes "". */
 export function safeUrl(u: string): string {
   return /^(https?|tg|mailto):/i.test(u.trim()) && canParse(u) ? u.trim() : "";
+}
+/** The link of the official TrustTunnel apps: tt:// only ("" for anything else, a link too long to parse included). */
+export function safeTtUrl(u: string): string {
+  return /^tt:\/\//i.test(u.trim()) && canParse(u) ? u.trim() : "";
 }
 /** Add links are app deep links (happ://add/...), so any scheme goes except the script-carrying ones. */
 export function safeAddUrl(u: string): string {
@@ -275,11 +329,6 @@ export function detectPlatform(ua: string, touchPoints = 0): Platform | null {
 export const asPlatform = (v: string | null | undefined): Platform | null => (platformOrder.includes(v as Platform) ? (v as Platform) : null);
 export const asTheme = (v: string | null | undefined): Theme => (v === "light" || v === "dark" ? v : "auto");
 
-/** Kinds the user may use (access) and the instance has an app for, in display order (Happ first). */
-export function kinds(d: MgData): Kind[] {
-  return kindOrder.filter((k) => d.access[k] && d.apps.some((a) => a.kind === k));
-}
-
 /** The apps the user may use, in the settings' order. */
 export const usableApps = (d: MgData): AppEntry[] => d.apps.filter((a) => d.access[a.kind]);
 
@@ -296,9 +345,6 @@ export const appsOn = (d: MgData, platform: Platform): AppEntry[] => usableApps(
 export function pickPlatform(d: MgData, remembered: Platform | null, detected: Platform | null): Platform {
   return remembered ?? detected ?? platformsOf(d)[0] ?? platformOrder[0]!;
 }
-
-/** How an app connects: by the subscription link ("link") or by a per-device AmneziaWG key ("key"). */
-export const connectBy = (a: AppEntry): "link" | "key" => (a.kind === "amnezia" ? "key" : "link");
 
 /** The two ways to connect: the subscription link (every server, it updates itself) and the AmneziaVPN key (one per device). */
 export type Way = "link" | "key";
@@ -335,9 +381,6 @@ export function chosenApp(d: MgData, platform: Platform, key: string, kind?: Kin
   return all.find((a) => appKey(a) === key) ?? all[0];
 }
 
-/** The names of an app list, without repeats. */
-export const appNames = (apps: AppEntry[]) => [...new Set(apps.map((a) => a.name).filter(Boolean))];
-
 /** The apps of one kind on a platform: the recommended one first, the rest in the settings' order. */
 export function appsFor(d: MgData, platform: Platform | null, kind: Kind): AppEntry[] {
   return platform ? appList(d, platform).filter((a) => a.kind === kind) : [];
@@ -346,12 +389,6 @@ export function appsFor(d: MgData, platform: Platform | null, kind: Kind): AppEn
 /** The key app's name: the platform's, else any in the settings; AmneziaVPN when the settings name none. */
 export function keyAppName(d: MgData, platform: Platform | null): string {
   return appsFor(d, platform, "amnezia")[0]?.name || d.apps.find((a) => a.kind === "amnezia")?.name || "AmneziaVPN";
-}
-
-/** The name of the link app a phone would scan the QR code in: the recommended one, else the first, on iPhone or Android. "" when there is none. */
-export function qrApp(d: MgData): string {
-  const phone = usableApps(d).filter((a) => a.kind === "happ" && (a.platform === "ios" || a.platform === "android") && a.name !== "");
-  return (phone.find((a) => a.recommended) ?? phone[0])?.name ?? "";
 }
 
 /** The subscription link is shown as a QR code when the page has the option on and some link app is usable. */
@@ -369,8 +406,6 @@ export function storeLabel(url: string, t: Dict): string {
   return t.store.site;
 }
 
-export const isTelegram = (url: string) => /^(tg:|https?:\/\/(t\.me|telegram\.me|telegram\.dog)\/)/i.test(url);
-
 /** What a device row draws: a phone, a Mac (laptop), a computer, or a plain device. */
 export function deviceIcon(platform: string): "phone" | "android" | "monitor" | "laptop" | "terminal" | "other" {
   if (platform === "ios") return "phone";
@@ -386,7 +421,6 @@ export const platformWord = (platform: string, t: Dict) => (platform && platform
 
 // --- countries and servers ---------------------------------------------------------------------------------
 
-const flagOf = (cc: string) => String.fromCodePoint(...[...cc].map((c) => 0x1f1e6 + c.charCodeAt(0) - 65));
 const validCc = (cc: string) => /^[A-Z]{2}$/.test(cc.trim().toUpperCase());
 
 /** The country's name in the page language; the code when the browser has no region names. "" for no country. */
@@ -400,20 +434,8 @@ export function countryName(cc: string, lang: Lang): string {
   }
 }
 
-/** The flag emoji of a country code; "" for none. (The page shows the code instead where the system draws no flags.) */
-export const flagEmoji = (cc: string) => (validCc(cc) ? flagOf(cc.trim().toUpperCase()) : "");
-
-/**
- * "🇩🇪 Германия": the flag and the country in the page language; "" for no country. `flags` off where the system has no
- * flag emoji (Windows draws the two letters, "DE Германия"): the name alone reads better there.
- */
-export function countryLabel(cc: string, lang: Lang, flags = true): string {
-  const name = countryName(cc, lang);
-  return name && flags ? `${flagEmoji(cc)} ${name}` : name;
-}
-
 /** A server's name split the way the card writes it: the country, and the owner's place after a dot ("Германия" "Франкфурт"). */
-export function serverName(s: ServerEntry, lang: Lang): { country: string; place: string } {
+export function serverName(s: Pick<ServerEntry, "country_code" | "place" | "label">, lang: Lang): { country: string; place: string } {
   const country = countryName(s.country_code, lang);
   if (country) return { country, place: s.place };
   const [head, ...rest] = s.label.split(" · ");
@@ -432,39 +454,51 @@ export function serverText(s: ServerEntry, lang: Lang): string {
  */
 export function serversOf(d: MgData): ServerEntry[] {
   if (d.servers.length > 0) return [...d.servers.filter((s) => s.online), ...d.servers.filter((s) => !s.online)];
-  return d.server_loads.map((s) => ({ id: "", country_code: "", place: "", label: s.name, app_names: [], connections: [], online: true, load: s.level, dns: null }));
+  return d.server_loads.map((s) => ({ id: "", country_code: "", place: "", label: s.name, host: "", app_names: [], connections: [], online: true, load: s.level, dns: null }));
 }
 
-/**
- * The choices of a device's configs, one per node: the panel's public name of the server, as the server list and the
- * user's app name it ("Germany 2", "Germany · Frankfurt", "Server"), with the country's flag where the system draws flags.
- * The page never shows the panel's node name.
- */
-export function nodeLabels(configs: AwgConfig[], flags = true): string[] {
-  return configs.map((c, k) => {
-    const name = c.label || String(k + 1);
-    const cc = c.country_code.trim().toUpperCase();
-    return flags && validCc(cc) ? `${flagOf(cc)} ${name}` : name;
-  });
+/** The number a server has among the ones of its country ("DE-2"), when it has twins and no place of its own to tell it apart. "" otherwise. */
+export function serverNum(all: ServerEntry[], x: ServerEntry): string {
+  const cc = x.country_code.trim().toUpperCase();
+  if (!cc || x.place) return "";
+  const same = all.filter((y) => y.country_code.trim().toUpperCase() === cc && !y.place);
+  if (same.length < 2) return "";
+  // the panel names the twins "Germany 2": its number is the server's; else the order in the subscription
+  const n = /\s(\d{1,2})$/.exec(x.label.trim());
+  return `${cc}-${n ? n[1] : same.indexOf(x) + 1}`;
 }
+
+/** What tells a server from the others of its country: the owner's place, else its number among the twins, else "". */
+export const serverMark = (all: ServerEntry[], x: ServerEntry): string => x.place || serverNum(all, x);
 
 const profileRank = (p: AwgProfile) => (p.version === "2.0" ? 2 : p.egress === "warp" ? 1 : 0);
 
+/** A server of a key as the window lists it: the country, what tells it from the others of its country, the domain it is reached by. */
+export type KeyServer = { cc: string; country: string; mark: string; host: string };
+/** One profile the person can make a key on: the owner's name for it, whether it leaves through the spare exit (WARP), the servers the key holds. */
+export type KeySet = { id: string; name: string; warp: boolean; servers: KeyServer[]; countries: string[] };
+/** The profiles of one app version: "new" (5.0.1.5 and newer, AWG 3.x) or "old" (AWG 2.0); `awg` is the protocol version the badge names. */
+export type KeyVersion = { kind: "new" | "old"; awg: string; sets: KeySet[] };
+
 /**
- * "Add a device" names a profile by what a friend can tell apart, never by the panel's name: the countries of the main
- * one, "the spare exit" for a WARP one, "for old versions" for 2.0. The main one (3.x, direct) first; a label that repeats
- * gets a number. `kind` says which of the three it is, for the line under the choice.
+ * What "New device → key" offers, by what a person can choose between: the app's version first (the new one, then the old one),
+ * and inside a version, when the owner made several, the profiles, each with the servers its key holds (the servers that carry
+ * the profile, in the order of the Servers table, marked as the table marks them). A profile no server says it is on (an older
+ * panel sends no `servers[]`) lists the countries the panel names for it instead, and no server count.
  */
-export function profileChoices(profiles: AwgProfile[], t: Dict, lang: Lang, app: string, flags = true): { id: string; label: string; kind: "main" | "warp" | "old"; countries: string[] }[] {
-  const sorted = [...profiles].sort((a, b) => profileRank(a) - profileRank(b));
-  const seen = new Map<string, number>();
-  return sorted.map((p) => {
-    const base =
-      p.version === "2.0" ? t.profileOld(app) : p.egress === "warp" ? t.profileWarp : p.countries.map((c) => countryLabel(c, lang, flags)).filter(Boolean).join(", ") || t.profileMain;
-    const n = (seen.get(base) ?? 0) + 1;
-    seen.set(base, n);
-    return { id: p.id, label: n > 1 ? `${base} (${n})` : base, kind: p.version === "2.0" ? "old" : p.egress === "warp" ? "warp" : "main", countries: p.countries };
-  });
+export function keyVersions(d: MgData, lang: Lang): KeyVersion[] {
+  const all = serversOf(d);
+  const out: KeyVersion[] = [];
+  for (const p of [...(d.amnezia?.profiles ?? [])].sort((a, b) => profileRank(a) - profileRank(b))) {
+    const kind = p.version === "2.0" ? "old" : "new";
+    const servers = all
+      .filter((x) => x.connections.some((k) => k.way === "key" && k.profile_id === p.id))
+      .map((x) => ({ cc: x.country_code, country: serverName(x, lang).country, mark: serverMark(all, x), host: x.host }));
+    let v = out.find((x) => x.kind === kind);
+    if (!v) out.push((v = { kind, awg: p.version, sets: [] }));
+    v.sets.push({ id: p.id, name: p.name.trim(), warp: p.egress === "warp", servers, countries: servers.length > 0 ? [...new Set(servers.map((x) => x.cc))] : p.countries });
+  }
+  return out;
 }
 
 /** The profile "add a device" starts on: the main one. */
@@ -486,11 +520,6 @@ export const dnsPresetOf = (d: MgData, id: string): DnsPreset | undefined => d.d
 export const presetName = (p: DnsPreset, lang: Lang): string => p.names?.[lang] || p.name;
 /** A preset's description in the language of the page. */
 export const presetDescription = (p: DnsPreset, lang: Lang): string => p.descriptions?.[lang] ?? describePreset(p.description, lang);
-/** A preset's name for the page; "" when the id is unknown. */
-export const dnsName = (d: MgData, id: string, lang: Lang): string => {
-  const p = dnsPresetOf(d, id);
-  return p ? presetName(p, lang) : "";
-};
 
 /** The preset a server falls back to when nothing was chosen: what the server says, else what applies now when nothing is chosen, else the first allowed. */
 export function dnsDefault(s: ServerDns): string {
@@ -571,16 +600,22 @@ export const isReturning = (d: MgData, marked: boolean): boolean => fetchedUnix(
 // --- numbers and dates -------------------------------------------------------------------------------------
 
 const locale = localeOf;
-const units: Record<Lang, string[]> = { ru: ["Б", "КБ", "МБ", "ГБ", "ТБ"], en: ["B", "KB", "MB", "GB", "TB"], zh: ["B", "KB", "MB", "GB", "TB"] };
+const latinUnits = ["B", "KB", "MB", "GB", "TB"];
+// Persian keeps the Latin units the apps show (and the Latin digits, localeOf), as one left-to-right piece: "100 GB" (qty)
+const units: Record<Lang, string[]> = { ru: ["Б", "КБ", "МБ", "ГБ", "ТБ"], en: latinUnits, zh: latinUnits, fa: latinUnits, tr: latinUnits };
+
+/** "100 GB": a number with its unit, kept in one left-to-right piece inside Persian text. */
+const qty = (n: string, unit: string, lang: Lang) => (lang === "fa" ? ltr(`${n} ${unit}`) : `${n} ${unit}`);
 
 export function fmtNum(n: number, lang: Lang): string {
   return new Intl.NumberFormat(locale(lang), { maximumFractionDigits: n < 1 ? 2 : n < 10 ? 1 : 0 }).format(n);
 }
 
-
 export function fmtDate(unix: number, lang: Lang, now = Date.now() / 1000): string {
   const d = new Date(unix * 1000);
-  const sameYear = d.getFullYear() === new Date(now * 1000).getFullYear();
+  // the year of the page's calendar (the Persian one starts in March)
+  const year = new Intl.DateTimeFormat(locale(lang), { year: "numeric" });
+  const sameYear = year.format(d) === year.format(new Date(now * 1000));
   return new Intl.DateTimeFormat(locale(lang), { day: "numeric", month: "long", ...(sameYear ? {} : { year: "numeric" }) }).format(d);
 }
 
@@ -596,34 +631,20 @@ export function fmtAgo(unix: number, lang: Lang, now = Date.now() / 1000): strin
 }
 
 export type Hero = {
-  state: Status;
-  tone: "ok" | "warn" | "bad" | "off";
   /** active, and the term ends within a week */
   soon: boolean;
-  /** the term tile ("Осталось" / "Срок"): the number, its unit, the date under it; shown for an active subscription only */
-  showTerm: boolean;
-  termL: string;
-  big: string;
-  unit: string;
-  sub: string;
-  /** the traffic tile: shown for an active subscription and for used-up traffic */
-  showTraffic: boolean;
-  usedN: string;
-  usedOf: string;
-  /** the bar, 0-100 (null = no quota, no bar) */
-  pct: number | null;
-  /** "resets on 14 October" ("" = none) */
-  reset: string;
-  /** traffic is 90 % used or more (or all of it): the tile is a warning */
-  low: boolean;
-  /** the one line about what is left when traffic is nearly used up ("" otherwise) */
-  left: string;
   /** days left, at least 1 while it is soon */
   days: number;
+  /** the used traffic with its unit ("17 GB"), and the quota without one ("100"; "" when unlimited): the board's figure and its line */
+  usedQ: string;
+  quotaN: string;
+  /** "resets on 14 October" ("" = none or no quota) */
+  reset: string;
+  /** traffic is 90 % used or more (or all of it): the figure is a warning */
+  low: boolean;
 };
 
-const tones: Record<Status, Hero["tone"]> = { active: "ok", expired: "bad", limited: "warn", disabled: "off" };
-
+/** What the subscription card reads off the data: the term's days, the traffic in the unit of its quota, the warnings. */
 export function hero(d: MgData, lang: Lang, now = Date.now() / 1000): Hero {
   const t = dict[lang];
   const u = d.user;
@@ -631,35 +652,21 @@ export function hero(d: MgData, lang: Lang, now = Date.now() / 1000): Hero {
   const noExpiry = !u.expires_unix;
   const days = noExpiry ? 0 : Math.max(0, Math.ceil((u.expires_unix - now) / day));
   const soon = active && !noExpiry && u.expires_unix - now <= soonDays * day;
-  const shown = soon ? Math.max(1, days) : days;
 
   // traffic, in the unit of the quota (or of the usage when there is no quota)
   const ref = u.quota_bytes || u.used_bytes;
   const i = Math.max(0, Math.min(units.ru.length - 1, Math.floor(Math.log(Math.max(ref, 1)) / Math.log(1024))));
   const unit = units[lang][i] ?? "";
-  const quota = u.quota_bytes ? `${fmtNum(u.quota_bytes / 1024 ** i, lang)} ${unit}` : "";
   const pct = u.quota_bytes ? Math.min(100, (u.used_bytes / u.quota_bytes) * 100) : null;
-  const low = u.status === "limited" || (active && pct !== null && pct >= lowTraffic);
   const resetDate = u.quota_reset !== "none" && u.next_reset_unix ? fmtDate(u.next_reset_unix, lang, now) : "";
-  const rest = u.quota_bytes ? `${fmtNum(Math.max(0, u.quota_bytes - u.used_bytes) / 1024 ** i, lang)} ${unit}` : "";
 
   return {
-    state: u.status,
-    tone: soon || low ? "warn" : tones[u.status],
     soon,
-    showTerm: active,
-    termL: noExpiry ? t.termL : t.leftL,
-    big: noExpiry ? "∞" : String(shown),
-    unit: noExpiry ? t.noExpiry : t.dayWord(shown),
-    sub: noExpiry ? "" : t.until(fmtDate(u.expires_unix, lang, now)),
-    showTraffic: active || u.status === "limited",
-    usedN: fmtNum(u.used_bytes / 1024 ** i, lang),
-    usedOf: quota ? t.of(quota) : `${unit} · ${t.unlimited}`,
-    pct,
+    days: soon ? Math.max(1, days) : days,
+    usedQ: qty(fmtNum(u.used_bytes / 1024 ** i, lang), unit, lang),
+    quotaN: u.quota_bytes ? fmtNum(u.quota_bytes / 1024 ** i, lang) : "",
     reset: !u.quota_bytes ? "" : resetDate ? t.resets(resetDate) : "",
-    low,
-    left: active && low && rest ? (resetDate ? t.leftUntil(rest, resetDate) : t.leftOnly(rest)) : "",
-    days: shown,
+    low: u.status === "limited" || (active && pct !== null && pct >= lowTraffic),
   };
 }
 
@@ -668,9 +675,6 @@ export const atDeviceLimit = (d: MgData) => d.user.device_limit > 0 && d.user.de
 
 /** The page may call the self-service endpoints: the admin allows it and this is not the admin's preview (no address). */
 export const selfServe = (d: MgData) => !!d.amnezia && d.amnezia.self_service && d.amnezia.endpoints !== "";
-
-/** "Add a device" is offered: self-service, the user is active, there is a profile to add on and a free slot. */
-export const canAddDevice = (d: MgData) => selfServe(d) && d.user.status === "active" && (d.amnezia?.profiles.length ?? 0) > 0 && !atDeviceLimit(d);
 
 /** Why a key cannot be added, in the order the page checks: the owner issues the keys, the admin's preview, no profile, no free slot. "none": no key way at all. */
 export type KeyAvailability = "ok" | "none" | "admin" | "preview" | "noprofile" | "limit";
@@ -735,17 +739,3 @@ export const isPhone = (platform: string) => platform === "ios" || platform === 
 /** The platforms "add a device" offers, in display order. */
 export const addPlatforms = ["ios", "android", "windows", "macos", "linux", "other"] as const;
 
-/** What the status card says for a state that is not "active": [the bold first sentence, what happened, what to do]. The "what to do" is dropped without support. */
-export function stateText(d: MgData, lang: Lang, brand: string): { head: string; body: string; call: string } | null {
-  const t = dict[lang].txt;
-  switch (d.user.status) {
-    case "expired":
-      return { head: d.user.expires_unix ? t.expiredOn(fmtDate(d.user.expires_unix, lang)) : "", ...t.expired(brand) };
-    case "limited":
-      return { head: "", ...(d.user.next_reset_unix && d.user.quota_reset !== "none" ? t.limitedReset(fmtDate(d.user.next_reset_unix, lang), d.user.quota_reset) : t.limited()) };
-    case "disabled":
-      return { head: "", ...t.disabled() };
-    default:
-      return null;
-  }
-}

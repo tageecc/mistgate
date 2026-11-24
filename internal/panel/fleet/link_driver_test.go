@@ -1,6 +1,7 @@
 package fleet
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	agentv1 "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/internal/agentlink"
 	"github.com/mistgate/mistgate/internal/statehash"
 	"google.golang.org/protobuf/proto"
 )
@@ -119,7 +121,7 @@ func restartInbound(id string) *agentv1.ConnectResponse {
 	return &agentv1.ConnectResponse{Message: &agentv1.ConnectResponse_RestartInbound{RestartInbound: &agentv1.RestartInbound{RequestId: id}}}
 }
 
-func TestLinkOpenKeepsOnlyPoison(t *testing.T) {
+func TestLinkOpenCarriesPoisonAndNodeStatsBudget(t *testing.T) {
 	r := newLinkRig(t, "alice-open")
 	var old SessionState
 	fillSessionStateValue(t, reflect.ValueOf(&old).Elem())
@@ -135,7 +137,8 @@ func TestLinkOpenKeepsOnlyPoison(t *testing.T) {
 	out := r.call(LinkIn{Kind: LinkOpen, Generation: 7, CertSerial: "0a1b", CertNotAfter: notAfter})
 
 	want := SessionState{Version: sessionStateVersion, NodeID: r.nodeID, OwnerGeneration: 7, PeerCertSerial: "0a1b",
-		PeerCertNotAfter: notAfter, HelloDeadline: r.now.Add(helloTimeout), Poison: &PoisonBatch{Instance: "inst-a", Seq: 41}}
+		PeerCertNotAfter: notAfter, HelloDeadline: r.now.Add(helloTimeout), Poison: &PoisonBatch{Instance: "inst-a", Seq: 41},
+		StatsBudgetLeftNanos: old.StatsBudgetLeftNanos, StatsBudgetAt: old.StatsBudgetAt}
 	if got := r.decoded(); !sessionStateDeepEqual(reflect.ValueOf(got), reflect.ValueOf(want)) {
 		t.Fatalf("open state = %+v\nwant %+v", got, want)
 	}
@@ -528,9 +531,10 @@ func TestLinkStateRoundTripContinuesTheSession(t *testing.T) {
 }
 
 func TestLinkHandlerAnswersWithTheMarkerOnTheEdge(t *testing.T) {
+	const nodeID = "nod_aaaaaaaaaaaaaaaaaaaaaaaaaa"
 	r := newLinkRig(t, "alice-marker")
 	serve := func(h http.Handler, upgrade string) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodGet, "/link/nod_x", nil)
+		req := httptest.NewRequest(http.MethodGet, "/link/"+nodeID, nil)
 		if upgrade != "" {
 			req.Header.Set("Upgrade", upgrade)
 		}
@@ -540,7 +544,7 @@ func TestLinkHandlerAnswersWithTheMarkerOnTheEdge(t *testing.T) {
 	}
 	r.e.f.cfg.Remote = &testRemote{}
 	h := r.e.f.LinkHandler()
-	if w := serve(h, "websocket"); w.Code != http.StatusNoContent || w.Header().Get(LinkMarkerHeader) != "nod_x" {
+	if w := serve(h, "websocket"); w.Code != http.StatusNoContent || w.Header().Get(LinkMarkerHeader) != nodeID {
 		t.Fatalf("edge upgrade: status %d, header %q", w.Code, w.Header().Get(LinkMarkerHeader))
 	}
 	if w := serve(h, ""); w.Code != http.StatusNotFound {
@@ -596,7 +600,7 @@ func TestLinkRequestPastItsDeadlineIsNotSent(t *testing.T) {
 	}
 }
 
-func TestLinkClosingCallReturnsTheChangedState(t *testing.T) {
+func TestLinkDropsPermanentStatsFailureAndReturnsAck(t *testing.T) {
 	r := newLinkRig(t, "alice-poison")
 	ids := r.e.fixture(r.nodeID)
 	r.helloed(1, "instance-poison")
@@ -606,30 +610,60 @@ func TestLinkClosingCallReturnsTheChangedState(t *testing.T) {
 		Traffic: []*agentv1.TrafficDelta{{CredId: "crd_alice_hy", InboundId: ids.i1, BytesUp: 5}},
 	}}}
 	first := r.frame(batch)
-	if first.Close == nil || first.Close.Code != 1011 || len(first.Frames) != 0 {
-		t.Fatalf("first refusal = close %+v, frames %d; want 1011 and no frame", first.Close, len(first.Frames))
+	frames := linkFrames(t, first)
+	if first.Close != nil || len(frames) != 1 || frames[0].GetAck().GetUpToSeq() != 1 {
+		t.Fatalf("permanent refusal = close %+v, frames %v; want Ack 1 and an open link", first.Close, frames)
 	}
-	if p := r.decoded().Poison; p == nil || p.Instance != "instance-poison" || p.Seq != 1 {
-		t.Fatalf("the closing call did not return Poison: %+v", p)
-	}
-	r.now = r.now.Add(time.Second)
-	r.call(LinkIn{Kind: LinkClosed})
-	// The agent reconnects as generation 2 and resends the batch it never got an Ack for.
-	r.now = r.now.Add(time.Second)
-	r.open(2)
-	if p := r.decoded().Poison; p == nil || p.Seq != 1 {
-		t.Fatalf("open lost Poison: %+v", p)
-	}
-	r.frame(hello("instance-poison", 0, ""))
-	second := r.frame(batch)
-	frames := linkFrames(t, second)
-	if second.Close != nil || len(frames) != 1 || frames[0].GetAck().GetUpToSeq() != 1 {
-		t.Fatalf("second refusal = close %+v, frames %v; want the batch dropped and Ack 1", second.Close, frames)
-	}
-	if r.decoded().Poison != nil {
-		t.Fatalf("the successful drop left Poison behind: %+v", r.decoded().Poison)
+	if p := r.decoded().Poison; p != nil {
+		t.Fatalf("a permanently dropped batch left Poison behind: %+v", p)
 	}
 	if n := r.e.count(`SELECT count(*) FROM event WHERE node_id = ? AND code = 'stats_dropped'`, r.nodeID); n != 1 {
 		t.Fatalf("stats_dropped events = %d, want 1", n)
+	}
+}
+
+// A sealed session on the edge: Link opens the agent's frames and seals its own with the keys the open step carried, a
+// frame changed on the way closes the session, and the keys do not outlive it in the stored state.
+func TestLinkSealedSession(t *testing.T) {
+	r := newLinkRig(t, "alice-sealed")
+	keys := bytes.Repeat([]byte{9}, 64)
+	sealed := func(seq uint64, msg *agentv1.ConnectRequest) []byte {
+		raw, _ := proto.Marshal(msg)
+		b, err := agentlink.SealFrame(keys, true, seq, raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	opened := func(out LinkOut, first uint64) []*agentv1.ConnectResponse {
+		var frames []*agentv1.ConnectResponse
+		for i, raw := range out.Frames {
+			plain, err := agentlink.OpenFrame(keys, false, first+uint64(i), raw)
+			var m agentv1.ConnectResponse
+			if err != nil || proto.Unmarshal(plain, &m) != nil {
+				t.Fatalf("panel frame %d does not open: %v", i, err)
+			}
+			frames = append(frames, &m)
+		}
+		return frames
+	}
+
+	r.call(LinkIn{Kind: LinkOpen, Generation: 1, Seal: keys})
+	out := r.call(LinkIn{Kind: LinkFrame, Frame: sealed(0, hello("instance-sealed", 0, ""))})
+	if frames := opened(out, 0); len(frames) != 2 || frames[0].GetHelloAck() == nil || frames[1].GetDesiredState() == nil {
+		t.Fatalf("sealed hello answered %v; want HelloAck then DesiredState", frames)
+	}
+	if s := r.decoded(); s.SealUp != 1 || s.SealDown != 2 {
+		t.Fatalf("counters up %d down %d, want 1 and 2", s.SealUp, s.SealDown)
+	}
+
+	// The same frame again (a replay) does not open under the next number.
+	replay := r.call(LinkIn{Kind: LinkFrame, Frame: sealed(0, hello("instance-sealed", 0, ""))})
+	if replay.Close == nil || replay.Close.Code != 1008 || len(replay.Frames) != 0 {
+		t.Fatalf("replayed frame = %+v; want close 1008", replay)
+	}
+	r.call(LinkIn{Kind: LinkClosed})
+	if s := r.decoded(); s.Seal != nil || s.SealUp != 0 || s.SealDown != 0 {
+		t.Error("the closed session's keys are still in the stored state")
 	}
 }

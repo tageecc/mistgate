@@ -21,19 +21,17 @@ import (
 	"connectrpc.com/connect"
 	"golang.org/x/crypto/curve25519"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
 	"github.com/mistgate/mistgate/gen/mistgate/admin/v1/adminv1connect"
 	agentv1 "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/internal/agentcap"
 	"github.com/mistgate/mistgate/internal/panel/auth"
 	"github.com/mistgate/mistgate/internal/panel/store"
 	"github.com/mistgate/mistgate/internal/panel/vault"
 	"github.com/mistgate/mistgate/internal/plugin"
 )
-
-// CapWarp is the Hello capability of an agent that can run WARP. The panel registers or imports an account only for
-// a node that listed it (agent.proto, AWG AND WARP).
-const CapWarp = "warp/1"
 
 // Fleet is what the module needs from the fleet module (*fleet.Fleet implements it).
 type Fleet interface {
@@ -99,6 +97,19 @@ type Service struct {
 
 	mu      sync.Mutex // serialises every change of an account, and therefore every call to Cloudflare
 	lastReg time.Time  // when the last registration call ended (mu)
+
+	// The checks of the reach sites in flight and how the newest ended (reach_now.go: the VPS edition's).
+	reachMu   sync.Mutex
+	reachBusy map[string]bool      // node id -> a check is on
+	reachAsk  map[string]time.Time // node id -> when the last check by hand started
+	reachLast map[string]reachEnd  // node id -> how the newest check ended
+	reachWG   sync.WaitGroup
+}
+
+// reachEnd is how a check of a node's reach sites ended: "ok", or "busy", "too_soon", "warp_down", "failed".
+type reachEnd struct {
+	how string
+	at  time.Time
 }
 
 // New builds the module. fl may be nil.
@@ -173,11 +184,16 @@ func (s *Service) Handler(opts ...connect.HandlerOption) (string, http.Handler) 
 
 // secrets is the sealed part of an account (warp_account.secret_enc, AAD = node id). token, reg_id and license are
 // empty for an imported profile that came without wgcf-account.toml. Every formatting path prints [REDACTED].
+// License is the account's own key as Cloudflare issued it; PlusKey is the paid WARP+ key the owner gave
+// (SetWarpLicense), the one a re-registration binds to the new device. LicenseError is no secret: the code of the
+// refusal when that bind failed, kept here so the account row needs no column for it.
 type secrets struct {
-	PrivateKey string `json:"private_key"`
-	Token      string `json:"token"`
-	RegID      string `json:"reg_id"`
-	License    string `json:"license"`
+	PrivateKey   string `json:"private_key"`
+	Token        string `json:"token"`
+	RegID        string `json:"reg_id"`
+	License      string `json:"license"`
+	PlusKey      string `json:"plus_key,omitempty"`
+	LicenseError string `json:"license_error,omitempty"`
 }
 
 func (secrets) String() string       { return "[REDACTED]" }
@@ -212,7 +228,7 @@ func (s *Service) open(a store.WarpAccountRow) (secrets, error) {
 func fail(code connect.Code, key string) error { return connect.NewError(code, errors.New(key)) }
 
 func (s *Service) internal(what string, err error) error {
-	s.log.Error("warp: "+what, "err", err)
+	s.log.Error("warp: "+what, "code", "warp_internal_error", "err", err)
 	return connect.NewError(connect.CodeInternal, errors.New("internal error"))
 }
 
@@ -220,7 +236,7 @@ func (s *Service) internal(what string, err error) error {
 // HTTP status travels as "code: status=N" (the web errorVars format) so the owner sees what Cloudflare answered.
 func (s *Service) cloudflareErr(nodeID, what string, err error) error {
 	st := apiStatus(err)
-	s.log.Warn("warp: cloudflare call failed", "node", nodeID, "call", what, "status", st, "err", err)
+	s.log.Warn("warp: cloudflare call failed", "code", "warp_cloudflare_call_failed", "node", nodeID, "call", what, "status", st, "err", err)
 	switch {
 	case st == http.StatusTooManyRequests:
 		return fail(connect.CodeResourceExhausted, fmt.Sprintf("cloudflare_rate_limited: status=%d", st)) // import a wgcf profile instead
@@ -238,10 +254,49 @@ func revoked(status int) bool {
 	return status == http.StatusUnauthorized || status == http.StatusNotFound
 }
 
+// licenseFailure names why Cloudflare did not take a WARP+ key, as a code the card words. Cloudflare's text for a
+// refusal is not documented and may change, so the words it carries ("limit", "invalid") are matched loosely, after
+// the status.
+func licenseFailure(err error) string {
+	var ae *APIError
+	if !errors.As(err, &ae) {
+		return "cloudflare_unreachable"
+	}
+	m := strings.ToLower(ae.Message)
+	switch {
+	case ae.Status == http.StatusTooManyRequests:
+		return "license_rate_limited"
+	case ae.Status == http.StatusUnauthorized: // the device token, not the key
+		return "account_revoked"
+	case strings.Contains(m, "limit") || strings.Contains(m, "maximum") || strings.Contains(m, "too many"):
+		return "license_device_limit"
+	case strings.Contains(m, "licen") || strings.Contains(m, "invalid") || strings.Contains(m, "key"):
+		return "license_invalid"
+	case revoked(ae.Status):
+		return "account_revoked"
+	case ae.Status == http.StatusBadRequest || ae.Status == http.StatusUnprocessableEntity:
+		return "license_invalid"
+	}
+	return "license_rejected"
+}
+
+var licenseCode = map[string]connect.Code{
+	"license_invalid": connect.CodeInvalidArgument, "license_device_limit": connect.CodeFailedPrecondition,
+	"license_rate_limited": connect.CodeResourceExhausted, "account_revoked": connect.CodeFailedPrecondition,
+	"license_rejected": connect.CodeUnavailable, "cloudflare_unreachable": connect.CodeUnavailable,
+}
+
+// licenseErr is the client error for a refused key, and logs the class (never the key: SetLicense cuts it out of the text).
+func (s *Service) licenseErr(nodeID string, err error) error {
+	why := licenseFailure(err)
+	s.log.Warn("warp: cloudflare did not take the license key", "code", "warp_license_failed", "node", nodeID, "reason", why, "status", apiStatus(err), "err", err)
+	return fail(licenseCode[why], why)
+}
+
 func (s *Service) audit(ctx context.Context, actor, action string, params map[string]string) {
 	b, _ := json.Marshal(params)
 	if err := s.st.Audit(ctx, s.now(), store.AuditEntry{Actor: actor, Action: action, Params: string(b), Result: "ok"}); err != nil {
-		s.log.Warn("warp: audit", "action", action, "err", err)
+		s.log.Warn("warp: audit", "code", "warp_audit_failed", "action", action, "err", err)
 	}
 }
 
@@ -266,7 +321,7 @@ func (s *Service) node(ctx context.Context, id string, mutating bool) (store.Nod
 
 // supports is whether the node's agent (last Hello, or the live stream) lists warp/1.
 func (s *Service) supports(n store.NodeRow) bool {
-	return slices.Contains(n.AgentCaps, CapWarp)
+	return slices.Contains(n.AgentCaps, agentcap.Warp)
 }
 
 func (s *Service) liveNode(ctx context.Context, nodeID string) (store.NodeLiveRow, error) {
@@ -276,7 +331,7 @@ func (s *Service) liveNode(ctx context.Context, nodeID string) (store.NodeLiveRo
 func (s *Service) params(ctx context.Context) Params {
 	raw, err := s.st.Setting(ctx, SettingKey)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		s.log.Warn("warp: read params", "err", err)
+		s.log.Warn("warp: read params", "code", "warp_params_read_failed", "err", err)
 	}
 	return parseParams(raw)
 }
@@ -358,7 +413,7 @@ func (s *Service) forget(nodeID string, p Params, x secrets) bool {
 		return false
 	}
 	if err := c.Delete(ctx, p, x.RegID, x.Token); err != nil {
-		s.log.Warn("warp: delete device at cloudflare failed", "node", nodeID, "status", apiStatus(err), "err", err)
+		s.log.Warn("warp: delete device at cloudflare failed", "code", "warp_cloudflare_device_delete_failed", "node", nodeID, "status", apiStatus(err), "err", err)
 		return false
 	}
 	return true
@@ -403,17 +458,23 @@ func (s *Service) register(ctx context.Context, nodeID string, acceptTOS bool, t
 	if err != nil {
 		return store.WarpAccountRow{}, err
 	}
+	oldSecrets, _ := s.open(old)   // unreadable (wrong master key): only the local account goes
+	x.PlusKey = oldSecrets.PlusKey // the owner's key outlives the account; it is bound below, once the old device is gone
 	row.SecretEnc = s.seal(nodeID, x)
 	if replace {
-		oldSecrets, _ := s.open(old) // unreadable (wrong master key): only the local account goes
 		if err := s.st.ReplaceWarpAccount(ctx, row); err != nil {
 			s.forget(nodeID, p, x)
 			return store.WarpAccountRow{}, s.accountErr("replace account", err)
 		}
 		remote := s.forget(nodeID, p, oldSecrets)
+		// After the old device is deleted: while it lives it holds a place of the key, and a key at its limit of devices would refuse the new one.
+		license := "none"
+		if oldSecrets.PlusKey != "" {
+			license = s.carryLicense(ctx, p, oldSecrets.PlusKey, &row, &x)
+		}
 		s.log.Info("warp: account registered again", "node", nodeID, "admin", actor, "old_deleted", remote)
 		s.audit(ctx, actor, "warp_reregister", map[string]string{"node_id": nodeID, "node": n.Name, "tos_url": tosURL, "api": p.APIVersion,
-			"old_deleted": fmt.Sprint(remote)})
+			"old_deleted": fmt.Sprint(remote), "license": license})
 		s.fl.StateChanged()
 		return row, nil
 	}
@@ -482,7 +543,9 @@ func (s *Service) importAccount(ctx context.Context, nodeID, profileText, accoun
 		NodeID: nodeID, Source: store.WarpImported, PeerPublicKey: pr.peerPublicKey, EndpointV4: ep, Ports: ports,
 		AddressV4: pr.addressV4, AddressV6: pr.addressV6, MTU: pr.mtu, Enabled: true, CreatedAt: now, UpdatedAt: now,
 	}
-	row.SecretEnc = s.seal(nodeID, secrets{PrivateKey: pr.privateKey, Token: ac.accessToken, RegID: ac.deviceID, License: ac.licenseKey})
+	x := secrets{PrivateKey: pr.privateKey, Token: ac.accessToken, RegID: ac.deviceID, License: ac.licenseKey}
+	row.AccountType = s.accountTypeOf(ctx, nodeID, x)
+	row.SecretEnc = s.seal(nodeID, x)
 	actor := s.cfg.Actor(ctx)
 
 	s.mu.Lock()
@@ -497,6 +560,125 @@ func (s *Service) importAccount(ctx context.Context, nodeID, profileText, accoun
 	s.audit(ctx, actor, "warp_import", map[string]string{"node_id": nodeID, "node": n.Name, "with_token": fmt.Sprint(ac.accessToken != "")})
 	s.fl.StateChanged()
 	return row, nil
+}
+
+// accountTypeOf asks Cloudflare for the type of an imported account ("free" or "plus"); "" without a token or when
+// Cloudflare does not answer: an import must not fail on it, and the next read of the account fills it in.
+func (s *Service) accountTypeOf(ctx context.Context, nodeID string, x secrets) string {
+	if !x.hasToken() {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	p := s.params(ctx)
+	c, err := s.cfg.NewClient(p)
+	if err != nil {
+		return ""
+	}
+	reg, err := c.Get(ctx, p, x.RegID, x.Token)
+	if err != nil {
+		s.log.Warn("warp: read the type of an imported account failed", "code", "warp_account_type_failed", "node", nodeID, "status", apiStatus(err), "err", err)
+		return ""
+	}
+	return reg.AccountType
+}
+
+// --- WARP+ license key -------------------------------------------------------------------------------------
+
+// cleanLicense checks what the owner typed before Cloudflare is asked: a WARP+ key is three groups of letters and digits
+// joined by dashes (26 characters today); the check is loose so that a change of the format does not lock the box.
+func cleanLicense(key string) (string, error) {
+	key = strings.TrimSpace(key)
+	if len(key) < 16 || len(key) > 64 || strings.ContainsFunc(key, func(r rune) bool {
+		return r != '-' && (r < '0' || r > '9') && (r < 'A' || r > 'Z') && (r < 'a' || r > 'z')
+	}) {
+		return "", fail(connect.CodeInvalidArgument, "license_invalid")
+	}
+	return key, nil
+}
+
+// bindLicense binds key to the account's device at Cloudflare and reads the device back: the account type it reports
+// now. "" (and no error) when the bind went through but the read did not: the next read of the account fills it in.
+func (s *Service) bindLicense(ctx context.Context, nodeID string, p Params, x secrets, key string) (string, error) {
+	c, err := s.cfg.NewClient(p)
+	if err != nil {
+		return "", err
+	}
+	if err := c.SetLicense(ctx, p, x.RegID, x.Token, key); err != nil {
+		return "", err
+	}
+	reg, err := c.Get(ctx, p, x.RegID, x.Token)
+	if err != nil {
+		s.log.Warn("warp: read the account after binding a license failed", "code", "warp_account_type_failed", "node", nodeID, "status", apiStatus(err), "err", err)
+		return "", nil
+	}
+	return reg.AccountType, nil
+}
+
+// carryLicense binds the owner's key of the replaced account to the new device (row and x: the new account, which is stored
+// already and whose old device is gone) and stores the result. A refusal does not fail the re-registration: the account stays
+// "free" and x.LicenseError says why, which the card shows. It returns "applied", or that reason.
+func (s *Service) carryLicense(ctx context.Context, p Params, key string, row *store.WarpAccountRow, x *secrets) string {
+	x.PlusKey = key // kept either way: the owner's key outlives a refusal, the next re-registration tries it again
+	license := "applied"
+	typ, err := s.bindLicense(ctx, row.NodeID, p, *x, key)
+	if err != nil {
+		x.LicenseError = licenseFailure(err)
+		s.log.Warn("warp: the license key was not bound to the new device", "code", "warp_license_carry_failed", "node", row.NodeID, "reason", x.LicenseError, "status", apiStatus(err), "err", err)
+		license = x.LicenseError
+	} else if typ != "" {
+		row.AccountType = typ
+	}
+	row.SecretEnc = s.seal(row.NodeID, *x)
+	if err := s.st.SetWarpSecret(ctx, row.NodeID, row.SecretEnc, row.AccountType, s.now()); err != nil {
+		s.log.Warn("warp: the license result was not stored", "code", "warp_license_store_failed", "node", row.NodeID, "err", err)
+	}
+	return license
+}
+
+// setLicense is "Set the WARP+ key": bind it to the node's device, keep it sealed with the account's secrets and take the
+// account type Cloudflare reports. Nothing is stored when Cloudflare refuses.
+func (s *Service) setLicense(ctx context.Context, nodeID, key string) (store.WarpAccountRow, error) {
+	key, err := cleanLicense(key)
+	if err != nil {
+		return store.WarpAccountRow{}, err
+	}
+	n, err := s.node(ctx, nodeID, true)
+	if err != nil {
+		return store.WarpAccountRow{}, err
+	}
+	// A browser that goes away must not leave a key bound at Cloudflare that the panel never stored.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+	defer cancel()
+	actor := s.cfg.Actor(ctx)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a, err := s.st.WarpAccount(ctx, nodeID)
+	if err != nil {
+		return store.WarpAccountRow{}, s.accountErr("load account", err)
+	}
+	x, err := s.open(a)
+	if err != nil {
+		return store.WarpAccountRow{}, s.internal("open secrets (wrong master key?)", err)
+	}
+	if !x.hasToken() {
+		return store.WarpAccountRow{}, fail(connect.CodeFailedPrecondition, "no_token")
+	}
+	typ, err := s.bindLicense(ctx, nodeID, s.params(ctx), x, key)
+	if err != nil {
+		return store.WarpAccountRow{}, s.licenseErr(nodeID, err)
+	}
+	x.PlusKey, x.LicenseError = key, ""
+	if typ != "" {
+		a.AccountType = typ
+	}
+	if err := s.st.SetWarpSecret(ctx, nodeID, s.seal(nodeID, x), a.AccountType, s.now()); err != nil {
+		return store.WarpAccountRow{}, s.accountErr("store license", err)
+	}
+	s.log.Info("warp: license key set", "node", nodeID, "admin", actor, "type", a.AccountType)
+	s.audit(ctx, actor, "warp_license", map[string]string{"node_id": nodeID, "node": n.Name, "account_type": a.AccountType})
+	return s.st.WarpAccount(ctx, nodeID)
 }
 
 // --- enable, refresh, delete -------------------------------------------------------------------------------
@@ -632,7 +814,7 @@ func (s *Service) refreshLocked(ctx context.Context, nodeID, actor string) (stor
 	if err != nil {
 		if revoked(apiStatus(err)) {
 			if aerr := s.st.SetWarpAttention(ctx, nodeID, "revoked", s.now()); aerr != nil {
-				s.log.Warn("warp: record attention", "node", nodeID, "err", aerr)
+				s.log.Warn("warp: record attention", "code", "warp_attention_record_failed", "node", nodeID, "err", aerr)
 			}
 		}
 		return store.WarpAccountRow{}, s.cloudflareErr(nodeID, "refresh", err)
@@ -673,7 +855,7 @@ func (s *Service) delete(ctx context.Context, nodeID, confirmName string) (remot
 	}
 	x, err := s.open(a)
 	if err != nil {
-		s.log.Error("warp: open secrets (wrong master key?); deleting the local account only", "node", nodeID, "err", err)
+		s.log.Error("warp: open secrets (wrong master key?); deleting the local account only", "code", "warp_secret_open_failed", "node", nodeID, "err", err)
 	}
 	remote := s.forget(nodeID, s.params(ctx), x)
 	if err := s.st.DeleteWarpAccount(ctx, nodeID); err != nil {
@@ -732,6 +914,7 @@ func (s *Service) AutoReregister(ctx context.Context, nodeID string) (bool, erro
 	if err != nil {
 		return false, err
 	}
+	x.PlusKey = old.PlusKey // bound below, once the old device is gone (see register)
 	row.SecretEnc = s.seal(nodeID, x)
 	row.Enabled, row.CreatedAt = a.Enabled, a.CreatedAt
 	if err := s.st.ReplaceWarpAccount(ctx, row); err != nil {
@@ -739,8 +922,12 @@ func (s *Service) AutoReregister(ctx context.Context, nodeID string) (bool, erro
 		return false, s.internal("replace account", err)
 	}
 	s.forget(nodeID, p, old)
+	license := "none"
+	if old.PlusKey != "" {
+		license = s.carryLicense(ctx, p, old.PlusKey, &row, &x)
+	}
 	s.log.Info("warp: account re-registered automatically", "node", nodeID)
-	s.audit(ctx, "system", "warp_reregister", map[string]string{"node_id": nodeID, "node": n.Name, "tos_url": TOSURL})
+	s.audit(ctx, "system", "warp_reregister", map[string]string{"node_id": nodeID, "node": n.Name, "tos_url": TOSURL, "license": license})
 	s.fl.StateChanged()
 	return true, nil
 }
@@ -749,7 +936,7 @@ func (s *Service) AutoReregister(ctx context.Context, nodeID string) (bool, erro
 
 // Spec is the node's WarpSpec for the desired state: nil when the node has no account. An account that is paused
 // (enabled = false) is returned with Enabled false, which tears the tunnel down on the node and makes every inbound
-// with egress "warp" fail closed. The caller must send it only to a stream that listed CapWarp.
+// with egress "warp" fail closed. The caller must send it only to a stream that listed agentcap.Warp.
 func (s *Service) Spec(ctx context.Context, nodeID string) (*plugin.WarpSpec, error) {
 	a, err := s.st.WarpAccount(ctx, nodeID)
 	if errors.Is(err, store.ErrNotFound) {
@@ -783,7 +970,22 @@ func specOf(a store.WarpAccountRow, privateKey string) *plugin.WarpSpec {
 // StoreHealth keeps the last WarpHealth a node reported (StatsBatch.warp), for GetWarp and the node badge. A node
 // without an account is ignored.
 func (s *Service) StoreHealth(ctx context.Context, nodeID string, h *agentv1.WarpHealth) error {
-	b, err := protojson.Marshal(h)
+	if h == nil {
+		return nil
+	}
+	health := proto.Clone(h).(*agentv1.WarpHealth)
+	health.Backend = store.Clip(health.Backend, 32)
+	health.Endpoint = store.Clip(health.Endpoint, 64)
+	health.WarpFlag = store.Clip(health.WarpFlag, 16)
+	health.Colo = store.Clip(health.Colo, 16)
+	health.LastError = store.Clip(health.LastError, 128)
+	if health.ProbeCloudflare != nil {
+		health.ProbeCloudflare.FailureCode = store.Clip(health.ProbeCloudflare.FailureCode, 64)
+	}
+	if health.ProbeOther != nil {
+		health.ProbeOther.FailureCode = store.Clip(health.ProbeOther.FailureCode, 64)
+	}
+	b, err := protojson.Marshal(health)
 	if err != nil {
 		return err
 	}

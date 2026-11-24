@@ -10,6 +10,9 @@ package update
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -25,6 +28,7 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 
 	pb "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/internal/agentcap"
 	"github.com/mistgate/mistgate/internal/release"
 )
 
@@ -36,12 +40,14 @@ const (
 	FileRolledBack         = "update.rolledback"
 	FileRolledBackWhy      = "update.rolledback.reason"
 	FileOutcome            = "update.outcome"
+	FilePrev               = "update.prev"
 	FileUnitRefreshPending = "unit-refresh.pending"
-	CapUpdate              = "update/1"
-	CapGuard               = "update-guard/1"
 	CommitWindow           = 5 * time.Minute
+	DefaultIdleTimeout     = 90 * time.Second
 	probeName              = ".mistgate-write-probe"
 	defaultTimeout         = 10 * time.Minute
+	minDownloadTimeout     = 5 * time.Minute
+	maxDownloadTimeout     = 2 * time.Hour
 	defaultRetryWait       = 5 * time.Second
 	defaultMaxReasonSz     = 64
 )
@@ -77,6 +83,13 @@ type Source interface {
 	Fetch(ctx context.Context, name string, offset uint64, w io.Writer) (total uint64, err error)
 	Failed() []string
 	Now() time.Time
+	LocalNow() time.Time
+}
+
+// FetcherSource optionally builds the sources requested by an UpdateAgent. Without it the updater keeps the historical
+// single-panel path.
+type FetcherSource interface {
+	Fetchers(m *release.Manifest, f release.File) []Fetcher
 }
 
 // Finish ends an update or a rollback: it re-executes the new binary. The agent calls it after the CommandResult is on
@@ -87,24 +100,32 @@ type Finish func() error
 // Config describes the running binary and its environment. Zero values are production defaults except Exec, which
 // the caller sets to syscall.Exec (nil means "do not exec", for tests).
 type Config struct {
-	StateDir string
-	ExePath  string // default: the running executable, symlinks resolved, taken once at New
-	Version  string
-	Built    int64
-	Key      ed25519.PublicKey // nil = unsigned build: no self-update
-	UnitGen  int               // MISTGATE_UNIT_GEN: >= 2 means the unit carries the crash-loop guard
-	Exec     func(path string, argv, env []string) error
-	Args     []string // default os.Args
-	Env      []string // default os.Environ()
-	Now      func() time.Time
-	GOOS     string // default runtime.GOOS
-	GOARCH   string
-	Window   time.Duration // commit window, default CommitWindow
-	Backoff  []time.Duration
-	Timeout  time.Duration // whole download, default 10 min
-	Log      *slog.Logger
+	StateDir    string
+	ExePath     string // default: the running executable, symlinks resolved, taken once at New
+	Version     string
+	Built       int64
+	Key         ed25519.PublicKey // nil = unsigned build: no self-update
+	UnitGen     int               // MISTGATE_UNIT_GEN: >= 2 means the unit carries the crash-loop guard
+	Exec        func(path string, argv, env []string) error
+	Args        []string // default os.Args
+	Env         []string // default os.Environ()
+	Now         func() time.Time
+	GOOS        string // default runtime.GOOS
+	GOARCH      string
+	Window      time.Duration // commit window, default CommitWindow
+	Backoff     []time.Duration
+	Timeout     time.Duration // whole download, default 10 min
+	IdleTimeout time.Duration // no download data, default 90 s
+	Log         *slog.Logger
 	// RetryWait is the pause after ErrRetryLater.
 	RetryWait time.Duration
+	// Source policy timing knobs. Zero values select the production policy.
+	SourceStallTimeout time.Duration
+	SourceSlowAfter    time.Duration
+	SourceSlowWindow   time.Duration
+	SourceSlowInterval time.Duration
+	SourceSlowBytes    uint64
+	SourceBackoff      []time.Duration
 }
 
 // Marker is the content of update.pending (and, after a crash-loop restore, of update.rolledback).
@@ -126,9 +147,11 @@ type Updater struct {
 	started  time.Time
 	deadline time.Time
 
-	busy    atomic.Bool
-	pend    atomic.Pointer[Marker]        // set by Startup for a new build inside its commit window
-	outcome atomic.Pointer[pb.LastUpdate] // what Hello reports until a HelloAck for it
+	busy          atomic.Bool
+	activeMu      sync.Mutex
+	activeRequest string
+	pend          atomic.Pointer[Marker]        // set by Startup for a new build inside its commit window
+	outcome       atomic.Pointer[pb.LastUpdate] // what Hello reports until a HelloAck for it
 }
 
 // New fills the defaults. It touches no file.
@@ -151,8 +174,29 @@ func New(cfg Config) *Updater {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = defaultTimeout
 	}
+	if cfg.IdleTimeout <= 0 {
+		cfg.IdleTimeout = DefaultIdleTimeout
+	}
 	if cfg.RetryWait <= 0 {
 		cfg.RetryWait = defaultRetryWait
+	}
+	if cfg.SourceStallTimeout <= 0 {
+		cfg.SourceStallTimeout = 30 * time.Second
+	}
+	if cfg.SourceSlowAfter <= 0 {
+		cfg.SourceSlowAfter = 30 * time.Second
+	}
+	if cfg.SourceSlowWindow <= 0 {
+		cfg.SourceSlowWindow = 30 * time.Second
+	}
+	if cfg.SourceSlowInterval <= 0 {
+		cfg.SourceSlowInterval = 10 * time.Second
+	}
+	if cfg.SourceSlowBytes == 0 {
+		cfg.SourceSlowBytes = 1 << 20
+	}
+	if cfg.SourceBackoff == nil {
+		cfg.SourceBackoff = []time.Duration{5 * time.Second, 15 * time.Second, 30 * time.Second}
 	}
 	if cfg.Args == nil {
 		cfg.Args = os.Args
@@ -176,6 +220,15 @@ func New(cfg Config) *Updater {
 	return u
 }
 
+// IdleTimeout is the no-data limit used by this updater. Link-only downloads use the same value so the two update
+// transports expose one idle-time contract.
+func (u *Updater) IdleTimeout() time.Duration {
+	if u == nil || u.cfg.IdleTimeout <= 0 {
+		return DefaultIdleTimeout
+	}
+	return u.cfg.IdleTimeout
+}
+
 // Capabilities lists "update/1" only when this process can really update itself: signed build, Linux, and
 // a writable executable directory (false under the generation 1 unit, which is what keeps old nodes on "update by
 // hand once"); "update-guard/1" when the unit carries the crash-loop guard.
@@ -183,9 +236,9 @@ func (u *Updater) Capabilities() []string {
 	if u == nil || u.cfg.Key == nil || u.cfg.GOOS != "linux" || u.exe == "" || u.probe() != nil {
 		return nil
 	}
-	caps := []string{CapUpdate}
+	caps := []string{agentcap.Update, agentcap.UpdateTimeout, agentcap.UpdateSources}
 	if u.cfg.UnitGen >= 2 {
-		caps = append(caps, CapGuard)
+		caps = append(caps, agentcap.UpdateGuard)
 	}
 	return caps
 }
@@ -202,6 +255,8 @@ func (u *Updater) probe() error {
 func (u *Updater) path(name string) string { return filepath.Join(u.cfg.StateDir, name) }
 func (u *Updater) prev() string            { return u.exe + ".prev" }
 func (u *Updater) newPath() string         { return u.exe + ".new" }
+func (u *Updater) prevNew() string         { return u.exe + ".prev.new" }
+func (u *Updater) prevOld() string         { return u.exe + ".prev.old" }
 
 // Outcome is the Hello.last_update to send now (nil = none). AckOutcome forgets it once a HelloAck for that Hello
 // arrived; an outcome that was replaced in between stays.
@@ -325,6 +380,7 @@ type Startup struct {
 
 func (u *Updater) Startup() Startup {
 	var st Startup
+	u.syncPrevRecord()
 	if m, err := readMarker(u.path(FileRolledBack)); m != nil || err != nil { // the unit guard restored .prev
 		if m == nil {
 			m = &Marker{}
@@ -341,7 +397,7 @@ func (u *Updater) Startup() Startup {
 	m, err := readMarker(u.path(FilePending))
 	switch {
 	case err != nil: // unreadable marker: drop it, say so, run as we are
-		u.log.Error("update marker unreadable, dropped", "err", err)
+		u.log.Error("update marker unreadable, dropped", "code", "update_marker_unreadable", "err", err)
 		_ = os.Remove(u.path(FilePending))
 		u.setOutcome(pb.UpdateOutcome_UPDATE_OUTCOME_FAILED, &Marker{}, "failed: bad marker")
 	case m == nil:
@@ -355,10 +411,10 @@ func (u *Updater) Startup() Startup {
 		_ = os.Remove(u.newPath())
 		u.setOutcome(pb.UpdateOutcome_UPDATE_OUTCOME_FAILED, m, ReasonInterrupted)
 	default: // the bundle held a binary that is not the release it claims to be
-		u.log.Error("binary is not the release the update marker describes", "built", u.cfg.Built, "marker_to", m.ToBuilt)
+		u.log.Error("binary is not the release the update marker describes", "code", "update_marker_built_mismatch", "built", u.cfg.Built, "marker_to", m.ToBuilt)
 		fin, err := u.rollbackFor(m, ReasonBuiltMismatch)
 		if err != nil {
-			u.log.Error("rollback failed", "err", err)
+			u.log.Error("rollback failed", "code", "update_rollback_failed", "err", err)
 		}
 		st.Finish = fin
 	}
@@ -457,8 +513,9 @@ func (u *Updater) rollbackFor(m *Marker, reason string) (Finish, error) {
 	}
 	_ = os.Remove(u.path(FilePending))
 	_ = os.Remove(u.path(FileStarts))
+	_ = os.Remove(u.path(FilePrev))
 	syncDir(filepath.Dir(u.exe))
-	u.log.Warn("rolling back to the previous build", "reason", reason, "from", m.FromVersion, "to", m.ToVersion)
+	u.log.Warn("rolling back to the previous build", "code", "update_rollback_started", "reason", reason, "from", m.FromVersion, "to", m.ToVersion)
 	return u.execFinish(nil), nil
 }
 
@@ -489,7 +546,7 @@ func (u *Updater) setOutcome(o pb.UpdateOutcome, m *Marker, reason string) {
 	u.outcome.Store(lu)
 	if b, err := protojson.Marshal(lu); err == nil {
 		if err := writeAtomic(u.path(FileOutcome), b, 0o600); err != nil {
-			u.log.Error("cannot write update outcome", "err", err)
+			u.log.Error("cannot write update outcome", "code", "update_outcome_write_failed", "err", err)
 		}
 	}
 }
@@ -500,7 +557,7 @@ func (u *Updater) loadOutcome() {
 		return
 	}
 	lu := &pb.LastUpdate{}
-	if protojson.Unmarshal(b, lu) != nil || lu.Outcome == pb.UpdateOutcome_UPDATE_OUTCOME_UNSPECIFIED {
+	if (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(b, lu) != nil || lu.Outcome == pb.UpdateOutcome_UPDATE_OUTCOME_UNSPECIFIED {
 		_ = os.Remove(u.path(FileOutcome))
 		return
 	}
@@ -520,20 +577,48 @@ func (u *Updater) loadOutcome() {
 // binary was swapped and the caller must send the result, drain the engines and call it.
 func (u *Updater) Apply(ctx context.Context, req *pb.UpdateAgent, src Source) (*pb.CommandResult, Finish) {
 	res := &pb.CommandResult{RequestId: req.RequestId}
+	sourceMode := len(req.GetSources()) != 0
+	currentSource := ""
+	report := func(p *pb.UpdateProgress) {
+		if p.RequestId == "" {
+			p.RequestId = req.RequestId
+		}
+		if sourceMode {
+			p.Source = currentSource
+		}
+		if x, ok := src.(interface{ Progress(*pb.UpdateProgress) }); ok {
+			x.Progress(p)
+		}
+	}
 	fail := func(err error) (*pb.CommandResult, Finish) {
 		res.Error = codeOf(err)
 		res.Detail = err.Error()
+		report(&pb.UpdateProgress{RequestId: req.RequestId, Phase: "failed", UpdatedUnix: src.Now().Unix(), Error: res.Error})
 		u.log.Warn("update refused", "code", res.Error, "err", err)
 		return res, nil
 	}
 	if u.cfg.Key == nil {
 		return fail(step("unsigned_build", errors.New("unsigned build: update by hand")))
 	}
+	report(&pb.UpdateProgress{RequestId: req.RequestId, Phase: "accepted", UpdatedUnix: src.Now().Unix()})
 	m, err := release.Verify(u.cfg.Key, req.Manifest, req.Signature)
 	if err != nil {
 		return fail(err)
 	}
-	switch err := m.Check(src.Now(), u.cfg.Built); {
+	adjustedNow := src.Now()
+	localNow := src.LocalNow()
+	adjustedExpired, localExpired := adjustedNow.Unix() > m.Expires, localNow.Unix() > m.Expires
+	if adjustedExpired || localExpired {
+		clock := "adjusted"
+		if adjustedExpired && localExpired {
+			clock = "adjusted and local"
+		} else if localExpired {
+			clock = "local"
+		}
+		return fail(fmt.Errorf("%w: expired by %s clock (adjusted time %s; local time %s)", release.ErrExpired, clock,
+			adjustedNow.Format(time.RFC3339Nano), localNow.Format(time.RFC3339Nano)))
+	}
+	switch err := m.Check(adjustedNow, u.cfg.Built); {
 	case errors.Is(err, release.ErrUpToDate):
 		res.Ok, res.Detail, res.Params = true, "already current", map[string]string{"noop": "1"}
 		return res, nil
@@ -544,32 +629,100 @@ func (u *Updater) Apply(ctx context.Context, req *pb.UpdateAgent, src Source) (*
 	if err != nil {
 		return fail(err)
 	}
-	if u.updateBlocked() || !u.busy.CompareAndSwap(false, true) {
+	u.activeMu.Lock()
+	if u.busy.Load() {
+		duplicate := req.RequestId != "" && req.RequestId == u.activeRequest
+		u.activeMu.Unlock()
+		if duplicate {
+			// A redelivery of the same command is still in flight. Send nothing: the original
+			// run answers this request id when it finishes, and any terminal frame from here
+			// would end it while the download is still going.
+			return nil, nil
+		}
 		return fail(step("busy", errors.New("another update or rollback is in progress")))
 	}
-	if u.updateBlocked() { // close the race with a unit-refresh reservation made after the first check
-		u.busy.Store(false)
-		return fail(step("busy", errors.New("a unit refresh or update commit is in progress")))
+	if u.updateBlocked() || !u.busy.CompareAndSwap(false, true) {
+		u.activeMu.Unlock()
+		return fail(step("busy", errors.New("another update or rollback is in progress")))
 	}
+	u.activeRequest = req.RequestId
+	u.activeMu.Unlock()
 	swapped := false
 	defer func() {
 		if !swapped {
+			u.activeMu.Lock()
+			u.activeRequest = ""
 			u.busy.Store(false)
+			u.activeMu.Unlock()
 		}
 	}()
 	if err := u.probe(); err != nil {
 		return fail(step("not_writable", err))
 	}
 
-	if err := u.download(ctx, src, file); err != nil {
-		_ = os.Remove(u.newPath())
-		return fail(err)
+	timeout := u.cfg.Timeout
+	if req.DownloadTimeoutSeconds != 0 {
+		timeout = time.Duration(req.DownloadTimeoutSeconds) * time.Second
+		if timeout < minDownloadTimeout {
+			timeout = minDownloadTimeout
+		}
+		if timeout > maxDownloadTimeout {
+			timeout = maxDownloadTimeout
+		}
 	}
+	var used, failed []string
+	var downloadErr error
+	if !sourceMode {
+		downloadErr = u.download(ctx, src, file, timeout, report)
+	} else {
+		var fetchers []Fetcher
+		if provider, ok := src.(FetcherSource); ok {
+			fetchers = provider.Fetchers(m, file)
+		} else {
+			// Test sources and link-only sources without a source provider retain the panel path.
+			fetchers = []Fetcher{{Kind: "panel", Fetch: func(ctx context.Context, offset uint64, w io.Writer) (uint64, error) {
+				return src.Fetch(ctx, file.Name, offset, w)
+			}}}
+		}
+		if len(fetchers) != 0 {
+			currentSource = fetchers[0].Kind
+		}
+		if len(fetchers) == 1 {
+			usedSet := make(map[string]bool, 1)
+			markUsed := func(kind string) {
+				if !usedSet[kind] {
+					usedSet[kind] = true
+					used = append(used, kind)
+				}
+			}
+			selected := selectedFetcher{Source: src, fetcher: fetchers[0], current: func(kind string) { currentSource = kind }, used: markUsed}
+			downloadErr = u.download(ctx, selected, file, timeout, report)
+			if downloadErr != nil {
+				failed = []string{fetchers[0].Kind + ":" + sourceFailureCode(downloadErr)}
+			}
+		} else {
+			used, failed, downloadErr = u.downloadSources(ctx, src, file, timeout, fetchers, report,
+				func(kind string) { currentSource = kind })
+		}
+		res.Params = map[string]string{"sources_used": strings.Join(used, ",")}
+		if downloadErr != nil && len(failed) != 0 {
+			res.Params["sources_failed"] = strings.Join(failed, ",")
+		}
+	}
+	if downloadErr != nil {
+		_ = os.Remove(u.newPath())
+		return fail(downloadErr)
+	}
+	report(&pb.UpdateProgress{RequestId: req.RequestId, Phase: "verifying", BytesDownloaded: uint64(file.Size), BytesTotal: uint64(file.Size), UpdatedUnix: src.Now().Unix()})
 	if err := u.verifyNew(file); err != nil {
 		_ = os.Remove(u.newPath())
 		return fail(err)
 	}
-	if err := copyFile(u.exe, u.prev(), 0o755); err != nil {
+	report(&pb.UpdateProgress{RequestId: req.RequestId, Phase: "installing", BytesDownloaded: uint64(file.Size), BytesTotal: uint64(file.Size), UpdatedUnix: src.Now().Unix()})
+	// The copy of the running build is staged beside .prev: .prev (the older rollback target) is replaced only once the
+	// update can no longer be refused before the swap, and put back if the swap itself fails.
+	prevRec, err := u.stagePrev()
+	if err != nil {
 		_ = os.Remove(u.newPath())
 		return fail(step("not_writable", err))
 	}
@@ -580,13 +733,24 @@ func (u *Updater) Apply(ctx context.Context, req *pb.UpdateAgent, src Source) (*
 	b, _ := jsonMarshal(marker)
 	if err := writeAtomic(u.path(FilePending), b, 0o600); err != nil {
 		_ = os.Remove(u.newPath())
+		_ = os.Remove(u.prevNew())
+		return fail(step("not_writable", err))
+	}
+	restorePrev, err := u.swapPrev(prevRec)
+	if err != nil {
+		_ = os.Remove(u.path(FilePending))
+		_ = os.Remove(u.newPath())
+		_ = os.Remove(u.prevNew())
 		return fail(step("not_writable", err))
 	}
 	if err := os.Rename(u.newPath(), u.exe); err != nil {
+		restorePrev()
 		_ = os.Remove(u.path(FilePending))
 		_ = os.Remove(u.newPath())
 		return fail(step("not_writable", err))
 	}
+	_ = os.Remove(u.prevOld())
+	report(&pb.UpdateProgress{RequestId: req.RequestId, Phase: "restarting", BytesDownloaded: uint64(file.Size), BytesTotal: uint64(file.Size), UpdatedUnix: src.Now().Unix()})
 	syncDir(filepath.Dir(u.exe))
 	swapped = true
 	u.log.Info("binary replaced, re-executing", "from", marker.FromVersion, "to", marker.ToVersion)
@@ -595,11 +759,15 @@ func (u *Updater) Apply(ctx context.Context, req *pb.UpdateAgent, src Source) (*
 		"from_version": marker.FromVersion, "from_built": fmt.Sprint(marker.FromBuilt),
 		"to_version": marker.ToVersion, "to_built": fmt.Sprint(marker.ToBuilt),
 	}
+	if sourceMode {
+		res.Params["sources_used"] = strings.Join(used, ",")
+	}
 	return res, u.execFinish(func() { // exec failed: put the old binary back, forget the marker, let the supervisor restart us
 		if err := os.Rename(u.prev(), u.exe); err != nil {
-			u.log.Error("cannot restore the previous binary after a failed exec; the marker stays for the next start", "err", err)
+			u.log.Error("cannot restore the previous binary after a failed exec; the marker stays for the next start", "code", "update_exec_restore_failed", "err", err)
 		} else {
 			_ = os.Remove(u.path(FilePending))
+			_ = os.Remove(u.path(FilePrev))
 		}
 		u.setOutcome(pb.UpdateOutcome_UPDATE_OUTCOME_FAILED, marker, ReasonExec)
 	})
@@ -635,6 +803,9 @@ func (u *Updater) Rollback(_ context.Context, req *pb.RollbackAgent) (*pb.Comman
 	if err := u.probe(); err != nil {
 		return fail(step("not_writable", err))
 	}
+	if err := u.verifyPrev(); err != nil {
+		return fail(step("no_previous", err))
+	}
 	// to = the build we leave; from (the restored build) is filled in by the old binary at its start.
 	left := &Marker{ToVersion: u.cfg.Version, ToBuilt: u.cfg.Built}
 	u.setOutcome(pb.UpdateOutcome_UPDATE_OUTCOME_ROLLED_BACK, left, ReasonManual)
@@ -645,13 +816,127 @@ func (u *Updater) Rollback(_ context.Context, req *pb.RollbackAgent) (*pb.Comman
 	}
 	_ = os.Remove(u.path(FilePending))
 	_ = os.Remove(u.path(FileStarts))
+	_ = os.Remove(u.path(FilePrev))
 	syncDir(filepath.Dir(u.exe))
 	done = true
 	u.pend.Store(nil)
-	u.log.Warn("manual rollback: previous binary restored, re-executing", "leaving", u.cfg.Version)
+	u.log.Warn("manual rollback: previous binary restored, re-executing", "code", "update_manual_rollback", "leaving", u.cfg.Version)
 	res.Ok, res.Affected = true, 1
 	res.Params = map[string]string{"from_version": u.cfg.Version, "from_built": fmt.Sprint(u.cfg.Built)}
 	return res, u.execFinish(nil)
+}
+
+// prevRecord ties <exe>.prev to the build it was copied from: the sha256 of the file and that build's Built.
+type prevRecord struct {
+	SHA256 string `json:"sha256"`
+	Built  int64  `json:"built"`
+}
+
+// stagePrev copies the running executable to <exe>.prev.new and returns the record that describes the copy.
+func (u *Updater) stagePrev() ([]byte, error) {
+	if err := copyFile(u.exe, u.prevNew(), 0o755); err != nil {
+		return nil, err
+	}
+	f, err := os.Open(u.prevNew())
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		_ = os.Remove(u.prevNew())
+		return nil, err
+	}
+	return jsonMarshal(prevRecord{SHA256: hex.EncodeToString(h.Sum(nil)), Built: u.cfg.Built})
+}
+
+// syncPrevRecord runs first at every start, before the panel can send a command. A .prev with no record was left by an
+// agent that did not write records (the update that installed this one): the file is taken as it is, its hash recorded
+// once, its Built unknown (0, which verifyPrev does not compare). Whoever can write the executable's directory before
+// the agent starts owns the node anyway; the panel cannot. A record whose .prev is gone (the unit guard moved it back
+// over the executable) is removed.
+func (u *Updater) syncPrevRecord() {
+	fi, err := os.Stat(u.prev())
+	if err != nil || !fi.Mode().IsRegular() {
+		_ = os.Remove(u.path(FilePrev))
+		return
+	}
+	if _, err := os.Stat(u.path(FilePrev)); err == nil {
+		return
+	}
+	sum, err := fileSHA256(u.prev())
+	if err != nil {
+		u.log.Warn("cannot record the previous build", "code", "update_prev_record_failed", "err", err)
+		return
+	}
+	rec, _ := jsonMarshal(prevRecord{SHA256: sum})
+	if err := writeAtomic(u.path(FilePrev), rec, 0o600); err != nil {
+		u.log.Warn("cannot record the previous build", "code", "update_prev_record_failed", "err", err)
+	}
+}
+
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// swapPrev makes the staged copy the rollback target together with its record. restore puts the older target back.
+func (u *Updater) swapPrev(rec []byte) (restore func(), err error) {
+	oldRec, _ := os.ReadFile(u.path(FilePrev))
+	hadOld := os.Rename(u.prev(), u.prevOld()) == nil
+	restore = func() {
+		_ = os.Remove(u.prev())
+		if hadOld {
+			_ = os.Rename(u.prevOld(), u.prev())
+		}
+		if oldRec != nil {
+			_ = writeAtomic(u.path(FilePrev), oldRec, 0o600)
+		} else {
+			_ = os.Remove(u.path(FilePrev))
+		}
+	}
+	if err = os.Rename(u.prevNew(), u.prev()); err == nil {
+		err = writeAtomic(u.path(FilePrev), rec, 0o600)
+	}
+	if err != nil {
+		restore()
+		return nil, err
+	}
+	return restore, nil
+}
+
+// verifyPrev checks <exe>.prev against the record Apply wrote for it. A .prev without a matching record (swapped
+// file, or left by an agent that did not write records) is not installed.
+func (u *Updater) verifyPrev() error {
+	b, err := os.ReadFile(u.path(FilePrev))
+	if err != nil {
+		return errors.New("the previous build has no record: it cannot be verified")
+	}
+	var rec prevRecord
+	if err := json.Unmarshal(b, &rec); err != nil || rec.SHA256 == "" {
+		return errors.New("the record of the previous build is unreadable")
+	}
+	f, err := os.Open(u.prev())
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return err
+	}
+	if hex.EncodeToString(h.Sum(nil)) != rec.SHA256 || (rec.Built != 0 && rec.Built > u.cfg.Built) {
+		return errors.New("the previous build does not match its record")
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -659,34 +944,72 @@ func (u *Updater) Rollback(_ context.Context, req *pb.RollbackAgent) (*pb.Comman
 
 // download streams the file into <exe>.new (0700 while it is being written), resuming from the bytes already on disk
 // after a dropped stream: one try plus one retry per Backoff entry, each failure counted; ErrRetryLater waits without
-// counting; the whole thing is bounded by Config.Timeout.
-func (u *Updater) download(ctx context.Context, src Source, f release.File) error {
-	ctx, cancel := context.WithTimeout(ctx, u.cfg.Timeout)
+// counting; the whole thing is bounded by timeout and by the configured no-data idle timeout.
+func (u *Updater) download(ctx context.Context, src Source, f release.File, timeout time.Duration, report func(*pb.UpdateProgress)) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	activity, hasActivity := src.(interface{ SetActivity(func()) })
+	// Progress timestamps must use the same corrected source clock as the other update frames. The updater's
+	// process clock is deliberately not authoritative: an agent can correct it after connecting to the panel.
+	tracker := newProgressTracker(report, f.Size, src.Now)
 	fh, err := os.OpenFile(u.newPath(), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o700)
 	if err != nil {
 		return step("not_writable", err)
 	}
 	defer fh.Close()
-	w := &capWriter{w: fh, left: f.Size}
+	cw := &capWriter{w: fh, left: f.Size}
+	resetIdle := func() {}
+	w := &progressWriter{w: cw, onWrite: func(n int) {
+		resetIdle()
+		tracker.add(uint64(n))
+	}}
 	failed := 0
-	for w.n < f.Size {
-		total, err := src.Fetch(ctx, f.Name, uint64(w.n), w)
+	for cw.n < f.Size {
+		attemptCtx, attemptCancel := context.WithCancel(ctx)
+		var idleFired atomic.Bool
+		idle := time.AfterFunc(u.cfg.IdleTimeout, func() {
+			idleFired.Store(true)
+			attemptCancel()
+		})
+		resetIdle = func() { idle.Reset(u.cfg.IdleTimeout) }
+		if hasActivity {
+			activity.SetActivity(resetIdle)
+		}
+		total, err := src.Fetch(attemptCtx, f.Name, uint64(cw.n), w)
+		if hasActivity {
+			activity.SetActivity(nil)
+		}
+		resetIdle = func() {}
+		idle.Stop()
+		attemptCancel()
 		if err == nil && total != 0 && total != uint64(f.Size) {
 			return step("size_mismatch", fmt.Errorf("panel serves %d bytes, manifest says %d", total, f.Size))
 		}
 		switch {
-		case err == nil && w.n == f.Size:
+		case err == nil && cw.n == f.Size:
 		case errors.Is(err, errOverflow):
 			return step("size_mismatch", err)
 		case ctx.Err() != nil:
 			return step("download_failed", ctx.Err())
-		case errors.Is(err, ErrPermanent):
-			return step("download_failed", err)
 		case errors.Is(err, ErrRetryLater):
+			// A busy panel has not started this attempt. The idle timer is scoped to
+			// the fetch, so the retry wait is not mistaken for a stalled transfer;
+			// the overall timeout still bounds how long the update may wait.
 			if !sleep(ctx, u.cfg.RetryWait) {
 				return step("download_failed", ctx.Err())
 			}
+		case idleFired.Load():
+			idleFired.Store(false)
+			if failed >= len(u.cfg.Backoff) {
+				return step("download_failed", errDownloadIdleTimeout)
+			}
+			u.log.Warn("download idle, retrying", "code", "update_download_idle", "have", cw.n, "of", f.Size)
+			if !sleep(ctx, u.cfg.Backoff[failed]) {
+				return step("download_failed", ctx.Err())
+			}
+			failed++
+		case errors.Is(err, ErrPermanent):
+			return step("download_failed", err)
 		default:
 			if err == nil {
 				err = io.ErrUnexpectedEOF // the stream ended early
@@ -694,17 +1017,76 @@ func (u *Updater) download(ctx context.Context, src Source, f release.File) erro
 			if failed >= len(u.cfg.Backoff) {
 				return step("download_failed", err)
 			}
-			u.log.Warn("download interrupted, retrying", "have", w.n, "of", f.Size, "err", err)
+			u.log.Warn("download interrupted, retrying", "code", "update_download_interrupted", "have", cw.n, "of", f.Size, "err", err)
 			if !sleep(ctx, u.cfg.Backoff[failed]) {
 				return step("download_failed", ctx.Err())
 			}
 			failed++
 		}
 	}
+	tracker.flush()
 	if err := fh.Sync(); err != nil {
 		return step("not_writable", err)
 	}
 	return nil
+}
+
+type progressWriter struct {
+	w       io.Writer
+	onWrite func(int)
+}
+
+func (w *progressWriter) Write(p []byte) (int, error) {
+	n, err := w.w.Write(p)
+	if n > 0 && w.onWrite != nil {
+		w.onWrite(n)
+	}
+	return n, err
+}
+
+type progressTracker struct {
+	report            func(*pb.UpdateProgress)
+	total, done, last uint64
+	lastAt            time.Time
+	now               func() time.Time
+}
+
+func newProgressTracker(report func(*pb.UpdateProgress), total int64, now func() time.Time) *progressTracker {
+	t := now()
+	p := &progressTracker{report: report, total: uint64(total), lastAt: t, now: now}
+	if report != nil {
+		report(&pb.UpdateProgress{Phase: "downloading", BytesTotal: uint64(total), UpdatedUnix: t.Unix()})
+	}
+	return p
+}
+
+func (p *progressTracker) add(n uint64) {
+	p.done += n
+	now := p.now()
+	if p.report == nil || now.Sub(p.lastAt) < 5*time.Second {
+		return
+	}
+	p.emit(now)
+}
+
+func (p *progressTracker) flush() {
+	if p.report != nil {
+		p.emit(p.now())
+	}
+}
+
+func (p *progressTracker) emit(now time.Time) {
+	if now.Equal(p.lastAt) && p.done == p.last {
+		return
+	}
+	elapsed := now.Sub(p.lastAt)
+	delta := p.done - p.last
+	var speed uint64
+	if elapsed > 0 && delta > 0 {
+		speed = uint64(float64(delta) / elapsed.Seconds())
+	}
+	p.report(&pb.UpdateProgress{Phase: "downloading", BytesDownloaded: p.done, BytesTotal: p.total, BytesPerSecond: speed, UpdatedUnix: now.Unix()})
+	p.lastAt, p.last = now, p.done
 }
 
 // verifyNew checks size and SHA-256 of <exe>.new against the signed manifest, then makes it executable and durable.
@@ -728,7 +1110,10 @@ func (u *Updater) verifyNew(f release.File) error {
 	return nil
 }
 
-var errOverflow = errors.New("update: more bytes than the manifest lists")
+var (
+	errOverflow            = errors.New("update: more bytes than the manifest lists")
+	errDownloadIdleTimeout = errors.New("download idle timeout")
+)
 
 // capWriter refuses to write past the size the signed manifest promised (a bad panel must not fill the disk).
 type capWriter struct {

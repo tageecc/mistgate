@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 
@@ -342,7 +343,7 @@ func validate(s Settings) []protocols.FieldError {
 		case targetSelf:
 			// The node's own site: its name comes from the node or the inbound (BuildInbound).
 		case targetSite:
-			errs = append(errs, validateSiteTarget(s.Reality)...)
+			errs = append(errs, validateSiteTarget(s.Reality, s.Port)...)
 		default:
 			add("/reality/target_kind", "invalid_enum", "target_kind must be self or site")
 		}
@@ -432,10 +433,18 @@ func validate(s Settings) []protocols.FieldError {
 }
 
 // validateSiteTarget checks the target of another site and the names REALITY accepts for it.
-func validateSiteTarget(r RealitySettings) []protocols.FieldError {
+func validateSiteTarget(r RealitySettings, listenPort int) []protocols.FieldError {
 	var errs []protocols.FieldError
 	add := func(ptr, code, message string) { errs = append(errs, fe(ptr, code, message)) }
-	targetHost, targetErr := targetHostPort(r.Target)
+	targetHost, targetPort, targetErr := targetHostPort(r.Target)
+	if targetErr == nil && localTargetHost(targetHost) {
+		// A local site next to the node on another port works; only the inbound's own port is a loop.
+		if listenPort > 0 && targetPort == uint64(listenPort) {
+			targetErr = &targetError{"same_port", "the target uses this inbound's listen port; choose this node's site instead"}
+		} else if unspecifiedTargetHost(targetHost) {
+			targetErr = &targetError{"unspecified", "an unspecified address is not a site; use a host name or a real address"}
+		}
+	}
 	if targetErr != nil {
 		add("/reality/target", targetErr.code, targetErr.message)
 	}
@@ -472,26 +481,60 @@ type targetError struct{ code, message string }
 
 func (e *targetError) Error() string { return e.message }
 
-func targetHostPort(target string) (string, *targetError) {
+func targetHostPort(target string) (string, uint64, *targetError) {
 	target = strings.TrimSpace(target)
 	if target == "" {
-		return "", &targetError{"required", "enter the site's host:port"}
+		return "", 0, &targetError{"required", "enter the site's host:port"}
 	}
 	host, portText, err := net.SplitHostPort(target)
 	if err != nil || strings.TrimSpace(host) == "" {
-		return "", &targetError{"format", "must be an external host:port"}
+		return "", 0, &targetError{"format", "must be an external host:port"}
 	}
 	if !validHost(host) {
-		return "", &targetError{"host", "must use a plain host name or IP address"}
+		return "", 0, &targetError{"host", "must use a plain host name or IP address"}
 	}
 	if portText == "" || strings.IndexFunc(portText, func(r rune) bool { return r < '0' || r > '9' }) >= 0 {
-		return "", &targetError{"port_range", "port must be 1-65535"}
+		return "", 0, &targetError{"port_range", "port must be 1-65535"}
 	}
 	port, err := strconv.ParseUint(portText, 10, 16)
 	if err != nil || port == 0 {
-		return "", &targetError{"port_range", "port must be 1-65535"}
+		return "", 0, &targetError{"port_range", "port must be 1-65535"}
 	}
-	return host, nil
+	return host, port, nil
+}
+
+func normalizeTargetHost(host string) string {
+	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(strings.Trim(host, "[]")), "."))
+}
+
+// localTargetHost uses only the host text; validation must not resolve names. Dialing an unspecified address
+// reaches the local host on Linux, so it counts as local.
+func localTargetHost(host string) bool {
+	host = normalizeTargetHost(host)
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	addr, err := netip.ParseAddr(host)
+	return err == nil && (addr.Unmap().IsLoopback() || addr.Unmap().IsUnspecified())
+}
+
+func unspecifiedTargetHost(host string) bool {
+	addr, err := netip.ParseAddr(normalizeTargetHost(host))
+	return err == nil && addr.Unmap().IsUnspecified()
+}
+
+// sameTargetHost compares only supplied address text; validation must not resolve names.
+func sameTargetHost(targetHost, nodeAddress string) bool {
+	targetHost, nodeAddress = normalizeTargetHost(targetHost), normalizeTargetHost(nodeAddress)
+	if targetHost == "" || nodeAddress == "" {
+		return false
+	}
+	targetIP, targetErr := netip.ParseAddr(targetHost)
+	nodeIP, nodeErr := netip.ParseAddr(nodeAddress)
+	if targetErr == nil && nodeErr == nil {
+		return targetIP.Unmap() == nodeIP.Unmap()
+	}
+	return strings.EqualFold(targetHost, nodeAddress)
 }
 
 func validHost(host string) bool {
@@ -501,23 +544,7 @@ func validHost(host string) bool {
 	return isHostname(host)
 }
 
-func isHostname(host string) bool {
-	if host == "" || len(host) > 253 || net.ParseIP(host) != nil || strings.HasPrefix(host, ".") || strings.HasSuffix(host, ".") || strings.Contains(host, "..") {
-		return false
-	}
-	for _, label := range strings.Split(host, ".") {
-		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
-			return false
-		}
-		for _, r := range label {
-			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' {
-				continue
-			}
-			return false
-		}
-	}
-	return true
-}
+func isHostname(host string) bool { return protocols.IsHostname(host) }
 
 func validateXHTTP(s XHTTPSettings) []protocols.FieldError {
 	var errs []protocols.FieldError
@@ -559,11 +586,26 @@ func effectiveServerNames(s RealitySettings) []string {
 	if len(s.ServerNames) > 0 {
 		return s.ServerNames
 	}
-	host, err := targetHostPort(s.Target)
+	host, _, err := targetHostPort(s.Target)
 	if err == nil && isHostname(host) {
 		return []string{host}
 	}
 	return nil
+}
+
+// realityOverrideTarget cleans a target set on the node, "host:port", into the target as the node gets it and its host: a host name
+// with a dot (REALITY asks the site for that name, and an IP address has none), not this machine, and not the node's own address at
+// the listen port, which would loop.
+func realityOverrideTarget(target string, listenPort int, nodeAddress string) (clean, host string, err error) {
+	text := plugin.NormalizeRealityTarget(target) // a name written with its closing dot is the same name
+	host, port, perr := targetHostPort(text)
+	if perr != nil || net.ParseIP(strings.Trim(host, "[]")) != nil || !isHostname(host) || !strings.Contains(host, ".") || localTargetHost(host) {
+		return "", "", &protocols.RealityTargetError{Reason: "invalid", Target: target}
+	}
+	if port == uint64(listenPort) && sameTargetHost(host, nodeAddress) {
+		return "", "", &protocols.RealityTargetError{Reason: "same_node", Target: target}
+	}
+	return net.JoinHostPort(host, strconv.FormatUint(port, 10)), host, nil
 }
 
 // siteName is the name of the node's own site, which is the certificate's name and the only name REALITY accepts: the
@@ -640,6 +682,15 @@ func (*Protocol) BuildInbound(in protocols.InboundInput) (plugin.InboundSpec, er
 	if port < 1 || port > 65535 || port == 80 {
 		return plugin.InboundSpec{}, errors.New("VLESS TCP port must be 1-65535 and not 80")
 	}
+	if in.RealityTargetOverride != "" && s.Security != "reality" {
+		return plugin.InboundSpec{}, &protocols.RealityTargetError{Reason: "unsupported", Target: in.RealityTargetOverride}
+	}
+	if s.Security == "reality" && s.Reality.kind() == targetSite && in.RealityTargetOverride == "" {
+		targetHost, targetPort, targetErr := targetHostPort(s.Reality.Target)
+		if targetErr == nil && targetPort == uint64(port) && sameTargetHost(targetHost, in.Node.Address) {
+			return plugin.InboundSpec{}, errors.New("invalid profile settings: /reality/target same_node: target uses this node's address and listen port; choose this node's site instead")
+		}
+	}
 	var privateKey []byte
 	target, names, tlsSpec := "", []string(nil), plugin.TLS{}
 	if s.Security == "reality" {
@@ -649,7 +700,15 @@ func (*Protocol) BuildInbound(in protocols.InboundInput) (plugin.InboundSpec, er
 		}
 		privateKey = priv.Bytes()
 		target, names = strings.TrimSpace(s.Reality.Target), effectiveServerNames(s.Reality)
-		if s.Reality.kind() == targetSelf {
+		if in.RealityTargetOverride != "" {
+			// The site this node shows instead of the profile's target, whatever that is: the host is the one name REALITY accepts and
+			// rides in the TLS block (no certificate: mode 0) so that subscriptions and probes read it there.
+			clean, host, err := realityOverrideTarget(in.RealityTargetOverride, port, in.Node.Address)
+			if err != nil {
+				return plugin.InboundSpec{}, err
+			}
+			target, names, tlsSpec = clean, []string{host}, plugin.TLS{ServerName: host}
+		} else if s.Reality.kind() == targetSelf {
 			name, err := siteName(in)
 			if err != nil {
 				return plugin.InboundSpec{}, err
@@ -762,6 +821,8 @@ func (*Protocol) Doctor() []protocols.Check { return nil }
 
 func (*Protocol) Render(in protocols.RenderInput) (plugin.Fragment, bool) {
 	switch in.Format {
+	case plugin.FormatMistgate:
+		return renderMistgate(in)
 	case plugin.FormatURIList:
 		return renderURI(in)
 	case plugin.FormatMihomo:
@@ -872,9 +933,11 @@ func ResolveClientParams(in protocols.RenderInput) (ClientParams, bool) {
 	names := effectiveServerNames(s.Reality)
 	if s.Reality.kind() == targetSelf {
 		names = nil // the node's own site: the one name the inbound was built with
-		if in.Inbound.TLSServerName != "" {
-			names = []string{in.Inbound.TLSServerName}
-		}
+	}
+	if in.Inbound.TLSServerName != "" {
+		// the inbound's own name: the node's own site, or the site this node shows instead of the profile's (a profile's site
+		// without one has no name in its TLS block)
+		names = []string{in.Inbound.TLSServerName}
 	}
 	if len(names) == 0 || len(s.Reality.ShortIDs) == 0 {
 		return ClientParams{}, false

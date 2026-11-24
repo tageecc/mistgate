@@ -4,17 +4,16 @@ import (
 	"context"
 	"errors"
 	"math"
+	"slices"
 	"time"
 
 	"connectrpc.com/connect"
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
+	"github.com/mistgate/mistgate/internal/agentcap"
 	"github.com/mistgate/mistgate/internal/panel/connectiondiag"
 	"github.com/mistgate/mistgate/internal/panel/store"
 )
-
-// capLinks: the agent sends connection counters (StatsBatch.links, agent.proto LinkCounters).
-const capLinks = "links/1"
 
 // GetNodeConnections: the connection counters of the node's inbounds over the last hours (agent.proto LinkCounters). A read; no
 // address is stored or returned.
@@ -30,7 +29,7 @@ func (s nodeService) GetNodeConnections(ctx context.Context, req *connect.Reques
 		return nil, internalErr(f.log.Error, "get node", err)
 	}
 	resp := &adminv1.GetNodeConnectionsResponse{SinceUnix: since.Unix(), NowUnix: now.Unix()}
-	if !capabilityPresent(n.AgentCaps, capLinks) {
+	if !store.CapabilityPresent(n.AgentCaps, agentcap.Links) {
 		return connect.NewResponse(resp), nil
 	}
 	resp.Supported = true
@@ -58,15 +57,18 @@ func (s nodeService) GetNodeConnections(ctx context.Context, req *connect.Reques
 			Accepted: clamp32(r.Accepted), HellosForeign: clamp32(r.HellosForeign),
 			RttMs:        connectiondiag.AverageRTTMS(r.RttMSSum, r.RttSamples),
 			LossPermille: connectiondiag.LossPermille(r.PktsLost, r.PktsSent), RttSamples: clamp32(r.RttSamples), PktsSent: r.PktsSent,
-			Unsupported: connectiondiag.UnsupportedCountersForNode(in.Protocol, n.AgentCaps),
+			Unsupported: connectiondiag.UnsupportedCountersFor(in.Protocol, n.AgentCaps, linkVariant(in)),
 		}
+		setInboundReasons(msg, r.LinkReasons)
 		for _, h := range report.Hours {
-			msg.Hours = append(msg.Hours, &adminv1.LinkHour{HourStartUnix: h.HourStart, Connects: clamp32(h.Connects), Rejects: clamp32(h.Rejects),
+			hour := &adminv1.LinkHour{HourStartUnix: h.HourStart, Connects: clamp32(h.Connects), Rejects: clamp32(h.Rejects),
 				Drops: clamp32(h.Drops), Stalls: clamp32(h.Stalls), OnlineS: h.OnlineS, UnknownKeys: clamp32(h.UnknownKeys),
 				Hellos: clamp32(h.Hellos), Handshakes: clamp32(h.Handshakes), ClientCloses: clamp32(h.ClientCloses),
 				Freezes: clamp32(h.Freezes), Quiet: clamp32(h.Quiet), Accepted: clamp32(h.Accepted), HellosForeign: clamp32(h.HellosForeign),
 				RttMs: connectiondiag.AverageRTTMS(h.RttMSSum, h.RttSamples), LossPermille: connectiondiag.LossPermille(h.PktsLost, h.PktsSent),
-				RttSamples: clamp32(h.RttSamples), PktsSent: h.PktsSent})
+				RttSamples: clamp32(h.RttSamples), PktsSent: h.PktsSent}
+			setHourReasons(hour, h.LinkReasons)
+			msg.Hours = append(msg.Hours, hour)
 		}
 		for _, c := range report.Clients {
 			msg.Clients = append(msg.Clients, &adminv1.ClientConnections{Client: c.Client, Platform: c.Platform, Devices: clamp32(c.Devices),
@@ -87,6 +89,59 @@ func (s nodeService) GetNodeConnections(ctx context.Context, req *connect.Reques
 
 // clamp32 fits a window sum into a uint32 field (168 hours of uint32 batches can in theory pass it).
 func clamp32(n uint64) uint32 { return uint32(min(n, math.MaxUint32)) }
+
+// linkVariant is what decides, beyond the protocol and the agent, which counters the inbound has: the VLESS settings, or the AWG
+// backend of the node's last report.
+func linkVariant(in store.FleetInboundRow) connectiondiag.Variant {
+	switch in.Protocol {
+	case "vless":
+		return connectiondiag.VLESSVariant(in.Settings)
+	case "awg":
+		if h := awgStatusMsg(in); h != nil {
+			return connectiondiag.Variant{AwgBackend: h.GetBackend()}
+		}
+	}
+	return connectiondiag.Variant{}
+}
+
+// setInboundReasons copies the links/3 sums of an inbound (agent.proto LinkCounters from hs_unfinished on).
+func setInboundReasons(msg *adminv1.InboundConnections, r store.LinkReasons) {
+	msg.HsUnfinished, msg.TlsAlertsSent, msg.TlsAlertsRecv = clamp32(r.HsUnfinished), clamp32(r.TLSAlertsSent), clamp32(r.TLSAlertsRecv)
+	msg.TlsCertRefused, msg.RealityFallback, msg.AuthFailed = clamp32(r.TLSCertRefused), clamp32(r.RealityFallback), clamp32(r.AuthFailed)
+	msg.TcpStalls, msg.TcpStalls_16K = clamp32(r.TCPStalls), clamp32(r.TCPStalls16K)
+	msg.Initiations, msg.Responses, msg.ResponsesUnmatched = clamp32(r.Initiations), clamp32(r.Responses), clamp32(r.ResponsesUnmatched)
+	t := r.Tunnel // trusttunnel-refusals/1
+	msg.TunnelBlocked, msg.TunnelNoIpv4, msg.TunnelConnRefused, msg.TunnelConnUnreachable = clamp32(t[0]), clamp32(t[1]), clamp32(t[2]), clamp32(t[3])
+	msg.TunnelConnDns, msg.TunnelConnOther, msg.TunnelTimeout = clamp32(t[4]), clamp32(t[5]), clamp32(t[6])
+	msg.TunnelOtherDeadlines, msg.TunnelOtherAuthority, msg.TunnelOtherIcmp, msg.TunnelOtherDial = clamp32(t[7]), clamp32(t[8]), clamp32(t[9]), clamp32(t[10])
+	msg.TunnelStreamClosed, msg.TunnelStreamCredGone, msg.TunnelStreamConnLimit = clamp32(t[11]), clamp32(t[12]), clamp32(t[13])
+}
+
+// setHourReasons copies the links/3 sums of an hour bucket.
+func setHourReasons(h *adminv1.LinkHour, r store.LinkReasons) {
+	h.HsUnfinished, h.TlsAlertsSent, h.TlsAlertsRecv = clamp32(r.HsUnfinished), clamp32(r.TLSAlertsSent), clamp32(r.TLSAlertsRecv)
+	h.TlsCertRefused, h.RealityFallback, h.AuthFailed = clamp32(r.TLSCertRefused), clamp32(r.RealityFallback), clamp32(r.AuthFailed)
+	h.TcpStalls, h.TcpStalls_16K = clamp32(r.TCPStalls), clamp32(r.TCPStalls16K)
+	h.Initiations, h.Responses, h.ResponsesUnmatched = clamp32(r.Initiations), clamp32(r.Responses), clamp32(r.ResponsesUnmatched)
+	t := r.Tunnel // trusttunnel-refusals/1
+	h.TunnelBlocked, h.TunnelNoIpv4, h.TunnelConnRefused, h.TunnelConnUnreachable = clamp32(t[0]), clamp32(t[1]), clamp32(t[2]), clamp32(t[3])
+	h.TunnelConnDns, h.TunnelConnOther, h.TunnelTimeout = clamp32(t[4]), clamp32(t[5]), clamp32(t[6])
+	h.TunnelOtherDeadlines, h.TunnelOtherAuthority, h.TunnelOtherIcmp, h.TunnelOtherDial = clamp32(t[7]), clamp32(t[8]), clamp32(t[9]), clamp32(t[10])
+	h.TunnelStreamClosed, h.TunnelStreamCredGone, h.TunnelStreamConnLimit = clamp32(t[11]), clamp32(t[12]), clamp32(t[13])
+}
+
+// helloKexListLimit is how many devices with classic hellos GetFleetConnections lists.
+const helloKexListLimit = 50
+
+// servesVLESSReality says whether the node has a VLESS inbound with security reality.
+func servesVLESSReality(n store.FleetConnectionNode) bool {
+	for _, in := range n.Inbounds {
+		if in.Protocol == "vless" && linkVariant(in).Security == "reality" {
+			return true
+		}
+	}
+	return false
+}
 
 // GetFleetConnections returns the counters of every non-retired node, with one metadata read and one link_hour read.
 func (s nodeService) GetFleetConnections(ctx context.Context, req *connect.Request[adminv1.GetFleetConnectionsRequest]) (*connect.Response[adminv1.GetFleetConnectionsResponse], error) {
@@ -109,9 +164,24 @@ func (s nodeService) GetFleetConnections(ctx context.Context, req *connect.Reque
 		byNode[sum.NodeID][sum.InboundID] = sum.LinkInboundSums
 	}
 	resp := &adminv1.GetFleetConnectionsResponse{SinceUnix: since.Unix(), NowUnix: now.Unix(), Nodes: []*adminv1.NodeConnections{}}
+	kex, err := f.st.HelloKex(ctx, since, helloKexListLimit)
+	if err != nil {
+		return nil, internalErr(f.log.Error, "fleet hello key exchange", err)
+	}
+	resp.HelloKexPqOnly, resp.HelloKexClassicOnly = clamp32(kex.PQOnly), clamp32(kex.ClassicOnly)
+	resp.HelloKexMixed, resp.HelloKexUnknownOnly = clamp32(kex.Mixed), clamp32(kex.UnknownOnly)
+	resp.HelloKexClassic = make([]*adminv1.HelloKexDevice, 0, len(kex.Classic))
+	for _, d := range kex.Classic {
+		resp.HelloKexClassic = append(resp.HelloKexClassic, &adminv1.HelloKexDevice{DeviceId: d.DeviceID, UserId: d.UserID, UserName: d.UserName,
+			Client: d.Client, Platform: d.Platform, HelloPq: clamp32(d.PQ), HelloClassic: clamp32(d.Classic), HelloUnknown: clamp32(d.Unknown),
+			LastHourUnix: d.LastHour.Unix()})
+	}
 	for _, n := range nodes {
+		if !slices.Contains(n.AgentCaps, agentcap.VLESSHelloKex) && servesVLESSReality(n) {
+			resp.HelloKexNodesWithout = append(resp.HelloKexNodesWithout, n.ID)
+		}
 		node := &adminv1.NodeConnections{NodeId: n.ID, NodeName: n.Name, CountryCode: n.CountryCode,
-			Supported: capabilityPresent(n.AgentCaps, capLinks), Inbounds: []*adminv1.InboundConnections{}}
+			Supported: store.CapabilityPresent(n.AgentCaps, agentcap.Links), Inbounds: []*adminv1.InboundConnections{}}
 		if node.Supported {
 			for _, in := range n.Inbounds {
 				r := byNode[n.ID][in.ID]
@@ -124,8 +194,9 @@ func (s nodeService) GetFleetConnections(ctx context.Context, req *connect.Reque
 					Accepted: clamp32(r.Accepted), HellosForeign: clamp32(r.HellosForeign),
 					RttMs:        connectiondiag.AverageRTTMS(r.RttMSSum, r.RttSamples),
 					LossPermille: connectiondiag.LossPermille(r.PktsLost, r.PktsSent), RttSamples: clamp32(r.RttSamples), PktsSent: r.PktsSent,
-					Unsupported: connectiondiag.UnsupportedCountersForNode(in.Protocol, n.AgentCaps),
+					Unsupported: connectiondiag.UnsupportedCountersFor(in.Protocol, n.AgentCaps, linkVariant(in)),
 				}
+				setInboundReasons(msg, r.LinkReasons)
 				if in.Protocol == "awg" {
 					if h := awgStatusMsg(in); h != nil {
 						msg.Awg = &adminv1.AwgPackets{UdpRxPackets: h.GetUdpRxPackets(), ReportedUnix: h.GetReportedUnix(),

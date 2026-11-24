@@ -17,6 +17,7 @@ import (
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
 	agentv1 "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/internal/agentcap"
 	"github.com/mistgate/mistgate/internal/panel/store"
 )
 
@@ -97,6 +98,8 @@ func alertActions(a store.HealthAlert) []string {
 	switch a.Kind {
 	case kPortLossy:
 		return []string{"open_profiles"}
+	case kWarpReach: // another exit: restart WARP from its card
+		return []string{"open_warp"}
 	case kCheckFailed:
 		switch variant {
 		case "timeout", "auth", "refused":
@@ -177,10 +180,10 @@ func (s *Service) fixOffers(ctx context.Context) (func(store.HealthAlert) string
 		if fix == "" {
 			return ""
 		}
-		if node := live[a.NodeID]; !node.Connected || !slices.Contains(node.AgentCaps, capDoctor) {
+		if node := live[a.NodeID]; !node.Connected || !slices.Contains(node.AgentCaps, agentcap.Doctor) {
 			return ""
 		}
-		if fix == "refresh_unit" && !slices.Contains(live[a.NodeID].AgentCaps, capUnitRefresh) {
+		if fix == "refresh_unit" && !slices.Contains(live[a.NodeID].AgentCaps, agentcap.UnitRefresh) {
 			return ""
 		}
 		return fix
@@ -267,10 +270,82 @@ func (r rpc) MuteAlert(ctx context.Context, req *connect.Request[adminv1.MuteAle
 	return connect.NewResponse(&adminv1.MuteAlertResponse{Alert: alertMsg(a, names, fixable)}), nil
 }
 
+// DismissAlert closes an active alert (resolution "dismissed", silent) or, with reopen, undoes the close.
+func (r rpc) DismissAlert(ctx context.Context, req *connect.Request[adminv1.DismissAlertRequest]) (*connect.Response[adminv1.DismissAlertResponse], error) {
+	s := r.s
+	var a store.HealthAlert
+	var err error
+	if req.Msg.Reopen {
+		a, err = s.st.ReopenDismissedAlert(ctx, req.Msg.AlertId, s.now())
+	} else {
+		a, err = s.st.DismissAlert(ctx, req.Msg.AlertId, s.now())
+	}
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return nil, notFound("alert")
+	case errors.Is(err, store.ErrConflict) && req.Msg.Reopen:
+		return nil, precondition("the alert is not closed or has been opened again")
+	case errors.Is(err, store.ErrConflict):
+		return nil, precondition("the alert is already resolved")
+	case err != nil:
+		return nil, s.internal("dismiss alert", err)
+	}
+	action := "health.dismiss_alert"
+	if req.Msg.Reopen {
+		action = "health.reopen_alert"
+	}
+	s.audit(ctx, action, map[string]string{"alert_id": a.ID, "kind": a.Kind, "node_id": a.NodeID})
+	names, _ := s.nodeNames(ctx)
+	fixable, err := s.fixOffers(ctx)
+	if err != nil {
+		return nil, s.internal("doctor rows", err)
+	}
+	return connect.NewResponse(&adminv1.DismissAlertResponse{Alert: alertMsg(a, names, fixable)}), nil
+}
+
 // ---------------------------------------------------------------------------------------------------
 // Synthetic checks
 
 const buckets = 48 // half-hour buckets = 24 h
+
+// nearestRank is the p-th percentile of an ascending list by nearest rank, the rule the daily rollup uses in SQL.
+func nearestRank(sorted []uint32, p int) uint32 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	return sorted[(len(sorted)*p+99)/100-1]
+}
+
+// stddev is the population standard deviation of l, rounded to a millisecond.
+func stddev(l []uint32) uint32 {
+	if len(l) == 0 {
+		return 0
+	}
+	var sum, sq float64
+	for _, v := range l {
+		sum += float64(v)
+		sq += float64(v) * float64(v)
+	}
+	n := float64(len(l))
+	return uint32(math.Round(math.Sqrt(math.Max(sq/n-(sum/n)*(sum/n), 0))))
+}
+
+// checkStats is the cell's stats_24h from the window's rounds that came up; nil when there are none.
+func checkStats(up uint32, conn, resp []uint32) *adminv1.CheckStats {
+	if up == 0 {
+		return nil
+	}
+	slices.Sort(conn)
+	slices.Sort(resp)
+	return &adminv1.CheckStats{Rounds: up, ConnectP50Ms: nearestRank(conn, 50), ConnectP95Ms: nearestRank(conn, 95),
+		ResponseP50Ms: nearestRank(resp, 50), ResponseP95Ms: nearestRank(resp, 95), JitterMs: stddev(resp)}
+}
+
+func dayMsg(d store.DailyRow) *adminv1.CheckDay {
+	return &adminv1.CheckDay{DayUnix: d.Day.Unix(), Ok: uint32(d.OK), Degraded: uint32(d.Degraded), Failed: uint32(d.Failed),
+		LatencyP50Ms: d.P50MS, LatencyP95Ms: d.P95MS, ConnectP50Ms: d.ConnectP50MS, ConnectP95Ms: d.ConnectP95MS,
+		ResponseP50Ms: d.ResponseP50MS, ResponseP95Ms: d.ResponseP95MS, JitterMs: d.JitterMS}
+}
 
 // median is the middle value of l (the upper one for an even count), 0 for none. It sorts l.
 func median(l []uint32) uint32 {
@@ -445,6 +520,9 @@ func (r rpc) GetChecks(ctx context.Context, req *connect.Request[adminv1.GetChec
 	hourLat := map[string][]uint32{}  // latencies of the last hour's non-failed rounds, for the cell median
 	hourConn := map[string][]uint32{} // their connect_ms (0 = not measured, left out)
 	hourResp := map[string][]uint32{} // their response_ms (0 = not measured, left out)
+	dayConn := map[string][]uint32{}  // the connect_ms of the whole window's non-failed rounds, for stats_24h
+	dayResp := map[string][]uint32{}  // their response_ms
+	dayUp := map[string]uint32{}      // how many non-failed rounds the window holds
 	hourOK := map[string][]okRound{}  // the last hour's OK rounds, for the UDP-loss notice
 	hourUDP := map[string][2]uint64{} // packets the Hysteria2 client sent and lost in the last hour's rounds
 	for _, x := range samples {
@@ -457,6 +535,13 @@ func (r rpc) GetChecks(ctx context.Context, req *connect.Request[adminv1.GetChec
 			h[i].failed++
 		} else {
 			h[i].ok++
+			dayUp[x.InboundID]++
+			if x.ConnectMS > 0 {
+				dayConn[x.InboundID] = append(dayConn[x.InboundID], x.ConnectMS)
+			}
+			if x.ResponseMS > 0 {
+				dayResp[x.InboundID] = append(dayResp[x.InboundID], x.ResponseMS)
+			}
 			if x.LatencyMS > 0 {
 				h[i].lat = append(h[i].lat, x.LatencyMS)
 				if !x.At.Before(hourAgo) {
@@ -478,6 +563,17 @@ func (r rpc) GetChecks(ctx context.Context, req *connect.Request[adminv1.GetChec
 			}
 		}
 		hist[x.InboundID] = h
+	}
+
+	days := map[string][]*adminv1.CheckDay{}
+	if n := int64(min(req.Msg.DailyDays, 90)); n > 0 {
+		rows, err := s.st.DailyRowsSince(ctx, time.Unix(now.Unix()-now.Unix()%86400-n*86400, 0))
+		if err != nil {
+			return nil, s.internal("daily checks", err)
+		}
+		for _, d := range rows {
+			days[d.InboundID] = append(days[d.InboundID], dayMsg(d))
+		}
 	}
 
 	resp := &adminv1.GetChecksResponse{NowUnix: now.Unix(), IntervalS: uint32(s.interval(ctx) / time.Second)}
@@ -517,6 +613,8 @@ func (r rpc) GetChecks(ctx context.Context, req *connect.Request[adminv1.GetChec
 			cell.LatencyHourMs = median(hourLat[t.in.ID])
 			cell.ConnectHourMs = median(hourConn[t.in.ID])
 			cell.ResponseHourMs = median(hourResp[t.in.ID])
+			cell.Stats_24H = checkStats(dayUp[t.in.ID], dayConn[t.in.ID], dayResp[t.in.ID])
+			cell.Daily = days[t.in.ID]
 			u, back := hourUDP[t.in.ID], probePkts[t.in.ID]
 			cell.UdpSentHour, cell.UdpLostHour = uint32(min(u[0], math.MaxUint32)), uint32(min(u[1], math.MaxUint32))
 			cell.NodeSentHour, cell.NodeLostHour = uint32(min(back[0], math.MaxUint32)), uint32(min(back[1], math.MaxUint32))
@@ -547,6 +645,7 @@ func (r rpc) GetChecks(ctx context.Context, req *connect.Request[adminv1.GetChec
 		return nil, s.internal("country checks", err)
 	}
 	resp.TspuRun = s.tspuState(ctx).Run
+	resp.CountryNow = s.countryNowViews(ctx, req.Msg.NodeId)
 	return connect.NewResponse(resp), nil
 }
 
@@ -563,10 +662,15 @@ func (r rpc) RunChecksNow(ctx context.Context, req *connect.Request[adminv1.RunC
 	if err != nil {
 		return nil, s.internal("run checks", err)
 	}
-	if scheduled == 0 && retry > 0 {
+	// the country check has its own limit (10 minutes a node): the round asked for it does not wait for the profiles' 30 s
+	var country *adminv1.CountryNow
+	if req.Msg.NodeId != "" {
+		country = s.RunCountryNow(ctx, req.Msg.NodeId)
+	}
+	if scheduled == 0 && retry > 0 && !country.GetRunning() {
 		return nil, connect.NewError(connect.CodeResourceExhausted, fmt.Errorf("checks ran a moment ago: try again in %d s", int(retry.Seconds())))
 	}
-	return connect.NewResponse(&adminv1.RunChecksNowResponse{Scheduled: uint32(scheduled), Skipped: uint32(skipped)}), nil
+	return connect.NewResponse(&adminv1.RunChecksNowResponse{Scheduled: uint32(scheduled), Skipped: uint32(skipped), CountryNow: country}), nil
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -614,7 +718,7 @@ func (r rpc) RunDoctor(ctx context.Context, req *connect.Request[adminv1.RunDoct
 		live := indexLiveRows(liveRows)
 		var wg sync.WaitGroup
 		for _, n := range nodes {
-			if node := live[n.ID]; !node.Connected || !slices.Contains(node.AgentCaps, capDoctor) {
+			if node := live[n.ID]; !node.Connected || !slices.Contains(node.AgentCaps, agentcap.Doctor) {
 				continue // offline and old nodes keep their last report; that is not an error
 			}
 			wg.Add(1)
@@ -735,7 +839,7 @@ func (r rpc) plan(ctx context.Context, n store.NodeRow, fix string, params map[s
 		planParams = s.restartFacts(ctx, n.ID, params["inbound_id"], cr.Params)
 	}
 	return connect.NewResponse(&adminv1.ApplyFixResponse{
-		Plan:   &adminv1.FixPlan{FixId: fix, TitleKey: "health.fix." + fix + ".plan", Params: planParams, Detail: detail, Disruptive: fix == "restart_inbound" || fix == "reconnect_warp" || fix == "refresh_unit"},
+		Plan:   &adminv1.FixPlan{FixId: fix, TitleKey: "health.fix." + fix + ".plan", Params: planParams, Detail: detail, Disruptive: fix == "restart_inbound" || fix == "reconnect_warp" || fix == "refresh_unit" || fix == "awg_module_repair"},
 		PlanId: id, PlanExpiresUnix: now.Add(planTTL).Unix(),
 	}), nil
 }

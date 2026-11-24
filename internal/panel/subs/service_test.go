@@ -2,6 +2,7 @@ package subs_test
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"connectrpc.com/connect"
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
+	"github.com/mistgate/mistgate/internal/panel/access"
 	"github.com/mistgate/mistgate/internal/panel/auth"
 	"github.com/mistgate/mistgate/internal/panel/dns"
 	"github.com/mistgate/mistgate/internal/panel/instance"
@@ -16,7 +18,55 @@ import (
 	"github.com/mistgate/mistgate/internal/panel/store"
 	"github.com/mistgate/mistgate/internal/panel/subs"
 	"github.com/mistgate/mistgate/internal/panel/subsettings"
+	"github.com/mistgate/mistgate/internal/plugin"
 )
+
+func TestGetSubscriptionSettingsCountsLinkAWGKeys(t *testing.T) {
+	m := newM3Rig(t)
+	svc := subs.NewService(m.st, subsettings.NewCache(m.st, nil), builtin.Registry(),
+		func(ctx context.Context) (instance.Settings, error) { return instance.Load(ctx, m.st) }, nil, nil)
+	for _, name := range []string{"alice", "bob"} {
+		_, token := m.newUser(name, nil)
+		if _, err := m.svc.SubscriptionWith(m.ctx, token, access.SubOptions{Format: plugin.FormatMihomo, NoPageData: true}); err != nil {
+			t.Fatalf("Mihomo fetch for %s: %v", name, err)
+		}
+	}
+	resp := must(svc.GetSubscriptionSettings(m.ctx, connect.NewRequest(&adminv1.GetSubscriptionSettingsRequest{}))).Msg
+	if resp.LinkAwgKeys != 2 {
+		t.Fatalf("link_awg_keys = %d, want the two users' live peers", resp.LinkAwgKeys)
+	}
+}
+
+func TestSubscriptionSettingsAuditIncludesLinkAWG(t *testing.T) {
+	m := newM3Rig(t)
+	svc := subs.NewService(m.st, subsettings.NewCache(m.st, nil), builtin.Registry(),
+		func(ctx context.Context) (instance.Settings, error) { return instance.Load(ctx, m.st) }, nil, nil)
+	ctx := auth.WithAdmin(m.ctx, store.Admin{ID: "adm_link_awg"})
+	set := must(svc.GetSubscriptionSettings(ctx, connect.NewRequest(&adminv1.GetSubscriptionSettingsRequest{}))).Msg.Settings
+	no := false
+	set.LinkAwg = &no
+	if _, err := svc.UpdateSubscriptionSettings(ctx, connect.NewRequest(&adminv1.UpdateSubscriptionSettingsRequest{Settings: set})); err != nil {
+		t.Fatal(err)
+	}
+	rows := must(m.st.ListAudit(m.ctx, "", 0, 10))
+	for _, row := range rows {
+		if row.Action != "subscription_settings_update" {
+			continue
+		}
+		var params map[string]any
+		if err := json.Unmarshal([]byte(row.Params), &params); err != nil {
+			t.Fatal(err)
+		}
+		if got, ok := params["link_awg"].(bool); !ok || got {
+			t.Fatalf("audit link_awg = %v; want false", params["link_awg"])
+		}
+		if got, ok := params["link_auto_select"].(bool); !ok || !got {
+			t.Fatalf("audit link_auto_select = %v; want true by default", params["link_auto_select"])
+		}
+		return
+	}
+	t.Fatal("subscription settings audit row is missing")
+}
 
 // The admin's preview of server names is drawn from what a person of the busiest group gets in Happ now: its running
 // servers in subscription order, not made-up ones. AmneziaWG, a switched-off inbound and a node out of service are not
@@ -66,6 +116,29 @@ func TestSettingsCarryServerSamples(t *testing.T) {
 	must(m.svc.UpdateInbound(m.ctx, connect.NewRequest(&adminv1.UpdateInboundRequest{InboundId: off.Id, Enabled: new(false)})))
 	if r := get(); r.SampleGroup != "g2" || len(r.ServerSamples) != 1 || r.ServerSamples[0].Node != "de1" {
 		t.Errorf("busiest group = %q %v", r.SampleGroup, r.ServerSamples)
+	}
+}
+
+// A node the owner holds back is not in the preview of server names: nobody receives it.
+func TestSettingsServerSamplesLeaveOutAHeldNode(t *testing.T) {
+	m := newM3Rig(t)
+	m.st.W.Exec(`INSERT INTO node (id, name, address, country_code, state, created_at) VALUES ('nod_2', 'nl1', 'nl1.example.com', 'NL', 'active', 1)`)
+	must(m.svc.CreateInbound(m.ctx, connect.NewRequest(&adminv1.CreateInboundRequest{ProfileId: m.profile, NodeId: "nod_2"})))
+	svc := subs.NewService(m.st, subsettings.NewCache(m.st, nil), builtin.Registry(),
+		func(ctx context.Context) (instance.Settings, error) { return instance.Load(ctx, m.st) }, nil, nil)
+	names := func() []string {
+		var out []string
+		for _, s := range must(svc.GetSubscriptionSettings(m.ctx, connect.NewRequest(&adminv1.GetSubscriptionSettingsRequest{}))).Msg.ServerSamples {
+			out = append(out, s.Node)
+		}
+		return out
+	}
+	if got := names(); len(got) != 2 {
+		t.Fatalf("before: %v", got)
+	}
+	must(m.svc.SetNodeSharing(m.ctx, connect.NewRequest(&adminv1.SetNodeSharingRequest{NodeId: "nod_2", Mode: adminv1.NodeShareMode_NODE_SHARE_MODE_NONE})))
+	if got := names(); len(got) != 1 || got[0] != "de1" {
+		t.Fatalf("with nl1 held: %v", got)
 	}
 }
 

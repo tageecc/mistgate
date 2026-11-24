@@ -67,7 +67,7 @@ func relayStoreProof(t *testing.T, st *Store) {
 	relayExec(t, st, `INSERT INTO user_group (id, name, created_at) VALUES ('grp_a', 'a', 1)`)
 	subRelays := func(active bool) []RelayLink {
 		t.Helper()
-		d, err := st.Access().SubscriptionData(ctx, "usr_none", "grp_a", now, active, now, nil)
+		d, err := st.Access().SubscriptionData(ctx, "usr_none", now, active, now, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -313,7 +313,9 @@ func relayStoreProof(t *testing.T, st *Store) {
 		t.Fatal(err)
 	}
 	got, ok = mustRelay(t, st, "rly_a").Check()
-	if !ok || got.Counters == nil || *got.Counters != counters || got.Monitor == nil || *got.Monitor != monitor || got.Leg != chk.Leg || got.Path != chk.Path {
+	if !ok || got.Counters == nil || got.Counters.Bytes != counters.Bytes || got.Counters.Packets != counters.Packets ||
+		got.Counters.CountedUnix != counters.CountedUnix || got.Counters.TodayBytes != counters.Bytes ||
+		got.Monitor == nil || *got.Monitor != monitor || got.Leg != chk.Leg || got.Path != chk.Path {
 		t.Fatalf("counter writer changed another check_json member: %+v", got)
 	}
 

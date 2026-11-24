@@ -1,0 +1,35 @@
+// How a protocol is shown wherever the profiles screens name it: its place in lists, and what its one-line
+// summary says. Nothing here changes what a protocol can do; a protocol this file does not know still works everywhere.
+
+import { App } from "@/gen/mistgate/admin/v1/common_pb";
+
+// The guide's advice: start with Hysteria2, add VLESS, then the keys, then Telegram, then the newest.
+const order = ["hysteria2", "vless", "awg", "mtproto", "trusttunnel"];
+
+/** Sort protocol ids: the known ones in their order, the others after them by id. */
+export function byProtocol(a: string, b: string): number {
+  const rank = (id: string) => (order.includes(id) ? order.indexOf(id) : order.length);
+  return rank(a) - rank(b) || a.localeCompare(b);
+}
+
+/** A protocol whose only app is Telegram (MTProto): its tg:// links reach people outside the subscription formats. */
+export const telegramOnly = (apps: readonly App[]) => apps.length > 0 && apps.every((a) => a === App.TELEGRAM);
+
+/** A protocol whose only app is the official TrustTunnel one: its tt:// keys (and the Mistgate app's own path) reach people outside the subscription formats. */
+export const trustTunnelOnly = (apps: readonly App[]) => apps.length > 0 && apps.every((a) => a === App.TRUST_TUNNEL);
+
+/** A protocol that reaches people by a link of its own, in none of the subscription formats: Telegram's tg:// or TrustTunnel's tt://. */
+export const ownLinkOnly = (apps: readonly App[]) => telegramOnly(apps) || trustTunnelOnly(apps);
+
+/**
+ * The server's one-line summary as its parts: "UDP 443 · Salamander · Let's Encrypt · WARP" (MTProto writes "TCP 443 - Fake
+ * TLS"). A range like "hop 20000-30000" has no spaces around its dash and stays whole.
+ */
+export const summaryParts = (summary: string) =>
+  summary
+    .split(/\s+[·-]\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+/** Whether the profile leaves through WARP: the summary names it as a part of its own. */
+export const viaWarp = (summary: string) => summaryParts(summary).includes("WARP");

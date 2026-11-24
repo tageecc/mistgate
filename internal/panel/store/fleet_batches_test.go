@@ -39,9 +39,12 @@ func newFleetBatchFixture(t *testing.T, s *Store, prefix string) fleetBatchFixtu
 	if err := s.Access().CreateGroup(ctx, AccessGroup{ID: groupID, Name: prefix, CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := s.W.ExecContext(ctx, `INSERT INTO user_group_profile (group_id, profile_id) VALUES (?, ?)`, groupID, profileID); err != nil {
+		t.Fatal(err)
+	}
 	userID := "usr_" + prefix
-	if _, err := s.W.ExecContext(ctx, `INSERT INTO user (id, name, group_id, period_start, sub_token_hash, sub_token_enc, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`, userID, prefix, groupID, now.Unix(), []byte(prefix+"-sub"), []byte{1}, now.Unix()); err != nil {
+	if _, err := s.W.ExecContext(ctx, `INSERT INTO user (id, name, group_id, all_nodes, period_start, sub_token_hash, sub_token_enc, created_at)
+		VALUES (?, ?, ?, 1, ?, ?, ?, ?)`, userID, prefix, groupID, now.Unix(), []byte(prefix+"-sub"), []byte{1}, now.Unix()); err != nil {
 		t.Fatal(err)
 	}
 	deviceID := "dev_" + prefix
@@ -393,7 +396,7 @@ func TestFleetStatsWriteBatchStatementCount(t *testing.T) {
 	for i := 0; i < certificates; i++ {
 		certs = append(certs, fleetInboundCertWrite{InboundID: fmt.Sprintf("inb_%03d", i), Pin: "pin", NotAfter: now.Add(time.Hour).Unix()})
 	}
-	stmts, err := fleetStatsWriteStmts(in, in.Instance, 0, buckets, hours, userWrites, deviceWrites, certs, touches, nil, FleetLive{})
+	stmts, err := fleetStatsWriteStmts(in, in.Instance, 0, buckets, hours, userWrites, deviceWrites, certs, touches, nil, nil, nil, FleetLive{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -656,4 +659,31 @@ func queryInt(t *testing.T, s *Store, query string, args ...any) int64 {
 		t.Fatal(err)
 	}
 	return value
+}
+
+// A Telegram key's last use is its newest proxy session, like an AmneziaWG key's handshake: the person's page says when
+// Telegram last connected through it instead of "not connected yet".
+func TestIngestStatsTouchesTheTelegramKey(t *testing.T) {
+	s := openTemp(t)
+	f := newFleetBatchFixture(t, s, "stats_tg")
+	ctx := context.Background()
+	if _, err := s.W.ExecContext(ctx, `INSERT INTO device (id, user_id, kind, hwid_hash, first_seen_at, last_seen_at, created_at)
+		VALUES ('dev_tgkey_seen', ?, 'key', ?, 0, 0, ?)`, f.userID, []byte("stats-tg-key"), f.now.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.W.ExecContext(ctx, `INSERT INTO device_credential (id, device_id, user_id, protocol, secret_enc, data_json, created_at, profile_id, config_epoch)
+		VALUES ('crd_tgkey_seen', 'dev_tgkey_seen', ?, 'mtproto', ?, '{}', ?, NULL, 0)`, f.userID, []byte{1}, f.now.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	connectedAt := f.now.Add(-2 * time.Minute)
+	in := FleetStatsIn{
+		NodeID: f.nodeID, Instance: "instance-a", Seq: 1, Now: f.now, HourStart: f.now.Unix() / 3600 * 3600,
+		Sessions: []FleetSessionRef{{CredID: "crd_tgkey_seen", InboundID: f.inboundID, ConnectedAt: connectedAt}},
+	}
+	if out, err := s.IngestStats(ctx, in); err != nil || out.Duplicate {
+		t.Fatalf("stats ingest = %+v, %v; want applied", out, err)
+	}
+	if got := queryInt(t, s, `SELECT last_seen_at FROM device WHERE id = 'dev_tgkey_seen'`); got != connectedAt.Unix() {
+		t.Fatalf("Telegram key last_seen_at = %d, want %d", got, connectedAt.Unix())
+	}
 }

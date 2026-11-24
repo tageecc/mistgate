@@ -10,6 +10,7 @@ import { cx } from "@/lib/cx";
 import { useTx, type Tx } from "@/screens/users/t";
 import { Card, SectionLabel } from "@/components/ui/bits";
 import { errorsOf, getAt, isChanged, listIssues, makeSecret, MASK, setAt, type Field, type Group, type Settings } from "./schema";
+import { problemText } from "./problem-text";
 
 /** What a schema group is about: basics sand, the disguise sage, the rest of the protocol's knobs sky. */
 const groupMarks: Record<string, { icon: IconName; tone: Tone }> = {
@@ -66,7 +67,7 @@ export function SchemaForm({ protocol, groups, settings, base, problems, onChang
               type="button"
               aria-expanded={isOpen}
               onClick={() => setOpen({ ...open, [g.id]: !isOpen })}
-              className="flex h-12 w-full items-center gap-2.5 text-left"
+              className="flex h-12 w-full items-center gap-2.5 text-start"
             >
               <SectionLabel className="flex-1" icon={groupMark(g.id).icon} tone={groupMark(g.id).tone}>
                 {t.opt(`profiles.group.${g.id}`) ?? g.id}
@@ -137,7 +138,7 @@ function FieldRow({ protocol, f, t, settings, locked, offers, extra, dirty, prob
     case "number":
       control = (
         <>
-          <NumberInput label={label} value={getAt(settings, f.path)} integer={f.integer} invalid={invalid} describedBy={describedBy} onChange={(v) => onChange(f.path, v)} className="w-24 text-right" />
+          <NumberInput label={label} value={getAt(settings, f.path)} integer={f.integer} invalid={invalid} describedBy={describedBy} onChange={(v) => onChange(f.path, v)} className="w-24 text-end" />
           {unit && <span className="min-w-10 text-xs text-muted">{unit}</span>}
         </>
       );
@@ -192,7 +193,7 @@ function FieldRow({ protocol, f, t, settings, locked, offers, extra, dirty, prob
           <span id={errId} className="flex flex-col">
             {shown.map((p, i) => (
               <span key={i} role="alert" className="text-[11px] leading-snug text-danger-text">
-                {(p.code && t.opt(`field${p.pointer.replaceAll("/", ".")}.${p.code}`)) || p.message}
+                {problemText(t, protocol, p) || p.message}
               </span>
             ))}
           </span>
@@ -204,9 +205,10 @@ function FieldRow({ protocol, f, t, settings, locked, offers, extra, dirty, prob
 }
 
 /** Digits only (plus one dot for a non-integer); an empty box stays empty and the server names the problem. */
-function NumberInput({ label, value, integer, invalid, describedBy, onChange, className }: { label: string; value: unknown; integer: boolean; invalid: boolean; describedBy?: string; onChange: (v: number | string) => void; className?: string }) {
+export function NumberInput({ label, value, integer, invalid, describedBy, onChange, className, masked }: { label: string; value: unknown; integer: boolean; invalid: boolean; describedBy?: string; onChange: (v: number | string) => void; className?: string; masked?: boolean }) {
   return (
     <input
+      type={masked ? "password" : undefined}
       aria-label={label}
       aria-invalid={invalid || undefined}
       aria-describedby={describedBy}
@@ -229,7 +231,7 @@ const asList = (v: unknown): string[] => (Array.isArray(v) ? v.map(String) : [])
  * the schema's limit, and a bad value's problem right under its box. An empty box stays on screen while it is being
  * filled but is not part of the value, so a fresh "Add" never turns into a server error.
  */
-function StringList({ f, label, t, value, describedBy, onChange }: { f: Field; label: string; t: Tx; value: unknown; describedBy?: string; onChange: (v: string[]) => void }) {
+export function StringList({ f, label, t, value, describedBy, onChange }: { f: Field; label: string; t: Tx; value: unknown; describedBy?: string; onChange: (v: string[]) => void }) {
   const values = asList(value);
   const [rows, setRows] = useState(values);
   const id = useId();
@@ -317,7 +319,7 @@ function StringList({ f, label, t, value, describedBy, onChange }: { f: Field; l
  * says "••••"), so a saved one can be replaced but not read; a value typed or generated here stays local until the
  * profile is saved, so showing and copying it costs nothing.
  */
-function SecretField({ label, value, invalid, t, make, onChange }: { label: string; value: unknown; invalid: boolean; t: Tx; make: () => string; onChange: (v: string) => void }) {
+export function SecretField({ label, value, invalid, t, make, onChange }: { label: string; value: unknown; invalid: boolean; t: Tx; make: () => string; onChange: (v: string) => void }) {
   const toast = useToast();
   const [shown, setShown] = useState(false);
   const stored = value === MASK; // kept on the server: nothing to show or copy
@@ -335,7 +337,7 @@ function SecretField({ label, value, invalid, t, make, onChange }: { label: stri
   const eye = t(shown ? "profiles.secret.hide" : "profiles.secret.show");
   return (
     <div className="flex w-[300px] max-w-full flex-col gap-1">
-      <div className={cx("flex h-[38px] items-center gap-0.5 rounded-xl border bg-canvas pr-1 pl-3 transition-colors duration-200 focus-within:border-accent", invalid ? "border-danger" : "border-line")}>
+      <div className={cx("flex h-[38px] items-center gap-0.5 rounded-xl border bg-canvas pe-1 ps-3 transition-colors duration-200 focus-within:border-accent", invalid ? "border-danger" : "border-line")}>
         <input
           type={shown && !stored ? "text" : "password"}
           aria-label={label}

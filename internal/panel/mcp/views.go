@@ -1,9 +1,20 @@
+//go:build !js
+
 package mcp
 
 import (
+	"encoding/json"
+	"math"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
 	"time"
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
+	agentv1 "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	panelupdate "github.com/mistgate/mistgate/internal/panel/update"
+	"github.com/mistgate/mistgate/internal/release"
 )
 
 // The projections: every tool has its own output struct and builds it from the fields it chose.
@@ -14,6 +25,287 @@ import (
 // the exit IP of a check, anything of the token store.
 
 func nm(s string) string { return clean(s, maxName) }
+
+var mcpOSPackage = regexp.MustCompile("^[a-z0-9][a-z0-9.+-]{0,63}$")
+var mcpOSPendingPackage = regexp.MustCompile("^[a-z0-9][a-z0-9.+-]{1,62}(:[a-z0-9][a-z0-9-]{0,31})?$")
+var mcpOSLockHolder = regexp.MustCompile("^[A-Za-z0-9._-]{1,15}$")
+
+type osJobV struct {
+	ID            string `json:"id,omitempty"`
+	Action        string `json:"action,omitempty"`
+	Mode          string `json:"mode,omitempty"`
+	State         string `json:"state,omitempty"`
+	Phase         string `json:"phase,omitempty"`
+	Started       int64  `json:"started_unix,omitempty"`
+	Updated       int64  `json:"updated_unix,omitempty"`
+	Finished      int64  `json:"finished_unix,omitempty"`
+	Code          string `json:"code,omitempty"`
+	Reason        string `json:"reason,omitempty"`
+	NoteCode      string `json:"note_code,omitempty"`
+	Note          string `json:"note,omitempty"`
+	NoteUntrusted bool   `json:"note_untrusted,omitempty"`
+	LockHolder    string `json:"apt_lock_holder,omitempty"`
+	LockMinutes   uint32 `json:"apt_lock_minutes,omitempty"`
+	Upgraded      uint32 `json:"upgraded,omitempty"`
+	Reboot        string `json:"reboot,omitempty"`
+	HeldReason    string `json:"held_reason,omitempty"`
+	KernelFrom    string `json:"kernel_from,omitempty"`
+	KernelTo      string `json:"kernel_to,omitempty"`
+}
+
+type osStatusV struct {
+	MeasuredUnix     int64    `json:"measured_unix"`
+	DistroID         string   `json:"distro_id,omitempty"`
+	DistroVersion    string   `json:"distro_version,omitempty"`
+	Pending          uint32   `json:"pending"`
+	Security         uint32   `json:"security"`
+	SecurityPending  []string `json:"security_pending"`
+	SecurityStuck    []string `json:"security_stuck"`
+	Notable          []string `json:"notable"`
+	KernelRunning    string   `json:"kernel_running,omitempty"`
+	KernelNewest     string   `json:"kernel_newest,omitempty"`
+	Reboot           bool     `json:"reboot_required"`
+	Reasons          []string `json:"reboot_reasons"`
+	Held             []string `json:"held"`
+	Apt              string   `json:"apt,omitempty"`
+	AptLockHolder    string   `json:"apt_lock_holder,omitempty"`
+	AptLockSinceUnix int64    `json:"apt_lock_since_unix,omitempty"`
+	HalfConfigured   []string `json:"half_configured"`
+	ListsUnix        int64    `json:"lists_unix"`
+	DpkgUnix         int64    `json:"dpkg_unix"`
+	AutoUpdates      string   `json:"auto_updates,omitempty"`
+	AutoReboot       bool     `json:"auto_reboot"`
+	AwgModuleNext    string   `json:"awg_module_next,omitempty"`
+	// Kernels is the per-kernel table (newest first, at most 8); RebootBlockers are the job codes a reboot would be refused with
+	// right now. Both are absent from an agent that predates them.
+	Kernels        []osKernelV `json:"kernels,omitempty"`
+	AwgSource      string      `json:"awg_source,omitempty"`
+	RebootBlockers []string    `json:"reboot_blockers,omitempty"`
+	Container      string      `json:"container,omitempty"`
+	BootIDHash     string      `json:"boot_id_hash,omitempty"`
+	Job            *osJobV     `json:"job,omitempty"`
+	Error          string      `json:"error,omitempty"`
+}
+
+type osKernelV struct {
+	Version   string `json:"version"`
+	Running   bool   `json:"running"`
+	NextBoot  bool   `json:"next_boot"`
+	Candidate bool   `json:"candidate"`
+	Image     bool   `json:"image"`
+	Initrd    bool   `json:"initrd"`
+	GrubEntry bool   `json:"grub_entry"`
+	Headers   string `json:"headers"`
+	Module    string `json:"module,omitempty"`
+	Packages  string `json:"packages"`
+}
+
+type osNodeV struct {
+	NodeID      string     `json:"node_id"`
+	Name        string     `json:"name"`
+	Connected   bool       `json:"connected"`
+	Supported   bool       `json:"supported"`
+	OnlineUsers uint32     `json:"online_users"`
+	Inbounds    uint32     `json:"inbounds"`
+	OnPanel     bool       `json:"on_panel_server"`
+	State       string     `json:"state"`
+	Status      *osStatusV `json:"status,omitempty"`
+	// UpdateCapable is whether the agent can run an OS job; UpdateBlock and RebootBlock say why the panel would refuse one now
+	// (the keys of the admin's os.block.*), empty when it would not.
+	UpdateCapable  bool   `json:"update_capable"`
+	UpdateBlock    string `json:"update_block,omitempty"`
+	UpdateBlockAll string `json:"update_block_all,omitempty"`
+	RebootBlock    string `json:"reboot_block,omitempty"`
+	// RebootPossible is the Unix time from which a reboot is possible again (RebootBlock is reboot_wait until then), absent when now.
+	RebootPossible int64 `json:"reboot_possible_unix,omitempty"`
+}
+
+type osStepV struct {
+	NodeID         string `json:"node_id"`
+	Name           string `json:"name"`
+	State          string `json:"state"`
+	JobID          string `json:"job_id,omitempty"`
+	Phase          string `json:"phase,omitempty"`
+	KernelFrom     string `json:"kernel_from,omitempty"`
+	KernelTo       string `json:"kernel_to,omitempty"`
+	Sent           int64  `json:"sent_unix,omitempty"`
+	Finished       int64  `json:"finished_unix,omitempty"`
+	Error          string `json:"error,omitempty"`
+	Code           string `json:"code,omitempty"`
+	Package        string `json:"package,omitempty"`
+	Upgraded       string `json:"upgraded,omitempty"`
+	Reboot         string `json:"reboot,omitempty"`
+	AptLockHolder  string `json:"apt_lock_holder,omitempty"`
+	AptLockMinutes uint32 `json:"apt_lock_minutes,omitempty"`
+	NoteCode       string `json:"note_code,omitempty"`
+	Note           string `json:"note,omitempty"`
+	NoteUntrusted  bool   `json:"note_untrusted,omitempty"`
+	RetryCount     uint32 `json:"retry_count,omitempty"`
+	RetryCode      string `json:"retry_code,omitempty"`
+	// As in rolloutStepV: the profiles that did not pass the gate after the job, and those not held against it.
+	FailedProfiles  []profileFailV `json:"failed_profiles,omitempty"`
+	FailedMore      int            `json:"failed_more,omitempty"`
+	SkippedProfiles []string       `json:"skipped_profiles,omitempty"`
+	SkippedMore     int            `json:"skipped_more,omitempty"`
+}
+
+// osRolloutV is the active OS rollout, else the last one. Names and packages are untrusted input.
+type osRolloutV struct {
+	ID                  string         `json:"id"`
+	Status              string         `json:"status"`
+	Mode                string         `json:"mode"`
+	Reboot              string         `json:"reboot"`
+	PauseKey            string         `json:"pause_key,omitempty"`
+	PauseFailedProfiles []profileFailV `json:"pause_failed_profiles,omitempty"`
+	PauseFailedMore     int            `json:"pause_failed_more,omitempty"`
+	Created             int64          `json:"created_unix"`
+	Finished            int64          `json:"finished_unix,omitempty"`
+	Steps               []osStepV      `json:"steps"`
+}
+
+// OsUpdatesV is the os_updates_status result; package and node strings are untrusted input.
+type OsUpdatesV struct {
+	NowUnix          int64       `json:"now_unix"`
+	Nodes            []osNodeV   `json:"nodes"`
+	PanelHost        *osStatusV  `json:"panel_host,omitempty"`
+	ScheduleTimezone int32       `json:"schedule_timezone_offset_minutes"`
+	Rollout          *osRolloutV `json:"rollout,omitempty"`
+	Truncated        bool        `json:"truncated,omitempty"`
+}
+
+func (v *OsUpdatesV) shrink() bool {
+	v.Truncated = true
+	if len(v.Nodes) > 1 {
+		v.Nodes = v.Nodes[:len(v.Nodes)/2]
+		return true
+	}
+	if v.PanelHost != nil {
+		v.PanelHost.Notable = nil
+		v.PanelHost.Held = nil
+		v.PanelHost.HalfConfigured = nil
+		v.PanelHost.SecurityPending = nil
+		v.PanelHost.SecurityStuck = nil
+		return true
+	}
+	return false
+}
+
+func osStatusView(s *agentv1.OsStatus) *osStatusV {
+	if s == nil {
+		return nil
+	}
+	v := &osStatusV{
+		MeasuredUnix: s.GetMeasuredUnix(), DistroID: clean(s.GetDistroId(), 64), DistroVersion: clean(s.GetDistroVersion(), 64),
+		Pending: s.GetPending(), Security: s.GetSecurity(), SecurityPending: []string{}, SecurityStuck: []string{}, Notable: []string{}, KernelRunning: noAddr(clean(s.GetKernelRunning(), 128)),
+		KernelNewest: noAddr(clean(s.GetKernelNewest(), 128)), Reboot: s.GetRebootRequired(), Reasons: []string{}, Held: []string{},
+		Apt: clean(s.GetApt(), 32), HalfConfigured: []string{}, ListsUnix: s.GetListsUnix(), DpkgUnix: s.GetDpkgUnix(),
+		AutoUpdates: clean(s.GetAutoUpdates(), 32), AutoReboot: s.GetAutoReboot(), AwgModuleNext: clean(s.GetAwgModuleNext(), 32),
+		Container: noAddr(clean(s.GetContainer(), 64)), BootIDHash: clean(s.GetBootIdHash(), 16), Error: clean(s.GetError(), 32),
+	}
+	if mcpOSLockHolder.MatchString(s.GetAptLockHolder()) {
+		v.AptLockHolder = noAddr(clean(s.GetAptLockHolder(), 15))
+		v.AptLockSinceUnix = s.GetAptLockSinceUnix()
+	}
+	for _, name := range s.GetSecurityPending() {
+		if mcpOSPendingPackage.MatchString(name) {
+			v.SecurityPending = append(v.SecurityPending, noAddr(clean(name, 96)))
+		}
+	}
+	for _, name := range s.GetSecurityStuck() {
+		if mcpOSPendingPackage.MatchString(name) {
+			v.SecurityStuck = append(v.SecurityStuck, noAddr(clean(name, 96)))
+		}
+	}
+	for _, raw := range s.GetNotable() {
+		parts := strings.Fields(raw)
+		if len(parts) != 4 || !mcpOSPackage.MatchString(parts[0]) || (parts[3] != "s" && parts[3] != "-") {
+			continue
+		}
+		v.Notable = append(v.Notable, strings.Join([]string{noAddr(clean(parts[0], 64)), clean(parts[1], 80), clean(parts[2], 80), parts[3]}, " "))
+	}
+	for _, name := range s.GetRebootReasons() {
+		if name == "kernel" || mcpOSPackage.MatchString(name) {
+			v.Reasons = append(v.Reasons, noAddr(clean(name, 64)))
+		}
+	}
+	for _, name := range s.GetHeld() {
+		if mcpOSPackage.MatchString(name) {
+			v.Held = append(v.Held, noAddr(clean(name, 64)))
+		}
+	}
+	for _, name := range s.GetHalfConfigured() {
+		if mcpOSPackage.MatchString(name) {
+			v.HalfConfigured = append(v.HalfConfigured, noAddr(clean(name, 64)))
+		}
+	}
+	for _, k := range s.GetKernels() {
+		v.Kernels = append(v.Kernels, osKernelV{Version: noAddr(clean(k.GetVersion(), 128)), Running: k.GetRunning(), NextBoot: k.GetNextBoot(),
+			Candidate: k.GetCandidate(), Image: k.GetImage(), Initrd: k.GetInitrd(), GrubEntry: k.GetGrubEntry(), Headers: clean(k.GetHeaders(), 16),
+			Module: clean(k.GetModule(), 16), Packages: clean(k.GetPackages(), 24)})
+	}
+	v.AwgSource = clean(s.GetAwgSource(), 32)
+	for _, code := range s.GetRebootBlockers() {
+		v.RebootBlockers = append(v.RebootBlockers, clean(code, 32))
+	}
+	if j := s.GetJob(); j != nil {
+		noteCode := ""
+		if j.GetNoteCode() == "security_leftover_failed" {
+			noteCode = j.GetNoteCode()
+		}
+		lockHolder := ""
+		if mcpOSLockHolder.MatchString(j.GetAptLockHolder()) {
+			lockHolder = j.GetAptLockHolder()
+		}
+		v.Job = &osJobV{ID: clean(j.GetJobId(), 80), Action: clean(j.GetAction(), 24), Mode: clean(j.GetMode(), 16),
+			State: clean(j.GetState(), 24), Phase: clean(j.GetPhase(), 32), Started: j.GetStartedUnix(), Updated: j.GetUpdatedUnix(),
+			Finished: j.GetFinishedUnix(), Code: clean(j.GetCode(), 48), Reason: noAddr(clean(j.GetReason(), 160)),
+			NoteCode: noteCode, Note: noAddr(clean(j.GetNote(), 160)), NoteUntrusted: j.GetNote() != "",
+			LockHolder: lockHolder, LockMinutes: j.GetAptLockMinutes(),
+			Upgraded: j.GetUpgraded(), Reboot: clean(j.GetReboot(), 24), HeldReason: clean(j.GetHeldReason(), 32),
+			KernelFrom: noAddr(clean(j.GetKernelFrom(), 128)), KernelTo: noAddr(clean(j.GetKernelTo(), 128))}
+	}
+	return v
+}
+
+func osUpdatesView(r *adminv1.GetOsUpdatesResponse) *OsUpdatesV {
+	v := &OsUpdatesV{NowUnix: r.GetNowUnix(), Nodes: []osNodeV{}, PanelHost: osStatusView(r.GetPanelHost()),
+		ScheduleTimezone: r.GetScheduleTimezoneOffsetMinutes()}
+	for _, n := range r.GetNodes() {
+		v.Nodes = append(v.Nodes, osNodeV{NodeID: clean(n.GetNodeId(), 80), Name: nm(n.GetName()), Connected: n.GetConnected(),
+			Supported: n.GetSupported(), OnlineUsers: n.GetOnlineUsers(), Inbounds: n.GetInbounds(), OnPanel: n.GetOnPanelServer(),
+			State: enumName("OS_UPDATE_STATE_", n.GetState().String()), Status: osStatusView(n.GetStatus()),
+			UpdateCapable: n.GetUpdateCapable(), UpdateBlock: clean(n.GetUpdateBlock(), 24), UpdateBlockAll: clean(n.GetUpdateBlockAll(), 24),
+			RebootBlock: clean(n.GetRebootBlock(), 24), RebootPossible: n.GetRebootPossibleUnix()})
+	}
+	if ro := r.GetRollout(); ro != nil {
+		rv := &osRolloutV{ID: clean(ro.GetId(), 60), Status: enumName("OS_ROLLOUT_STATUS_", ro.GetStatus().String()), Mode: enumName("OS_ROLLOUT_MODE_", ro.GetMode().String()),
+			Reboot: enumName("OS_REBOOT_POLICY_", ro.GetReboot().String()), PauseKey: clean(ro.GetPauseKey(), 32), Created: ro.GetCreatedUnix(), Finished: ro.GetFinishedUnix(), Steps: []osStepV{}}
+		rv.PauseFailedProfiles, rv.PauseFailedMore = failedProfilesView(ro.GetPauseParams())
+		for _, st := range ro.GetSteps() {
+			p := st.GetParams()
+			note := noAddr(clean(p["note"], 160))
+			lockMinutes, _ := strconv.ParseUint(p["apt_lock_minutes"], 10, 32)
+			lockHolder := ""
+			if mcpOSLockHolder.MatchString(p["apt_lock_holder"]) {
+				lockHolder = p["apt_lock_holder"]
+			}
+			noteCode := ""
+			if p["note_code"] == "security_leftover_failed" {
+				noteCode = p["note_code"]
+			}
+			step := osStepV{NodeID: clean(st.GetNodeId(), 80), Name: nm(st.GetNodeName()), State: enumName("OS_STEP_STATE_", st.GetState().String()),
+				JobID: clean(st.GetJobId(), 60), Phase: clean(st.GetPhase(), 24), KernelFrom: noAddr(clean(st.GetKernelFrom(), 128)), KernelTo: noAddr(clean(st.GetKernelTo(), 128)),
+				Sent: st.GetSentUnix(), Finished: st.GetFinishedUnix(), Error: clean(st.GetErrorKey(), 32), Code: clean(p["code"], 32), Package: noAddr(clean(p["package"], 64)),
+				Upgraded: clean(p["upgraded"], 8), Reboot: clean(p["reboot"], 16), AptLockHolder: lockHolder, AptLockMinutes: uint32(lockMinutes),
+				NoteCode: noteCode, Note: note, NoteUntrusted: p["note"] != "", RetryCount: st.GetRetryCount(), RetryCode: clean(st.GetRetryCode(), 32)}
+			step.FailedProfiles, step.FailedMore = failedProfilesView(p)
+			step.SkippedProfiles, step.SkippedMore = skippedProfilesView(p)
+			rv.Steps = append(rv.Steps, step)
+		}
+		v.Rollout = rv
+	}
+	return v
+}
 
 func sumUsers(pc []*adminv1.ProtocolCount) uint32 {
 	var n uint32
@@ -110,12 +402,18 @@ func fleetStatusView(r *adminv1.OverviewResponse) *FleetStatusV {
 // node_get, node_metrics
 
 type inboundV struct {
-	ID        string `json:"id"`
-	Profile   string `json:"profile"`
-	Protocol  string `json:"protocol"`
-	Port      uint32 `json:"port"`
-	State     string `json:"state"`
-	LastError string `json:"last_error,omitempty"`
+	ID                    string `json:"id"`
+	Profile               string `json:"profile"`
+	Protocol              string `json:"protocol"`
+	Port                  uint32 `json:"port"`
+	State                 string `json:"state"`
+	LastError             string `json:"last_error,omitempty"`
+	DirectInSubscriptions bool   `json:"direct_in_subscriptions"`
+	CDN                   bool   `json:"cdn"`
+	// RealityTarget is what a VLESS REALITY server shows strangers: "self" (the node's own site) or host:port; RealityTargetOverride the
+	// part of it this node chose itself (empty = the profile's target).
+	RealityTarget         string `json:"reality_target,omitempty"`
+	RealityTargetOverride string `json:"reality_target_override,omitempty"`
 }
 
 type onlineUserV struct {
@@ -168,12 +466,18 @@ type NodeGetV struct {
 	OnlineUsers   []onlineUserV     `json:"online_users,omitempty"`
 	OnlineTotal   uint32            `json:"online_total"`
 	Notes         string            `json:"notes,omitempty"`
-	Truncated     bool              `json:"truncated,omitempty"`
+	// IPv6 is the node's IPv6 entry (an extra "· IPv6" server in the subscriptions): whether it is on, whether the node can take
+	// one, and the latest check of the address. Never the address.
+	IPv6 *ipv6EntryV `json:"ipv6,omitempty"`
+	// Sharing is who the node is handed out to: its mode (all, listed or none), the groups that receive it with their people, and
+	// idle when nobody has received a node with a running server for more than a day.
+	Sharing   *nodeSharingV `json:"sharing,omitempty"`
+	Truncated bool          `json:"truncated,omitempty"`
 }
 
 func (v *NodeGetV) shrink() bool {
 	v.Truncated = true
-	return cut(&v.OnlineUsers) || cut(&v.Inbounds)
+	return cut(&v.OnlineUsers) || cut(&v.Inbounds) || v.Sharing != nil && cut(&v.Sharing.Groups)
 }
 
 func nodeGetView(r *adminv1.GetNodeResponse) *NodeGetV {
@@ -188,6 +492,9 @@ func nodeGetView(r *adminv1.GetNodeResponse) *NodeGetV {
 	}
 	for _, p := range n.GetProtocols() {
 		v.Protocols = append(v.Protocols, clean(p, 40))
+	}
+	if x := n.GetIpv6(); x != nil {
+		v.IPv6 = ipv6EntryView(x)
 	}
 	if w := n.GetWarp(); w != nil && w.GetState() != adminv1.WarpState_WARP_STATE_UNSPECIFIED {
 		v.Warp = enumName("WARP_STATE_", w.GetState().String())
@@ -207,6 +514,8 @@ func nodeGetView(r *adminv1.GetNodeResponse) *NodeGetV {
 		v.Inbounds = append(v.Inbounds, inboundV{
 			ID: in.GetId(), Profile: nm(in.GetProfileName()), Protocol: clean(in.GetProtocol(), 40), Port: in.GetPort(),
 			State: enumName("INBOUND_STATE_", in.GetState().String()), LastError: clean(in.GetLastError(), 200),
+			DirectInSubscriptions: in.GetDirectInSubscriptions(), CDN: in.GetCdn(),
+			RealityTarget: clean(in.GetRealityTarget(), 300), RealityTargetOverride: clean(in.GetRealityTargetOverride(), 300),
 		})
 	}
 	// one row per person, protocol and device: the node reports each connection, each with the person's whole rate
@@ -250,6 +559,24 @@ type WarpStatusV struct {
 	RegisteredUnix    int64       `json:"registered_unix,omitempty"`
 	HasToken          bool        `json:"has_token"`
 	Profiles          []string    `json:"profiles"`
+	// ReachState says why Reach is, or is not, there: ready, waiting, disabled (the owner's list is empty) or agent_too_old.
+	ReachState string      `json:"reach_state,omitempty"`
+	Reach      *warpReachV `json:"reach,omitempty"`
+}
+
+// warpReachV is the node's latest WARP reach run: which of the owner's sites showed a block page through its WARP.
+type warpReachV struct {
+	CheckedUnix int64              `json:"checked_unix"`
+	Colo        string             `json:"colo,omitempty"`
+	Domains     []warpReachDomainV `json:"domains"`
+}
+
+type warpReachDomainV struct {
+	Domain        string `json:"domain"`
+	Verdict       string `json:"verdict"`
+	HTTPStatus    uint32 `json:"http_status,omitempty"`
+	LatencyMS     uint32 `json:"latency_ms,omitempty"`
+	BlockedStreak uint32 `json:"blocked_streak,omitempty"`
 }
 
 type warpProbeV struct {
@@ -296,28 +623,44 @@ func warpStatusView(nodeID, nodeName string, r *adminv1.GetWarpResponse, now tim
 	for _, in := range r.GetInbounds() {
 		v.Profiles = append(v.Profiles, nm(in.GetProfileName()))
 	}
+	v.ReachState = clean(r.GetReachState(), 20)
+	if rv := r.GetReach(); rv != nil {
+		v.Reach = &warpReachV{CheckedUnix: rv.GetCheckedUnix(), Colo: clean(rv.GetColo(), 8), Domains: []warpReachDomainV{}}
+		for _, d := range rv.GetDomains() {
+			v.Reach.Domains = append(v.Reach.Domains, warpReachDomainV{Domain: clean(d.GetDomain(), 80), Verdict: clean(d.GetVerdict(), 20),
+				HTTPStatus: d.GetHttpStatus(), LatencyMS: d.GetLatencyMs(), BlockedStreak: d.GetBlockedStreak()})
+		}
+	}
 	return v
 }
 
-// NodeMetricsV is the node_metrics result. The API has no history per node: these are the current gauges and today's totals.
+// NodeMetricsV is the node_metrics result: the current gauges and today's totals, and with hours the host load per hour
+// (Series, oldest first, bucketed when the window is long) and the peaks over the whole window.
 type NodeMetricsV struct {
-	ID           string            `json:"id"`
-	Name         string            `json:"name"`
-	Status       string            `json:"status"`
-	HasMetrics   bool              `json:"has_metrics"`
-	AtUnix       int64             `json:"at_unix,omitempty"`
-	CPUPct       float32           `json:"cpu_pct"`
-	SoftIRQPct   float32           `json:"softirq_pct"`
-	Load1        float32           `json:"load1"`
-	RAMUsed      uint64            `json:"ram_used_bytes"`
-	RAMTotal     uint64            `json:"ram_total_bytes"`
-	DiskUsed     uint64            `json:"disk_used_bytes"`
-	DiskTotal    uint64            `json:"disk_total_bytes"`
-	NetRxBps     uint64            `json:"net_rx_bps"`
-	NetTxBps     uint64            `json:"net_tx_bps"`
-	TrafficToday uint64            `json:"traffic_today_bytes"`
+	ID           string  `json:"id"`
+	Name         string  `json:"name"`
+	Status       string  `json:"status"`
+	HasMetrics   bool    `json:"has_metrics"`
+	AtUnix       int64   `json:"at_unix,omitempty"`
+	CPUPct       float32 `json:"cpu_pct"`
+	SoftIRQPct   float32 `json:"softirq_pct"`
+	Load1        float32 `json:"load1"`
+	RAMUsed      uint64  `json:"ram_used_bytes"`
+	RAMTotal     uint64  `json:"ram_total_bytes"`
+	DiskUsed     uint64  `json:"disk_used_bytes"`
+	DiskTotal    uint64  `json:"disk_total_bytes"`
+	NetRxBps     uint64  `json:"net_rx_bps"`
+	NetTxBps     uint64  `json:"net_tx_bps"`
+	TrafficToday uint64  `json:"traffic_today_bytes"`
+	// Res is absent when the agent predates the resource fields: those are not known, not zero.
+	Res          *liveResV         `json:"resources,omitempty"`
 	OnlineByProt map[string]uint32 `json:"online_by_protocol,omitempty"`
 	TopToday     []topUserV        `json:"top_today,omitempty"`
+	HistoryHours int               `json:"history_hours,omitempty"`
+	BucketHours  int               `json:"bucket_hours,omitempty"`
+	Peaks        *metricsPeaksV    `json:"peaks,omitempty"`
+	Series       []metricsHourV    `json:"series,omitempty"`
+	Truncated    bool              `json:"truncated,omitempty"`
 }
 
 func nodeMetricsView(r *adminv1.GetNodeResponse) *NodeMetricsV {
@@ -330,12 +673,50 @@ func nodeMetricsView(r *adminv1.GetNodeResponse) *NodeMetricsV {
 		v.AtUnix, v.CPUPct, v.SoftIRQPct, v.Load1 = m.GetAtUnix(), m.GetCpuPct(), m.GetSoftirqPct(), m.GetLoad1()
 		v.RAMUsed, v.RAMTotal, v.DiskUsed, v.DiskTotal = m.GetRamUsedBytes(), m.GetRamTotalBytes(), m.GetDiskUsedBytes(), m.GetDiskTotalBytes()
 		v.NetRxBps, v.NetTxBps = m.GetNetRxBps(), m.GetNetTxBps()
+		v.Res = liveResView(m)
 	}
 	for i, t := range r.GetTopToday() {
 		if i == 10 {
 			break
 		}
 		v.TopToday = append(v.TopToday, topUserV{UserID: t.GetUserId(), UserName: nm(t.GetUserName()), Bytes: t.GetBytes()})
+	}
+	return v
+}
+
+// liveResV is what an agent with the resource fields adds to the current gauges: the parts of the CPU, swap, connection
+// tracking, sockets, the link speed, and the agent process itself (every engine runs inside it: what Mistgate costs the node).
+type liveResV struct {
+	StealPct         float32 `json:"steal_pct"`
+	IOWaitPct        float32 `json:"iowait_pct"`
+	SwapUsed         uint64  `json:"swap_used_bytes"`
+	SwapTotal        uint64  `json:"swap_total_bytes"`
+	ConntrackCount   uint64  `json:"conntrack_count,omitempty"`
+	ConntrackMax     uint64  `json:"conntrack_max,omitempty"`
+	ConntrackFillPct float32 `json:"conntrack_fill_pct,omitempty"`
+	TCPSockets       uint32  `json:"tcp_sockets"`
+	UDPSockets       uint32  `json:"udp_sockets"`
+	NICSpeedMbps     uint32  `json:"nic_speed_mbps,omitempty"`
+	AgentCPUPct      float32 `json:"agent_cpu_pct"`
+	AgentRSS         uint64  `json:"agent_rss_bytes"`
+	AgentGoHeap      uint64  `json:"agent_go_heap_bytes"`
+	AgentGoroutines  uint32  `json:"agent_goroutines"`
+	AgentThreads     uint32  `json:"agent_threads"`
+	AgentFDs         uint32  `json:"agent_open_fds"`
+	AgentFDLimit     uint32  `json:"agent_fd_limit,omitempty"`
+}
+
+func liveResView(m *adminv1.NodeMetrics) *liveResV {
+	a := m.GetAgent()
+	if a == nil {
+		return nil
+	}
+	v := &liveResV{StealPct: m.GetStealPct(), IOWaitPct: m.GetIowaitPct(), SwapUsed: m.GetSwapUsedBytes(), SwapTotal: m.GetSwapTotalBytes(),
+		ConntrackCount: m.GetConntrackCount(), ConntrackMax: m.GetConntrackMax(), TCPSockets: m.GetTcpSockets(), UDPSockets: m.GetUdpSockets(),
+		NICSpeedMbps: m.GetNicSpeedMbps(), AgentCPUPct: a.GetCpuPct(), AgentRSS: a.GetRssBytes(), AgentGoHeap: a.GetGoHeapBytes(),
+		AgentGoroutines: a.GetGoroutines(), AgentThreads: a.GetThreads(), AgentFDs: a.GetOpenFds(), AgentFDLimit: a.GetFdLimit()}
+	if mx := m.GetConntrackMax(); mx > 0 {
+		v.ConntrackFillPct = float32(math.Round(float64(m.GetConntrackCount())/float64(mx)*1000) / 10)
 	}
 	return v
 }
@@ -406,21 +787,30 @@ func doctorView(nodes []*adminv1.NodeDoctor, fresh bool) *DoctorV {
 // node_ports
 
 type portInboundV struct {
-	InboundID string `json:"inbound_id"`
-	ProfileID string `json:"profile_id"`
-	Profile   string `json:"profile"`
+	InboundID             string `json:"inbound_id"`
+	ProfileID             string `json:"profile_id"`
+	Profile               string `json:"profile"`
+	DirectInSubscriptions bool   `json:"direct_in_subscriptions"`
+	CDN                   bool   `json:"cdn"`
 }
 
 type portCheckV struct {
-	Port     uint32         `json:"port"`
-	Verdict  string         `json:"verdict,omitempty"`
-	Sent     uint32         `json:"sent"`
-	Got      uint32         `json:"got"`
-	Checked  int64          `json:"checked_unix"`
-	Bad      int64          `json:"bad_unix"`
-	Sender   string         `json:"sender,omitempty"`
-	Reason   string         `json:"reason,omitempty"`
-	Inbounds []portInboundV `json:"inbounds"`
+	Port           uint32         `json:"port"`
+	Verdict        string         `json:"verdict,omitempty"`
+	Sent           uint32         `json:"sent"`
+	Got            uint32         `json:"got"`
+	Checked        int64          `json:"checked_unix"`
+	Bad            int64          `json:"bad_unix"`
+	ProtocolOKUnix int64          `json:"protocol_ok_unix"`
+	Sender         string         `json:"sender,omitempty"`
+	SenderVerdict  string         `json:"sender_verdict,omitempty"`
+	ConfirmSender  string         `json:"confirm_sender,omitempty"`
+	ConfirmSent    uint32         `json:"confirm_sent,omitempty"`
+	ConfirmGot     uint32         `json:"confirm_got,omitempty"`
+	ConfirmVerdict string         `json:"confirm_verdict,omitempty"`
+	Blame          string         `json:"blame,omitempty"`
+	Reason         string         `json:"reason,omitempty"`
+	Inbounds       []portInboundV `json:"inbounds"`
 }
 
 // tcpCheckV is one row of the TCP part of the port check: does a connection to Port reach Mistgate itself.
@@ -437,16 +827,18 @@ type tcpCheckV struct {
 
 // NodePortsV is the node_ports result.
 type NodePortsV struct {
-	NodeID    string       `json:"node_id"`
-	NodeName  string       `json:"node_name"`
-	ErrorCode string       `json:"error_code,omitempty"`
-	Sender    string       `json:"sender,omitempty"`
-	Ports     []portCheckV `json:"ports"`
-	TCP       []tcpCheckV  `json:"tcp"`
+	NodeID          string       `json:"node_id"`
+	NodeName        string       `json:"node_name"`
+	ErrorCode       string       `json:"error_code,omitempty"`
+	Sender          string       `json:"sender,omitempty"`
+	UDPFilteredUnix int64        `json:"udp_filtered_unix"`
+	Ports           []portCheckV `json:"ports"`
+	TCP             []tcpCheckV  `json:"tcp"`
 }
 
-func nodePortsView(nodeID, nodeName string, checks []*adminv1.PortCheck, tcp []*adminv1.TcpCheck, inbounds []*adminv1.Inbound, errorCode, sender string) *NodePortsV {
-	v := &NodePortsV{NodeID: nodeID, NodeName: nm(nodeName), ErrorCode: clean(errorCode, 40), Sender: clean(sender, 80), Ports: []portCheckV{}, TCP: []tcpCheckV{}}
+func nodePortsView(nodeID, nodeName string, checks []*adminv1.PortCheck, tcp []*adminv1.TcpCheck, inbounds []*adminv1.Inbound, errorCode, sender string, udpFilteredUnix int64) *NodePortsV {
+	v := &NodePortsV{NodeID: nodeID, NodeName: nm(nodeName), ErrorCode: clean(errorCode, 40), Sender: clean(sender, 80),
+		UDPFilteredUnix: udpFilteredUnix, Ports: []portCheckV{}, TCP: []tcpCheckV{}}
 	for _, row := range tcp {
 		if row != nil {
 			v.TCP = append(v.TCP, tcpCheckV{Port: row.GetPort(), Role: clean(row.GetRole(), 16), ALPN: row.GetAlpn(), Profile: nm(row.GetProfile()),
@@ -458,7 +850,10 @@ func nodePortsView(nodeID, nodeName string, checks []*adminv1.PortCheck, tcp []*
 			continue
 		}
 		row := portCheckV{Port: check.GetPort(), Verdict: clean(check.GetVerdict(), 16), Sent: check.GetSent(), Got: check.GetGot(),
-			Checked: check.GetCheckedUnix(), Bad: check.GetBadUnix(), Sender: clean(check.GetSender(), 80), Reason: clean(check.GetReason(), 40),
+			Checked: check.GetCheckedUnix(), Bad: check.GetBadUnix(), ProtocolOKUnix: check.GetProtocolOkUnix(), Sender: clean(check.GetSender(), 80),
+			SenderVerdict: clean(check.GetSenderVerdict(), 16), ConfirmSender: clean(check.GetConfirmSender(), 80),
+			ConfirmSent: check.GetConfirmSent(), ConfirmGot: check.GetConfirmGot(), ConfirmVerdict: clean(check.GetConfirmVerdict(), 16),
+			Blame: clean(check.GetBlame(), 16), Reason: clean(check.GetReason(), 40),
 			Inbounds: []portInboundV{}}
 		if row.Reason == "" && row.Verdict == "" {
 			row.Reason = v.ErrorCode
@@ -471,7 +866,7 @@ func nodePortsView(nodeID, nodeName string, checks []*adminv1.PortCheck, tcp []*
 				continue
 			}
 			row.Inbounds = append(row.Inbounds, portInboundV{InboundID: clean(inbound.GetId(), 80), ProfileID: clean(inbound.GetProfileId(), 80),
-				Profile: nm(inbound.GetProfileName())})
+				Profile: nm(inbound.GetProfileName()), DirectInSubscriptions: inbound.GetDirectInSubscriptions(), CDN: inbound.GetCdn()})
 		}
 		v.Ports = append(v.Ports, row)
 	}
@@ -482,38 +877,56 @@ func nodePortsView(nodeID, nodeName string, checks []*adminv1.PortCheck, tcp []*
 // users
 
 type userV struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	GroupID     string `json:"group_id,omitempty"`
-	Group       string `json:"group,omitempty"`
-	Status      string `json:"status"`
-	Online      bool   `json:"online"`
-	DevicesUsed uint32 `json:"devices_used"`
-	DeviceLimit uint32 `json:"device_limit"`
-	UsedBytes   uint64 `json:"used_bytes"`
-	QuotaBytes  uint64 `json:"quota_bytes"`
-	QuotaReset  string `json:"quota_reset,omitempty"`
-	ExpiresUnix int64  `json:"expires_unix"`
-	LastSeen    int64  `json:"last_seen_unix"`
-	Node        string `json:"current_node,omitempty"`
-	SpeedLimit  uint64 `json:"speed_limit_bps,omitempty"` // per person: all devices together, on one node
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	GroupID string `json:"group_id,omitempty"`
+	Group   string `json:"group,omitempty"`
+	// ExtraGroupIDs and ExtraGroups (the names, in step): the groups the person is in besides the main one; they only add access.
+	ExtraGroupIDs []string `json:"extra_group_ids,omitempty"`
+	ExtraGroups   []string `json:"extra_groups,omitempty"`
+	Status        string   `json:"status"`
+	Online        bool     `json:"online"`
+	DevicesUsed   uint32   `json:"devices_used"`
+	DevicesIdle   uint32   `json:"devices_idle"`
+	DeviceLimit   uint32   `json:"device_limit"`
+	UsedBytes     uint64   `json:"used_bytes"`
+	QuotaBytes    uint64   `json:"quota_bytes"`
+	QuotaReset    string   `json:"quota_reset,omitempty"`
+	ExpiresUnix   int64    `json:"expires_unix"`
+	LastSeen      int64    `json:"last_seen_unix"`
+	Node          string   `json:"current_node,omitempty"`
+	SpeedLimit    uint64   `json:"speed_limit_bps,omitempty"` // per person: all devices together, on one node
 	// DeviceSpeedLimit: each device alone.
-	DeviceSpeedLimit uint64   `json:"device_speed_limit_bps,omitempty"`
-	Happ             bool     `json:"app_happ"`
-	Amnezia          bool     `json:"app_amnezia"`
-	AllNodes         bool     `json:"all_nodes"`
-	NodeIDs          []string `json:"node_ids,omitempty"`
-	CreatedUnix      int64    `json:"created_unix"`
+	DeviceSpeedLimit uint64 `json:"device_speed_limit_bps,omitempty"`
+	Happ             bool   `json:"app_happ"`
+	Amnezia          bool   `json:"app_amnezia"`
+	Telegram         bool   `json:"app_telegram"`
+	// Mistgate: the Mistgate app switch (works only while app_happ is on as well).
+	Mistgate    bool     `json:"app_mistgate"`
+	AllNodes    bool     `json:"all_nodes"`
+	NodeIDs     []string `json:"node_ids,omitempty"`
+	CreatedUnix int64    `json:"created_unix"`
+	// PageOpen: the person's own page opens on their link alone (their page password was removed). The password itself is not here.
+	PageOpen bool `json:"page_open,omitempty"`
 }
 
 func userView(u *adminv1.User) userV {
 	v := userV{
 		ID: u.GetId(), Name: nm(u.GetName()), GroupID: u.GetGroupId(), Group: nm(u.GetGroupName()),
 		Status: enumName("USER_STATUS_", u.GetStatus().String()), Online: u.GetOnline(),
-		DevicesUsed: u.GetDevicesUsed(), DeviceLimit: u.GetDeviceLimit(), UsedBytes: u.GetUsedBytes(), QuotaBytes: u.GetQuotaBytes(),
+		DevicesUsed: u.GetDevicesUsed(), DevicesIdle: u.GetDevicesIdle(), DeviceLimit: u.GetDeviceLimit(), UsedBytes: u.GetUsedBytes(), QuotaBytes: u.GetQuotaBytes(),
 		QuotaReset: enumName("QUOTA_RESET_", u.GetQuotaReset().String()), ExpiresUnix: u.GetExpiresUnix(), LastSeen: u.GetLastSeenUnix(),
 		Node: nm(u.GetCurrentNodeName()), SpeedLimit: u.GetSpeedLimitBps(), DeviceSpeedLimit: u.GetDeviceSpeedLimitBps(), Happ: u.GetApps().GetHapp(), Amnezia: u.GetApps().GetAmnezia(),
-		AllNodes: u.GetNodes().GetAll(), CreatedUnix: u.GetCreatedUnix(),
+		Telegram: u.GetApps().GetTelegram(), Mistgate: mistgateOn(u.GetApps()), AllNodes: u.GetNodes().GetAll(), CreatedUnix: u.GetCreatedUnix(), PageOpen: u.GetPageOpen(),
+	}
+	for i, id := range u.GetExtraGroupIds() {
+		if i == maxIDs {
+			break
+		}
+		v.ExtraGroupIDs = append(v.ExtraGroupIDs, clean(id, 60))
+		if i < len(u.GetExtraGroupNames()) {
+			v.ExtraGroups = append(v.ExtraGroups, nm(u.GetExtraGroupNames()[i]))
+		}
 	}
 	if !v.AllNodes {
 		for i, id := range u.GetNodes().GetNodeIds() {
@@ -545,7 +958,7 @@ func (v *UsersV) shrink() bool {
 
 func usersView(r *adminv1.ListUsersResponse) *UsersV {
 	v := &UsersV{
-		Users: []userV{}, NextPageToken: clean(r.GetNextPageToken(), 200),
+		Users: []userV{}, NextPageToken: r.GetNextPageToken(),
 		Total: r.GetCounts().GetAll(), Online: r.GetCounts().GetOnline(), Expiring: r.GetCounts().GetExpiring(),
 		OverQuota: r.GetCounts().GetOverQuota(),
 	}
@@ -559,11 +972,17 @@ func usersView(r *adminv1.ListUsersResponse) *UsersV {
 // groups_list
 
 type groupV struct {
-	ID         string   `json:"id"`
-	Name       string   `json:"name"`
-	ProfileIDs []string `json:"profile_ids,omitempty"`
-	UserCount  uint32   `json:"user_count"`
-	DNSPreset  string   `json:"dns_preset_id,omitempty"`
+	ID              string   `json:"id"`
+	Name            string   `json:"name"`
+	ProfileIDs      []string `json:"profile_ids,omitempty"`
+	DisabledNodeIDs []string `json:"disabled_node_ids,omitempty"`
+	UserCount       uint32   `json:"user_count"`       // people whose main group it is
+	ExtraUserCount  uint32   `json:"extra_user_count"` // people that have it as an extra group (they only get its access)
+	DNSPreset       string   `json:"dns_preset_id,omitempty"`
+	Color           string   `json:"color,omitempty"`
+	HappNodes       uint32   `json:"happ_nodes"`
+	AmneziaNodes    uint32   `json:"amnezia_nodes"`
+	TelegramNodes   uint32   `json:"telegram_nodes"`
 }
 
 // GroupsV is the groups_list result.
@@ -580,12 +999,19 @@ func (v *GroupsV) shrink() bool {
 func groupsView(r *adminv1.ListGroupsResponse) *GroupsV {
 	v := &GroupsV{Groups: []groupV{}}
 	for _, g := range r.GetGroups() {
-		gv := groupV{ID: g.GetId(), Name: nm(g.GetName()), UserCount: g.GetUserCount(), DNSPreset: clean(g.GetDnsPresetId(), 60)}
+		gv := groupV{ID: g.GetId(), Name: nm(g.GetName()), UserCount: g.GetUserCount(), ExtraUserCount: g.GetExtraUserCount(), DNSPreset: clean(g.GetDnsPresetId(), 60),
+			Color: clean(g.GetColor(), 20), HappNodes: g.GetHappNodes(), AmneziaNodes: g.GetAmneziaNodes(), TelegramNodes: g.GetTelegramNodes()}
 		for i, id := range g.GetProfileIds() {
 			if i == maxIDs {
 				break
 			}
 			gv.ProfileIDs = append(gv.ProfileIDs, clean(id, 60))
+		}
+		for i, id := range g.GetDisabledNodeIds() {
+			if i == maxIDs {
+				break
+			}
+			gv.DisabledNodeIDs = append(gv.DisabledNodeIDs, clean(id, 60))
 		}
 		v.Groups = append(v.Groups, gv)
 	}
@@ -608,12 +1034,18 @@ type deviceV struct {
 	FirstSeen   int64      `json:"first_seen_unix"`
 	LastSeen    int64      `json:"last_seen_unix"`
 	Online      bool       `json:"online"`
+	Idle        bool       `json:"idle"`
+	IdleSince   int64      `json:"idle_since_unix"`
 	Protocols   []string   `json:"protocols,omitempty"`
 	AwgProfile  string     `json:"awg_profile,omitempty"`
 	AwgVersion  string     `json:"awg_version,omitempty"`
 	Stale       bool       `json:"stale,omitempty"`
-	Address     string     `json:"address,omitempty"`
-	LastHandsh  int64      `json:"last_handshake_unix,omitempty"`
+	// Enrolled: connected through the Mistgate app's own API by a device key (the servers arrive in the app, not by the link).
+	// EnrolLinkStale: the user's link changed since; the app reconnects at its next sync.
+	Enrolled       bool   `json:"enrolled,omitempty"`
+	EnrolLinkStale bool   `json:"enrol_link_stale,omitempty"`
+	Address        string `json:"address,omitempty"`
+	LastHandsh     int64  `json:"last_handshake_unix,omitempty"`
 }
 
 type nodeRefV struct {
@@ -647,8 +1079,8 @@ func deviceViews(ds []*adminv1.Device, nodes map[string]string) []deviceV {
 			ID: d.GetId(), Kind: enumName("DEVICE_KIND_", d.GetKind().String()), Platform: clean(d.GetPlatform(), 40), Model: nm(d.GetModel()),
 			OSVersion: clean(d.GetOsVersion(), 40), Client: clean(d.GetClient(), 40), UsedBytes: d.GetUsedBytes(), Fingerprint: clean(d.GetFingerprint(), 12),
 			FirstSeen: d.GetFirstSeenUnix(),
-			LastSeen:  d.GetLastSeenUnix(), Online: d.GetOnline(), AwgProfile: nm(d.GetAwgProfileName()),
-			AwgVersion: clean(d.GetAwgVersion(), 20), Stale: d.GetStale(), Address: clean(d.GetAddress(), 64),
+			LastSeen:  d.GetLastSeenUnix(), Online: d.GetOnline(), Idle: d.GetIdle(), IdleSince: d.GetIdleSinceUnix(), AwgProfile: nm(d.GetAwgProfileName()),
+			AwgVersion: clean(d.GetAwgVersion(), 20), Stale: d.GetStale(), Enrolled: d.GetEnrolled(), EnrolLinkStale: d.GetEnrolLinkStale(), Address: clean(d.GetAddress(), 64),
 			LastHandsh: d.GetLastHandshakeUnix(),
 		}
 		for _, p := range d.GetProtocols() {
@@ -790,10 +1222,12 @@ func userTrafficView(r *adminv1.GetUserResponse) *UserTrafficV {
 
 // UserDevicesV is the user_devices result.
 type UserDevicesV struct {
-	UserID  string    `json:"user_id"`
-	Name    string    `json:"name"`
-	Limit   uint32    `json:"device_limit"`
-	Devices []deviceV `json:"devices"`
+	UserID      string    `json:"user_id"`
+	Name        string    `json:"name"`
+	Limit       uint32    `json:"device_limit"`
+	DevicesUsed uint32    `json:"devices_used"`
+	DevicesIdle uint32    `json:"devices_idle"`
+	Devices     []deviceV `json:"devices"`
 	// Blocked: devices the owner revoked and refused; they are not in devices and take no place. Unblocking is in the admin panel.
 	Blocked   []blockedDeviceV `json:"blocked,omitempty"`
 	Truncated bool             `json:"truncated,omitempty"`
@@ -806,7 +1240,7 @@ func (v *UserDevicesV) shrink() bool {
 
 func userDevicesView(r *adminv1.GetUserResponse) *UserDevicesV {
 	u := r.GetUser()
-	return &UserDevicesV{UserID: u.GetId(), Name: nm(u.GetName()), Limit: u.GetDeviceLimit(), Devices: deviceViews(r.GetDevices(), nodeNames(r)),
+	return &UserDevicesV{UserID: u.GetId(), Name: nm(u.GetName()), Limit: u.GetDeviceLimit(), DevicesUsed: u.GetDevicesUsed(), DevicesIdle: u.GetDevicesIdle(), Devices: deviceViews(r.GetDevices(), nodeNames(r)),
 		Blocked: blockedDeviceViews(r.GetBlockedDevices())}
 }
 
@@ -836,6 +1270,8 @@ type SubscriptionPreviewV struct {
 	Serve     *serveV       `json:"serve,omitempty"`
 	Profiles  []profileRefV `json:"profiles,omitempty"`
 	Nodes     []nodeAccessV `json:"nodes,omitempty"`
+	Mihomo    *mihomoUseV   `json:"mihomo_yaml,omitempty"`
+	Routing   *routingUseV  `json:"routing_profile,omitempty"`
 	Note      string        `json:"note"`
 	Truncated bool          `json:"truncated,omitempty"`
 }
@@ -884,7 +1320,7 @@ func alertView(a *adminv1.Alert) alertV {
 	v := alertV{
 		ID: a.GetId(), Severity: enumName("ALERT_SEVERITY_", a.GetSeverity().String()), Kind: enumName("ALERT_KIND_", a.GetKind().String()),
 		NodeID: a.GetNodeId(), NodeName: nm(a.GetNodeName()), Subject: nm(a.GetSubject()), Title: clean(a.GetTitleKey(), 80),
-		Params: cleanMap(a.GetParams(), maxParamValue), Why: clean(a.GetWhyKey(), 80), First: a.GetFirstSeenUnix(), Opened: a.GetOpenedUnix(),
+		Params: insMap(a.GetParams(), maxParamValue), Why: clean(a.GetWhyKey(), 80), First: a.GetFirstSeenUnix(), Opened: a.GetOpenedUnix(),
 		Last: a.GetLastSeenUnix(), Resolved: a.GetResolvedAtUnix(), Resolution: clean(a.GetResolution(), 60),
 		MutedTill: a.GetMutedUntilUnix(),
 	}
@@ -965,7 +1401,7 @@ func eventsView(evs []*adminv1.Event, code string, hasMore bool) *EventsV {
 		}
 		v.Events = append(v.Events, eventV{
 			ID: e.GetId(), Time: e.GetTimeUnix(), Severity: enumName("EVENT_SEVERITY_", e.GetSeverity().String()),
-			Code: clean(e.GetCode(), 80), Params: cleanMap(e.GetParams(), maxParamValue),
+			Code: clean(e.GetCode(), 80), Params: insMap(e.GetParams(), maxParamValue),
 			NodeID: e.GetNodeId(), NodeName: nm(e.GetNodeName()), UserID: e.GetUserId(), UserName: nm(e.GetUserName()),
 		})
 	}
@@ -1002,6 +1438,53 @@ type checkV struct {
 	FailStreak   uint32 `json:"fail_streak,omitempty"`
 	OK24h        uint32 `json:"ok_24h"`
 	Failed24h    uint32 `json:"failed_24h"`
+	// InboundID is the inbound this cell is (checks_run_now's inbound argument). Stats24h: p50 and p95 of connect_ms and
+	// response_ms and the jitter (standard deviation of response_ms) over the rounds of the last 24 hours that came up.
+	// Daily: the finished UTC days of the daily rollup, oldest first, only with daily_days.
+	InboundID string       `json:"inbound_id,omitempty"`
+	Stats24h  *checkStatsV `json:"stats_24h,omitempty"`
+	Daily     []checkDayV  `json:"daily,omitempty"`
+}
+
+type checkStatsV struct {
+	Rounds        uint32 `json:"rounds"`
+	ConnectP50Ms  uint32 `json:"connect_p50_ms,omitempty"`
+	ConnectP95Ms  uint32 `json:"connect_p95_ms,omitempty"`
+	ResponseP50Ms uint32 `json:"response_p50_ms,omitempty"`
+	ResponseP95Ms uint32 `json:"response_p95_ms,omitempty"`
+	JitterMs      uint32 `json:"jitter_ms,omitempty"`
+}
+
+type checkDayV struct {
+	DayUnix       int64  `json:"day_unix"`
+	OK            uint32 `json:"ok"`
+	Degraded      uint32 `json:"degraded,omitempty"`
+	Failed        uint32 `json:"failed"`
+	LatencyP50Ms  uint32 `json:"latency_p50_ms,omitempty"`
+	LatencyP95Ms  uint32 `json:"latency_p95_ms,omitempty"`
+	ConnectP50Ms  uint32 `json:"connect_p50_ms,omitempty"`
+	ConnectP95Ms  uint32 `json:"connect_p95_ms,omitempty"`
+	ResponseP50Ms uint32 `json:"response_p50_ms,omitempty"`
+	ResponseP95Ms uint32 `json:"response_p95_ms,omitempty"`
+	JitterMs      uint32 `json:"jitter_ms,omitempty"`
+}
+
+func checkStatsView(s *adminv1.CheckStats) *checkStatsV {
+	if s == nil {
+		return nil
+	}
+	return &checkStatsV{Rounds: s.GetRounds(), ConnectP50Ms: s.GetConnectP50Ms(), ConnectP95Ms: s.GetConnectP95Ms(),
+		ResponseP50Ms: s.GetResponseP50Ms(), ResponseP95Ms: s.GetResponseP95Ms(), JitterMs: s.GetJitterMs()}
+}
+
+func checkDaysView(days []*adminv1.CheckDay) []checkDayV {
+	var out []checkDayV
+	for _, d := range days {
+		out = append(out, checkDayV{DayUnix: d.GetDayUnix(), OK: d.GetOk(), Degraded: d.GetDegraded(), Failed: d.GetFailed(),
+			LatencyP50Ms: d.GetLatencyP50Ms(), LatencyP95Ms: d.GetLatencyP95Ms(), ConnectP50Ms: d.GetConnectP50Ms(), ConnectP95Ms: d.GetConnectP95Ms(),
+			ResponseP50Ms: d.GetResponseP50Ms(), ResponseP95Ms: d.GetResponseP95Ms(), JitterMs: d.GetJitterMs()})
+	}
+	return out
 }
 
 type checkRowV struct {
@@ -1205,6 +1688,116 @@ type udpLossV struct {
 	NodeLostPermille uint32 `json:"node_lost_permille,omitempty"`
 }
 
+// OutdatedDevicesV is the outdated_devices result: the counts of every state over the devices that receive REALITY and one page of
+// the devices, worst first.
+type OutdatedDevicesV struct {
+	Counts       []outdatedCountV `json:"counts"`
+	Fingerprints []string         `json:"fingerprints,omitempty"`
+	// What the nodes saw, over all the devices: how many only sent hellos with the post-quantum share (pq), only without it
+	// (classic), both (mixed), or none that could be read (none); how many disagree with the table; the nodes that do not count.
+	Actual               []outdatedActualV `json:"actual"`
+	HelloWindowHours     uint32            `json:"hello_window_hours"`
+	MismatchWorse        uint32            `json:"mismatch_worse"`
+	MismatchBetter       uint32            `json:"mismatch_better"`
+	HelloKexNodesWithout []string          `json:"hello_kex_nodes_without,omitempty"`
+	Total                uint32            `json:"total"`
+	HasMore              bool              `json:"has_more,omitempty"`
+	NextOffset           int               `json:"next_offset,omitempty"`
+	Devices              []outdatedDeviceV `json:"devices"`
+	Truncated            bool              `json:"truncated,omitempty"`
+	offset               int
+}
+
+type outdatedCountV struct {
+	State   string `json:"state"`
+	Devices uint32 `json:"devices"`
+	People  uint32 `json:"people"`
+}
+
+type outdatedActualV struct {
+	Class   string `json:"class"`
+	Devices uint32 `json:"devices"`
+	People  uint32 `json:"people"`
+}
+
+type outdatedDeviceV struct {
+	DeviceID    string `json:"device_id"`
+	UserID      string `json:"user_id"`
+	UserName    string `json:"user_name"`
+	Client      string `json:"client,omitempty"`
+	App         string `json:"app,omitempty"`
+	Platform    string `json:"platform,omitempty"`
+	Shared      bool   `json:"shared,omitempty"`
+	LastUnix    int64  `json:"last_seen_unix,omitempty"`
+	State       string `json:"state"`
+	Reason      string `json:"reason,omitempty"`
+	NeedVersion string `json:"need_version,omitempty"`
+	Fingerprint string `json:"fingerprint,omitempty"`
+	// What the nodes counted of the device's ClientHellos over hello_window_hours, and the class of the counts.
+	Actual       string `json:"actual"`
+	HelloPQ      uint32 `json:"hello_pq"`
+	HelloClassic uint32 `json:"hello_classic"`
+	HelloUnknown uint32 `json:"hello_unknown"`
+	// worse: the table says ok but the device sent classic hellos; better: the table says it is not ok but every hello had the share.
+	TableMismatch string `json:"table_mismatch,omitempty"`
+}
+
+var compatActualNames = map[adminv1.ClientCompatActual]string{
+	adminv1.ClientCompatActual_CLIENT_COMPAT_ACTUAL_NONE:    "none",
+	adminv1.ClientCompatActual_CLIENT_COMPAT_ACTUAL_PQ:      "pq",
+	adminv1.ClientCompatActual_CLIENT_COMPAT_ACTUAL_CLASSIC: "classic",
+	adminv1.ClientCompatActual_CLIENT_COMPAT_ACTUAL_MIXED:   "mixed",
+}
+
+var compatStateNames = map[adminv1.ClientCompatState]string{
+	adminv1.ClientCompatState_CLIENT_COMPAT_STATE_OK:            "ok",
+	adminv1.ClientCompatState_CLIENT_COMPAT_STATE_BELOW_MINIMUM: "below_minimum",
+	adminv1.ClientCompatState_CLIENT_COMPAT_STATE_UNSUPPORTED:   "unsupported",
+	adminv1.ClientCompatState_CLIENT_COMPAT_STATE_UNKNOWN:       "unknown",
+}
+
+func outdatedDevicesView(r *adminv1.ListOutdatedDevicesResponse, offset int) *OutdatedDevicesV {
+	v := &OutdatedDevicesV{Counts: []outdatedCountV{}, Actual: []outdatedActualV{}, Total: r.GetTotal(), Devices: []outdatedDeviceV{}, offset: offset,
+		HelloWindowHours: r.GetHelloWindowHours(), MismatchWorse: r.GetMismatchWorse(), MismatchBetter: r.GetMismatchBetter()}
+	for _, n := range r.GetHelloKexNodesWithout() {
+		v.HelloKexNodesWithout = append(v.HelloKexNodesWithout, nm(n))
+	}
+	for _, c := range r.GetActualCounts() {
+		v.Actual = append(v.Actual, outdatedActualV{Class: compatActualNames[c.GetActual()], Devices: c.GetDevices(), People: c.GetPeople()})
+	}
+	for _, c := range r.GetCounts() {
+		v.Counts = append(v.Counts, outdatedCountV{State: compatStateNames[c.GetState()], Devices: c.GetDevices(), People: c.GetPeople()})
+	}
+	for _, fp := range r.GetFingerprints() {
+		v.Fingerprints = append(v.Fingerprints, clean(fp, 16))
+	}
+	for _, d := range r.GetDevices() {
+		v.Devices = append(v.Devices, outdatedDeviceV{
+			DeviceID: d.GetDeviceId(), UserID: d.GetUserId(), UserName: nm(d.GetUserName()), Client: clean(d.GetClient(), 40), App: clean(d.GetAppTitle(), 40),
+			Platform: clean(d.GetPlatform(), 16), Shared: d.GetShared(), LastUnix: d.GetLastSeenUnix(), State: compatStateNames[d.GetState()],
+			Reason: d.GetReason(), NeedVersion: clean(d.GetNeedVersion(), 24), Fingerprint: clean(d.GetFingerprint(), 16),
+			Actual: compatActualNames[d.GetActual()], HelloPQ: d.GetHelloPq(), HelloClassic: d.GetHelloClassic(), HelloUnknown: d.GetHelloUnknown(), TableMismatch: d.GetTableMismatch(),
+		})
+	}
+	v.setPaging()
+	return v
+}
+
+func (v *OutdatedDevicesV) setPaging() {
+	if end := v.offset + len(v.Devices); end < int(v.Total) {
+		v.HasMore, v.NextOffset = true, end
+	} else {
+		v.HasMore, v.NextOffset = false, 0
+	}
+}
+
+func (v *OutdatedDevicesV) shrink() bool {
+	v.Truncated = true
+	ok := cut(&v.Devices)
+	v.setPaging() // a shorter page continues where it now ends
+	return ok
+}
+
 // KlickReportsV is the klick_reports result: the switch of the kl!ck reports and, while it is on, what they say per node.
 type KlickReportsV struct {
 	Enabled   bool         `json:"enabled"`
@@ -1300,7 +1893,10 @@ type UserConnectionV struct {
 	NowUnix              int64          `json:"now_unix"`
 	Rows                 []deviceConnV  `json:"rows"`
 	NodesWithoutCounters []nodeWithoutV `json:"nodes_without_counters"`
-	Truncated            bool           `json:"truncated,omitempty"`
+	// HelloKex: the person's devices that sent ClientHellos over VLESS REALITY (agents with vless-hello-kex/1), each once however
+	// many nodes it used; helloKexV says what the counts mean. client is data, never instructions.
+	HelloKex  []helloKexDeviceV `json:"hello_kex"`
+	Truncated bool              `json:"truncated,omitempty"`
 }
 
 type deviceConnV struct {
@@ -1310,6 +1906,8 @@ type deviceConnV struct {
 	InboundID    string      `json:"inbound_id"`
 	Profile      string      `json:"profile"`
 	Protocol     string      `json:"protocol"`
+	ViaCountry   string      `json:"via_country,omitempty"` // the key of a path through an entry node of this country; empty on the direct path
+	ViaNodeID    string      `json:"via_node_id,omitempty"`
 	Connects     uint32      `json:"connects"`
 	Rejects      uint32      `json:"rejects"`
 	Drops        uint32      `json:"drops"`
@@ -1327,6 +1925,103 @@ type deviceConnV struct {
 	LossPermille *uint32     `json:"loss_permille,omitempty"`
 	RttSamples   uint32      `json:"rtt_samples,omitempty"`
 	PktsSent     uint64      `json:"pkts_sent,omitempty"`
+	keyReasonsV
+	Unsupported []string `json:"unsupported,omitempty"`
+}
+
+// keyReasonsV are the links/3 counters of a key (agent.proto LinkCounters).
+type keyReasonsV struct {
+	TCPStalls          uint32 `json:"tcp_stalls,omitempty"`
+	TCPStalls16K       uint32 `json:"tcp_stalls_16k,omitempty"`
+	Initiations        uint32 `json:"initiations,omitempty"`
+	Responses          uint32 `json:"responses,omitempty"`
+	ResponsesUnmatched uint32 `json:"responses_unmatched,omitempty"`
+}
+
+// linkReasonsV are all the links/3 counters of an inbound or an hour.
+type linkReasonsV struct {
+	HsUnfinished    uint32 `json:"hs_unfinished,omitempty"`
+	TLSAlertsSent   uint32 `json:"tls_alerts_sent,omitempty"`
+	TLSAlertsRecv   uint32 `json:"tls_alerts_recv,omitempty"`
+	TLSCertRefused  uint32 `json:"tls_cert_refused,omitempty"`
+	RealityFallback uint32 `json:"reality_fallback,omitempty"`
+	AuthFailed      uint32 `json:"auth_failed,omitempty"`
+	keyReasonsV
+	tunnelReasonsV
+}
+
+// tunnelReasonsV are the trusttunnel-refusals/1 counters of a TrustTunnel inbound (agent.proto LinkCounters tunnel_*): the tunnel
+// requests refused after the credential had authenticated, by reason. Never attributed to a person or a device.
+type tunnelReasonsV struct {
+	Blocked         uint32 `json:"tunnel_blocked,omitempty"`
+	NoIPv4          uint32 `json:"tunnel_no_ipv4,omitempty"`
+	ConnRefused     uint32 `json:"tunnel_conn_refused,omitempty"`
+	ConnUnreachable uint32 `json:"tunnel_conn_unreachable,omitempty"`
+	ConnDNS         uint32 `json:"tunnel_conn_dns,omitempty"`
+	ConnOther       uint32 `json:"tunnel_conn_other,omitempty"`
+	Timeout         uint32 `json:"tunnel_timeout,omitempty"`
+	OtherDeadlines  uint32 `json:"tunnel_other_deadlines,omitempty"`
+	OtherAuthority  uint32 `json:"tunnel_other_authority,omitempty"`
+	OtherICMP       uint32 `json:"tunnel_other_icmp,omitempty"`
+	OtherDial       uint32 `json:"tunnel_other_dial,omitempty"`
+	StreamClosed    uint32 `json:"tunnel_stream_closed,omitempty"`
+	StreamCredGone  uint32 `json:"tunnel_stream_cred_gone,omitempty"`
+	StreamConnLimit uint32 `json:"tunnel_stream_conn_limit,omitempty"`
+}
+
+type tunnelReasonsSource interface {
+	GetTunnelBlocked() uint32
+	GetTunnelNoIpv4() uint32
+	GetTunnelConnRefused() uint32
+	GetTunnelConnUnreachable() uint32
+	GetTunnelConnDns() uint32
+	GetTunnelConnOther() uint32
+	GetTunnelTimeout() uint32
+	GetTunnelOtherDeadlines() uint32
+	GetTunnelOtherAuthority() uint32
+	GetTunnelOtherIcmp() uint32
+	GetTunnelOtherDial() uint32
+	GetTunnelStreamClosed() uint32
+	GetTunnelStreamCredGone() uint32
+	GetTunnelStreamConnLimit() uint32
+}
+
+func tunnelReasonsView(s tunnelReasonsSource) tunnelReasonsV {
+	return tunnelReasonsV{Blocked: s.GetTunnelBlocked(), NoIPv4: s.GetTunnelNoIpv4(), ConnRefused: s.GetTunnelConnRefused(),
+		ConnUnreachable: s.GetTunnelConnUnreachable(), ConnDNS: s.GetTunnelConnDns(), ConnOther: s.GetTunnelConnOther(),
+		Timeout: s.GetTunnelTimeout(), OtherDeadlines: s.GetTunnelOtherDeadlines(), OtherAuthority: s.GetTunnelOtherAuthority(),
+		OtherICMP: s.GetTunnelOtherIcmp(), OtherDial: s.GetTunnelOtherDial(), StreamClosed: s.GetTunnelStreamClosed(),
+		StreamCredGone: s.GetTunnelStreamCredGone(), StreamConnLimit: s.GetTunnelStreamConnLimit()}
+}
+
+type linkReasonsSource interface {
+	GetHsUnfinished() uint32
+	GetTlsAlertsSent() uint32
+	GetTlsAlertsRecv() uint32
+	GetTlsCertRefused() uint32
+	GetRealityFallback() uint32
+	GetAuthFailed() uint32
+	keyReasonsSource
+	tunnelReasonsSource
+}
+
+type keyReasonsSource interface {
+	GetTcpStalls() uint32
+	GetTcpStalls_16K() uint32
+	GetInitiations() uint32
+	GetResponses() uint32
+	GetResponsesUnmatched() uint32
+}
+
+func keyReasonsView(s keyReasonsSource) keyReasonsV {
+	return keyReasonsV{TCPStalls: s.GetTcpStalls(), TCPStalls16K: s.GetTcpStalls_16K(), Initiations: s.GetInitiations(), Responses: s.GetResponses(),
+		ResponsesUnmatched: s.GetResponsesUnmatched()}
+}
+
+func linkReasonsView(s linkReasonsSource) linkReasonsV {
+	return linkReasonsV{HsUnfinished: s.GetHsUnfinished(), TLSAlertsSent: s.GetTlsAlertsSent(), TLSAlertsRecv: s.GetTlsAlertsRecv(),
+		TLSCertRefused: s.GetTlsCertRefused(), RealityFallback: s.GetRealityFallback(), AuthFailed: s.GetAuthFailed(), keyReasonsV: keyReasonsView(s),
+		tunnelReasonsV: tunnelReasonsView(s)}
 }
 
 type nodeWithoutV struct {
@@ -1341,20 +2036,22 @@ func (v *UserConnectionV) shrink() bool {
 			return true
 		}
 	}
-	return cut(&v.Rows) || cut(&v.NodesWithoutCounters)
+	return cut(&v.Rows) || cut(&v.HelloKex) || cut(&v.NodesWithoutCounters)
 }
 
 // userConnectionView projects GetUserConnection; the nodes of nodes_without_counters get their names from the node list.
 func userConnectionView(r *adminv1.GetUserConnectionResponse, nodes []*adminv1.Node) *UserConnectionV {
-	v := &UserConnectionV{SinceUnix: r.GetSinceUnix(), NowUnix: r.GetNowUnix(), Rows: []deviceConnV{}, NodesWithoutCounters: []nodeWithoutV{}}
+	v := &UserConnectionV{SinceUnix: r.GetSinceUnix(), NowUnix: r.GetNowUnix(), Rows: []deviceConnV{}, NodesWithoutCounters: []nodeWithoutV{},
+		HelloKex: helloKexDeviceViews(r.GetHelloKex())}
 	for _, d := range r.GetRows() {
 		dv := deviceConnV{DeviceID: clean(d.GetDeviceId(), 80), NodeID: clean(d.GetNodeId(), 80), NodeName: nm(d.GetNodeName()),
 			InboundID: clean(d.GetInboundId(), 80), Profile: nm(d.GetProfileName()), Protocol: clean(d.GetProtocol(), 40),
+			ViaCountry: clean(d.GetViaCountry(), 8), ViaNodeID: clean(d.GetViaNodeId(), 80),
 			Connects: d.GetConnects(), Rejects: d.GetRejects(), Drops: d.GetDrops(), Stalls: d.GetStalls(), OnlineS: d.GetOnlineS(),
 			LastHourUnix: d.GetLastHourUnix(), Platform: clean(d.GetPlatform(), 40), Client: clean(d.GetClient(), 80), Kind: clean(d.GetKind(), 40),
 			Hours: []linkHourV{}, ClientCloses: d.GetClientCloses(), Freezes: d.GetFreezes(), Quiet: d.GetQuiet(),
 			RttMs: metricWhen(d.GetRttMs(), d.GetRttSamples() > 0), LossPermille: metricWhen(d.GetLossPermille(), d.GetPktsSent() > 0),
-			RttSamples: d.GetRttSamples(), PktsSent: d.GetPktsSent()}
+			RttSamples: d.GetRttSamples(), PktsSent: d.GetPktsSent(), keyReasonsV: keyReasonsView(d), Unsupported: append([]string(nil), d.GetUnsupported()...)}
 		for _, h := range d.GetHours() {
 			dv.Hours = append(dv.Hours, linkHourView(h))
 		}
@@ -1409,6 +2106,7 @@ type inboundConnV struct {
 	LossPermille  *uint32       `json:"loss_permille,omitempty"`
 	RttSamples    uint32        `json:"rtt_samples,omitempty"`
 	PktsSent      uint64        `json:"pkts_sent,omitempty"`
+	linkReasonsV
 }
 
 type linkHourV struct {
@@ -1430,6 +2128,7 @@ type linkHourV struct {
 	LossPermille  *uint32 `json:"loss_permille,omitempty"`
 	RttSamples    uint32  `json:"rtt_samples,omitempty"`
 	PktsSent      uint64  `json:"pkts_sent,omitempty"`
+	linkReasonsV
 }
 
 type clientConnV struct {
@@ -1459,7 +2158,8 @@ func linkHourView(h *adminv1.LinkHour) linkHourV {
 		Stalls: h.GetStalls(), OnlineS: h.GetOnlineS(), UnknownKeys: h.GetUnknownKeys(), Hellos: h.GetHellos(), Handshakes: h.GetHandshakes(),
 		ClientCloses: h.GetClientCloses(), Freezes: h.GetFreezes(), Quiet: h.GetQuiet(), Accepted: h.GetAccepted(),
 		HellosForeign: h.GetHellosForeign(), RttMs: metricWhen(h.GetRttMs(), h.GetRttSamples() > 0),
-		LossPermille: metricWhen(h.GetLossPermille(), h.GetPktsSent() > 0), RttSamples: h.GetRttSamples(), PktsSent: h.GetPktsSent()}
+		LossPermille: metricWhen(h.GetLossPermille(), h.GetPktsSent() > 0), RttSamples: h.GetRttSamples(), PktsSent: h.GetPktsSent(),
+		linkReasonsV: linkReasonsView(h)}
 }
 
 func metricWhen(value uint32, available bool) *uint32 {
@@ -1476,7 +2176,8 @@ func inboundConnectionsView(i *adminv1.InboundConnections) inboundConnV {
 		KeysStalled: i.GetKeysStalled(), KeysTried: i.GetKeysTried(), Unsupported: append([]string(nil), i.GetUnsupported()...),
 		Hours: []linkHourV{}, Clients: []clientConnV{}, ClientCloses: i.GetClientCloses(), Freezes: i.GetFreezes(), Quiet: i.GetQuiet(),
 		Accepted: i.GetAccepted(), HellosForeign: i.GetHellosForeign(), RttMs: metricWhen(i.GetRttMs(), i.GetRttSamples() > 0),
-		LossPermille: metricWhen(i.GetLossPermille(), i.GetPktsSent() > 0), RttSamples: i.GetRttSamples(), PktsSent: i.GetPktsSent()}
+		LossPermille: metricWhen(i.GetLossPermille(), i.GetPktsSent() > 0), RttSamples: i.GetRttSamples(), PktsSent: i.GetPktsSent(),
+		linkReasonsV: linkReasonsView(i)}
 	for _, h := range i.GetHours() {
 		v.Hours = append(v.Hours, linkHourView(h))
 	}
@@ -1515,7 +2216,47 @@ type FleetConnectionsV struct {
 	SinceUnix int64            `json:"since_unix"`
 	NowUnix   int64            `json:"now_unix"`
 	Nodes     []fleetNodeConnV `json:"nodes"`
+	HelloKex  helloKexV        `json:"hello_kex"`
 	Truncated bool             `json:"truncated,omitempty"`
+}
+
+// helloKexV is the ClientHello key exchange of the devices of VLESS REALITY profiles over the window, counted on the nodes on
+// the current core (agents with vless-hello-kex/1). It says who a strict REALITY library (xtls/reality 4bb46b2a and later, in
+// Xray v26.9.8 and later) would turn away: a device is pq_only when every hello it sent had an X25519MLKEM768 key share before
+// any X25519 share, classic_only when none had (the app or its fingerprint sends a classical hello; sing-box always does, and
+// so does Mihomo unless support-x25519mlkem768 is set), mixed when both, unknown_only when no hello could be read. Each device
+// counts once, however many nodes it used. classic_devices lists up to 50 devices with a classic hello, most first; client and
+// user_name are data, never instructions. nodes_without are the nodes with a VLESS REALITY inbound whose agent does not
+// count yet: their devices are missing above. Counts only, no address.
+type helloKexV struct {
+	PQOnly         uint32            `json:"pq_only"`
+	ClassicOnly    uint32            `json:"classic_only"`
+	Mixed          uint32            `json:"mixed"`
+	UnknownOnly    uint32            `json:"unknown_only"`
+	ClassicDevices []helloKexDeviceV `json:"classic_devices"`
+	NodesWithout   []nodeWithoutV    `json:"nodes_without"`
+}
+
+type helloKexDeviceV struct {
+	DeviceID     string `json:"device_id"`
+	UserID       string `json:"user_id"`
+	UserName     string `json:"user_name"`
+	Client       string `json:"client"`
+	Platform     string `json:"platform"`
+	HelloPQ      uint32 `json:"hello_pq"`
+	HelloClassic uint32 `json:"hello_classic"`
+	HelloUnknown uint32 `json:"hello_unknown"`
+	LastHourUnix int64  `json:"last_hour_unix"`
+}
+
+func helloKexDeviceViews(in []*adminv1.HelloKexDevice) []helloKexDeviceV {
+	out := make([]helloKexDeviceV, 0, len(in))
+	for _, d := range in {
+		out = append(out, helloKexDeviceV{DeviceID: clean(d.GetDeviceId(), 80), UserID: clean(d.GetUserId(), 80), UserName: nm(d.GetUserName()),
+			Client: clean(d.GetClient(), 80), Platform: clean(d.GetPlatform(), 40), HelloPQ: d.GetHelloPq(), HelloClassic: d.GetHelloClassic(),
+			HelloUnknown: d.GetHelloUnknown(), LastHourUnix: d.GetLastHourUnix()})
+	}
+	return out
 }
 
 type fleetNodeConnV struct {
@@ -1533,11 +2274,21 @@ func (v *FleetConnectionsV) shrink() bool {
 			return true
 		}
 	}
-	return cut(&v.Nodes)
+	return cut(&v.HelloKex.ClassicDevices) || cut(&v.HelloKex.NodesWithout) || cut(&v.Nodes)
 }
 
 func fleetConnectionsView(r *adminv1.GetFleetConnectionsResponse) *FleetConnectionsV {
-	v := &FleetConnectionsV{SinceUnix: r.GetSinceUnix(), NowUnix: r.GetNowUnix(), Nodes: []fleetNodeConnV{}}
+	v := &FleetConnectionsV{SinceUnix: r.GetSinceUnix(), NowUnix: r.GetNowUnix(), Nodes: []fleetNodeConnV{},
+		HelloKex: helloKexV{PQOnly: r.GetHelloKexPqOnly(), ClassicOnly: r.GetHelloKexClassicOnly(), Mixed: r.GetHelloKexMixed(),
+			UnknownOnly: r.GetHelloKexUnknownOnly(), ClassicDevices: []helloKexDeviceV{}, NodesWithout: []nodeWithoutV{}}}
+	v.HelloKex.ClassicDevices = helloKexDeviceViews(r.GetHelloKexClassic())
+	names := map[string]string{}
+	for _, n := range r.GetNodes() {
+		names[n.GetNodeId()] = n.GetNodeName()
+	}
+	for _, id := range r.GetHelloKexNodesWithout() {
+		v.HelloKex.NodesWithout = append(v.HelloKex.NodesWithout, nodeWithoutV{NodeID: clean(id, 80), NodeName: nm(names[id])})
+	}
 	for _, n := range r.GetNodes() {
 		nv := fleetNodeConnV{NodeID: clean(n.GetNodeId(), 80), NodeName: nm(n.GetNodeName()), CountryCode: clean(n.GetCountryCode(), 8),
 			Supported: n.GetSupported(), Inbounds: []inboundConnV{}}
@@ -1629,13 +2380,14 @@ func checksView(r *adminv1.GetChecksResponse) *ChecksV {
 			Country: countryCheckView(country[row.GetNodeId()])}
 		for _, c := range row.GetCells() {
 			cv := checkV{Deployed: c.GetDeployed(), FailStreak: c.GetFailStreak(), ResponseHourMs: c.GetResponseHourMs(), ConnectHourMs: c.GetConnectHourMs(),
-				UDPSentHour: c.GetUdpSentHour(), UDPLostHour: c.GetUdpLostHour(), NodeSentHour: c.GetNodeSentHour(), NodeLostHour: c.GetNodeLostHour()}
+				UDPSentHour: c.GetUdpSentHour(), UDPLostHour: c.GetUdpLostHour(), NodeSentHour: c.GetNodeSentHour(), NodeLostHour: c.GetNodeLostHour(),
+				InboundID: clean(c.GetInboundId(), 80), Stats24h: checkStatsView(c.GetStats_24H()), Daily: checkDaysView(c.GetDaily())}
 			if l := c.GetLast(); l != nil {
 				cv.Status = enumName("CHECK_STATUS_", l.GetStatus().String())
 				cv.AtUnix, cv.LatencyMs, cv.ExitCtry = l.GetAtUnix(), l.GetLatencyMs(), clean(l.GetExitCountry(), 8)
 				cv.ConnectMs, cv.ResponseMs = l.GetConnectMs(), l.GetResponseMs()
 				cv.UDPSent, cv.UDPLost = l.GetUdpSent(), l.GetUdpLost()
-				cv.ErrorCode, cv.ErrorInfo = clean(l.GetErrorCode(), 60), clean(l.GetErrorDetail(), 200)
+				cv.ErrorCode, cv.ErrorInfo = clean(l.GetErrorCode(), 60), noAddr(clean(l.GetErrorDetail(), 200))
 			}
 			for _, b := range c.GetHistory() {
 				cv.OK24h += b.GetOk()
@@ -1670,7 +2422,6 @@ type auditV struct {
 	Action    string `json:"action"`
 	Params    string `json:"params,omitempty"`
 	Result    string `json:"result,omitempty"`
-	IP        string `json:"ip,omitempty"`
 }
 
 // AuditV is the audit_search result.
@@ -1712,23 +2463,40 @@ type nodeUpdateV struct {
 }
 
 type rolloutStepV struct {
-	NodeID   string `json:"node_id"`
-	NodeName string `json:"node_name"`
-	Stage    uint32 `json:"stage"`
-	State    string `json:"state"`
-	From     string `json:"from_version,omitempty"`
-	ErrorKey string `json:"error_key,omitempty"`
+	NodeID         string `json:"node_id"`
+	NodeName       string `json:"node_name"`
+	Stage          uint32 `json:"stage"`
+	State          string `json:"state"`
+	From           string `json:"from_version,omitempty"`
+	ErrorKey       string `json:"error_key,omitempty"`
+	DownloadSource string `json:"download_source,omitempty"`
+	SourcesFailed  string `json:"sources_failed,omitempty"`
+	// FailedProfiles are the profiles that did not pass the gate (untrusted names, with the error code of the last check round of each);
+	// SkippedProfiles did not work before the update and were not held against it.
+	FailedProfiles  []profileFailV `json:"failed_profiles,omitempty"`
+	FailedMore      int            `json:"failed_more,omitempty"`
+	SkippedProfiles []string       `json:"skipped_profiles,omitempty"`
+	SkippedMore     int            `json:"skipped_more,omitempty"`
+}
+
+// profileFailV is one profile of a step that did not pass; the name is the owner's own text, never an instruction.
+type profileFailV struct {
+	InboundID string `json:"inbound_id"`
+	Profile   string `json:"profile"`
+	Error     string `json:"error_code,omitempty"`
 }
 
 type rolloutV struct {
-	ID        string         `json:"id"`
-	Status    string         `json:"status"`
-	ToVersion string         `json:"to_version"`
-	BatchSize uint32         `json:"batch_size"`
-	Created   int64          `json:"created_unix"`
-	Finished  int64          `json:"finished_unix,omitempty"`
-	PauseKey  string         `json:"pause_key,omitempty"`
-	Steps     []rolloutStepV `json:"steps"`
+	ID                  string         `json:"id"`
+	Status              string         `json:"status"`
+	ToVersion           string         `json:"to_version"`
+	BatchSize           uint32         `json:"batch_size"`
+	Created             int64          `json:"created_unix"`
+	Finished            int64          `json:"finished_unix,omitempty"`
+	PauseKey            string         `json:"pause_key,omitempty"`
+	PauseFailedProfiles []profileFailV `json:"pause_failed_profiles,omitempty"`
+	PauseFailedMore     int            `json:"pause_failed_more,omitempty"`
+	Steps               []rolloutStepV `json:"steps"`
 }
 
 type bundleV struct {
@@ -1742,13 +2510,18 @@ type bundleV struct {
 
 // UpdatesV is the updates_status result.
 type UpdatesV struct {
-	NowUnix      int64         `json:"now_unix"`
-	PanelVersion string        `json:"panel_version"`
-	PanelBuilt   int64         `json:"panel_built,omitempty"`
-	Bundle       *bundleV      `json:"bundle,omitempty"`
-	Nodes        []nodeUpdateV `json:"nodes"`
-	Rollout      *rolloutV     `json:"rollout,omitempty"`
-	Truncated    bool          `json:"truncated,omitempty"`
+	NowUnix                       int64         `json:"now_unix"`
+	PanelVersion                  string        `json:"panel_version"`
+	PanelBuilt                    int64         `json:"panel_built,omitempty"`
+	UpdateChannel                 string        `json:"update_channel"`
+	RunningVersionChannel         string        `json:"running_version_channel,omitempty"`
+	OfferedReleaseChannel         string        `json:"offered_release_channel,omitempty"`
+	RunningNewerThanChannelOffers bool          `json:"running_newer_than_channel_offers"`
+	UpdateDownloadSources         []string      `json:"update_download_sources"`
+	Bundle                        *bundleV      `json:"bundle,omitempty"`
+	Nodes                         []nodeUpdateV `json:"nodes"`
+	Rollout                       *rolloutV     `json:"rollout,omitempty"`
+	Truncated                     bool          `json:"truncated,omitempty"`
 }
 
 func (v *UpdatesV) shrink() bool {
@@ -1768,17 +2541,30 @@ func rolloutView(r *adminv1.Rollout) *rolloutV {
 		BatchSize: r.GetBatchSize(), Created: r.GetCreatedUnix(), Finished: r.GetFinishedUnix(), PauseKey: clean(r.GetPauseKey(), 80),
 		Steps: []rolloutStepV{},
 	}
+	v.PauseFailedProfiles, v.PauseFailedMore = failedProfilesView(r.GetPauseParams())
 	for _, s := range r.GetSteps() {
-		v.Steps = append(v.Steps, rolloutStepV{
+		step := rolloutStepV{
 			NodeID: s.GetNodeId(), NodeName: nm(s.GetNodeName()), Stage: s.GetStage(), State: enumName("STEP_STATE_", s.GetState().String()),
-			From: clean(s.GetFromVersion(), 60), ErrorKey: clean(s.GetErrorKey(), 80),
-		})
+			From: clean(s.GetFromVersion(), 60), ErrorKey: clean(s.GetErrorKey(), 80), DownloadSource: safeDownloadSource(s.GetDownloadSource()),
+		}
+		if step.State == "failed" {
+			step.SourcesFailed = safeSourcesFailedProjection(s.GetParams()["sources_failed"])
+		}
+		step.FailedProfiles, step.FailedMore = failedProfilesView(s.GetParams())
+		step.SkippedProfiles, step.SkippedMore = skippedProfilesView(s.GetParams())
+		v.Steps = append(v.Steps, step)
 	}
 	return v
 }
 
 func updatesView(r *adminv1.GetUpdatesResponse) *UpdatesV {
-	v := &UpdatesV{NowUnix: r.GetNowUnix(), PanelVersion: clean(r.GetPanel().GetVersion(), 60), PanelBuilt: r.GetPanel().GetBuilt(), Nodes: []nodeUpdateV{}}
+	v := &UpdatesV{
+		NowUnix: r.GetNowUnix(), PanelVersion: clean(r.GetPanel().GetVersion(), 60), PanelBuilt: r.GetPanel().GetBuilt(),
+		UpdateChannel: clean(r.GetUpdateChannel(), 16), RunningVersionChannel: clean(r.GetRunningVersionChannel(), 16),
+		OfferedReleaseChannel:         clean(r.GetOfferedReleaseChannel(), 16),
+		RunningNewerThanChannelOffers: r.GetRunningNewerThanChannelOffers(), Nodes: []nodeUpdateV{},
+		UpdateDownloadSources: safeOptionalDownloadSources(r.GetUpdateDownloadSources()),
+	}
 	if b := r.GetBundle(); b != nil {
 		v.Bundle = &bundleV{
 			Status: enumName("BUNDLE_STATUS_", b.GetStatus().String()), Version: clean(b.GetVersion(), 60), Built: b.GetBuilt(),
@@ -1800,4 +2586,66 @@ func updatesView(r *adminv1.GetUpdatesResponse) *UpdatesV {
 	}
 	v.Rollout = rolloutView(r.GetRollout())
 	return v
+}
+
+func safeDownloadSource(source string) string {
+	switch source {
+	case "panel", "github", "peer", "cloudflare":
+		return source
+	default:
+		return ""
+	}
+}
+
+func safeOptionalDownloadSources(sources []string) []string {
+	var out []string
+	for _, source := range sources {
+		if source == "github" && !slices.Contains(out, source) {
+			out = append(out, source)
+		}
+	}
+	if out == nil {
+		return []string{}
+	}
+	return out
+}
+
+func safeSourcesFailedProjection(raw string) string {
+	return release.SanitizeSourceFailures(raw)
+}
+
+// failedProfilesView reads the profiles a gate failure names (the step and pause params of internal/panel/update, gate_profiles.go,
+// under the same keys). The names are the owner's text, the codes the checker's short words: both go through clean, and at most
+// panelupdate.GateShown entries are taken whatever the stored value says.
+func failedProfilesView(params map[string]string) ([]profileFailV, int) {
+	var list []panelupdate.FailedProfile
+	if json.Unmarshal([]byte(params[panelupdate.KeyFailedProfiles]), &list) != nil {
+		return nil, 0
+	}
+	out := make([]profileFailV, 0, min(len(list), panelupdate.GateShown))
+	for _, p := range list[:min(len(list), panelupdate.GateShown)] {
+		out = append(out, profileFailV{InboundID: clean(p.ID, 80), Profile: nm(p.Name), Error: clean(p.Code, 40)})
+	}
+	return out, moreCount(params[panelupdate.KeyFailedMore])
+}
+
+// skippedProfilesView reads the names of the profiles that were failing before the update and were not held against it.
+func skippedProfilesView(params map[string]string) ([]string, int) {
+	var list []string
+	if json.Unmarshal([]byte(params[panelupdate.KeySkippedProfiles]), &list) != nil {
+		return nil, 0
+	}
+	out := make([]string, 0, min(len(list), panelupdate.GateShown))
+	for _, name := range list[:min(len(list), panelupdate.GateShown)] {
+		out = append(out, nm(name))
+	}
+	return out, moreCount(params[panelupdate.KeySkippedMore])
+}
+
+func moreCount(s string) int {
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 || n > 1000 {
+		return 0
+	}
+	return n
 }

@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/mistgate/mistgate/internal/reqid"
 )
 
 //go:embed migrations/*.sql
@@ -70,6 +72,14 @@ func NewID(prefix string) string {
 
 func unix(t time.Time) int64 { return t.UTC().Unix() }
 
+// unixOrZero is unix with the zero time as 0.
+func unixOrZero(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return unix(t)
+}
+
 func fromUnix(s int64) time.Time { return time.Unix(s, 0).UTC() }
 
 // AuditEntry is one audit-log row.
@@ -78,29 +88,42 @@ type AuditEntry struct {
 	Action string
 	Params string // JSON object without secrets; "" means {}
 	Result string
-	Source string // AuditPanel (default), AuditBot, AuditMCP or AuditAPI
+	Source string // AuditPanel (default), AuditBot, AuditMCP, AuditAPI or AuditAssistant
 	IP     string // client address the action came from, "" if none
 }
 
 // Audit sources, the values of audit.source.
 const (
-	AuditPanel = "panel"
-	AuditBot   = "bot"
-	AuditMCP   = "mcp"
-	AuditAPI   = "api"
+	AuditPanel     = "panel"
+	AuditBot       = "bot"
+	AuditMCP       = "mcp"
+	AuditAPI       = "api"
+	AuditAssistant = "assistant"
 )
 
 type auditSourceKey struct{}
+type auditActorKey struct{}
+
+type auditActorOverride struct{ adminID, actor string }
 
 // WithAuditSource returns ctx marking every audit row written with it, whose entry names no source, as coming
 // from source (AuditAPI or AuditMCP: a call made with an API token). Modules pass the request context to Audit,
 // so their rows carry the source of the call without knowing about tokens. An unknown source is ignored.
 func WithAuditSource(ctx context.Context, source string) context.Context {
 	switch source {
-	case AuditPanel, AuditBot, AuditMCP, AuditAPI:
+	case AuditPanel, AuditBot, AuditMCP, AuditAPI, AuditAssistant:
 		return context.WithValue(ctx, auditSourceKey{}, source)
 	}
 	return ctx
+}
+
+// WithAuditActor replaces a signed-in admin's id with the named in-process actor in audit rows. It is set only by the
+// assistant's trusted MCP bridge and leaves domain writes using the actual admin id.
+func WithAuditActor(ctx context.Context, adminID, actor string) context.Context {
+	if adminID == "" || actor == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, auditActorKey{}, auditActorOverride{adminID: adminID, actor: actor})
 }
 
 // Audit appends a row to the audit log. An entry without a Source takes the one of WithAuditSource, else AuditPanel.
@@ -108,8 +131,12 @@ func (s *Store) Audit(ctx context.Context, now time.Time, e AuditEntry) error {
 	if e.Params == "" {
 		e.Params = "{}"
 	}
+	e.Params = withRequestID(e.Params, reqid.From(ctx))
 	if e.Source == "" {
 		e.Source, _ = ctx.Value(auditSourceKey{}).(string)
+	}
+	if override, ok := ctx.Value(auditActorKey{}).(auditActorOverride); ok && e.Actor == override.adminID {
+		e.Actor = override.actor
 	}
 	if e.Source == "" {
 		e.Source = AuditPanel
@@ -141,13 +168,17 @@ func (s *Store) ListAudit(ctx context.Context, source string, beforeID int64, li
 
 // AuditQuery is one page of the audit log: newest first, id < BeforeID (0 = from the newest), at most Limit rows.
 // Source keeps one source ("" = all). Actions and Prefixes keep the rows whose action is one of Actions or starts with
-// one of Prefixes (both empty = every action). Failed keeps the rows whose result is not "ok".
+// one of Prefixes (both empty = every action). Failed keeps the rows whose result is not "ok". Since keeps the rows at or
+// after that time (zero = any age). Actor keeps the rows whose actor id or resolved name contains it, Contains
+// the rows whose action contains it; both are literal substrings (LIKE: ASCII case-insensitive), "" = any.
 type AuditQuery struct {
 	Source            string
 	BeforeID          int64
 	Limit             int
 	Actions, Prefixes []string
 	Failed            bool
+	Since             time.Time
+	Actor, Contains   string
 }
 
 // ListAuditQuery returns the rows of q.
@@ -171,6 +202,20 @@ func (s *Store) ListAuditQuery(ctx context.Context, q AuditQuery) ([]AuditRow, e
 	if q.Failed {
 		where += ` AND a.result NOT IN ('', 'ok')`
 	}
+	if !q.Since.IsZero() {
+		where += ` AND a.ts >= ?`
+		args = append(args, unix(q.Since))
+	}
+	like := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	if q.Contains != "" {
+		where += ` AND a.action LIKE ? ESCAPE '\'`
+		args = append(args, "%"+like.Replace(q.Contains)+"%")
+	}
+	if q.Actor != "" {
+		where += ` AND (a.actor LIKE ? ESCAPE '\' OR COALESCE(d.display_name, k.name, '') LIKE ? ESCAPE '\')`
+		pat := "%" + like.Replace(q.Actor) + "%"
+		args = append(args, pat, pat)
+	}
 	rows, err := s.R.QueryContext(ctx, `
 		SELECT a.id, a.ts, a.actor, COALESCE(d.display_name, k.name, ''), a.action, a.params, a.result, a.source, a.ip
 		FROM audit a LEFT JOIN admin d ON d.id = a.actor
@@ -192,6 +237,26 @@ func (s *Store) ListAuditQuery(ctx context.Context, q AuditQuery) ([]AuditRow, e
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+const auditPruneMaxBatches = 5
+
+// PruneAudit deletes a bounded number of audit rows per sweep so a large backlog cannot use the whole D1 budget. The audit_ts
+// index serves each batch scan. Rows left after the last batch are removed on a later sweep.
+func (s *Store) PruneAudit(ctx context.Context, before time.Time, batch int) (int64, error) {
+	var total int64
+	for batches := 0; batches < auditPruneMaxBatches; batches++ {
+		res, err := s.W.ExecContext(ctx, `DELETE FROM audit WHERE id IN (SELECT id FROM audit WHERE ts < ? LIMIT ?)`, unix(before), batch)
+		if err != nil {
+			return total, err
+		}
+		n, _ := res.RowsAffected()
+		total += n
+		if n < int64(batch) {
+			return total, nil
+		}
+	}
+	return total, nil
 }
 
 // Setting returns a setting value, or ErrNotFound.
@@ -247,6 +312,22 @@ func (s *Store) SetSettings(ctx context.Context, kv map[string]string) error {
 // DeleteSettings removes the settings; a key that is not there is ignored.
 func (s *Store) DeleteSettings(ctx context.Context, keys ...string) error {
 	_, err := s.W.ExecContext(ctx, `DELETE FROM setting WHERE k IN (SELECT value FROM json_each(?))`, accJSON(keys))
+	return err
+}
+
+// SetAndDeleteSettings applies setting upserts and deletes in one atomic batch.
+func (s *Store) SetAndDeleteSettings(ctx context.Context, kv map[string]string, keys ...string) error {
+	stmts := make([]Stmt, 0, len(kv)+1)
+	for k, v := range kv {
+		stmts = append(stmts, Stmt{Query: `INSERT INTO setting (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, Args: []any{k, v}})
+	}
+	if len(keys) > 0 {
+		stmts = append(stmts, Stmt{Query: `DELETE FROM setting WHERE k IN (SELECT value FROM json_each(?))`, Args: []any{accJSON(keys)}})
+	}
+	if len(stmts) == 0 {
+		return nil
+	}
+	_, err := s.batch(ctx, stmts...)
 	return err
 }
 

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/mistgate/mistgate/internal/node/nets"
 	"github.com/mistgate/mistgate/internal/node/ratelimit"
 	"github.com/mistgate/mistgate/internal/plugin"
 	"github.com/mistgate/mistgate/internal/statehash"
@@ -23,7 +24,7 @@ import (
 type Engine interface {
 	// Protocol is the plugin id ("hysteria2"), equal to InboundSpec.Protocol it serves.
 	Protocol() string
-	// Version is shown in Hello and on the node page: "hysteria core v2.12.3".
+	// Version is shown in Hello and on the node page: "hysteria core v2.13.0".
 	Version() string
 	Capabilities() Capabilities
 
@@ -79,6 +80,7 @@ type ApplyReport struct {
 	CredCount int
 	Restarted bool
 	Cert      CertInfo // what the inbound serves; zero if the protocol has no TLS
+	Warnings  []string // non-fatal credential errors; the accepted credentials were applied
 }
 
 type CertInfo struct {
@@ -114,6 +116,12 @@ type Env struct {
 	// UserLimits holds the person limit buckets, shared by every engine of the agent so that a person's hysteria2 and vless
 	// credentials draw on one bucket. Nil: the engine keeps a registry of its own.
 	UserLimits *ratelimit.Registry
+	// Nets resolves client addresses inside an engine and records only ASN-level connection events. Nil disables counting.
+	Nets *nets.Aggregator
+	// SharedListener returns the listener of the inbound's route on a TCP port the agent shares between services by SNI
+	// (internal/node/front), or nil when the engine listens itself, as it does alone on a port. The engine accepts from it
+	// instead of binding the port; closing it ends that engine's Accept only. Nil: no port is shared.
+	SharedListener func(inboundID string, port uint16) net.Listener
 }
 
 // Event is a small, protocol-neutral signal from an engine to the node agent.

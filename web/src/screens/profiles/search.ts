@@ -1,0 +1,36 @@
+// The URL state of the profiles screens: the list (/profiles?protocol=vless&q=de&state=idle) and the step of a new profile
+// (/profiles/new?protocol=vless), so a link, a reload and Back all land on the same view.
+
+/** The list's state filter: a server warning, on no node, in no group, leaving through WARP. */
+export const facetIds = ["warn", "idle", "nogroup", "warp"] as const;
+export type FacetId = (typeof facetIds)[number];
+const isFacet = (v: string): v is FacetId => (facetIds as readonly string[]).includes(v);
+
+// the router parses "?q=123" into a number and "?q=true" into a boolean: a typed word comes back as text
+const text = (v: unknown) => (typeof v === "string" ? v : typeof v === "number" || typeof v === "boolean" ? String(v) : "");
+const id = (v: unknown) => (/^[a-z0-9_-]{1,32}$/.test(text(v)) ? text(v) : "");
+
+export type ProfilesSearch = { protocol?: string; q?: string; state?: FacetId; /** The matrix "Where it passes" (the list has none). */ view?: "where" };
+
+export function validateProfilesSearch(s: Record<string, unknown>): ProfilesSearch {
+  const protocol = id(s.protocol);
+  const q = text(s.q).slice(0, 64);
+  const state = text(s.state);
+  return { ...(protocol && { protocol }), ...(q && { q }), ...(isFacet(state) && { state }), ...(text(s.view) === "where" && { view: "where" as const }) };
+}
+
+/** /profiles/new: `node` (made from that node's page), the chosen `protocol` (step 2; without it, step 1) and, where one protocol serves two tasks (VLESS: REALITY or behind a CDN), the `task`. */
+export function validateNewProfileSearch(s: Record<string, unknown>): { node?: string; protocol?: string; task?: string } {
+  const node = text(s.node);
+  const protocol = id(s.protocol);
+  const task = protocol && text(s.task) === "cdn" ? "cdn" : "";
+  return { ...(node && { node }), ...(protocol && { protocol }), ...(task && { task }) };
+}
+
+/** /profiles/$id: the tab ("settings" is the first and has none in the address). */
+export const profileTabs = ["settings", "servers", "people"] as const;
+export type ProfileTab = (typeof profileTabs)[number];
+export function validateProfileSearch(s: Record<string, unknown>): { tab?: Exclude<ProfileTab, "settings"> } {
+  const tab = text(s.tab);
+  return tab === "servers" || tab === "people" ? { tab } : {};
+}

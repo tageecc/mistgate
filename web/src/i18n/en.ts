@@ -16,16 +16,65 @@ import { en as telegramEn } from "./telegram";
 import { en as portsEn } from "./ports";
 import { en as editionEn } from "./edition";
 import { en as decoyEn } from "./decoy";
+import { en as bulkEn } from "./bulk";
 import { en as countryEn } from "./country";
+import { en as probesEn } from "./probes";
 import { en as connectionsEn } from "./connections";
 import { en as journalEn } from "./journal";
 import { en as relayEn } from "./relay";
 import { en as waysEn } from "./ways";
+import { en as tgproxyEn } from "./tgproxy";
+import { en as clientcompatEn } from "./clientcompat";
+import { en as protocolsEn } from "./protocols";
+import { en as aiEn } from "./ai";
+import { en as graphEn } from "./graph";
+import { en as waysgraphEn } from "./waysgraph";
+import { en as fleetmapEn } from "./fleetmap";
+import { en as observabilityEn } from "./observability";
+import { en as debugEn } from "./debug";
+import { en as resourcesEn } from "./resources";
+import { en as tasksEn } from "./tasks";
+import { en as followupEn } from "./followup";
+import { en as osupdatesEn } from "./osupdates";
+import { en as fleetuiEn } from "./fleetui";
+import { en as clientlogsEn } from "./clientlogs";
+import { en as trusttunnelEn } from "./trusttunnel";
+import { en as tcpshareEn } from "./tcpshare";
+import { en as shellEn } from "./shell";
+import { en as nodesviewEn } from "./nodesview";
+import { en as nodeswaysEn } from "./nodesways";
+import { en as userslistEn } from "./userslist";
+import { en as userspageEn } from "./userspage";
+import { en as profilenewEn } from "./profilenew";
+import { en as settingspageEn } from "./settingspage";
+import { en as aipageEn } from "./aipage";
+import { en as igpageEn } from "./igpage";
+import { en as aspageEn } from "./aspage";
+import { en as nodeshareEn } from "./nodeshare";
+import { en as channelEn } from "./channel";
+import { en as countrynowEn } from "./countrynow";
+import { en as sniEn } from "./sni";
+import { en as overviewEn } from "./overview";
+import { en as windowsEn } from "./windows";
+import { en as nodepageEn } from "./nodepage";
+import { en as nodewaysEn } from "./nodeways";
+import { en as subspnEn } from "./subspn";
+import { en as subshxEn } from "./subshx";
+import { en as subsrtEn } from "./subsrt";
+import { en as subsdnsEn } from "./subsdns";
+import { en as usersgroupEn } from "./usersgroup";
+import { en as usersextraEn } from "./usersextra";
+import { en as decoysitesEn } from "./decoysites";
+import { en as planwordsEn } from "./planwords";
+import { en as profilespageEn } from "./profilespage";
+import { en as healthpageEn } from "./healthpage";
+import { en as reachpageEn } from "./reachpage";
+import { en as updatespageEn } from "./updatespage";
+import { en as profilesrvEn } from "./profilesrv";
 
 // The shell, auth and navigation copy. The screens' own copy lives next to their owners: ops.ts (overview, nodes,
 // settings), users.ts and profiles.ts; `en` below is all of it, so `MessageKey` covers every key.
 const core = {
-  "app.name": "Mistgate",
   "common.loading": "Loading…",
   "common.retry": "Try again",
   "common.undo": "Undo",
@@ -33,6 +82,8 @@ const core = {
   "common.quoted": "“{name}”",
   // "label: value" where the label and the value are separate texts; the colon belongs to the language (full-width in Chinese)
   "common.labeled": "{label}: {value}",
+  // a change or a span, "before → after"; the arrow points the way the language reads
+  "common.fromTo": "{from} → {to}",
 
   // the pager at the bottom of a long list (components/ui/pagination.tsx)
   "pager.nav": "Pages",
@@ -67,8 +118,8 @@ const core = {
   "nav.more": "More",
   "nav.main": "Main navigation",
   "nav.skip": "Skip to content",
-  "nav.group.setup": "SETUP",
-  "nav.group.ops": "OPERATIONS",
+  "nav.group.setup": "Setup",
+  "nav.group.ops": "Operations",
 
   "section.overview.desc": "Fleet health at a glance, node cards, traffic and the latest events.",
   "section.nodes.desc": "Servers in your fleet, their protocols, load and the wizard to add a new one.",
@@ -78,15 +129,13 @@ const core = {
   "section.health.desc": "Alerts, client-eye checks and the fleet doctor.",
   "section.reachability.desc": "Whether the nodes open from inside a country: the sources, each node’s verdict and its week.",
   "section.updates.desc": "Panel and node agent versions, staged rollouts and rollback.",
-  "section.integrations.desc": "API tokens for scripts, MCP for AI agents and the changes they ask you to approve.",
+  "section.integrations.desc": "Telegram alerts: every admin links their own chat.",
   "section.settings.desc": "Admins, security, backups and domains.",
   "section.empty": "Nothing here yet",
 
   "header.search": "Search nodes, users and sections",
   "header.language": "Language",
   "header.theme": "Theme",
-  "header.theme.toLight": "Switch to light theme",
-  "header.theme.toDark": "Switch to dark theme",
   "header.signOut": "Sign out",
   "header.version": "Panel version {version}",
   "stale.title": "The panel was updated to {version}",
@@ -95,8 +144,6 @@ const core = {
   "stale.expand": "Show the reload notice",
   "header.source": "Source code",
   "header.star": "Star on GitHub",
-  "more.theme": "Dark theme",
-  "more.language": "Language",
 
   "health.none": "No nodes",
   "health.ok": "Fleet is healthy",
@@ -104,15 +151,14 @@ const core = {
   "health.problems": "{n} problem|{n} problems",
 
   "palette.title": "Command palette",
-  "palette.placeholder": "Node, user, section…",
+  "palette.placeholder": "Node, person, section or action",
   "palette.empty": "Nothing found",
   "palette.searching": "Searching…",
-  "palette.nodes": "NODES",
-  "palette.users": "USERS",
-  "palette.places": "SECTIONS",
-  "palette.actions": "ACTIONS",
-  "palette.addNode": "Add node",
-  "palette.createUser": "New user",
+  "palette.nodes": "Nodes",
+  "palette.users": "People",
+  "palette.places": "Sections",
+  "palette.actions": "Actions",
+  "palette.createUser": "Add a person",
   "palette.newToken": "New API token",
   "palette.newProfile": "New profile",
   "palette.approvals": "Approvals",
@@ -154,6 +200,7 @@ const core = {
   "settings.accent.rose": "Rose",
   "settings.accent.sage": "Sage",
   "settings.local": "These choices are kept on this device only.",
+  "settings.fx": "Reveal animation",
   "settings.device": "Only on this device",
 
   "auth.setup.welcomeTitle": "Hi!",
@@ -162,11 +209,11 @@ const core = {
   "auth.setup.adminTitle": "Create the admin",
   "auth.setup.adminBody":
     "A passkey is best: sign in with a fingerprint or Face ID, no passwords. The key lives only on your device.",
-  "auth.login": "LOGIN",
-  "auth.password": "PASSWORD",
-  "auth.code": "AUTHENTICATOR CODE",
+  "auth.login": "Login",
+  "auth.password": "Password",
+  "auth.code": "Authenticator code",
   "auth.createPasskey": "Create passkey",
-  "auth.waitingPasskey": "Waiting for your device…",
+  "auth.waitingPasskey": "Waiting for passkey",
   "auth.setup.passkeyHint": "The browser will ask for a fingerprint, face or PIN",
   "auth.setup.otherWay": "password + authenticator code",
   "auth.setup.totpScan": "Scan with Google Authenticator, 1Password or Aegis",
@@ -184,7 +231,7 @@ const core = {
   "auth.recover.submit": "Reset sign-in",
   "auth.recover.doneTitle": "New sign-in details",
   "auth.recover.doneBody": "For {admin}. Save the password and scan the QR code now.",
-  "auth.recover.password": "NEW PASSWORD",
+  "auth.recover.password": "New password",
   "auth.recover.onceTitle": "Shown only once.",
   "auth.recover.onceBody": "After a reload or leaving this page they cannot be shown again.",
   "auth.recover.nextTitle": "Next",
@@ -231,8 +278,14 @@ const core = {
   // The panel's refusal codes (src/lib/errors.ts errorCodes): what happened and what to do.
   "err.name_taken": "This name is taken. Pick another one.",
   "err.group_not_empty": "Users still in this group: {users}. Move them to another group, then delete it.",
+  "err.page_password_removed": "This person’s page has no password now. Bring it back first.",
+  "err.group_in_both": "The same group is in both lists: add it or take it away, not both.",
+  "err.main_group": "The main group cannot be taken away: make another group the main one instead.",
+  "err.too_many_groups": "A person can be in 16 groups at most.",
   "err.profile_deployed": "The profile is on nodes {nodes}. Remove it from them first.",
   "err.stale_version": "The profile was changed in another tab. Reload the page.",
+  "err.stale_inbound": "The server's settings were changed somewhere else a moment ago. The list is refreshed: check it and repeat the change.",
+  "err.stale_user": "This person was changed somewhere else a moment ago (switched off, extended or edited). Reload the page, check the person and repeat the change.",
   "err.node_offline": "The node is not connected. Try again when its agent is back.",
   "err.agent_too_old": "The node’s agent is too old for this. Update it on the Updates page.",
   "err.node_retired": "The node is retired from the fleet.",
@@ -242,6 +295,8 @@ const core = {
 
   // A profile field the server refused: "field.<path>.<code>" of its FieldError; a pair without an entry shows the server’s text.
   "field.port.out_of_range": "The port is 1 to 65535",
+  "field.obfuscation.jc.handshake_budget": "Jc plus the non-empty I1–I5 packets and one handshake packet must not exceed 128.",
+  "field.obfuscation.header_protection_key.rt_range_requires_hpk": "With random trailers, any H1–H4 range wider than one value needs a header protection key.",
   "field.hop.from.invalid": "The port must be outside the hopping range",
   "field.hop.from.out_of_range": "The range starts between 1024 and 65535, clear of SSH and other well-known ports",
   "field.hop.to.too_wide": "The range holds at most 20,000 ports",
@@ -252,6 +307,9 @@ const core = {
   "field.reality.target.format": "Write it as host:port, for example www.example.org:443",
   "field.reality.target.host": "The host is a plain name or an IP address, with no spaces or slashes",
   "field.reality.target.port_range": "The port is 1 to 65535",
+  "field.reality.target.same_port": "The target uses this inbound’s own port: pick another address or port",
+  "field.reality.target.unspecified": "An unspecified address (0.0.0.0, ::) is not a site: use a name or a real address",
+  "field.reality.target.same_node": "The target is this node itself: pick another address or port",
   "field.reality.server_names.required": "The target is an IP address: list the names from its certificate",
   "field.reality.server_names.length": "At most 8 names",
   "field.reality.server_names.invalid": "A host name without wildcards, like www.example.org",
@@ -282,11 +340,12 @@ const core = {
   "field.egress.invalid_enum": "Direct or WARP",
   "field.reality.fingerprint.invalid_enum": "Chrome, Firefox, Safari, iOS, Edge or random",
   "field.reality.target_kind.invalid_enum": "This node’s site or another site",
+  "field.hysteria2.tls_mode.unsupported": "A Let’s Encrypt certificate for an IP address is not available yet: use a domain or self-signed",
 };
 
 export type CoreMessages = typeof core;
 export { core as coreEn };
-export const en = { ...cloudEn, ...core, ...opsEn, ...usersEn, ...securityEn, ...profilesEn, ...subsEn, ...healthEn, ...updatesEn, ...awgEn, ...warpEn, ...integrationsEn, ...telegramEn, ...portsEn, ...editionEn, ...decoyEn, ...countryEn, ...connectionsEn, ...journalEn, ...relayEn, ...waysEn };
+export const en = { ...cloudEn, ...core, ...opsEn, ...usersEn, ...securityEn, ...profilesEn, ...subsEn, ...healthEn, ...updatesEn, ...awgEn, ...warpEn, ...integrationsEn, ...telegramEn, ...portsEn, ...editionEn, ...decoyEn, ...bulkEn, ...countryEn, ...probesEn, ...connectionsEn, ...journalEn, ...relayEn, ...waysEn, ...tgproxyEn, ...clientcompatEn, ...protocolsEn, ...aiEn, ...graphEn, ...waysgraphEn, ...fleetmapEn, ...observabilityEn, ...debugEn, ...resourcesEn, ...tasksEn, ...followupEn, ...osupdatesEn, ...fleetuiEn, ...clientlogsEn, ...trusttunnelEn, ...tcpshareEn, ...shellEn, ...overviewEn, ...nodesviewEn, ...windowsEn, ...nodepageEn, ...userslistEn, ...userspageEn, ...usersgroupEn, ...usersextraEn, ...decoysitesEn, ...planwordsEn, ...nodeswaysEn, ...nodewaysEn, ...profilespageEn, ...healthpageEn, ...reachpageEn, ...profilesrvEn, ...profilenewEn, ...subspnEn, ...subshxEn, ...subsrtEn, ...subsdnsEn, ...updatespageEn, ...settingspageEn, ...aipageEn, ...igpageEn, ...aspageEn, ...nodeshareEn, ...channelEn, ...countrynowEn, ...sniEn };
 
 export type Messages = typeof en;
 export type MessageKey = keyof Messages;

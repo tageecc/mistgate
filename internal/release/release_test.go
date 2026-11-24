@@ -275,6 +275,8 @@ func TestCheck(t *testing.T) {
 		{"expired", m.Expires + 1, m.Built - 1, ErrExpired},
 		{"last second", m.Expires, m.Built - 1, nil},
 		{"expired wins over same built", m.Expires + 1, m.Built, ErrExpired},
+		{"built within the skew", m.Built - int64(MaxBuiltSkew/time.Second), m.Built - 1, nil},
+		{"built beyond the skew", m.Built - int64(MaxBuiltSkew/time.Second) - 1, m.Built - 1, ErrFutureBuilt},
 	} {
 		if got := m.Check(at(tc.now), tc.own); !errors.Is(got, tc.want) && got != tc.want {
 			t.Errorf("%s: %v, want %v", tc.name, got, tc.want)
@@ -296,6 +298,37 @@ func TestFileFor(t *testing.T) {
 	}
 	if _, ok := m.FindName("manifest.json"); ok {
 		t.Fatal("FindName found an unlisted file")
+	}
+}
+
+func TestASNDataFileDoesNotMatchNodePlatform(t *testing.T) {
+	m := &Manifest{
+		Schema:  Schema,
+		Version: "v0.1.4",
+		Built:   1,
+		Expires: 2,
+		Files: []File{
+			{OS: "data", Arch: "any", Name: "mistgate-asndb-data-any", Size: 1, SHA256: strings.Repeat("0", 64)},
+			{OS: "linux", Arch: "amd64", Name: "mistgate-node-linux-amd64", Size: 1, SHA256: strings.Repeat("1", 64)},
+		},
+	}
+	body, err := m.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := Parse(body)
+	if err != nil {
+		t.Fatalf("manifest with the ASN data file did not parse: %v", err)
+	}
+	if f, err := parsed.FileFor("linux", "amd64"); err != nil || f.Name != "mistgate-node-linux-amd64" {
+		t.Fatalf("node selected %+v, %v", f, err)
+	}
+	if _, err := parsed.FileFor("data", "any"); err != nil {
+		t.Fatalf("data entry is not addressable by its manifest metadata: %v", err)
+	}
+	parsed.Files = parsed.Files[:1]
+	if _, err := parsed.FileFor("linux", "amd64"); !errors.Is(err, ErrNoFile) {
+		t.Fatalf("old agent matched the ASN data file: %v", err)
 	}
 }
 
@@ -367,5 +400,20 @@ func TestCode(t *testing.T) {
 		if got := Code(err); got != want {
 			t.Errorf("Code(%v) = %q, want %q", err, got, want)
 		}
+	}
+}
+
+// A manifest whose Built lies far in the future is refused instead of making every honest release a downgrade.
+func TestFutureBuiltIsRefused(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	future := now.AddDate(70, 0, 0).Unix()
+	poison := sampleManifest()
+	poison.Built, poison.Expires = future, future+3600*24*30
+	if err := poison.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	err := poison.Check(now, 1_700_000_000)
+	if !errors.Is(err, ErrFutureBuilt) || !errors.Is(err, ErrBadManifest) || Code(err) != "bad_manifest" {
+		t.Fatalf("Check = %v", err)
 	}
 }

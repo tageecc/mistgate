@@ -1,15 +1,19 @@
 import type { StatusKind } from "@/components/ui/status";
 import { InboundState, NodeStatus } from "@/gen/mistgate/admin/v1/common_pb";
 import { CheckStatus, CountryVerdict } from "@/gen/mistgate/admin/v1/health_pb";
+import type { NodeIpv6 } from "@/gen/mistgate/admin/v1/node_pb";
 import type { CountryCheck } from "./health";
+import type { Plain } from "./plain";
+import { testBlocked } from "./port-check";
 import { isCut, relayState, type CountryHint, type RelayMsg } from "./relay";
 
-// The ways people reach a node (the node page's "Ways in" tab): straight to its address, through another node (a relay),
-// over IPv6 (later), and, on an entry node, the nodes people reach through it. One lane per way, each with its own state
-// and whether people of the audience country see it. The verdicts are the ones Health and the relay dialog use
+// The ways people reach a node (the node page's "Ways in" tab): straight to its address, through a CDN (the VLESS profiles
+// behind one), through another node (a relay), over IPv6 (the IPv6 entry), and, on an entry node, the nodes people reach
+// through it. One lane per way, each with its own
+// state and whether people of the audience country see it. The verdicts are the ones Health and the relay dialog use
 // (countryLook, relayState, the server's relay hints): the lanes add no judgement of their own.
 
-export type WayId = "direct" | "ipv6" | `via:${string}` | `out:${string}`;
+export type WayId = "direct" | "cdn" | "ipv6" | `via:${string}` | `out:${string}`;
 /** How much of the audience country sees the lane: every network, some, none, or no data. */
 export type Seen = "all" | "part" | "none" | "unknown";
 /** The ring on the line: its state, and for a lane that works, how much of the country sees it. */
@@ -19,7 +23,7 @@ export type Ipv6Fact = "ok" | "none" | "broken" | "unknown";
 
 export type Lane = {
   id: WayId;
-  kind: "direct" | "via" | "ipv6" | "out";
+  kind: "direct" | "cdn" | "via" | "ipv6" | "out";
   /** The lane's own state: ours to fix when it is bad. */
   state: StatusKind;
   seen: Seen;
@@ -32,12 +36,15 @@ export type Lane = {
   relays: RelayMsg[];
   /** The networks that see the lane dark: the node's own (direct), the entry's among the exit's (via). */
   dark: string[];
+  /** Direct and CDN: every enabled server of the lane is kept out of subscriptions (it still serves relays and the CDN). */
+  hidden?: boolean;
 };
 
 export type WaysInput = {
   node: { id: string; status: NodeStatus };
-  inbounds: readonly { state: InboundState }[];
-  portChecks?: readonly { verdict: string }[];
+  /** cdn: people reach it through a CDN host; directInSubscriptions false: its plain server is not in subscriptions. */
+  inbounds: readonly { state: InboundState; cdn?: boolean; directInSubscriptions?: boolean }[];
+  portChecks?: readonly { verdict: string; checkedUnix?: number; protocolOkUnix?: number }[];
   tcpChecks?: readonly { verdict: string }[];
   /** The client-side checks of the node's profiles (Health). */
   cells?: readonly { deployed: boolean; last?: { status: CheckStatus } }[];
@@ -49,6 +56,8 @@ export type WaysInput = {
   countryOf?: (nodeId: string) => CountryCheck | undefined;
   ipv6?: Ipv6Fact;
   hasIpv6?: boolean;
+  /** The IPv6 entry: on, on while the server's IPv6 does not work (people get nothing through it), or off (undefined). */
+  entry?: "on" | "down";
 };
 
 export type Ways = {
@@ -120,23 +129,43 @@ function byPeer(list: readonly RelayMsg[], peer: (r: RelayMsg) => [string, strin
 
 export function lanesOf(w: WaysInput): Ways {
   const offline = w.node.status === NodeStatus.DOWN || w.node.status === NodeStatus.BLIP;
-  const enabled = w.inbounds.filter((i) => i.state !== InboundState.DISABLED);
+  const running = w.inbounds.filter((i) => i.state !== InboundState.DISABLED);
+  const listed = (i: WaysInput["inbounds"][number]) => i.directInSubscriptions !== false;
+  // the node's own address: the servers people reach on it, not those behind a CDN (their lane is "cdn")
+  const enabled = running.filter((i) => !i.cdn);
+  const cdn = running.filter((i) => i.cdn);
+  // nobody is given the address when every server on it is kept out of subscriptions (or the node serves only a CDN)
+  const hidden = running.length > 0 && !enabled.some(listed);
   const failed = enabled.filter((i) => i.state === InboundState.FAILED).length;
-  const udp = (w.portChecks ?? []).map((c) => c.verdict);
+  // a port whose test is blocked while the protocol through it works lets people in: it counts as a working port
+  const udp = (w.portChecks ?? []).map((c) => (testBlocked(c) ? "ok" : c.verdict));
   const tcp = (w.tcpChecks ?? []).map((c) => c.verdict);
   const cells = (w.cells ?? []).filter((c) => c.deployed && c.last);
   const cellsDown = cells.filter((c) => c.last!.status === CheckStatus.FAILED).length;
-  const portsBroken = udp.includes("broken") || tcp.some((v) => v === "refused" || v === "timeout");
+  // a port that gets nothing through: UDP under 70 %, TCP refused or silent. Some such ports make the lane warn, all of
+  // them make it bad: one broken port among working ones is not a way in that is down
+  const udpDead = udp.filter((v) => v === "broken").length;
+  const tcpDead = tcp.filter((v) => v === "refused" || v === "timeout").length;
+  const portsBroken = udpDead + tcpDead > 0;
+  const portsAllBroken = portsBroken && udpDead === udp.length && tcpDead === tcp.length;
   const direct: StatusKind =
-    offline || enabled.length === 0
+    offline || enabled.length === 0 || hidden
       ? "off"
       : worst(
           failed === 0 ? "ok" : failed === enabled.length ? "bad" : "warn",
-          portsBroken ? "bad" : udp.includes("lossy") || tcp.some((v) => v === "other" || v === "busy") ? "warn" : "ok",
+          portsAllBroken ? "bad" : portsBroken || udp.includes("lossy") || tcp.some((v) => v === "other" || v === "busy") ? "warn" : "ok",
           cellsDown === 0 ? "ok" : cellsDown === cells.length ? "bad" : "warn",
         );
   const own = hintOf(w.country);
-  const lanes: Lane[] = [lane({ id: "direct", kind: "direct", state: direct, seen: seenOf(own), fault: !offline && portsBroken, dark: own?.dark ?? [] })];
+  const lanes: Lane[] = [lane({ id: "direct", kind: "direct", state: direct, seen: seenOf(own), fault: !offline && !hidden && portsBroken, dark: own?.dark ?? [], hidden })];
+
+  // through a CDN: the country sees the CDN, not the node, so the lane has no country verdict of its own
+  if (cdn.length > 0) {
+    const cdnHidden = !cdn.some(listed);
+    const cdnFailed = cdn.filter((i) => i.state === InboundState.FAILED).length;
+    const state: StatusKind = offline || cdnHidden ? "off" : cdnFailed === 0 ? "ok" : cdnFailed === cdn.length ? "bad" : "warn";
+    lanes.push(lane({ id: "cdn", kind: "cdn", state, seen: "unknown", fault: !offline && !cdnHidden && cdnFailed > 0, hidden: cdnHidden }));
+  }
 
   // through an entry: the entry against the networks that see this node dark, else the entry's own verdict
   const cut = isCut(own) && own!.dark.length > 0;
@@ -152,8 +181,11 @@ export function lanesOf(w: WaysInput): Ways {
     lanes.push(lane({ id: `via:${g.id}`, kind: "via", state, seen, fault: g.relays.some((r) => relayState(r) === "failed"), peer: { id: g.id, name: g.name }, relays: g.relays, dark }));
   }
 
-  // the IPv6 entry is not built yet: a server with IPv6 shows the lane switched off, with why
-  if (w.ipv6 === "ok" || w.ipv6 === "broken" || w.hasIpv6) lanes.push(lane({ id: "ipv6", kind: "ipv6", state: "off", seen: seenOf(hintOf(w.country?.ipv6)), fault: false }));
+  // the IPv6 entry: a server with IPv6 (or an entry) has the lane, off until the owner turns it on
+  if (w.entry || w.ipv6 === "ok" || w.ipv6 === "broken" || w.hasIpv6) {
+    const state: StatusKind = w.entry === "on" ? "ok" : w.entry === "down" ? "bad" : "off";
+    lanes.push(lane({ id: "ipv6", kind: "ipv6", state, seen: seenOf(hintOf(w.country?.ipv6)), fault: w.entry === "down" }));
+  }
 
   const out = byPeer((w.relays ?? []).filter((r) => r.viaNodeId === w.node.id), (r) => [r.exitNodeId, r.exitNodeName]).map((g) =>
     lane({ id: `out:${g.id}`, kind: "out", state: relaysState(g.relays), seen: "unknown", fault: g.relays.some((r) => relayState(r) === "failed"), peer: { id: g.id, name: g.name }, relays: g.relays }),
@@ -172,5 +204,24 @@ export function ipv6FactOf(items: readonly { id: string; params: Record<string, 
   return "unknown";
 }
 
+export type Ipv6Entry = Plain<NodeIpv6>;
+
+/**
+ * The node's IPv6 entry as the server sends it (Node.ipv6). A node message without it (built without the doctor's view)
+ * reads from the doctor's fact: nothing to offer, the reason the fact gives.
+ */
+export function entryOf(v6: Ipv6Entry | undefined, fact: Ipv6Fact): Ipv6Entry {
+  if (v6) return v6;
+  const reason = { ok: "", none: "no_ipv6", broken: "ipv6_broken", unknown: "not_checked" }[fact];
+  return { entry: "", entrySupported: false, unavailableReason: reason, addresses: [], src: "" };
+}
+
+/** The lane's word for the entry: on, on while the server's IPv6 does not work (people get nothing), or off. */
+export const entryState = (v6: Ipv6Entry): WaysInput["entry"] =>
+  !v6.entry ? undefined : v6.unavailableReason === "no_ipv6" || v6.unavailableReason === "ipv6_broken" ? "down" : "on";
+
+/** Whether the owner can turn the entry on now: the node takes one and it is off. */
+export const entryOffered = (v6: Ipv6Entry) => v6.entrySupported && !v6.entry;
+
 /** A ?way= value of the URL, kept only in its known shapes. */
-export const isWayId = (s: unknown): s is WayId => typeof s === "string" && (s === "direct" || s === "ipv6" || /^(via|out):[\w-]+$/.test(s));
+export const isWayId = (s: unknown): s is WayId => typeof s === "string" && (s === "direct" || s === "cdn" || s === "ipv6" || /^(via|out):[\w-]+$/.test(s));

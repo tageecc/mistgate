@@ -1,19 +1,19 @@
 import { Code, ConnectError } from "@connectrpc/connect";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useMemo, type ReactElement, type ReactNode } from "react";
+import { useMemo, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icons";
 import { StatusDot } from "@/components/ui/status";
 import { useToast } from "@/components/ui/toast";
-import { Tip } from "@/components/ui/tooltip";
 import { CheckStatus } from "@/gen/mistgate/admin/v1/health_pb";
 import { useT } from "@/i18n";
+import { nowToast } from "@/lib/country-now";
 import { health } from "@/lib/api";
 import { cx } from "@/lib/cx";
 import { useEdition } from "@/lib/edition";
 import { errorText } from "@/lib/errors";
 import { useFmt } from "@/lib/format";
-import { barsOf, checkError, useCan, type Bar, type CellLook, type CheckCell } from "@/lib/health";
+import { barsOf, checkError, useCan, type Bar, type CheckCell } from "@/lib/health";
 import { plain } from "@/lib/plain";
 
 const toneCls: Record<Bar["tone"], string> = {
@@ -31,7 +31,7 @@ export function Bars({ cell }: { cell: CheckCell }) {
   const failed = bars.reduce((n, b) => n + b.bucket.failed, 0);
   return (
     <div className="flex flex-col gap-1.5">
-      <div className="flex h-10 items-end gap-0.5" role="img" aria-label={t("common.labeled", { label: `${t("hl.hist.h24")} → ${t("hl.hist.now")}`, value: `${failed} ✕` })}>
+      <div dir="ltr" className="flex h-10 items-end gap-0.5" role="img" aria-label={t("common.labeled", { label: t("common.fromTo", { from: t("hl.hist.h24"), to: t("hl.hist.now") }), value: `${failed} ✕` })}>
         {bars.map((b, i) => (
           <span
             key={b.bucket.startUnix || i}
@@ -45,7 +45,7 @@ export function Bars({ cell }: { cell: CheckCell }) {
           />
         ))}
       </div>
-      <div className="flex justify-between font-mono text-[10px] text-muted">
+      <div className="flex justify-between font-mono text-[11px] text-muted">
         <span>{t("hl.hist.h24")}</span>
         <span>{t("hl.hist.h12")}</span>
         <span>{t("hl.hist.now")}</span>
@@ -54,24 +54,10 @@ export function Bars({ cell }: { cell: CheckCell }) {
   );
 }
 
-/** The tooltip of a cell or a row: its lines, the last one (where it is measured from) quieter. */
-export function CellTip({ look, children }: { look: CellLook; children: ReactElement }) {
-  const label = (
-    <span className="flex flex-col gap-0.5">
-      {look.tip.map((line, i) => (
-        <span key={i} className={cx(i > 0 && i === look.tip.length - 1 && "font-normal text-muted")}>
-          {line}
-        </span>
-      ))}
-    </span>
-  );
-  return <Tip label={label}>{children}</Tip>;
-}
-
 /** The second line of a cell whose connect is slow: a clock, not a colour, because the tunnel itself works. */
 export function SlowMark({ text, className }: { text: string; className?: string }) {
   return (
-    <span className={cx("flex items-center gap-0.5 font-sans text-[10px] font-semibold text-muted", className)}>
+    <span className={cx("flex items-center gap-0.5 font-sans text-[11px] font-semibold text-muted", className)}>
       <Icon name="clock" size={10} aria-hidden />
       {text}
     </span>
@@ -126,8 +112,8 @@ export function HistoryCard({
           </span>
           <span className="min-w-0 flex-1">
             <b>{checkError(t, last.errorCode)}</b>
-            {last.errorDetail && <span className="ml-2 font-mono text-[11px] break-words text-muted">{last.errorDetail}</span>}
-            {cell.failStreak > 1 && <span className="ml-2 text-muted">{t("hl.hist.streak", { n: cell.failStreak })}</span>}
+            {last.errorDetail && <span className="ms-2 font-mono text-[11px] break-words text-muted">{last.errorDetail}</span>}
+            {cell.failStreak > 1 && <span className="ms-2 text-muted">{t("hl.hist.streak", { n: cell.failStreak })}</span>}
           </span>
         </div>
       )}
@@ -144,7 +130,8 @@ export function HistoryCard({
 }
 
 /** "Check now": schedule an immediate round, then look at the results after a few seconds. The server limits it to one round per profile per 30 s. */
-export function useRunChecks(nodeId = "") {
+/** `onDone` hears how many profiles the panel scheduled (none: the nodes are offline or were checked a moment ago). */
+export function useRunChecks(nodeId = "", onDone?: (scheduled: number) => void) {
   const t = useT();
   const toast = useToast();
   const qc = useQueryClient();
@@ -153,7 +140,13 @@ export function useRunChecks(nodeId = "") {
   const m = useMutation({
     mutationFn: async () => plain(await health.runChecksNow({ nodeId })),
     onSuccess: (r) => {
-      toast(r.scheduled > 0 ? t.n("hl.checks.nowToast", r.scheduled) : t("hl.checks.nowNone"));
+      onDone?.(r.scheduled);
+      // the country round asked with it (one node only) has its word: asked, or when the next one may be
+      const country = nowToast(t, r.countryNow);
+      toast(r.scheduled > 0 ? t.n("hl.checks.nowToast", r.scheduled) : country || t("hl.checks.nowNone"));
+      if (r.scheduled > 0 && r.countryNow?.retryAfterS) toast(country);
+      // the country round is running (or has said why not): the card shows it at once
+      void qc.invalidateQueries({ queryKey: ["health", "checks"] });
       // the round takes a few seconds (a failing one up to 25 s): look twice
       for (const ms of [4000, 14000]) setTimeout(() => void qc.invalidateQueries({ queryKey: ["health", "checks"] }), ms);
     },

@@ -13,7 +13,7 @@ export type ReachHistory = Plain<GetReachabilityHistoryResponse>;
 export type Lane = ReachHistory["nodes"][number]["lanes"][number];
 
 /** The sources in the order of the page (and of the server's `sources`). */
-export const reachSources = ["globalping", "lists", "tspu", "cheburcheck", "cheburcheck_own", "bsbord"] as const;
+export const reachSources = ["globalping", "lists", "tspu", "cheburcheck", "cheburcheck_own", "bsbord", "probes"] as const;
 export type ReachSource = (typeof reachSources)[number];
 
 /** The lines of a node: the first three always (dimmed while off, so the rows keep their shape), an external source while it is on. */
@@ -41,6 +41,8 @@ export const history6Query = queryOptions({
  * when it has none (one quiet line why), null while Globalping's IPv6 checks are off (no CountryCheck.ipv6).
  */
 export function ipv6State(v6: CountryCheck | undefined, lane: Lane | undefined): "data" | "reason" | null {
+  // the node is no longer measured over IPv6 (its entry is off and IPv4 is seen): the reason, not last week's lane
+  if (v6?.reason === "entry_off") return "reason";
   const seen = (v6 && v6.verdict !== CountryVerdict.UNKNOWN) || lane?.points.some((p) => p.verdict !== CountryVerdict.UNKNOWN);
   return seen ? "data" : v6 ? "reason" : null;
 }

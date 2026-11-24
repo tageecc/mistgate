@@ -11,6 +11,7 @@ import (
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
 	agentv1 "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/internal/agentcap"
 	"github.com/mistgate/mistgate/internal/panel/store"
 )
 
@@ -87,7 +88,7 @@ func TestListAlerts(t *testing.T) {
 	}
 
 	// history: resolved ones, newest first, no buttons but open_node; the window is clamped at 30 days
-	e.fl.set("de1", liveState{up: true, caps: []string{capDoctor}})
+	e.fl.set("de1", liveState{up: true, caps: []string{agentcap.Doctor}})
 	e.clock.Advance(time.Minute)
 	e.report("de1", true, res("disk_space", dOK, ""))
 	resp, _ = r.ListAlerts(e.ctx, req(&adminv1.ListAlertsRequest{HistoryWindowS: 365 * 86400}))
@@ -111,6 +112,7 @@ func TestNewAlertKindsUseTheirProtoNames(t *testing.T) {
 		{kUserConnection, adminv1.AlertKind_ALERT_KIND_USER_CONNECTION},
 		{kUsersImpacted, adminv1.AlertKind_ALERT_KIND_USERS_IMPACTED},
 		{kPortLossy, adminv1.AlertKind_ALERT_KIND_PORT_LOSSY},
+		{kPathLossy, adminv1.AlertKind_ALERT_KIND_PATH_LOSSY},
 		{kRelayDown, adminv1.AlertKind_ALERT_KIND_RELAY_DOWN},
 	} {
 		if got := kindProto[tc.stored]; got != tc.proto {
@@ -137,6 +139,14 @@ func TestUserAlertsOfferOpenUser(t *testing.T) {
 		if got := strings.Join(m.Actions, ","); got != tc.want {
 			t.Errorf("%s: actions %q, want %q", tc.name, got, tc.want)
 		}
+	}
+}
+
+func TestPathLossyAlertOffersNodeAndMuteActions(t *testing.T) {
+	a := store.HealthAlert{Kind: kPathLossy, Severity: sevWarning, NodeID: "minsk1", Subject: "nl1"}
+	m := alertMsg(a, map[string]string{"minsk1": "minsk1"}, func(store.HealthAlert) string { return "" })
+	if got := strings.Join(m.Actions, ","); got != "open_node,mute" || m.Kind != adminv1.AlertKind_ALERT_KIND_PATH_LOSSY {
+		t.Fatalf("path-loss alert = %+v", m)
 	}
 }
 
@@ -168,6 +178,36 @@ func TestMuteAlertRPC(t *testing.T) {
 	_, err = r.MuteAlert(e.ctx, req(&adminv1.MuteAlertRequest{AlertId: id, DurationS: 60}))
 	wantCode(t, err, connect.CodeFailedPrecondition, "resolved")
 	if rows, _ := e.st.ListAudit(e.ctx, "", 0, 10); len(rows) != 2 || rows[0].Action != "health.mute_alert" || rows[0].Actor != "adm_test" {
+		t.Fatalf("audit: %+v", rows)
+	}
+}
+
+func TestDismissAlertRPC(t *testing.T) {
+	e := newEnv(t)
+	e.node("de1", "hetzner", true)
+	r := rpc{e.s}
+	e.report("de1", false, res("disk_space", dFail, ""))
+	id := e.active()["doctor_fail/de1/disk_space"].ID
+
+	_, err := r.DismissAlert(e.ctx, req(&adminv1.DismissAlertRequest{AlertId: "alt_nope"}))
+	wantCode(t, err, connect.CodeNotFound, "alert")
+	d, err := r.DismissAlert(e.ctx, req(&adminv1.DismissAlertRequest{AlertId: id}))
+	if err != nil || d.Msg.Alert.ResolvedAtUnix == 0 || d.Msg.Alert.Resolution != "dismissed" {
+		t.Fatalf("dismiss: %+v %v", d, err)
+	}
+	if n, _ := e.s.AlertCounts(e.ctx); n != 0 {
+		t.Fatal("closed alert in the badge")
+	}
+	_, err = r.DismissAlert(e.ctx, req(&adminv1.DismissAlertRequest{AlertId: id}))
+	wantCode(t, err, connect.CodeFailedPrecondition, "resolved")
+	u, err := r.DismissAlert(e.ctx, req(&adminv1.DismissAlertRequest{AlertId: id, Reopen: true}))
+	if err != nil || u.Msg.Alert.ResolvedAtUnix != 0 {
+		t.Fatalf("reopen: %+v %v", u, err)
+	}
+	_, err = r.DismissAlert(e.ctx, req(&adminv1.DismissAlertRequest{AlertId: id, Reopen: true}))
+	wantCode(t, err, connect.CodeFailedPrecondition, "not closed")
+	rows, _ := e.st.ListAudit(e.ctx, "", 0, 10)
+	if len(rows) != 2 || rows[0].Action != "health.reopen_alert" || rows[1].Action != "health.dismiss_alert" || rows[1].Actor != "adm_test" {
 		t.Fatalf("audit: %+v", rows)
 	}
 }
@@ -415,7 +455,7 @@ func TestRefreshUnitFixOfferRequiresCapability(t *testing.T) {
 	if item := getDoctor().Items[0]; item.FixId != "" {
 		t.Fatalf("old agent was offered %q", item.FixId)
 	}
-	e.fl.set("de1", liveState{up: true, caps: []string{capDoctor, capUnitRefresh}})
+	e.fl.set("de1", liveState{up: true, caps: []string{agentcap.Doctor, agentcap.UnitRefresh}})
 	if item := getDoctor().Items[0]; item.FixId != "refresh_unit" {
 		t.Fatalf("capable agent fix = %q", item.FixId)
 	}
@@ -427,6 +467,42 @@ func TestRefreshUnitPlanIsDisruptive(t *testing.T) {
 	resp, err := rpc{e.s}.ApplyFix(e.ctx, req(&adminv1.ApplyFixRequest{NodeId: "de1", FixId: "refresh_unit", DryRun: true}))
 	if err != nil || resp.Msg.Plan == nil || !resp.Msg.Plan.Disruptive || resp.Msg.Plan.TitleKey != "health.fix.refresh_unit.plan" {
 		t.Fatalf("refresh plan = %+v, %v", resp, err)
+	}
+}
+
+func TestEnableSecurityUpdatesFixPlanAndApply(t *testing.T) {
+	e := newEnv(t)
+	e.node("de1", "hetzner", true)
+	e.report("de1", false, res("security_updates", dWarn, "enable_security_updates", "off", "apt-daily.timer disabled"))
+	view, err := (rpc{e.s}).GetDoctor(e.ctx, req(&adminv1.GetDoctorRequest{NodeId: "de1"}))
+	if err != nil || len(view.Msg.Nodes) != 1 || len(view.Msg.Nodes[0].Items) != 1 || view.Msg.Nodes[0].Items[0].FixId != "enable_security_updates" {
+		t.Fatalf("security updates fix offer = %+v, %v", view, err)
+	}
+
+	params := map[string]string{"install": "1", "conf": "APT::Periodic::Unattended-Upgrade", "timers": "apt-daily.timer", "unmask": ""}
+	e.fl.fix = func(c fixCall) (*agentv1.CommandResult, error) {
+		if c.fix != "enable_security_updates" {
+			t.Fatalf("fix id = %q", c.fix)
+		}
+		if c.dry {
+			return &agentv1.CommandResult{Ok: true, Detail: "would enable unattended security updates", Params: params}, nil
+		}
+		e.s.DoctorReport(e.ctx, c.node, &agentv1.DoctorReport{Partial: true, Results: []*agentv1.DoctorResult{
+			res("security_updates", dWarn, "", "reason", "task is running"),
+		}})
+		return &agentv1.CommandResult{Ok: true, Affected: 1, Detail: "security updates enablement started"}, nil
+	}
+	r := rpc{e.s}
+	plan, err := r.ApplyFix(e.ctx, req(&adminv1.ApplyFixRequest{NodeId: "de1", FixId: "enable_security_updates", DryRun: true}))
+	if err != nil || plan.Msg.Plan == nil || plan.Msg.Plan.FixId != "enable_security_updates" ||
+		plan.Msg.Plan.TitleKey != "health.fix.enable_security_updates.plan" || plan.Msg.Plan.Disruptive ||
+		plan.Msg.Plan.Params["install"] != "1" || plan.Msg.Plan.Params["timers"] != "apt-daily.timer" {
+		t.Fatalf("security updates plan = %+v, %v", plan, err)
+	}
+	done, err := r.ApplyFix(e.ctx, req(&adminv1.ApplyFixRequest{NodeId: "de1", FixId: "enable_security_updates", PlanId: plan.Msg.PlanId}))
+	if err != nil || !done.Msg.Applied || done.Msg.Affected != 1 || len(e.fl.fixCalls) != 2 ||
+		e.fl.fixCalls[1].dry || e.fl.fixCalls[1].fix != "enable_security_updates" {
+		t.Fatalf("security updates apply = %+v, calls=%+v, err=%v", done, e.fl.fixCalls, err)
 	}
 }
 
@@ -477,7 +553,7 @@ func TestRefreshUnitAlertActionRequiresCapability(t *testing.T) {
 	if got := strings.Join(list().Actions, ","); strings.Contains(got, "apply_fix:") {
 		t.Fatalf("old agent alert action = %s", got)
 	}
-	e.fl.set("de1", liveState{up: true, caps: []string{capDoctor, capUnitRefresh}})
+	e.fl.set("de1", liveState{up: true, caps: []string{agentcap.Doctor, agentcap.UnitRefresh}})
 	if got := strings.Join(list().Actions, ","); !strings.Contains(got, "apply_fix:refresh_unit") {
 		t.Fatalf("capable agent alert actions = %s", got)
 	}
@@ -787,5 +863,58 @@ func TestReconnectWarpPlanIsDisruptiveAndRequiresConfirmation(t *testing.T) {
 	wantCode(t, err, connect.CodeFailedPrecondition, "no fresh plan")
 	if len(e.fl.fixCalls) != 1 || !e.fl.fixCalls[0].dry {
 		t.Fatalf("WARP changed before confirmation: %+v", e.fl.fixCalls)
+	}
+}
+
+// stats_24h: percentiles of connect_ms and response_ms and the jitter over the rounds that came up; daily_days attaches
+// the rolled-up days.
+func TestGetChecksStatsAndDaily(t *testing.T) {
+	e := newEnv(t)
+	e.node("de1", "hetzner", true)
+	a := e.inbound("de1", 443)
+	now := e.clock.Now()
+	for i, x := range []struct {
+		st         adminv1.CheckStatus
+		conn, resp uint32
+	}{
+		{cOK, 200, 100}, {cOK, 300, 200}, {cDeg, 500, 0}, {cFail, 900, 999},
+	} {
+		e.s.record(e.ctx, a, Result{Status: x.st, At: now.Add(-time.Duration(i+1) * 10 * time.Minute), LatencyMS: 400, ConnectMS: x.conn, ResponseMS: x.resp, ExitIP: "203.0.113.9", ExitCountry: "DE"})
+	}
+	// a finished day, as the rollup leaves it
+	day := now.Unix() - now.Unix()%86400 - 86400
+	e.exec(`INSERT INTO health_check_daily (inbound_id, day, ok, failed, degraded, p50_ms, p95_ms, connect_p50_ms, connect_p95_ms, response_p50_ms, response_p95_ms, jitter_ms)
+		VALUES (?, ?, 5, 1, 2, 300, 900, 250, 800, 100, 400, 40)`, a, day)
+
+	resp, err := rpc{e.s}.GetChecks(e.ctx, req(&adminv1.GetChecksRequest{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cell *adminv1.CheckCell
+	for _, c := range resp.Msg.Rows[0].Cells {
+		if c.Deployed {
+			cell = c
+		}
+	}
+	st := cell.GetStats_24H()
+	// connect 200,300,500 (the failed round is left out): p50 300, p95 500; response 100,200: p50 100, p95 200, stddev 50.
+	if st.GetRounds() != 3 || st.GetConnectP50Ms() != 300 || st.GetConnectP95Ms() != 500 || st.GetResponseP50Ms() != 100 || st.GetResponseP95Ms() != 200 || st.GetJitterMs() != 50 {
+		t.Fatalf("stats_24h: %+v", st)
+	}
+	if len(cell.Daily) != 0 {
+		t.Fatalf("daily without daily_days: %+v", cell.Daily)
+	}
+	resp, err = rpc{e.s}.GetChecks(e.ctx, req(&adminv1.GetChecksRequest{DailyDays: 7}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range resp.Msg.Rows[0].Cells {
+		if c.Deployed {
+			cell = c
+		}
+	}
+	if len(cell.Daily) != 1 || cell.Daily[0].DayUnix != day || cell.Daily[0].ConnectP95Ms != 800 || cell.Daily[0].ResponseP95Ms != 400 || cell.Daily[0].JitterMs != 40 ||
+		cell.Daily[0].Ok != 5 || cell.Daily[0].LatencyP50Ms != 300 {
+		t.Fatalf("daily: %+v", cell.Daily)
 	}
 }

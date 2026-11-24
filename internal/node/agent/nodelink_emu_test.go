@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -87,6 +88,15 @@ func (e *nodeLinkEmu) nowMs() int64 { return e.now().UnixMilli() }
 // advance moves the emulated clock forward. Timers are not re-armed: call runAlarm.
 func (e *nodeLinkEmu) advance(d time.Duration) { e.offset.Add(int64(d)) }
 
+// advanceBetweenSteps moves the clock as an event of the node's object, so no step of it is under way when time jumps. A
+// step sends its frames before it stores its alarm: a test that saw the agent act on a frame and moved the clock at once
+// would have that step clamp a deadline counted on the old clock to "now + MIN_ALARM_GAP_MS" on the new one, and the
+// alarm would not be due. Use it before runAlarm.
+func (e *nodeLinkEmu) advanceBetweenSteps(nodeID string, d time.Duration) {
+	o := e.object(nodeID)
+	o.do(func() { e.advance(d) })
+}
+
 // limits are BLOCK_MS and STEP_MS: tests shorten them for the moment a step is meant to run out of time.
 func (e *nodeLinkEmu) limits() (budget, stepMax time.Duration) {
 	e.mu.Lock()
@@ -119,7 +129,7 @@ func (e *nodeLinkEmu) object(id string) *linkObject {
 	o := e.objs[id]
 	if o == nil {
 		o = &linkObject{e: e, id: id, wake: make(chan struct{}, 1), waiters: map[string]*emuWaiter{},
-			failNext: map[fleet.LinkKind]int{}, loseState: map[fleet.LinkKind]int{}}
+			failNext: map[fleet.LinkKind]int{}, failNextFrame: map[string]int{}, loseState: map[fleet.LinkKind]int{}}
 		e.objs[id] = o
 		if !e.closed {
 			e.wg.Add(1)
@@ -310,8 +320,16 @@ func (e *nodeLinkEmu) Poke(ctx context.Context, nodeIDs []string) error {
 }
 
 // runAlarm is the platform calling alarm(). The platform does so only for an armed alarm whose time has come, so this
-// fails the test when none is armed or it is not due yet (move the clock with advance or advanceToAlarm first).
-func (e *nodeLinkEmu) runAlarm(nodeID string) {
+// fails the test when none is armed or it is not due yet (move the clock with advanceBetweenSteps or advanceToAlarm first).
+func (e *nodeLinkEmu) runAlarm(nodeID string) { e.callAlarm(nodeID, true) }
+
+// runAlarmIfArmed is runAlarm for a clock moved past a deadline that the object may re-arm at any moment (it does so when it
+// hears a socket's close): the platform fires an alarm that is already due by itself, in real time, so a test that only needs
+// the alarm to have run must not insist on being the one to run it. A due alarm that is armed is run here; none armed means
+// the platform took it, and its event is already queued.
+func (e *nodeLinkEmu) runAlarmIfArmed(nodeID string) { e.callAlarm(nodeID, false) }
+
+func (e *nodeLinkEmu) callAlarm(nodeID string, mustBeArmed bool) {
 	o := e.object(nodeID)
 	o.do(func() {
 		o.tmu.Lock()
@@ -319,7 +337,9 @@ func (e *nodeLinkEmu) runAlarm(nodeID string) {
 		o.tmu.Unlock()
 		now := e.nowMs()
 		if target == 0 {
-			e.t.Errorf("runAlarm(%s): no alarm is armed, the platform would not call alarm()", nodeID)
+			if mustBeArmed {
+				e.t.Errorf("runAlarm(%s): no alarm is armed, the platform would not call alarm()", nodeID)
+			}
 			return
 		}
 		if target > now {
@@ -370,6 +390,11 @@ func (e *nodeLinkEmu) reset(nodeID string) {
 func (e *nodeLinkEmu) failNext(nodeID string, kind fleet.LinkKind) {
 	o := e.object(nodeID)
 	o.do(func() { o.failNext[kind]++ })
+}
+
+func (e *nodeLinkEmu) failNextFrame(nodeID, message string) {
+	o := e.object(nodeID)
+	o.do(func() { o.failNextFrame[message]++ })
 }
 
 // loseState makes the next step of this kind lose the state it returns: frames, replies and alarm are applied, the state
@@ -541,15 +566,16 @@ type linkObject struct {
 	wake  chan struct{}
 
 	// Storage (sync kv). Only the object's goroutine touches it; tests read through do().
-	gen, live uint64
-	state     string
-	alarmAt   int64
-	poke      bool
-	sockets   []*linkSocket
-	until     time.Time // the end of the current serial block's Go budget
-	forget    bool      // a step asked to forget the node: storage and alarm go after the block
-	failNext  map[fleet.LinkKind]int
-	loseState map[fleet.LinkKind]int
+	gen, live     uint64
+	state         string
+	alarmAt       int64
+	poke          bool
+	sockets       []*linkSocket
+	until         time.Time // the end of the current serial block's Go budget
+	forget        bool      // a step asked to forget the node: storage and alarm go after the block
+	failNext      map[fleet.LinkKind]int
+	failNextFrame map[string]int
+	loseState     map[fleet.LinkKind]int
 
 	// The platform alarm.
 	tmu         sync.Mutex
@@ -1024,6 +1050,7 @@ func (o *linkObject) authenticate(s *linkSocket, auth []byte) {
 		serial   string
 		notAfter time.Time
 		frame    []byte
+		seal     []byte
 		ok       bool
 	}
 	att := s.att
@@ -1032,8 +1059,8 @@ func (o *linkObject) authenticate(s *linkSocket, auth []byte) {
 		if before != nil {
 			before(ctx, fleet.LinkIn{NodeID: o.id, Kind: emuAcceptKind})
 		}
-		serial, notAfter, frame, ok := o.e.fl.Load().LinkAccept(ctx, o.id, att.audience, att.nonce, auth)
-		return accept{serial, notAfter, frame, ok}, nil
+		serial, notAfter, frame, seal, ok := o.e.fl.Load().LinkAccept(ctx, o.id, att.audience, att.nonce, auth)
+		return accept{serial, notAfter, frame, seal, ok}, nil
 	})
 	if err != nil {
 		o.shut(s, 1011, "link error")
@@ -1055,7 +1082,7 @@ func (o *linkObject) authenticate(s *linkSocket, auth []byte) {
 	o.dropLive(false)
 	o.live = generation
 	o.send(s, res.frame)
-	o.run(s, emuEvent{kind: fleet.LinkOpen, at: o.nowMs(), generation: generation, certSerial: res.serial, certNotAfter: res.notAfter}, generation)
+	o.run(s, emuEvent{kind: fleet.LinkOpen, at: o.nowMs(), generation: generation, certSerial: res.serial, certNotAfter: res.notAfter, seal: res.seal}, generation)
 }
 
 type emuEvent struct {
@@ -1064,6 +1091,7 @@ type emuEvent struct {
 	generation   uint64
 	certSerial   string
 	certNotAfter time.Time
+	seal         []byte
 	frame        []byte
 	requestID    string
 	deadlineAt   int64
@@ -1099,6 +1127,29 @@ func emuOneof(m proto.Message) string {
 	return ""
 }
 
+// emuOpened opens the frames of a sealed session for the test log (the object itself never reads a frame), with the keys
+// and counters of a state: the agent's frame against the state before its step, the panel's against the state the step
+// returned, whose counter is already past the `sent` frames. Frames of a plain session, or that do not open, come back
+// as they are.
+func emuOpened(state string, fromAgent bool, sent int, frames [][]byte) [][]byte {
+	var st fleet.SessionState
+	if json.Unmarshal([]byte(state), &st) != nil || st.Seal == nil {
+		return frames
+	}
+	seq := st.SealUp
+	if !fromAgent {
+		seq = st.SealDown - uint64(sent)
+	}
+	out := make([][]byte, len(frames))
+	for i, f := range frames {
+		out[i] = f
+		if plain, err := agentlink.OpenFrame(st.Seal, fromAgent, seq+uint64(i), f); err == nil {
+			out[i] = plain
+		}
+	}
+	return out
+}
+
 func takeFault(faults map[fleet.LinkKind]int, kind fleet.LinkKind) bool {
 	if faults[kind] == 0 {
 		return false
@@ -1107,22 +1158,38 @@ func takeFault(faults map[fleet.LinkKind]int, kind fleet.LinkKind) bool {
 	return true
 }
 
+func takeMessageFault(faults map[string]int, message string) bool {
+	if faults[message] == 0 {
+		return false
+	}
+	faults[message]--
+	return true
+}
+
 // run is one session step on the Go side, applied to the session's socket (nil once it is gone). The state is written
 // first, then the frames go out. An error or a spent budget closes 1011, rejects the waiters and writes nothing.
 func (o *linkObject) run(s *linkSocket, ev emuEvent, gen uint64) (fleet.LinkOut, error) {
 	in := fleet.LinkIn{NodeID: o.id, State: o.state, Kind: ev.kind, At: time.UnixMilli(ev.at), Generation: ev.generation,
-		CertSerial: ev.certSerial, CertNotAfter: ev.certNotAfter, Frame: ev.frame, RequestID: ev.requestID, Record: ev.record}
+		CertSerial: ev.certSerial, CertNotAfter: ev.certNotAfter, Seal: ev.seal, Frame: ev.frame, RequestID: ev.requestID, Record: ev.record}
 	if ev.kind == fleet.LinkRequest {
 		in.DeadlineAt = time.UnixMilli(ev.deadlineAt)
 	}
-	step := emuStep{Gen: gen, Kind: ev.kind, Msg: emuMessage(ev.kind, ev.frame)}
+	shown := ev.frame
+	if ev.kind == fleet.LinkFrame {
+		shown = emuOpened(o.state, true, 0, [][]byte{ev.frame})[0]
+	}
+	step := emuStep{Gen: gen, Kind: ev.kind, Msg: emuMessage(ev.kind, shown)}
 	if ev.kind == fleet.LinkFrame {
 		var frame agentv1.ConnectRequest
-		if proto.Unmarshal(ev.frame, &frame) == nil {
+		if proto.Unmarshal(shown, &frame) == nil {
 			step.Result = frame.GetCommandResult()
 		}
 	}
-	fail, lose := takeFault(o.failNext, ev.kind), takeFault(o.loseState, ev.kind)
+	fail := takeFault(o.failNext, ev.kind)
+	if !fail {
+		fail = ev.kind == fleet.LinkFrame && takeMessageFault(o.failNextFrame, step.Msg)
+	}
+	lose := takeFault(o.loseState, ev.kind)
 	before := o.e.beforeHook()
 	out, err := emuCall(o, func(ctx context.Context) (fleet.LinkOut, error) {
 		if before != nil {
@@ -1149,11 +1216,12 @@ func (o *linkObject) run(s *linkSocket, ev emuEvent, gen uint64) (fleet.LinkOut,
 		o.state = out.State
 	}
 	if s != nil {
-		for _, raw := range out.Frames {
+		shown := emuOpened(out.State, false, len(out.Frames), out.Frames)
+		for i, raw := range out.Frames {
 			// Logged before the write: the agent acts on a frame as soon as it reads it, and a test that has seen it act
 			// must find the frame in the log.
 			var m agentv1.ConnectResponse
-			if s.writable() && proto.Unmarshal(raw, &m) == nil {
+			if s.writable() && proto.Unmarshal(shown[i], &m) == nil {
 				o.logMu.Lock()
 				o.sentLog = append(o.sentLog, emuSent{Gen: gen, Frame: &m})
 				o.logMu.Unlock()

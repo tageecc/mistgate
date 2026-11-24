@@ -28,6 +28,15 @@ const stripes: Record<string, Stripes> = {
   RO: { v: ["#002b7f", "#fcd116", "#ce1126"] },
   BE: { v: ["#000", "#fdda24", "#ef3340"] },
   IR: { h: ["#239f40", "#fff", "#da0000"] },
+  MD: { v: ["#0046ae", "#ffd200", "#cc092f"] },
+  RS: { h: ["#c6363c", "#0c4076", "#fff"] },
+  SK: { h: ["#fff", "#0b4ea2", "#ee1c25"] },
+  SI: { h: ["#fff", "#0057b8", "#ed1c24"] },
+  HR: { h: ["#f00", "#fff", "#171796"] },
+  ID: { h: ["#ce1126", "#fff"] },
+  TH: { h: ["#a51931", "#f4f5f8", "#2d2a4a", "#f4f5f8", "#a51931"], w: [1, 1, 2, 1, 1] },
+  CA: { v: ["#d80621", "#fff", "#d80621"], w: [1, 2, 1] },
+  MX: { v: ["#006847", "#fff", "#ce1126"] },
 };
 
 const W = 30;
@@ -94,6 +103,27 @@ const special: Record<string, ReactNode> = {
       <circle cx={15} cy={10} r={6} fill="#bc002d" />
     </>
   ),
+  // the crescent and the five stars, the stars as dots: at chip size their points are under a pixel
+  SG: (
+    <>
+      <rect width={W} height={H / 2} fill="#ef3340" />
+      <rect y={H / 2} width={W} height={H / 2} fill="#fff" />
+      <circle cx={6.8} cy={5} r={4} fill="#fff" />
+      <circle cx={8.5} cy={5} r={3.4} fill="#ef3340" />
+      {[0, 1, 2, 3, 4].map((i) => {
+        const a = -Math.PI / 2 + (i * 2 * Math.PI) / 5;
+        return <circle key={i} cx={12.2 + 2.2 * Math.cos(a)} cy={5 + 2.2 * Math.sin(a)} r={0.8} fill="#fff" />;
+      })}
+    </>
+  ),
+  BY: (
+    <>
+      <rect width={W} height={H} fill="#cf101a" />
+      <rect y={(H * 2) / 3} width={W} height={H / 3} fill="#007c30" />
+      <rect width={3.6} height={H} fill="#fff" />
+      <rect x={1.2} width={1.2} height={H} fill="#cf101a" />
+    </>
+  ),
   KZ: (
     <>
       <rect width={W} height={H} fill="#00afca" />
@@ -135,9 +165,6 @@ const special: Record<string, ReactNode> = {
   ),
 };
 
-/** True when the flag is drawn here (otherwise the two letters are shown). */
-export const hasFlag = (code: string) => code.toUpperCase() in stripes || code.toUpperCase() in special;
-
 /** A small rounded flag of an ISO 3166 country code; an unknown code shows its letters in a grey tile. `size` is the height. */
 export function Flag({ code, size = 16, className }: { code: string; size?: number; className?: string }) {
   const c = code.toUpperCase();
@@ -145,13 +172,13 @@ export function Flag({ code, size = 16, className }: { code: string; size?: numb
   const art = c in special ? special[c] : c in stripes ? bands(stripes[c]!) : null;
   if (!art) {
     return (
-      <span aria-hidden className={cx("inline-flex flex-none items-center justify-center rounded-[3px] bg-surface-2 font-mono font-bold text-muted", className)} style={{ width, height: size, fontSize: Math.max(7, Math.round(size * 0.5)) }}>
+      <span aria-hidden className={cx("inline-flex flex-none items-center justify-center rounded-[4px] bg-surface-2 font-mono font-bold text-muted", className)} style={{ width, height: size, fontSize: Math.max(7, Math.round(size * 0.5)) }}>
         {c.slice(0, 2)}
       </span>
     );
   }
   return (
-    <svg aria-hidden width={width} height={size} viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" className={cx("block flex-none rounded-[3px] shadow-[0_0_0_1px_rgb(128_128_128/0.35)]", className)}>
+    <svg aria-hidden width={width} height={size} viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" className={cx("block flex-none rounded-[4px] shadow-[0_0_0_1px_rgb(128_128_128/0.3)]", className)}>
       {art}
     </svg>
   );
@@ -164,7 +191,7 @@ const letters = (flag: string) => String.fromCharCode(...[...flag].map((ch) => c
 export function FlagText({ text, size = 14 }: { text: string; size?: number }) {
   return (
     <>
-      {text.split(pair).map((part, i) => (i % 2 === 1 ? <Flag key={i} code={letters(part)} size={size} className="mr-1 inline-block align-[-2px]" /> : part))}
+      {text.split(pair).map((part, i) => (i % 2 === 1 ? <Flag key={i} code={letters(part)} size={size} className="me-1 inline-block align-[-2px]" /> : part))}
     </>
   );
 }

@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -19,6 +20,8 @@ import (
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
 	agentv1 "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/internal/agentcap"
+	"github.com/mistgate/mistgate/internal/node/osupdate"
 	"github.com/mistgate/mistgate/internal/panel/store"
 	"github.com/mistgate/mistgate/internal/release"
 )
@@ -51,6 +54,7 @@ type fakeFleet struct {
 	drift           map[string]bool
 	online          map[string]int
 	updates         []string // node ids UpdateAgent was sent to, in order
+	updateOptions   map[string][]UpdateAgentOptions
 	rollback        []string
 	sendFrames      []sentUpdateFrame
 	rollbackFrames  []sentRollbackFrame
@@ -61,10 +65,41 @@ type fakeFleet struct {
 	onRollback func(node string) (*agentv1.CommandResult, error)
 	// afterLive runs (under the lock) once a Live snapshot is built: what it changes is seen by the next read only.
 	afterLive func(f *fakeFleet)
+	// osSent records the OS jobs sent, in order; onOs decides the answer (nil = started under the job id of the request).
+	osSent []sentOsJob
+	onOs   func(node string, req OsJobRequest) (*agentv1.CommandResult, error)
+	// gateChecks counts the second-vantage runs per node; onGate answers them (nil = no other node: "no_sender").
+	gateChecks map[string]int
+	onGate     func(node string, run int) (sender string, udp []store.PortCheck, tcp []store.TCPCheck, code string)
+}
+
+func (f *fakeFleet) CheckPortsForGate(_ context.Context, id string) (string, []store.PortCheck, []store.TCPCheck, string) {
+	f.mu.Lock()
+	if f.gateChecks == nil {
+		f.gateChecks = map[string]int{}
+	}
+	f.gateChecks[id]++
+	run, fn := f.gateChecks[id], f.onGate
+	f.mu.Unlock()
+	if fn == nil {
+		return "", nil, nil, "no_sender"
+	}
+	return fn(id, run)
+}
+
+func (f *fakeFleet) gateRuns(id string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.gateChecks[id]
+}
+
+type sentOsJob struct {
+	nodeID string
+	req    OsJobRequest
 }
 
 func newFakeFleet() *fakeFleet {
-	return &fakeFleet{live: map[string]bool{}, noSession: map[string]bool{}, caps: map[string][]string{}, drift: map[string]bool{}, online: map[string]int{}}
+	return &fakeFleet{live: map[string]bool{}, noSession: map[string]bool{}, caps: map[string][]string{}, drift: map[string]bool{}, online: map[string]int{}, updateOptions: map[string][]UpdateAgentOptions{}}
 }
 
 func (f *fakeFleet) HasSession(nodeID string) bool {
@@ -131,21 +166,61 @@ func (f *fakeFleet) precondition(id string) error {
 		return connect.NewError(connect.CodeFailedPrecondition, errors.New("node is offline"))
 	}
 	for _, c := range f.caps[id] {
-		if c == capUpdate || c == capLinkUpdate { // the edge fleet asks link-only nodes with update-link/1
+		if c == agentcap.Update || c == agentcap.UpdateLink { // the edge fleet asks link-only nodes with update-link/1
 			return nil
 		}
 	}
 	return connect.NewError(connect.CodeFailedPrecondition, errors.New("node cannot update itself"))
 }
 
+// UpdateOs is the fleet's: offline and agents without os-update/1 are refused before anything is sent.
+func (f *fakeFleet) UpdateOs(_ context.Context, id string, req OsJobRequest, _ time.Duration) (*agentv1.CommandResult, error) {
+	f.mu.Lock()
+	if !f.live[id] {
+		f.mu.Unlock()
+		return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("node is offline"))
+	}
+	if !slices.Contains(f.caps[id], agentcap.OSUpdate) {
+		f.mu.Unlock()
+		return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("agent too old"))
+	}
+	f.osSent = append(f.osSent, sentOsJob{id, req})
+	fn := f.onOs
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(id, req)
+	}
+	return &agentv1.CommandResult{Ok: true, Params: map[string]string{"state": osupdate.AnswerStarted, "job_id": req.JobID}}, nil
+}
+
+func (f *fakeFleet) osJobs() []sentOsJob {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]sentOsJob(nil), f.osSent...)
+}
+
 func okResult() *agentv1.CommandResult { return &agentv1.CommandResult{Ok: true, Affected: 1} }
 
-func (f *fakeFleet) UpdateAgent(_ context.Context, id string, _, _ []byte, _ time.Duration) (*agentv1.CommandResult, error) {
+func (f *fakeFleet) UpdateAgent(_ context.Context, id string, _, _ []byte, _, _ time.Duration) (*agentv1.CommandResult, error) {
+	return f.updateAgent(id)
+}
+
+func (f *fakeFleet) UpdateAgentWithRequestID(_ context.Context, id, _ string, _, _ []byte, _, _ time.Duration, options UpdateAgentOptions) (*agentv1.CommandResult, error) {
+	return f.updateAgentWithOptions(id, options)
+}
+
+func (f *fakeFleet) updateAgent(id string) (*agentv1.CommandResult, error) {
+	return f.updateAgentWithOptions(id, UpdateAgentOptions{})
+}
+
+func (f *fakeFleet) updateAgentWithOptions(id string, options UpdateAgentOptions) (*agentv1.CommandResult, error) {
 	if err := f.precondition(id); err != nil {
 		return nil, err
 	}
 	f.mu.Lock()
 	f.updates = append(f.updates, id)
+	options.Sources = append([]string(nil), options.Sources...)
+	f.updateOptions[id] = append(f.updateOptions[id], options)
 	fn := f.onUpdate
 	f.mu.Unlock()
 	if fn != nil {
@@ -179,7 +254,7 @@ type sentRollbackFrame struct {
 	deadline          time.Time
 }
 
-func (f *fakeFleet) SendUpdateAgent(_ context.Context, nodeID, requestID string, manifest, signature []byte, token string, deadline time.Time) error {
+func (f *fakeFleet) SendUpdateAgent(_ context.Context, nodeID, requestID string, manifest, signature []byte, token string, deadline time.Time, _ time.Duration) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.sendFrames = append(f.sendFrames, sentUpdateFrame{nodeID: nodeID, requestID: requestID, manifest: append([]byte(nil), manifest...),
@@ -227,10 +302,15 @@ type fakeHealth struct {
 	runs      map[string]int
 	since     map[string]time.Time
 	errors    map[string]error
+	timeouts  map[string]bool                // every failed round was a timeout
+	lasted    map[string]time.Duration       // how long the failures have lasted
+	pending   map[string][]string            // inbound ids without an OK round, for NodeChecksPending
+	rounds    map[string][]store.CheckSample // the newest round of each probeable inbound, for NodeLastRounds
 }
 
 func newFakeHealth() *fakeHealth {
-	return &fakeHealth{probeable: map[string]int{}, ok: map[string]int{}, failed: map[string]int{}, runs: map[string]int{}, since: map[string]time.Time{}, errors: map[string]error{}}
+	return &fakeHealth{probeable: map[string]int{}, ok: map[string]int{}, failed: map[string]int{}, runs: map[string]int{}, since: map[string]time.Time{}, errors: map[string]error{},
+		timeouts: map[string]bool{}, lasted: map[string]time.Duration{}}
 }
 
 func (h *fakeHealth) RunChecksNow(_ context.Context, id string) (int, int, time.Duration, error) {
@@ -240,11 +320,34 @@ func (h *fakeHealth) RunChecksNow(_ context.Context, id string) (int, int, time.
 	return 1, 0, 0, nil
 }
 
-func (h *fakeHealth) NodeChecksSince(_ context.Context, id string, since time.Time) (int, int, int, error) {
+func (h *fakeHealth) NodeChecksSince(_ context.Context, id string, since time.Time) (int, int, int, bool, time.Duration, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.since[id] = since
-	return h.probeable[id], h.ok[id], h.failed[id], h.errors[id]
+	return h.probeable[id], h.ok[id], h.failed[id], h.timeouts[id], h.lasted[id], h.errors[id]
+}
+
+// lossy sets what the panel's probes see: one inbound whose failures are timeouts (or not) that have lasted d.
+func (h *fakeHealth) lossy(id string, timeouts bool, d time.Duration) {
+	h.mu.Lock()
+	h.probeable[id], h.ok[id], h.failed[id] = 1, 0, 1
+	h.timeouts[id], h.lasted[id] = timeouts, d
+	h.mu.Unlock()
+}
+
+func (h *fakeHealth) NodeChecksPending(_ context.Context, id string, _ time.Time) ([]string, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.pending[id], h.errors[id]
+}
+
+func (h *fakeHealth) setPending(id string, inbounds ...string) {
+	h.mu.Lock()
+	if h.pending == nil {
+		h.pending = map[string][]string{}
+	}
+	h.pending[id] = inbounds
+	h.mu.Unlock()
 }
 
 func (h *fakeHealth) set(id string, probeable, ok, failed int) {
@@ -294,6 +397,10 @@ func newEnv(t *testing.T) *env {
 	}
 	e := &env{t: t, ctx: ctx, st: st, fl: newFakeFleet(), hl: newFakeHealth(), dir: t.TempDir(), pub: pub, priv: priv,
 		clk: &clock{t: time.Unix(1_791_100_000, 0)}, built: map[string]int64{}}
+	if _, err := st.W.ExecContext(ctx, `INSERT INTO admin (id, display_name, role, user_handle, created_at) VALUES (?, ?, ?, ?, ?)`,
+		"adm_test", "alice", store.RoleOwner, []byte("admin-handle"), e.clk.Now().Unix()); err != nil {
+		t.Fatal(err)
+	}
 	e.stepUp = func(context.Context) error { return nil }
 	e.s = e.newService(pub)
 	return e
@@ -326,6 +433,13 @@ func (e *env) newEdgeService(key ed25519.PublicKey, version string) *Service {
 		e.t.Fatal(err)
 	}
 	return s
+}
+
+// syncBundle runs the GitHub bundle sync the way the worker starts it, and waits for it.
+func (e *env) syncBundle() {
+	e.t.Helper()
+	e.s.startNodeBundleSync(e.ctx)
+	e.s.wg.Wait()
 }
 
 // restart replaces the Service with a new one on the same database, the way a panel restart does.
@@ -401,7 +515,7 @@ func (e *env) addNode(name string, o nodeOpts) string {
 		e.t.Fatal(err)
 	}
 	if o.caps == nil {
-		o.caps = []string{"doctor/1", capUpdate, capGuard}
+		o.caps = []string{"doctor/1", agentcap.Update, agentcap.UpdateGuard}
 	}
 	if o.built == 0 {
 		o.built = oldBuilt
@@ -440,7 +554,7 @@ func (e *env) hello(id, version string, built int64, caps []string, lastUpdateJS
 // upgrade plays what the agent does after a successful UpdateAgent: it re-executes and reconnects with the new build.
 func (e *env) upgrade(id string) {
 	e.t.Helper()
-	e.hello(id, "0.2.0-new", newBuilt, []string{"doctor/1", capUpdate, capGuard}, "")
+	e.hello(id, "0.2.0-new", newBuilt, []string{"doctor/1", agentcap.Update, agentcap.UpdateGuard}, "")
 }
 
 // commit plays the agent raising update_committed.
@@ -549,4 +663,20 @@ func (e *env) nodeState(id string) adminv1.NodeUpdateState {
 	}
 	e.t.Fatalf("node %s is not listed", id)
 	return 0
+}
+
+func (h *fakeHealth) NodeLastRounds(_ context.Context, id string) ([]store.CheckSample, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return slices.Clone(h.rounds[id]), h.errors[id]
+}
+
+// setRounds sets the newest round of each probeable inbound of the node (what NodeLastRounds returns).
+func (h *fakeHealth) setRounds(id string, rounds ...store.CheckSample) {
+	h.mu.Lock()
+	if h.rounds == nil {
+		h.rounds = map[string][]store.CheckSample{}
+	}
+	h.rounds[id] = rounds
+	h.mu.Unlock()
 }

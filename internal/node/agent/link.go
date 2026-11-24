@@ -8,7 +8,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -27,6 +26,7 @@ const linkHandshakeTimeout = 10 * time.Second
 type websocketAgentTransport struct {
 	ctx         context.Context
 	conn        *websocket.Conn
+	link        *agentlink.Link
 	closeOnce   sync.Once
 	established bool
 }
@@ -34,11 +34,11 @@ type websocketAgentTransport struct {
 func (s *websocketAgentTransport) Context() context.Context { return s.ctx }
 
 func (s *websocketAgentTransport) Send(m *pb.ConnectRequest) error {
-	return agentlink.WriteFrame(s.ctx, s.conn, m)
+	return s.link.Write(s.ctx, m)
 }
 
 func (s *websocketAgentTransport) Receive() (*pb.ConnectResponse, error) {
-	typ, frame, err := agentlink.ReadFrame(s.ctx, s.conn)
+	typ, frame, err := s.link.Read(s.ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -72,6 +72,10 @@ func parseLinkBase(raw string) (*url.URL, error) {
 }
 
 func (a *Agent) dialLink(ctx context.Context) (*websocketAgentTransport, func(), error) {
+	return a.dialLinkVia(ctx, "")
+}
+
+func (a *Agent) dialLinkVia(ctx context.Context, viaNodeID string) (*websocketAgentTransport, func(), error) {
 	base, err := parseLinkBase(a.cfg.LinkURL)
 	if err != nil {
 		return nil, nil, err
@@ -83,7 +87,16 @@ func (a *Agent) dialLink(ctx context.Context) (*websocketAgentTransport, func(),
 	endpoint.Fragment = ""
 	endpoint.Scheme = "wss"
 
-	client, cleanup := a.newLinkHTTPClient()
+	var client *http.Client
+	var cleanup func()
+	if viaNodeID == "" {
+		client, cleanup = a.newLinkHTTPClient()
+	} else {
+		client, cleanup, err = a.newLinkHTTPClientVia(viaNodeID)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
 
 	hctx, cancel := context.WithTimeout(ctx, linkHandshakeTimeout)
 	defer cancel()
@@ -120,16 +133,38 @@ func (a *Agent) dialLink(ctx context.Context) (*websocketAgentTransport, func(),
 	if !ok || key.Curve != elliptic.P256() {
 		return refuse(errors.New("node link key is invalid"))
 	}
-	nodeNonce := make([]byte, 32)
-	if _, err := io.ReadFull(rand.Reader, nodeNonce); err != nil {
+	// The agent asks the panel to seal the session (the marker in its nonce) and signs that nonce too (v2). Only after a
+	// handshake that failed once the proof was sent does the next dial sign as an agent of the older panels did (v1, still
+	// asking to seal): a panel that cannot read v2 hangs up, and the old proof is the one it knows. A v2 dial takes a sealed
+	// answer only.
+	legacy := a.linkLegacy.Swap(false) && !a.linkPlain
+	nodeNonce, err := agentlink.SealNonce()
+	if a.linkPlain {
+		_, err = rand.Read(nodeNonce)
+	}
+	if err != nil {
 		return refuse(errors.New("node link nonce generation failed"))
 	}
-	signature, err := agentlink.Sign(key, agentlink.AgentDigest(a.meta.NodeID, challenge.Audience, challenge.Nonce))
+	digest := agentlink.AgentDigestV2(a.meta.NodeID, challenge.Audience, challenge.Nonce, nodeNonce)
+	if legacy || a.linkPlain {
+		digest = agentlink.AgentDigest(a.meta.NodeID, challenge.Audience, challenge.Nonce)
+	}
+	signature, err := agentlink.Sign(key, digest)
 	if err != nil {
 		return refuse(errors.New("node link signature failed"))
 	}
 	if err := agentlink.WriteFrame(hctx, ws, &pb.LinkAuth{NodeId: a.meta.NodeID, Nonce: nodeNonce, Signature: signature}); err != nil {
 		return refuse(errors.New("panel link authentication failed"))
+	}
+	refuse = func(reason error) (*websocketAgentTransport, func(), error) {
+		if !legacy && !a.linkPlain {
+			a.linkLegacy.Store(true)
+		}
+		_ = ws.Close(websocket.StatusPolicyViolation, "")
+		if cleanup != nil {
+			cleanup()
+		}
+		return nil, nil, reason
 	}
 	typ, frame, err = agentlink.ReadFrame(hctx, ws)
 	if err != nil || typ != websocket.MessageBinary {
@@ -143,10 +178,20 @@ func (a *Agent) dialLink(ctx context.Context) (*websocketAgentTransport, func(),
 		return refuse(errors.New("panel link authentication failed"))
 	}
 	caKey, ok := id.caCert.PublicKey.(*ecdsa.PublicKey)
-	if !ok || !agentlink.Verify(caKey, agentlink.PanelDigest(a.meta.NodeID, challenge.Audience, challenge.Nonce, nodeNonce), accepted.Signature) {
+	if !ok {
 		return refuse(errors.New("panel link authentication failed"))
 	}
-	return &websocketAgentTransport{ctx: ctx, conn: ws}, cleanup, nil
+	var keys []byte // nil: an older panel, which signs the plain digest and does not seal (never after a v2 proof)
+	switch {
+	case agentlink.Verify(caKey, agentlink.SealedPanelDigest(a.meta.NodeID, challenge.Audience, challenge.Nonce, nodeNonce), accepted.Signature):
+		if keys, err = agentlink.SealKeys(key, caKey, a.meta.NodeID, challenge.Audience, challenge.Nonce, nodeNonce); err != nil {
+			return refuse(errors.New("panel link authentication failed"))
+		}
+	case (legacy || a.linkPlain) && agentlink.Verify(caKey, agentlink.PanelDigest(a.meta.NodeID, challenge.Audience, challenge.Nonce, nodeNonce), accepted.Signature):
+	default:
+		return refuse(errors.New("panel link authentication failed"))
+	}
+	return &websocketAgentTransport{ctx: ctx, conn: ws, link: agentlink.NewLink(ws, keys, true)}, cleanup, nil
 }
 
 // newLinkHTTPClient shares the link transport's TLS settings and test seam with link downloads.
@@ -160,15 +205,36 @@ func (a *Agent) newLinkHTTPClient() (*http.Client, func()) {
 		st = &pb.NodeSettings{}
 	}
 	timeout := dialTimeout(st)
+	dialContext := (&net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}).DialContext
+	if a.directDialContext != nil {
+		dialContext = a.directDialContext
+	}
 	transport := &http.Transport{
 		TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}},
-		DialContext:         (&net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}).DialContext,
+		DialContext:         dialContext,
 		TLSHandshakeTimeout: timeout,
 		IdleConnTimeout:     30 * time.Second,
 		MaxIdleConns:        1,
 	}
 	client := &http.Client{Transport: transport}
 	return client, client.CloseIdleConnections
+}
+
+func (a *Agent) newLinkHTTPClientVia(entryNodeID string) (*http.Client, func(), error) {
+	base, _ := a.newLinkHTTPClient()
+	var transport *http.Transport
+	switch current := base.Transport.(type) {
+	case nil:
+		transport = http.DefaultTransport.(*http.Transport).Clone()
+	case *http.Transport:
+		transport = current.Clone()
+	default:
+		return nil, nil, errors.New("link transport cannot use the bridge")
+	}
+	transport.DialContext = a.panelBridgeDial(entryNodeID)
+	client := *base
+	client.Transport = transport
+	return &client, transport.CloseIdleConnections, nil
 }
 
 var _ agentTransport = (*websocketAgentTransport)(nil)

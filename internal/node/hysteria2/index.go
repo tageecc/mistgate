@@ -8,12 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/apernet/hysteria/core/v2/server"
 	quic "github.com/apernet/quic-go"
+	"github.com/mistgate/mistgate/internal/node/nets"
 	"github.com/mistgate/mistgate/internal/node/ratelimit"
 	"github.com/mistgate/mistgate/internal/plugin"
 )
@@ -63,36 +65,43 @@ type parsedCred struct {
 	hash [32]byte
 }
 
-// buildIndex validates creds (nothing is touched on error), then reuses the states of credentials that
-// already exist in old and updates their mutable fields. users hands out the person buckets of the inbound's
-// credentials (nil: no person limits).
-func buildIndex(inboundID string, old *index, creds []plugin.UserCred, users *ratelimit.Registry) (*index, error) {
+// buildIndex skips malformed credentials and later duplicate ids or tokens, then reuses the states of credentials
+// already in old and updates their mutable fields. users hands out the person buckets of the inbound's credentials.
+func buildIndex(inboundID string, old *index, creds []plugin.UserCred, users *ratelimit.Registry) (*index, []error) {
+	creds = append([]plugin.UserCred(nil), creds...)
+	sort.SliceStable(creds, func(i, j int) bool { return creds[i].CredID < creds[j].CredID })
 	parsed := make([]parsedCred, 0, len(creds))
 	seenID := make(map[string]struct{}, len(creds))
 	seenHash := make(map[[32]byte]string, len(creds))
+	var skipped []error
 	for _, c := range creds {
 		if c.CredID == "" {
-			return nil, fmt.Errorf("credential without id")
+			skipped = append(skipped, fmt.Errorf("credential without id"))
+			continue
 		}
+		if _, dup := seenID[c.CredID]; dup {
+			skipped = append(skipped, fmt.Errorf("duplicate credential id %s", c.CredID))
+			continue
+		}
+		seenID[c.CredID] = struct{}{}
 		var d struct {
 			AuthSHA256 string `json:"auth_sha256"`
 		}
 		if err := json.Unmarshal(c.Data, &d); err != nil {
-			return nil, fmt.Errorf("credential %s: data: %w", c.CredID, err)
+			skipped = append(skipped, fmt.Errorf("credential %s: data: %w", c.CredID, err))
+			continue
 		}
 		raw, err := hex.DecodeString(d.AuthSHA256)
 		if err != nil || len(raw) != sha256.Size {
-			return nil, fmt.Errorf("credential %s: auth_sha256 must be 64 hex chars", c.CredID)
+			skipped = append(skipped, fmt.Errorf("credential %s: auth_sha256 must be 64 hex chars", c.CredID))
+			continue
 		}
 		var h [32]byte
 		copy(h[:], raw)
-		if _, dup := seenID[c.CredID]; dup {
-			return nil, fmt.Errorf("duplicate credential id %s", c.CredID)
-		}
 		if other, dup := seenHash[h]; dup {
-			return nil, fmt.Errorf("credentials %s and %s share one token", other, c.CredID)
+			skipped = append(skipped, fmt.Errorf("credentials %s and %s share one token", other, c.CredID))
+			continue
 		}
-		seenID[c.CredID] = struct{}{}
 		seenHash[h] = c.CredID
 		parsed = append(parsed, parsedCred{c, h})
 	}
@@ -134,7 +143,7 @@ func buildIndex(inboundID string, old *index, creds []plugin.UserCred, users *ra
 		ix.byHash[p.hash] = cs
 		ix.byID[p.c.CredID] = cs
 	}
-	return ix, nil
+	return ix, skipped
 }
 
 // ---- hot path: hysteria core callbacks, all on *inbound ----
@@ -246,6 +255,7 @@ func (cs *credState) clampKicks(open int32) {
 // The old EventLogger methods below retain address-keyed state only for compatibility with an unpatched core.
 type session struct {
 	cs                 *credState
+	asn                uint32
 	since              time.Time
 	conn               *quic.Conn
 	startBytes         uint64
@@ -259,7 +269,15 @@ func (in *inbound) Connect(addr net.Addr, id string, _ uint64) {
 	if cs == nil {
 		return
 	}
-	s := &session{cs: cs, since: in.e.now(), startBytes: cs.bytesMoved()}
+	asn := nets.LookupAddr(in.e.env.Nets, addr)
+	if in.e.env.Nets != nil {
+		userID := ""
+		if owner := cs.owner.Load(); owner != nil {
+			userID = owner.userID
+		}
+		in.e.env.Nets.Add(in.spec.ID, asn, nets.Connect, cs.id, userID)
+	}
+	s := &session{cs: cs, asn: asn, since: in.e.now(), startBytes: cs.bytesMoved()}
 	cs.conns.Add(1)
 	cs.connects.Add(1)
 	in.smu.Lock()
@@ -285,16 +303,32 @@ func (in *inbound) Disconnect(addr net.Addr, id string, err error) {
 	}
 }
 
-func (in *inbound) Accepted(*quic.Conn) { in.accepted.Add(1) }
+func (in *inbound) Accepted(conn *quic.Conn) {
+	in.accepted.Add(1)
+	markAccepted(conn)
+}
 
 func (in *inbound) ConnConnect(conn *quic.Conn, id string, _ uint64) {
 	cs := in.idx.Load().byID[id]
 	if cs == nil || conn == nil {
 		return
 	}
+	asn := uint32(0)
+	if hs, ok := conn.Context().Value(handshakeKey{}).(*handshake); ok && hs != nil {
+		asn = hs.asn
+	} else {
+		asn = nets.LookupAddr(in.e.env.Nets, conn.RemoteAddr())
+	}
+	if in.e.env.Nets != nil {
+		userID := ""
+		if owner := cs.owner.Load(); owner != nil {
+			userID = owner.userID
+		}
+		in.e.env.Nets.Add(in.spec.ID, asn, nets.Connect, cs.id, userID)
+	}
 	stats := connStats(conn)
 	s := &session{
-		cs: cs, since: in.e.now(), conn: conn, startBytes: stats.BytesSent + stats.BytesReceived,
+		cs: cs, asn: asn, since: in.e.now(), conn: conn, startBytes: stats.BytesSent + stats.BytesReceived,
 		last: stats, silencePacketsRecv: stats.PacketsReceived, silencePacketsSent: stats.PacketsSent,
 	}
 	// the handshake and the authentication are this key's too: their packets, and the ones lost on the way
@@ -362,6 +396,7 @@ func addConnectionDelta(cs *credState, previous, current quic.ConnectionStats) {
 
 func (in *inbound) endSession(s *session, err error) {
 	cs := s.cs
+	broken := false
 	var stats quic.ConnectionStats
 	if s.conn != nil {
 		stats = connStats(s.conn)
@@ -371,6 +406,7 @@ func (in *inbound) endSession(s *session, err error) {
 	if errors.As(err, &idleTimeout) {
 		if isFreezeAtClose(stats, s.last, s.silencePacketsRecv, s.silencePacketsSent) && s.conn != nil {
 			cs.freezes.Add(1)
+			broken = true
 		} else {
 			cs.quiet.Add(1)
 		}
@@ -380,9 +416,18 @@ func (in *inbound) endSession(s *session, err error) {
 		}
 		if moved < s.startBytes || moved-s.startBytes < 64<<10 || in.e.now().Sub(s.since) < 60*time.Second {
 			cs.drops.Add(1)
+			broken = true
 		}
 	} else if isClientClose(err) {
 		cs.clientCloses.Add(1)
+	}
+	// Ordinary client closes have no failure signal, so only an observed freeze or short idle-timeout drop is counted broken.
+	if broken && in.e.env.Nets != nil {
+		userID := ""
+		if owner := cs.owner.Load(); owner != nil {
+			userID = owner.userID
+		}
+		in.e.env.Nets.Add(in.spec.ID, s.asn, nets.Broken, cs.id, userID)
 	}
 	cs.clampKicks(cs.conns.Add(-1))
 }
@@ -407,6 +452,8 @@ func (in *inbound) takeLinkStats() plugin.LinkStat {
 	return plugin.LinkStat{
 		InboundID: in.spec.ID, UnknownKeys: in.unknownKeys.Swap(0), Hellos: in.hellos.Swap(0), Handshakes: in.handshakes.Swap(0),
 		Accepted: in.accepted.Swap(0), HellosForeign: in.hellosForeign.Swap(0),
+		HsUnfinished: in.hsUnfinished.Swap(0), TLSAlertsSent: in.tlsAlertsSent.Swap(0), TLSAlertsRecv: in.tlsAlertsRecv.Swap(0),
+		TLSCertRefused: in.tlsCertRefused.Swap(0),
 	}
 }
 

@@ -3,7 +3,7 @@ import { InboundState, NodeStatus } from "@/gen/mistgate/admin/v1/common_pb";
 import { CheckStatus, CountryVerdict } from "@/gen/mistgate/admin/v1/health_pb";
 import type { CountryCheck } from "./health";
 import type { RelayMsg } from "./relay";
-import { hintOf, ipv6FactOf, isWayId, lanesOf, relaysState, type WaysInput } from "./ways";
+import { entryOf, entryOffered, entryState, hintOf, ipv6FactOf, isWayId, lanesOf, relaysState, type Ipv6Entry, type WaysInput } from "./ways";
 
 const country = (verdict: CountryVerdict, dark: string[] = [], over: Partial<CountryCheck> = {}) =>
   ({ nodeId: "", verdict, atUnix: 100, probes: [], vantages: dark.map((network) => ({ network, key: "", state: "dark" })), ...over }) as unknown as CountryCheck;
@@ -21,6 +21,30 @@ const base = (over: Partial<WaysInput> = {}): WaysInput => ({
 });
 
 describe("lanesOf", () => {
+  it("servers kept out of subscriptions: the direct lane is off and hidden only when all of them are", () => {
+    const hiddenAll = lanesOf(base({ country: country(CountryVerdict.PARTIAL, ["MTS"]), inbounds: [{ state: InboundState.ACTIVE, directInSubscriptions: false }, { state: InboundState.ACTIVE, directInSubscriptions: false }] }));
+    expect(hiddenAll.lanes[0]).toMatchObject({ id: "direct", state: "off", ring: "off", hidden: true, fault: false });
+    const hiddenOne = lanesOf(base({ inbounds: [{ state: InboundState.ACTIVE, directInSubscriptions: false }, { state: InboundState.ACTIVE }] }));
+    expect(hiddenOne.lanes[0]).toMatchObject({ state: "ok", hidden: false });
+    // a disabled server does not count: the one running is hidden
+    const disabledToo = lanesOf(base({ inbounds: [{ state: InboundState.DISABLED }, { state: InboundState.ACTIVE, directInSubscriptions: false }] }));
+    expect(disabledToo.lanes[0]).toMatchObject({ state: "off", hidden: true });
+  });
+
+  it("a CDN profile is a lane of its own, after direct, with no country verdict", () => {
+    const w = lanesOf(base({ country: country(CountryVerdict.BLOCKED), inbounds: [{ state: InboundState.ACTIVE, directInSubscriptions: false }, { state: InboundState.ACTIVE, cdn: true }], relays: [on] }));
+    expect(w.lanes.map((l) => l.id)).toEqual(["direct", "cdn", "via:msk1"]);
+    expect(w.lanes[0]).toMatchObject({ state: "off", hidden: true });
+    expect(w.lanes[1]).toMatchObject({ kind: "cdn", state: "ok", seen: "unknown", ring: "ok", hidden: false });
+    expect(isWayId("cdn")).toBe(true);
+    // only CDN servers: nobody is given the node's address
+    const cdnOnly = lanesOf(base({ inbounds: [{ state: InboundState.ACTIVE, cdn: true }] }));
+    expect(cdnOnly.lanes[0]).toMatchObject({ id: "direct", state: "off", hidden: true });
+    // the CDN servers kept out of subscriptions, or one of them failing
+    expect(lanesOf(base({ inbounds: [{ state: InboundState.ACTIVE, cdn: true, directInSubscriptions: false }] })).lanes[1]).toMatchObject({ state: "off", hidden: true });
+    expect(lanesOf(base({ inbounds: [{ state: InboundState.ACTIVE, cdn: true }, { state: InboundState.FAILED, cdn: true }] })).lanes[1]).toMatchObject({ state: "warn", fault: true });
+  });
+
   it("a node dark on part of the country: direct works, half seen, opened first, no badge", () => {
     const w = lanesOf(base({ country: country(CountryVerdict.PARTIAL, ["Tele2", "MTS"]) }));
     expect(w.lanes.map((l) => l.id)).toEqual(["direct"]);
@@ -85,6 +109,12 @@ describe("lanesOf", () => {
     const broken = lanesOf(base({ portChecks: [{ verdict: "broken" }] }));
     expect(broken.lanes[0]).toMatchObject({ state: "bad", fault: true });
     expect(broken.badge).toBe(1);
+    // one broken port among working ones: the lane warns (and still counts in the badge), it is not down
+    const some = lanesOf(base({ portChecks: [{ verdict: "ok" }, { verdict: "broken" }, { verdict: "lossy" }], tcpChecks: [{ verdict: "ours" }] }));
+    expect(some.lanes[0]).toMatchObject({ state: "warn", fault: true });
+    expect(some.badge).toBe(1);
+    expect(lanesOf(base({ portChecks: [{ verdict: "broken" }], tcpChecks: [{ verdict: "timeout" }] })).lanes[0]!.state).toBe("bad");
+    expect(lanesOf(base({ portChecks: [{ verdict: "broken" }], tcpChecks: [{ verdict: "ours" }] })).lanes[0]!.state).toBe("warn");
     expect(lanesOf(base({ tcpChecks: [{ verdict: "busy" }] })).lanes[0]!.state).toBe("warn");
     const cells = [{ deployed: true, last: { status: CheckStatus.FAILED } }, { deployed: true, last: { status: CheckStatus.OK } }];
     expect(lanesOf(base({ cells })).lanes[0]!.state).toBe("warn");
@@ -93,12 +123,58 @@ describe("lanesOf", () => {
     expect(gone.lanes[0]).toMatchObject({ state: "off", fault: false });
   });
 
+  it("a port whose test is blocked while its protocol check passes lets people in: the lane works and has no badge", () => {
+    const blocked = { verdict: "broken", checkedUnix: 1000, protocolOkUnix: 1060 };
+    const w = lanesOf(base({ portChecks: [{ verdict: "ok" }, blocked], tcpChecks: [{ verdict: "ours" }] }));
+    expect(w.lanes[0]).toMatchObject({ state: "ok", fault: false });
+    expect(w.badge).toBe(0);
+    expect(lanesOf(base({ portChecks: [blocked, { ...blocked, verdict: "lossy" }] })).lanes[0]!.state).toBe("ok");
+    // the protocol check failed (0) or is older than 15 minutes before the run: the loss stands
+    expect(lanesOf(base({ portChecks: [{ ...blocked, protocolOkUnix: 0 }] })).lanes[0]).toMatchObject({ state: "bad", fault: true });
+    expect(lanesOf(base({ portChecks: [{ verdict: "ok" }, { ...blocked, protocolOkUnix: 1000 - 16 * 60 }] })).lanes[0]).toMatchObject({ state: "warn", fault: true });
+  });
+
   it("the IPv6 lane: shown, off, for a server with IPv6, seen by the IPv6 rounds", () => {
     expect(lanesOf(base({ ipv6: "none" })).lanes.map((l) => l.id)).toEqual(["direct"]);
     const w = lanesOf(base({ ipv6: "ok", country: country(CountryVerdict.PARTIAL, ["MTS"], { ipv6: country(CountryVerdict.OK) }) }));
     expect(w.lanes.map((l) => l.id)).toEqual(["direct", "ipv6"]);
     expect(w.lanes[1]).toMatchObject({ state: "off", ring: "off", seen: "all" });
     expect(lanesOf(base({ ipv6: "broken" })).lanes[1]!.id).toBe("ipv6");
+  });
+
+  it("the IPv6 lane with the entry on works, and is down (a fault) while the server's IPv6 does not work", () => {
+    const lit = lanesOf(base({ ipv6: "ok", entry: "on", country: country(CountryVerdict.PARTIAL, ["MTS"], { ipv6: country(CountryVerdict.OK) }) }));
+    expect(lit.lanes[1]).toMatchObject({ id: "ipv6", state: "ok", ring: "ok", fault: false });
+    // the doctor may stop reporting, the entry still has its lane
+    const dark = lanesOf(base({ ipv6: "none", entry: "down" }));
+    expect(dark.lanes[1]).toMatchObject({ id: "ipv6", state: "bad", ring: "bad", fault: true });
+    expect(dark.badge).toBe(1);
+  });
+});
+
+describe("the IPv6 entry", () => {
+  const v6 = (over: Partial<Ipv6Entry>): Ipv6Entry => ({ entry: "", entrySupported: true, unavailableReason: "", addresses: [], src: "", ...over });
+
+  it("entryState: on, down while the uplink has no working IPv6, else off", () => {
+    expect(entryState(v6({}))).toBeUndefined();
+    expect(entryState(v6({ entry: "2001:db8::5" }))).toBe("on");
+    expect(entryState(v6({ entry: "2001:db8::5", entrySupported: false, unavailableReason: "ipv6_broken" }))).toBe("down");
+    expect(entryState(v6({ entry: "2001:db8::5", entrySupported: false, unavailableReason: "no_ipv6" }))).toBe("down");
+    // an old agent names no address, but the entry that is on still works
+    expect(entryState(v6({ entry: "2001:db8::5", entrySupported: false, unavailableReason: "agent_old" }))).toBe("on");
+  });
+
+  it("entryOffered only when the node takes one and it is off", () => {
+    expect(entryOffered(v6({}))).toBe(true);
+    expect(entryOffered(v6({ entry: "2001:db8::5" }))).toBe(false);
+    expect(entryOffered(v6({ entrySupported: false, unavailableReason: "main_is_ipv6" }))).toBe(false);
+  });
+
+  it("entryOf keeps the server's view, and words the doctor's fact when the node message has none", () => {
+    const sent = v6({ entry: "2001:db8::5" });
+    expect(entryOf(sent, "none")).toBe(sent);
+    expect(entryOf(undefined, "broken")).toMatchObject({ entrySupported: false, unavailableReason: "ipv6_broken" });
+    expect(entryOf(undefined, "unknown").unavailableReason).toBe("not_checked");
   });
 });
 

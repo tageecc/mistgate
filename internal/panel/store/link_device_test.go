@@ -96,7 +96,7 @@ func TestEnsureLinkDeviceHWIDsGetCredentialsOfTheirOwn(t *testing.T) {
 		if hash != "" {
 			h = []byte(hash)
 		}
-		data, err := s.Access().SubscriptionData(ctx, "usr_l", "grp_link", linkNow, true, linkNow, h)
+		data, err := s.Access().SubscriptionData(ctx, "usr_l", linkNow, true, linkNow, h)
 		if err != nil || data.Device.ID != want || len(data.DeviceCreds) != 2 || len(data.Devices) != 3 {
 			t.Fatalf("SubscriptionData for %q: device %q with %d credentials of %d devices, %v; want %q", want, data.Device.ID, len(data.DeviceCreds), len(data.Devices), err, want)
 		}
@@ -106,7 +106,7 @@ func TestEnsureLinkDeviceHWIDsGetCredentialsOfTheirOwn(t *testing.T) {
 			}
 		}
 	}
-	if data, err := s.Access().SubscriptionData(ctx, "usr_l", "grp_link", linkNow, true, linkNow, HWIDHash("usr_l", "cccccccccccccccc")); err != nil || data.Device.ID != "" || len(data.DeviceCreds) != 0 {
+	if data, err := s.Access().SubscriptionData(ctx, "usr_l", linkNow, true, linkNow, HWIDHash("usr_l", "cccccccccccccccc")); err != nil || data.Device.ID != "" || len(data.DeviceCreds) != 0 {
 		t.Fatalf("an unknown HWID reads %+v, %v; want no device", data.Device, err)
 	}
 	// None of them is a key.
@@ -183,7 +183,7 @@ func TestEnsureLinkDeviceAdoptsTheSharedDevice(t *testing.T) {
 		t.Fatalf("live devices after the adoption = %d, want 1", n)
 	}
 	// The shared place is empty now: an app without a HWID is a new device, and a second HWID does not adopt anything.
-	if data, err := s.Access().SubscriptionData(ctx, "usr_l", "grp_link", linkNow, true, linkNow, nil); err != nil || data.Device.ID != "" {
+	if data, err := s.Access().SubscriptionData(ctx, "usr_l", linkNow, true, linkNow, nil); err != nil || data.Device.ID != "" {
 		t.Fatalf("the shared device after the adoption reads %+v, %v; want none", data.Device, err)
 	}
 	second, err := s.Access().EnsureLinkDevice(ctx, linkDevice("usr_l", "b", HWIDHash("usr_l", "bbbbbbbbbbbbbbbb")), 10, linkNow, linkCreds("b", "usr_l"))
@@ -438,8 +438,8 @@ func TestDeviceCountsCountManyLinkDevicesOnce(t *testing.T) {
 	if _, err := s.Access().EnsureLinkDevice(ctx, linkDevice("usr_o", "one", nil), 0, linkNow, linkCreds("one", "usr_o")); err != nil {
 		t.Fatal(err)
 	}
-	counts, err := s.Access().DeviceCounts(ctx, []string{"usr_l", "usr_o"})
-	if err != nil || counts["usr_l"] != 5 || counts["usr_o"] != 1 {
+	counts, err := s.Access().DeviceCounts(ctx, []string{"usr_l", "usr_o"}, linkNow)
+	if err != nil || counts["usr_l"].Used != 5 || counts["usr_o"].Used != 1 {
 		t.Fatalf("DeviceCounts = %v, %v; want 5 and 1", counts, err)
 	}
 	users, _, listCounts, err := s.Access().ListUsers(ctx, AccessUserQuery{Sort: AccessUserSortDevices, Descending: true, Now: linkNow, Limit: 10})

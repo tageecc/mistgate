@@ -3,14 +3,16 @@ title: 添加节点
 description: 选择 SSH 安装或手动安装，使用一次性命令注册服务器，查看节点上线情况，并在之后彻底移除节点。
 ---
 
+![“新节点”窗口：先填服务器地址，再依次是登录、检查和安装步骤，直到节点连上](../../images/readme/addnode-dark-en.webp)
+
 节点 Agent 从面板获取证书、将自己安装为 systemd 服务并连接后，节点就会加入集群。**节点 → 添加节点**提供两种方式：
 
 | 方式 | 操作 | 适用情形 |
 |:--|:--|:--|
-| **通过 SSH 自动安装** | 输入服务器地址，确认 SSH 主机密钥并输入密码；其余由面板完成。 | 通常使用此方式。详见[通过 SSH 安装节点](ssh-install.md)。 |
-| **获取手动安装命令** | 将 Agent 复制到服务器，并以 root 身份运行一次性命令。 | 面板无法通过 SSH 访问服务器（在 Cloudflare 版中：地址属于 Cloudflare 或由其代理、网络为私有网络，或 SSH 只允许你自己的 IP）；服务器只允许密钥登录；或你希望自行运行命令。详见本页。 |
+| **通过 SSH** | 输入服务器地址，确认 SSH 主机密钥，并使用面板密钥或密码登录；其余由面板完成。 | 通常使用此方式。详见[通过 SSH 安装节点](ssh-install.md)。 |
+| **使用命令** | 将 Agent 复制到服务器，并以 root 身份运行一次性命令。 | 面板无法通过 SSH 访问服务器（在 Cloudflare 版中：地址属于 Cloudflare 或由其代理、网络为私有网络，或 SSH 只允许你自己的 IP）；或你希望自行运行命令。详见本页。 |
 
-AI 智能体也可以通过 MCP 发起 SSH 安装；你需要在审批页面上批准并输入密码：见 [AI 智能体指南](ai-agents.md)。本页也介绍如何移除节点。如果对话框直接显示名称、国家/地区和地址字段，说明面板版本早于 SSH 安装功能；先更新面板（见[面板更新](../operations/updates.md)）。
+AI 智能体也可以通过 MCP 发起 SSH 安装；你需要在审批页面上批准，并选择面板密钥或输入密码：见 [AI 智能体指南](ai-agents.md)。本页也介绍如何移除节点。如果对话框直接显示名称、国家/地区和地址字段，说明面板版本早于 SSH 安装功能；先更新面板（见[面板更新](../operations/updates.md)）。
 
 ## 手动安装前
 
@@ -20,15 +22,17 @@ AI 智能体也可以通过 MCP 发起 SSH 安装；你需要在审批页面上�
 
 ## 1. 选择手动安装
 
-在**节点 → 添加节点**中选择**获取手动安装命令**。从概览页的**添加节点**卡片、命令面板和设置向导末尾，也可以打开同一个窗口。如果已经创建了等待手动安装的节点，又想在 SSH 向导中使用同一名称，请先将它退役，或换一个未使用的名称。
+在**节点 → 添加节点**中选择**使用命令**。从概览页的**添加节点**卡片、命令面板和设置向导末尾，也可以打开同一个窗口。如果已经创建了等待手动安装的节点，又想在 SSH 向导中使用同一名称，请先将它退役，或换一个未使用的名称。
 
 | 字段 | 输入内容 |
 |:--|:--|
 | 名称 | a–z、0–9 和连字符，2 到 24 个字符，例如 `de1`。活动节点和正在进行的 SSH 安装名称不能重复；节点退役后会释放名称，但保留历史记录。 |
-| 国家/地区 | 可选。它会影响 DNS：对于俄罗斯节点，诊断会检查 gosuslugi.ru 并推荐 Yandex DNS。 |
+| 国家/地区 | 可选。它会影响 DNS：对于俄罗斯节点，诊断会检查 gosuslugi.ru 并推荐 Yandex DNS；对于中国节点，会检查 www.baidu.com 并推荐 AliDNS 和 DNSPod。 |
 | 地址 | 域名或 IP，不带 `https://` 和端口。客户端会连接到此地址，而且该地址会写入所有订阅。Hysteria2 使用 Let’s Encrypt 证书时，需要 A 记录指向服务器的域名。 |
 
 如果地址是 IP，窗口会在继续前提示：该节点上的 Hysteria2 需要有 A 记录的域名，或在添加协议配置时选择自签名（固定指纹）证书。AmneziaWG 可以直接使用 IP。
+
+从第二个节点起，窗口还会询问**节点分发给谁**：**所有人**（所有分组，以及之后新建的分组）、**部分分组**（只给你勾选的分组）或**暂不分发**（先检查节点：没有任何分组获得它，因此它不在任何订阅中）。选项默认是你上次的选择，之前没有选择过则是**暂不分发**。面板的第一个节点不会询问：它分发给所有分组，让新面板立即可用，窗口也会这样说明。之后可以在节点页面修改：见[节点分发给谁](../guide/nodes.md#节点列表)。
 
 点击**生成安装命令**。节点会以「等待安装」状态显示在列表中，窗口会显示三个步骤。
 
@@ -80,7 +84,7 @@ started; follow it with: journalctl -u mistgate-node -f
 
 `install`：
 
-1. 检查是否以 root 身份运行，以及状态目录中是否有身份信息。
+1. 检查是否以 root 身份运行、状态目录中是否有身份信息，以及服务器上是否有 `nft` 命令。它自己不安装任何软件包：没有 `nft` 时不会更改任何内容，只给出提示和要运行的命令（Debian 和 Ubuntu 上为 `apt-get install -y nftables`；Debian 13 云镜像不带它），并以退出码 3 结束。
 2. 将自身复制到 `/usr/local/bin/mistgate-node`。之后不再需要 `/root` 中的文件。
 3. 根据服务器内存写入加固过的服务单元 `/etc/systemd/system/mistgate-node.service`，然后运行 `systemctl daemon-reload`、`enable` 和 `restart`。
 
@@ -126,7 +130,7 @@ systemctl restart mistgate-node && journalctl -u mistgate-node -n 50 --no-pager
 - 从所有用户的访问权限中移除此节点：用户的订阅中不再包含该节点，但链接保持不变；
 - 吊销节点证书，并取消其尚未使用的安装命令；
 - 在面板和审计日志中保留节点记录和历史记录；节点名称可供以后重新安装时使用；
-- 保留通过 SSH 安装节点的已保存 SSH 凭据：仍可在已退役节点的**服务器 → SSH 凭据**中查看密码；只有使用**清除已保存的凭据**才会删除。如果密码由面板生成（通过 MCP 轮换），退役对话框会提醒你先显示并保存副本。
+- 保留通过 SSH 安装节点的已保存 SSH 凭据：仍可在已退役节点的**服务器 → SSH 访问**中查看密码；只有使用**清除已保存的凭据**才会删除。如果密码由面板生成（通过 MCP 轮换），退役对话框会提醒你先显示并保存副本。
 
 如果 Agent 已连接，它会收到退役指令，并在服务器上执行以下操作：
 
@@ -156,7 +160,7 @@ systemctl restart systemd-journald
 
 如果应用过诊断中的 DNS 解析器修复，删除 `/etc/systemd/resolved.conf.d/90-mistgate.conf` 并重启 systemd-resolved；或者使用 `/etc/resolv.conf.mistgate.bak` 还原 `/etc/resolv.conf`（如果存在 `/etc/resolv.conf.mistgate.bak.link`，原文件是指向其中所写路径的符号链接）。
 
-可以随时运行 `mistgate-node cleanup-net`。它会移除 AmneziaWG 和 WARP 接口、WARP 路由和规则，以及对应的 nftables 表；Agent 启动后会重新创建它们。
+可以随时运行 `mistgate-node cleanup-net`。它会移除 AmneziaWG 和 WARP 接口、WARP 路由和规则，以及对应的 nftables 表；Agent 启动后会重新创建它们。它不会动 Agent 添加到服务器上的 IPv6 地址（节点自己的地址，记录在状态目录的 `ipv6-owned.json` 中），因此重启或更新不会让它们消失；`mistgate-node cleanup-net --ipv6-addresses` 会一并移除它们，但绝不会移除主机原有的地址。退役节点同样会移除它们。
 
 ## 注册失败时
 
@@ -171,6 +175,7 @@ systemctl restart systemd-journald
 | 超时或 `connection refused` | 面板已停止、防火墙阻止到面板 TCP 443 的连接，或命令中的地址错误。 | 检查面板和防火墙；从节点运行 `curl -I https://panel.example.com/` 测试。 |
 | `already enrolled; use --force to replace the identity` | 状态目录中已有身份信息。 | 在 `enroll` 后添加 `--force`，或者先移除 `/var/lib/mistgate-node`。 |
 | `install: must run as root` | 当前用户不是 root。 | 以 root 身份运行命令。 |
+| `install: nft is not installed on this server`（退出码 3） | 缺少 `nftables` 软件包，Debian 13 云镜像就是如此。没有任何更改。 | 运行提示中给出的命令（`apt-get install -y nftables`），然后再次运行 `install`。 |
 | `holds no identity: run mistgate-node enroll first` | `enroll` 失败，或 `install` 使用了另一个 `--state-dir`。 | 在相同状态目录中重新运行 `enroll`。 |
 | 管理后台在**生成安装命令**后显示「未配置面板地址」 | 面板没有 Agent 地址：setup 未使用 `--public-url`，且 `serve` 没有 `--agent-addr`。 | 重启面板并传入 `--agent-addr panel.example.com:443`。 |
 

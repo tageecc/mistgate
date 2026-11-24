@@ -25,12 +25,13 @@ import (
 	"github.com/mistgate/mistgate/internal/panel/auth"
 	"github.com/mistgate/mistgate/internal/panel/httpserver/ratelimit"
 	"github.com/mistgate/mistgate/internal/panel/store"
+	"github.com/mistgate/mistgate/internal/panel/update"
 	"github.com/mistgate/mistgate/web"
 )
 
-// AdminHandler is one more Connect service of the admin API. Path is the prefix the
-// generated constructor returns ("/mistgate.admin.v1.NodeService/"). It is served at
-// /api<Path> behind the session middleware, so handlers can rely on auth.AdminFrom.
+// AdminHandler is one more handler under the admin API, usually a Connect service but
+// sometimes a plain HTTP route. Path is its prefix and is served at /api<Path> behind
+// the session middleware, so handlers can rely on auth.AdminFrom.
 type AdminHandler struct {
 	Path    string
 	Handler http.Handler
@@ -116,6 +117,18 @@ type Config struct {
 	// on the admin surface (behind the secret prefix, host or separate listener): never on the decoy side, the public mounts
 	// or the agent endpoint. The handler authenticates its own requests (a bearer token, never a cookie). nil: no endpoint.
 	MCP func(api http.Handler) http.Handler
+	// AdminAPIReady is called with the authenticated in-process API after all handlers have been registered. Internal
+	// services that act through the same API can bind here without depending on the HTTP listener.
+	AdminAPIReady func(api http.Handler)
+	// Metrics, if set, is asked first for <admin>/metrics on the admin surface only. It authenticates its own requests (a
+	// bearer secret of its own, never a session) and returns false, having written nothing, while the owner has the endpoint
+	// off: the request then gets what any unknown admin path gets. nil: no endpoint (the Cloudflare edition).
+	Metrics func(w http.ResponseWriter, r *http.Request) bool
+	// RPCStats, if set, is told about every admin API call (/api/...) when it ends: its status, how long it took and whether
+	// it was a stream (rpcstat.Window, read by OpsService.GetPanelResources). The VPS edition only.
+	RPCStats interface {
+		Record(status int, d time.Duration, stream bool)
+	}
 }
 
 // mcpWriteWindow is how long an MCP call may take to answer: longer than the listener's write timeout, because a plan that
@@ -206,10 +219,14 @@ type apiRouter []AdminHandler
 func (a apiRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for _, h := range a {
 		if strings.HasPrefix(r.URL.Path, h.Path) {
-			if isStream(r) {
-				liftDeadlines(w)
-			} else if longUnary[r.URL.Path] {
-				liftWriteDeadline(w)
+			// Only a signed-in caller gets the deadlines lifted: the public procedures reach this router without a
+			// session, and a stream content type there must not let a slow client hold the connection open.
+			if _, ok := auth.AdminFrom(r.Context()); ok {
+				if isStream(r) {
+					liftDeadlines(w)
+				} else if longUnary[r.URL.Path] {
+					liftWriteDeadline(w)
+				}
 			}
 			h.Handler.ServeHTTP(w, r)
 			return
@@ -219,7 +236,11 @@ func (a apiRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // longUnary are the admin calls that answer after more than the listener's write timeout: a TSPU probe test runs for minutes.
-var longUnary = map[string]bool{adminv1connect.TspuProbeServiceTestTspuProbeProcedure: true}
+var longUnary = map[string]bool{
+	adminv1connect.TspuProbeServiceTestTspuProbeProcedure: true,
+	auth.BackupDownloadProcedure:                          true, // the archive is streamed after its snapshot
+	auth.NodeSniScanProcedure:                             true, // the node walks its /24 for up to 50 s
+}
 
 // isStream reports a Connect or gRPC streaming-capable request: its response may last
 // longer than the listener's write timeout.
@@ -242,8 +263,11 @@ func liftWriteDeadline(w http.ResponseWriter) {
 	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
 }
 
+// validSecretPrefix: "/" + something + "/", with nothing a URL path cannot carry as is (spaces, control characters,
+// quotes, angle brackets, backslashes). The admin prefix ends up in the <base href> of the SPA, escaped there too.
 func validSecretPrefix(p string) bool {
-	return len(p) >= 4 && strings.HasPrefix(p, "/") && strings.HasSuffix(p, "/")
+	return len(p) >= 4 && strings.HasPrefix(p, "/") && strings.HasSuffix(p, "/") &&
+		!strings.ContainsFunc(p, func(r rune) bool { return r <= ' ' || r == 0x7f || strings.ContainsRune("\"'<>`\\", r) })
 }
 
 // New validates cfg and builds the server. st is the panel database (instance settings,
@@ -289,8 +313,12 @@ func New(cfg Config, a *auth.Service, st *store.Store) (*Server, error) {
 		s.pages[page.Path+"/"] = protected
 	}
 	s.logo = NewLogoHandler(st, cfg.Log)
+	protectedAPI := a.RequireSession(s.api)
+	if cfg.AdminAPIReady != nil {
+		cfg.AdminAPIReady(protectedAPI)
+	}
 	if cfg.MCP != nil {
-		s.mcp = cfg.MCP(a.RequireSession(s.api))
+		s.mcp = cfg.MCP(protectedAPI)
 	}
 	if cfg.UserPagePreview != nil {
 		s.preview = s.requireLinkAccess(http.HandlerFunc(s.servePreview))
@@ -334,7 +362,7 @@ func newServer(cfg Config, st *store.Store, clientIP func(*http.Request) netip.A
 		return nil, errors.New("AgentLinkPrefix must be a separate secret path prefix of at least 16 characters")
 	}
 	cfg.AdminHost = strings.ToLower(strings.TrimSuffix(cfg.AdminHost, "."))
-	s := &Server{cfg: cfg, st: st, decoy: newDecoy(cfg.DecoyDir, cfg.Log), dist: cfg.Dist, clientIP: clientIP, withIP: withIP}
+	s := &Server{cfg: cfg, st: st, decoy: newDecoy(cfg.DecoyDir, cfg.Log, st), dist: cfg.Dist, clientIP: clientIP, withIP: withIP}
 	s.pubLim = cfg.Limits.limiter(cfg.Limits.Public, Rate{PerSecond: 10, Burst: 60})
 	s.adminLim = cfg.Limits.limiter(cfg.Limits.Admin, Rate{PerSecond: 30, Burst: 200}) // a page load and its polling
 	s.agentLim = cfg.Limits.limiter(cfg.Limits.Agent, Rate{PerSecond: 5, Burst: 30})
@@ -429,6 +457,8 @@ func (s *Server) serveAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	if agentStream(r) {
 		liftDeadlines(w)
+		controller := http.NewResponseController(w)
+		r = r.WithContext(update.WithWriteDeadline(r.Context(), controller.SetWriteDeadline))
 	} else {
 		r.Body = http.MaxBytesReader(w, r.Body, agentUnauthBody)
 	}
@@ -562,7 +592,7 @@ func (s *Server) AdminListener() http.Handler {
 func (s *Server) newAdmin(base string) http.Handler {
 	api := http.StripPrefix("/api", s.auth.RequireSession(withVersion(s.api)))
 	spa := s.spa(base)
-	return s.securityHeaders(s.cop.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	admin := s.requestID(s.securityHeaders(s.cop.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch p := r.URL.Path; {
 		case p == "/api/recover-login":
 			if !s.auth.RecoveryEnabled() {
@@ -575,6 +605,7 @@ func (s *Server) newAdmin(base string) http.Handler {
 		case p == "/mcp" && s.mcp != nil:
 			http.NewResponseController(w).SetWriteDeadline(time.Now().Add(mcpWriteWindow)) // the error: a writer without deadlines
 			s.mcp.ServeHTTP(w, r)
+		case p == "/metrics" && s.serveMetrics(w, r): // answered (token, or 401); false: off, fall through
 		case p == "/brand/logo.svg":
 			s.logo.ServeHTTP(w, r)
 		case p == "/recover" && !s.auth.RecoveryEnabled():
@@ -586,7 +617,8 @@ func (s *Server) newAdmin(base string) http.Handler {
 		default:
 			spa.ServeHTTP(w, r)
 		}
-	})))
+	}))))
+	return admin
 }
 
 // cloudflare is the one third-party origin the admin pages may use: while the captcha is on, and on the page where the
@@ -665,10 +697,13 @@ func (s *Server) Serve(ctx context.Context, o ServeOptions) error {
 			ReadHeaderTimeout: 10 * time.Second,
 			ReadTimeout:       30 * time.Second,
 			WriteTimeout:      60 * time.Second,
-			IdleTimeout:       2 * time.Minute,
-			MaxHeaderBytes:    16 << 10,
-			TLSConfig:         tlsCfg,
-			ErrorLog:          log.New(serverLog{s.cfg.Log}, "", 0),
+			// This frees an HTTP/2 handler when a pending write makes no progress for two minutes.
+			// Go 1.27 starts the timer only when data is pending and extends it whenever bytes are written, so idle connections and slow readers that keep making progress are unaffected.
+			HTTP2:          &http.HTTP2Config{WriteByteTimeout: 2 * time.Minute},
+			IdleTimeout:    2 * time.Minute,
+			MaxHeaderBytes: 16 << 10,
+			TLSConfig:      tlsCfg,
+			ErrorLog:       log.New(serverLog{s.cfg.Log}, "", 0),
 		}
 	}
 	tlsCfg, mgr, err := s.publicTLS(o)

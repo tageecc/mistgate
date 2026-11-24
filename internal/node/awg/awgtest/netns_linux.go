@@ -82,8 +82,11 @@ func NewNS(t testing.TB, suffix string) NS {
 	return ns
 }
 
-// Cmd builds a command that runs inside the namespace.
+// Cmd builds a command that runs inside the namespace. The zero NS is the host itself (the benchmark suite's loopback mode).
 func (n NS) Cmd(args ...string) *exec.Cmd {
+	if n.Name == "" {
+		return exec.Command(args[0], args[1:]...)
+	}
 	return exec.Command("ip", append([]string{"netns", "exec", n.Name}, args...)...)
 }
 
@@ -169,6 +172,9 @@ func (n NS) Start(t testing.TB, env []string, args ...string) *Proc {
 	t.Cleanup(p.Kill)
 	return p
 }
+
+// Pid is the process id (the benchmark suite reads its CPU time and memory from /proc).
+func (p *Proc) Pid() int { return p.cmd.Process.Pid }
 
 // Output is everything the process printed so far.
 func (p *Proc) Output() string { return p.out.String() }

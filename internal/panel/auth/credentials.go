@@ -15,6 +15,7 @@ import (
 	"connectrpc.com/connect"
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
+	"github.com/mistgate/mistgate/internal/panel/adminqr"
 	"github.com/mistgate/mistgate/internal/panel/instance"
 	"github.com/mistgate/mistgate/internal/panel/store"
 	"github.com/mistgate/mistgate/internal/panel/vault"
@@ -85,34 +86,53 @@ func (s *Service) ChangePassword(ctx context.Context, req *connect.Request[admin
 	} else if prior.Locked(now) {
 		return nil, connect.NewError(connect.CodeResourceExhausted, errors.New("too many wrong attempts, try again later"))
 	}
+	attempt, err := s.st.RecordLoginFailure(ctx, key, now, MaxSignInFailures+reservationLockHeadroom, FailureWindow, LockDuration)
+	if err != nil {
+		s.log.Error("reserve password-change attempt", "code", "password_change_attempt_reserve_failed", "err", err)
+		return nil, errInternal(err)
+	}
+	if attempt.Failures > MaxSignInFailures {
+		return nil, connect.NewError(connect.CodeResourceExhausted, errors.New("too many wrong attempts, try again later"))
+	}
+	releaseAttempt := func() {
+		if err := s.releaseLoginFailure(ctx, key, MaxSignInFailures); err != nil {
+			s.log.Warn("release password-change attempt", "code", "password_change_attempt_release_failed", "err", err)
+		}
+	}
 	if len(m.CurrentPassword) > maxPasswordBytes {
 		m.CurrentPassword = "" // never matches; the hash is not asked to chew on a megabyte
 	}
 	ok, err := verifyPassword(ctx, s.pepper, cred.Hash, m.CurrentPassword)
 	if err != nil {
+		releaseAttempt()
 		return nil, connect.NewError(connect.CodeUnavailable, errors.New("server is busy, try again"))
 	}
 	if !ok {
-		if _, err := s.st.RecordLoginFailure(ctx, key, now, MaxSignInFailures, FailureWindow, LockDuration); err != nil {
-			s.log.Error("record step-up failure", "err", err)
+		if attempt.Failures >= MaxSignInFailures {
+			if _, lockErr := s.st.LockLoginFailure(ctx, key, MaxSignInFailures, now, FailureWindow, LockDuration); lockErr != nil {
+				s.log.Error("lock failed password-change proof", "code", "password_change_lock_failed", "err", lockErr)
+			}
 		}
 		s.audit(ctx, admin.ID, "password_change", "fail", ip, map[string]any{"reason": "wrong current password"})
 		return nil, codedErr(connect.CodeInvalidArgument, "wrong_password")
 	}
 	hash, err := hashPassword(ctx, s.pepper, m.NewPassword)
 	if err != nil {
+		releaseAttempt()
 		return nil, connect.NewError(connect.CodeUnavailable, errors.New("server is busy, try again"))
 	}
 	if err := s.st.SetPasswordHash(ctx, admin.ID, hash); err != nil {
+		releaseAttempt()
 		s.log.Error("set password", "err", err)
 		return nil, errInternal(err)
 	}
-	ended, err := s.st.DeleteOtherSessions(ctx, admin.ID, currentHash(req))
+	ended, err := s.st.DeleteOtherSessions(ctx, admin.ID, s.currentHash(req))
 	if err != nil {
+		releaseAttempt()
 		s.log.Error("end other sessions", "err", err)
 		return nil, errInternal(err)
 	}
-	if err := s.st.ClearLoginFailures(ctx, key); err != nil {
+	if err := s.clearLoginFailures(ctx, key); err != nil {
 		s.log.Warn("clear step-up failures", "err", err)
 	}
 	s.audit(ctx, admin.ID, "password_change", "ok", ip, map[string]any{"login": cred.Login, "sessions_ended": ended})
@@ -139,7 +159,7 @@ func (s *Service) BeginTotpEnrollment(ctx context.Context, req *connect.Request[
 		return nil, codedErr(connect.CodeFailedPrecondition, "no_master_key")
 	}
 	m := req.Msg
-	c := &ceremony{kind: ceremonyTOTPEnroll, src: SourceKey(s.clientIP(req)), admin: admin, tokenHash: currentHash(req)}
+	c := &ceremony{kind: ceremonyTOTPEnroll, src: SourceKey(s.clientIP(req)), admin: admin, tokenHash: s.currentHash(req)}
 	switch cred, err := s.st.PasswordByAdmin(ctx, admin.ID); {
 	case err == nil: // re-bind: the login and the password stay as they are
 		if m.Login != "" || m.Password != "" {
@@ -172,8 +192,9 @@ func (s *Service) BeginTotpEnrollment(ctx context.Context, req *connect.Request[
 	if err != nil {
 		return nil, ceremonyPutError(err)
 	}
+	uri := totpURI(s.brandName(ctx), c.login, c.totp)
 	return connect.NewResponse(&adminv1.BeginTotpEnrollmentResponse{
-		CeremonyId: id, TotpUri: totpURI(s.brandName(ctx), c.login, c.totp), TotpSecret: b32.EncodeToString(c.totp),
+		CeremonyId: id, TotpUri: uri, TotpSecret: b32.EncodeToString(c.totp), TotpQr: adminqr.Encode(uri),
 	}), nil
 }
 
@@ -196,7 +217,7 @@ func (s *Service) FinishTotpEnrollment(ctx context.Context, req *connect.Request
 	if !ok {
 		return nil, expired()
 	}
-	if c.admin.ID != admin.ID || !bytes.Equal(c.tokenHash, currentHash(req)) {
+	if c.admin.ID != admin.ID || !bytes.Equal(c.tokenHash, s.currentHash(req)) {
 		if _, err := s.st.ConsumeAuthCeremony(ctx, m.CeremonyId); err != nil {
 			s.log.Error("consume foreign TOTP enrollment ceremony", "err", err)
 		}
@@ -221,7 +242,7 @@ func (s *Service) FinishTotpEnrollment(ctx context.Context, req *connect.Request
 	if !consumed {
 		return nil, expired()
 	}
-	sealed := s.vault.Seal(c.totp, totpAAD(admin.ID))
+	sealed := s.vault.Seal(c.totp, TOTPSecretAAD(admin.ID))
 	resp := &adminv1.FinishTotpEnrollmentResponse{Login: c.login}
 	if c.pwHash == "" { // re-bind
 		switch err := s.st.SetTOTPSecret(ctx, admin.ID, sealed, step); {
@@ -231,7 +252,7 @@ func (s *Service) FinishTotpEnrollment(ctx context.Context, req *connect.Request
 			s.log.Error("set totp secret", "err", err)
 			return nil, errInternal(err)
 		}
-		ended, err := s.st.DeleteOtherSessions(ctx, admin.ID, currentHash(req))
+		ended, err := s.st.DeleteOtherSessions(ctx, admin.ID, s.currentHash(req))
 		if err != nil {
 			s.log.Error("end other sessions", "err", err)
 			return nil, errInternal(err)
@@ -347,7 +368,7 @@ func ResetLogin(ctx context.Context, st *store.Store, v *vault.Vault, in ResetLo
 		brand = set.BrandName()
 	}
 	out.TOTPURI, out.TOTPSecret = totpURI(brand, login, secret), b32.EncodeToString(secret)
-	cred := store.PasswordCred{AdminID: target.ID, Login: login, Hash: hash, TOTPSecret: v.Seal(secret, totpAAD(target.ID))}
+	cred := store.PasswordCred{AdminID: target.ID, Login: login, Hash: hash, TOTPSecret: v.Seal(secret, TOTPSecretAAD(target.ID))}
 	params, _ := json.Marshal(map[string]any{"admin": target.ID, "login": login, "created": out.Created})
 	actor := in.Actor
 	if actor == "" {

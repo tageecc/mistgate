@@ -41,9 +41,10 @@ type NodeRow struct {
 	RetiredAt                                                 time.Time
 	// From the last Hello: Hello.built, Hello.capabilities and Hello.last_update as JSON
 	// ("" = never reported; see LastUpdateRow).
-	AgentBuilt     int64
-	AgentCaps      []string
-	LastUpdateJSON string
+	AgentBuilt       int64
+	AgentCaps        []string
+	LastUpdateJSON   string
+	NetworksDBSHA256 string
 	// AwgBackend is the node setting "auto" | "kernel" | "userspace" (migration 00014), sent to agents that list awg/1.
 	AwgBackend string
 	// AwgPrepareJSON is the state of the automatic kernel-module build (migration 00019, see AwgPrepareRow); "" = never asked.
@@ -57,6 +58,24 @@ type NodeRow struct {
 	BandwidthMbps int
 	// DecoyMode is the configured per-node site. DecoyBundleHash names the uploaded own bundle; agent fields come from Hello.
 	DecoyMode, DecoyBundleHash, DecoyAgentMode, DecoyAgentHash string
+	// IPv6Entry is the address of the IPv6 entry (migration 00086): the node's "· IPv6" server in subscriptions connects to it;
+	// "" = off. IPv6JSON is the document around it (IPv6State, ipv6_entry.go).
+	IPv6Entry, IPv6JSON string
+	// PublicLabel is the short text the owner shows people in the Mistgate app next to the server (migration 00129); "" = none.
+	PublicLabel string
+	// LinkSealed is set once the node opened a sealed link session (migration 00134); a plain one is refused after that.
+	LinkSealed bool
+	// BridgePort is the TCP port of the node's site that the bridge of a reverse relay arrives at when the node is an entry; 0 = 443
+	// on the node's own site. BridgePath is the random path of the bridge ("" until the first reverse relay of the entry; migration
+	// 00141). It is the panel's: it goes to the two agents of a pair and nowhere else.
+	BridgePort uint16
+	BridgePath string
+	// DecoySiteID is the library site this node serves in mode "own" ("" = none; migration 00143). DecoyBundleHash follows the site's
+	// current version while it is set.
+	DecoySiteID string
+	// Share is how a new node is handed out to groups: an input of CreateEnrollment only (read it with NodeShares). The zero
+	// value decides by whether the node is the panel's first.
+	Share NodeShareChoice
 }
 
 const nodeCols = `id, name, address, country_code, location, provider, notes, dns_resolvers,
@@ -64,7 +83,7 @@ const nodeCols = `id, name, address, country_code, location, provider, notes, dn
 	boot_at, last_seen_at, last_connected_at, last_disconnected_at, agent_instance_id, last_seq,
 	desired_revision, desired_hash, applied_revision, applied_hash, created_at, retired_at,
 	agent_built, agent_caps, last_update_json, awg_backend, awg_prepare_json, torrent_blocker_enabled, bandwidth_mbps, client_ipv6,
-	decoy_mode, decoy_bundle_hash, decoy_agent_mode, decoy_agent_hash`
+	decoy_mode, decoy_bundle_hash, decoy_agent_mode, decoy_agent_hash, ipv6_entry, ipv6_json, networks_db_sha256, public_label, link_sealed, bridge_port, bridge_path, decoy_site_id`
 
 type rowScanner interface{ Scan(dest ...any) error }
 
@@ -74,14 +93,14 @@ func scanNode(r rowScanner) (NodeRow, error) {
 	var serial sql.NullString
 	var boot, seen, conn, disc, created int64
 	var retired sql.NullInt64
-	var lastSeq, desRev, appRev int64
+	var lastSeq, desRev, appRev, bridgePort int64
 	var caps string
 	err := r.Scan(&n.ID, &n.Name, &n.Address, &n.CountryCode, &n.Location, &n.Provider, &n.Notes, &dns,
 		&n.LivenessTimeoutS, &n.ApplyTimeoutS, &n.DialTimeoutS, &n.State, &serial, &n.AgentVersion, &n.APIVersion,
 		&boot, &seen, &conn, &disc, &n.AgentInstanceID, &lastSeq,
 		&desRev, &n.DesiredHash, &appRev, &n.AppliedHash, &created, &retired,
 		&n.AgentBuilt, &caps, &n.LastUpdateJSON, &n.AwgBackend, &n.AwgPrepareJSON, &n.TorrentBlockerEnabled, &n.BandwidthMbps, &n.ClientIPv6,
-		&n.DecoyMode, &n.DecoyBundleHash, &n.DecoyAgentMode, &n.DecoyAgentHash)
+		&n.DecoyMode, &n.DecoyBundleHash, &n.DecoyAgentMode, &n.DecoyAgentHash, &n.IPv6Entry, &n.IPv6JSON, &n.NetworksDBSHA256, &n.PublicLabel, &n.LinkSealed, &bridgePort, &n.BridgePath, &n.DecoySiteID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return NodeRow{}, ErrNotFound
 	}
@@ -95,12 +114,19 @@ func scanNode(r rowScanner) (NodeRow, error) {
 	n.CreatedAt = fleetTime(created)
 	n.RetiredAt = fleetTime(retired.Int64)
 	n.AgentCaps = strings.Fields(caps)
+	n.BridgePort = uint16(bridgePort)
 	return n, nil
 }
 
 // Node returns one node or ErrNotFound.
 func (s *Store) Node(ctx context.Context, id string) (NodeRow, error) {
 	return scanNode(s.R.QueryRowContext(ctx, `SELECT `+nodeCols+` FROM node WHERE id = ?`, id))
+}
+
+// MarkNodeLinkSealed records that the node opened a sealed link session.
+func (s *Store) MarkNodeLinkSealed(ctx context.Context, id string) error {
+	_, err := s.W.ExecContext(ctx, `UPDATE node SET link_sealed = 1 WHERE id = ?`, id)
+	return err
 }
 
 // NodeWithSentDigest returns one node and its last-sent digest in one read batch.
@@ -140,13 +166,13 @@ func (s *Store) Nodes(ctx context.Context, includeRetired bool) ([]NodeRow, erro
 
 // NodePatch updates the admin-editable fields; nil = unchanged.
 type NodePatch struct {
-	Name, Address, CountryCode, Location, Provider, Notes *string
-	DNSResolvers                                          *[]string
-	LivenessTimeoutS, ApplyTimeoutS, DialTimeoutS         *int
-	AwgBackend                                            *string // "auto" | "kernel" | "userspace"
-	TorrentBlockerEnabled                                 *bool
-	BandwidthMbps                                         *int
-	ClientIPv6                                            *bool
+	Name, Address, CountryCode, Location, Provider, Notes, PublicLabel *string
+	DNSResolvers                                                       *[]string
+	LivenessTimeoutS, ApplyTimeoutS, DialTimeoutS                      *int
+	AwgBackend                                                         *string // "auto" | "kernel" | "userspace"
+	TorrentBlockerEnabled                                              *bool
+	BandwidthMbps                                                      *int
+	ClientIPv6                                                         *bool
 }
 
 // UpdateNode applies the patch and returns the new row. ErrConflict on a name clash.
@@ -158,7 +184,7 @@ func (s *Store) UpdateNode(ctx context.Context, id string, p NodePatch) (NodeRow
 		col string
 		v   *string
 	}{{"name", p.Name}, {"address", p.Address}, {"country_code", p.CountryCode}, {"location", p.Location},
-		{"provider", p.Provider}, {"notes", p.Notes}, {"awg_backend", p.AwgBackend}} {
+		{"provider", p.Provider}, {"notes", p.Notes}, {"awg_backend", p.AwgBackend}, {"public_label", p.PublicLabel}} {
 		if f.v != nil {
 			add(f.col, *f.v)
 		}
@@ -236,11 +262,12 @@ type HelloInfo struct {
 	Facts        NodeFactsRow
 	// Built is Hello.built, Caps Hello.capabilities. LastUpdateJSON is Hello.last_update as JSON (LastUpdateRow);
 	// "" = the Hello carried none, which keeps what is stored (the agent reports an outcome once).
-	Built          int64
-	Caps           []string
-	LastUpdateJSON string
-	DecoyMode      string
-	DecoyHash      string
+	Built            int64
+	Caps             []string
+	LastUpdateJSON   string
+	NetworksDBSHA256 string
+	DecoyMode        string
+	DecoyHash        string
 }
 
 // NodeHello records a (re)connect: the node becomes active, facts are stored, and the reliable-message
@@ -265,10 +292,11 @@ func (s *Store) NodeHello(ctx context.Context, id string, session uint64, h Hell
 			last_seen_at = ?, last_connected_at = ?, agent_instance_id = ?,
 			last_seq = CASE WHEN agent_instance_id = ? THEN last_seq ELSE 0 END,
 			agent_built = ?, agent_caps = ?, last_update_json = CASE WHEN ? <> '' THEN ? ELSE last_update_json END,
-			decoy_agent_mode = ?, decoy_agent_hash = ?
+			decoy_agent_mode = ?, decoy_agent_hash = ?, networks_db_sha256 = ?
 		WHERE id = ?`,
 			Args: []any{h.AgentVersion, h.APIVersion, fleetUnix(h.BootAt), fleetUnix(h.BootAt), unix(now), unix(now), h.Instance, h.Instance,
-				max(h.Built, 0), strings.Join(h.Caps, " "), h.LastUpdateJSON, h.LastUpdateJSON, h.DecoyMode, h.DecoyHash, id}},
+				max(h.Built, 0), strings.Join(h.Caps, " "), h.LastUpdateJSON, h.LastUpdateJSON, h.DecoyMode, h.DecoyHash,
+				h.NetworksDBSHA256, id}},
 		Stmt{Query: `
 		INSERT INTO node_facts (node_id, hostname, os, kernel, arch, cpu_count, ram_total_bytes, disk_total_bytes, virt, has_ipv6, engines_json, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)

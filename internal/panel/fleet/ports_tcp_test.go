@@ -13,6 +13,7 @@ import (
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
 	agentv1 "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/internal/agentcap"
 	"github.com/mistgate/mistgate/internal/panel/protocols"
 	"github.com/mistgate/mistgate/internal/panel/store"
 	"github.com/mistgate/mistgate/internal/plugin"
@@ -71,7 +72,7 @@ func TestTCPTargets(t *testing.T) {
 			specs: []tcpSpec{vlessSpec("b", 8443, realityOther, plugin.TLS{}), hy2Spec("a", plugin.TLSAcmeDomain, "node-a.example.com", "")},
 			want: []tcpTarget{
 				{Port: 80, Role: "acme", Kind: "http_mark"},
-				{Port: 443, Role: "site", ALPN: true, Profile: "hy2-a", Kind: "tls", SNI: "node-a.example.com"},
+				{Port: 443, Role: "site", ALPN: true, Profile: "hy2-a", Kind: "tls", SNI: "node-a.example.com", PublicCert: true},
 				{Port: 8443, Role: "vless", Profile: "vless-b", Kind: "tls", SNI: "www.example.org"},
 			},
 		},
@@ -79,7 +80,7 @@ func TestTCPTargets(t *testing.T) {
 			specs: []tcpSpec{hy2Spec("a", plugin.TLSAcmeDomain, "node-a.example.com", `{"masquerade":{"tcp_port":8443}}`)},
 			want: []tcpTarget{
 				{Port: 80, Role: "acme", Kind: "http_mark"},
-				{Port: 8443, Role: "site", Profile: "hy2-a", Kind: "tls", SNI: "node-a.example.com"},
+				{Port: 8443, Role: "site", Profile: "hy2-a", Kind: "tls", SNI: "node-a.example.com", PublicCert: true},
 			},
 		},
 		"a site that is switched off is not probed": {
@@ -99,8 +100,8 @@ func TestTCPTargets(t *testing.T) {
 			},
 			want: []tcpTarget{
 				{Port: 80, Role: "acme", Kind: "http_mark"},
-				{Port: 443, Role: "vless", ALPN: true, Profile: "vless-b", Kind: "tls", SNI: "node-a.example.com"},
-				{Port: 8443, Role: "vless", Profile: "vless-c", Kind: "tls", SNI: "node-a.example.com"},
+				{Port: 443, Role: "vless", ALPN: true, Profile: "vless-b", Kind: "tls", SNI: "node-a.example.com", PublicCert: true},
+				{Port: 8443, Role: "vless", Profile: "vless-c", Kind: "tls", SNI: "node-a.example.com", PublicCert: true},
 			},
 		},
 		"TLS fronts use their server name and only ACME on 443 gets ALPN": {
@@ -111,8 +112,8 @@ func TestTCPTargets(t *testing.T) {
 			},
 			want: []tcpTarget{
 				{Port: 80, Role: "acme", Kind: "http_mark"},
-				{Port: 443, Role: "vless", ALPN: true, Profile: "vless-a", Kind: "tls", SNI: "origin.example.com"},
-				{Port: 8443, Role: "vless", Profile: "vless-b", Kind: "tls", SNI: "origin.example.com"},
+				{Port: 443, Role: "vless", ALPN: true, Profile: "vless-a", Kind: "tls", SNI: "origin.example.com", PublicCert: true},
+				{Port: 8443, Role: "vless", Profile: "vless-b", Kind: "tls", SNI: "origin.example.com", PublicCert: true},
 				{Port: 9443, Role: "vless", Profile: "vless-c", Kind: "tls", SNI: "origin.example.com"},
 			},
 		},
@@ -128,12 +129,90 @@ func TestTCPTargets(t *testing.T) {
 			specs: []tcpSpec{vlessSpec("b", 8443, `{"reality":{"target":"www.example.org:443"}}`, plugin.TLS{})},
 			want:  []tcpTarget{{Port: 8443, Role: "vless", Profile: "vless-b", Kind: "tls", SNI: "www.example.org"}},
 		},
+		"MTProto own-site fallback is probed by its inbound server name": {
+			specs: []tcpSpec{{Profile: "Telegram", Spec: plugin.InboundSpec{ID: "mt", Protocol: "mtproto", Listen: plugin.Listen{Network: "tcp", Port: 443},
+				TLS: plugin.TLS{ServerName: "node-a.example.com"}, Settings: json.RawMessage(`{"domains":["node-a.example.com"],"fallback":"decoy"}`)}}},
+			pins: map[string]string{"mt": pin},
+			want: []tcpTarget{{Port: 443, Role: "mtproto", Profile: "Telegram", Kind: "tls", SNI: "node-a.example.com", Pin: pin, PublicCert: true}},
+		},
+		// The node closes the Hysteria2 site on a TCP port MTProto holds, so the port is MTProto's whichever id is lower.
+		"MTProto and a Hysteria2 site on 443: the target is MTProto": {
+			specs: []tcpSpec{hy2Spec("a", plugin.TLSAcmeDomain, "hy2.example.com", ""),
+				{Profile: "Telegram", Spec: plugin.InboundSpec{ID: "mt", Protocol: "mtproto", Listen: plugin.Listen{Network: "tcp", Port: 443},
+					TLS: plugin.TLS{ServerName: "node-a.example.com"}, Settings: json.RawMessage(`{"domains":["node-a.example.com"],"fallback":"decoy"}`)}}},
+			want: []tcpTarget{
+				{Port: 80, Role: "acme", Kind: "http_mark"},
+				{Port: 443, Role: "mtproto", Profile: "Telegram", Kind: "tls", SNI: "node-a.example.com", PublicCert: true},
+			},
+		},
+		"MTProto with another site and a Hysteria2 site on 443: nothing proves this node's identity there": {
+			specs: []tcpSpec{hy2Spec("a", plugin.TLSAcmeDomain, "hy2.example.com", ""),
+				{Profile: "Telegram", Spec: plugin.InboundSpec{ID: "mt", Protocol: "mtproto", Listen: plugin.Listen{Network: "tcp", Port: 443},
+					TLS: plugin.TLS{ServerName: "www.example.org"}, Settings: json.RawMessage(`{"domains":["www.example.org"],"fallback":"site"}`)}}},
+			want: []tcpTarget{{Port: 80, Role: "acme", Kind: "http_mark"}},
+		},
+		"MTProto foreign-site fallback does not prove this node's identity": {
+			specs: []tcpSpec{{Profile: "Telegram", Spec: plugin.InboundSpec{ID: "mt", Protocol: "mtproto", Listen: plugin.Listen{Network: "tcp", Port: 443},
+				TLS: plugin.TLS{ServerName: "www.example.org"}, Settings: json.RawMessage(`{"domains":["www.example.org"],"fallback":"site"}`)}}},
+		},
+		"MTProto own-site fallback without an SNI is not probed": {
+			specs: []tcpSpec{{Profile: "Telegram", Spec: plugin.InboundSpec{ID: "mt", Protocol: "mtproto", Listen: plugin.Listen{Network: "tcp", Port: 443},
+				Settings: json.RawMessage(`{"domains":["node-a.example.com"],"fallback":"decoy"}`)}}},
+		},
+		"a TrustTunnel port is probed as a site, with ALPN on 443, and closes a Hysteria2 site there": {
+			specs: []tcpSpec{hy2Spec("a", plugin.TLSAcmeDomain, "node-a.example.com", ""),
+				{Profile: "TrustTunnel", Spec: plugin.InboundSpec{ID: "tt", Protocol: "trusttunnel", Listen: plugin.Listen{Network: "tcp", Port: 443},
+					TLS: plugin.TLS{Mode: plugin.TLSAcmeDomain, ServerName: "node-a.example.com"}, Settings: json.RawMessage(`{"h3":true}`)}}},
+			pins: map[string]string{"tt": pin},
+			want: []tcpTarget{
+				{Port: 80, Role: "acme", Kind: "http_mark"},
+				{Port: 443, Role: "site", ALPN: true, Profile: "TrustTunnel", Kind: "tls", SNI: "node-a.example.com", Pin: pin, PublicCert: true},
+			},
+		},
+		// Services that share 443 by SNI have one target, the default route: a probe with no name gets that service.
+		"a shared port is probed through its default route, not the lowest id": {
+			specs: []tcpSpec{
+				vlessSpec("a", 443, realityOther, plugin.TLS{}),
+				{Profile: "TrustTunnel", Spec: plugin.InboundSpec{ID: "tt", Protocol: "trusttunnel", Listen: plugin.Listen{Network: "tcp", Port: 443},
+					TLS: plugin.TLS{Mode: plugin.TLSAcmeDomain, ServerName: "tt.example.com"}, Settings: json.RawMessage(`{"h3":false}`)}},
+			},
+			want: []tcpTarget{
+				{Port: 80, Role: "acme", Kind: "http_mark"},
+				{Port: 443, Role: "site", ALPN: true, Profile: "TrustTunnel", Kind: "tls", SNI: "tt.example.com", PublicCert: true},
+			},
+		},
+		"two sites on 443: the lower id is the default, with its own name": {
+			specs: []tcpSpec{
+				{Profile: "Telegram", Spec: plugin.InboundSpec{ID: "mt", Protocol: "mtproto", Listen: plugin.Listen{Network: "tcp", Port: 443},
+					TLS: plugin.TLS{ServerName: "tg.example.com"}, Settings: json.RawMessage(`{"domains":["tg.example.com"],"fallback":"decoy"}`)}},
+				vlessSpec("b", 443, `{"security":"reality","reality":{"target":"self","server_names":["node-a.example.com"]}}`, plugin.TLS{Mode: plugin.TLSAcmeDomain, ServerName: "node-a.example.com"}),
+				hy2Spec("h", plugin.TLSAcmeDomain, "hy2.example.com", ""),
+			},
+			want: []tcpTarget{
+				{Port: 80, Role: "acme", Kind: "http_mark"},
+				{Port: 443, Role: "vless", ALPN: true, Profile: "vless-b", Kind: "tls", SNI: "node-a.example.com", PublicCert: true},
+			},
+		},
+		"a name two services ask for: the one that holds it is probed": {
+			specs: []tcpSpec{
+				vlessSpec("a", 443, `{"security":"reality","reality":{"target":"self","server_names":["x.example.com"]}}`, plugin.TLS{Mode: plugin.TLSAcmeDomain, ServerName: "x.example.com"}),
+				{Profile: "Telegram", Spec: plugin.InboundSpec{ID: "mt", Protocol: "mtproto", Listen: plugin.Listen{Network: "tcp", Port: 443},
+					TLS: plugin.TLS{ServerName: "X.example.com"}, Settings: json.RawMessage(`{"domains":["X.example.com"],"fallback":"decoy"}`)}},
+			},
+			want: []tcpTarget{
+				{Port: 80, Role: "acme", Kind: "http_mark"},
+				{Port: 443, Role: "vless", ALPN: true, Profile: "vless-a", Kind: "tls", SNI: "x.example.com", PublicCert: true},
+			},
+		},
 		"a UDP inbound of another protocol is not a TCP port": {
 			specs: []tcpSpec{{Profile: "awg", Spec: plugin.InboundSpec{ID: "w", Protocol: "awg", Listen: plugin.Listen{Network: "udp", Port: 51820}}}},
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			got := tcpTargets(tc.specs, tc.pins)
+			for i := range got {
+				got[i].Inbound = "" // whose counters a check is taken off: own_probes_test.go
+			}
 			if len(got) == 0 && len(tc.want) == 0 {
 				return
 			}
@@ -186,8 +265,12 @@ func (p tcpProto) BuildInbound(in protocols.InboundInput) (plugin.InboundSpec, e
 	switch s.TLS {
 	case "acme":
 		spec.TLS = plugin.TLS{Mode: plugin.TLSAcmeDomain, ServerName: s.Name}
+	case "acme_ip":
+		spec.TLS = plugin.TLS{Mode: plugin.TLSAcmeIP, ServerName: s.Name}
 	case "self":
 		spec.TLS = plugin.TLS{Mode: plugin.TLSSelfSigned, ServerName: s.Name}
+	case "name": // a server name and no certificate mode, like MTProto's
+		spec.TLS = plugin.TLS{ServerName: s.Name}
 	}
 	return spec, nil
 }
@@ -210,7 +293,7 @@ func tcpCheckTarget(t *testing.T) (*l3Env, *agent, *conn) {
 	x.exec(`INSERT INTO inbound (id, profile_id, node_id, spec_version, enabled, created_at, updated_at) VALUES
 		('inb_hy2', 'prf_hy2', ?, 1, 1, 1, 1), ('inb_vless', 'prf_vless', ?, 1, 1, 1, 1)`, target.nodeID, target.nodeID)
 	x.f.settleUDP = func(context.Context) error { return nil }
-	targetConn, _, _ := connectCaps(target, "tcp-target", capUDPCheck, capTCPCheck)
+	targetConn, _, _ := connectCaps(target, "tcp-target", agentcap.UDPCheck, agentcap.TCPCheck)
 	return x, target, targetConn
 }
 
@@ -229,18 +312,18 @@ func driveUDPPart(targetConn, senderConn *conn) {
 	arm := waitUDPCount(targetConn, false)
 	replyPortCommand(targetConn, arm.RequestId, &agentv1.CommandResult{Ok: true})
 	send := waitUDPSend(senderConn)
-	replyPortCommand(senderConn, send.RequestId, &agentv1.CommandResult{Ok: true, Params: map[string]string{"family": "4", "sent": "300"}})
+	replyPortCommand(senderConn, send.RequestId, &agentv1.CommandResult{Ok: true, Params: map[string]string{"family": "4", "sent": strconv.Itoa(udpCheckSendCount)}})
 	stop := waitUDPCount(targetConn, true)
 	got, packets := map[uint16]uint64{}, map[uint16]uint64{}
 	for _, port := range arm.Ports {
-		got[uint16(port)], packets[uint16(port)] = 300, 300
+		got[uint16(port)], packets[uint16(port)] = udpCheckSendCount, udpCheckSendCount
 	}
 	replyPortStop(targetConn, stop, "4", got, packets)
 }
 
 func TestCheckPortsProbesTCPAfterUDPAndStoresTheRows(t *testing.T) {
 	x, target, targetConn := tcpCheckTarget(t)
-	sender, senderConn := addPortCheckPeer(x, "sender", "provider-b", "DE", capUDPCheck, capTCPCheck)
+	sender, senderConn := addPortCheckPeer(x, "sender", "provider-b", "DE", agentcap.UDPCheck, agentcap.TCPCheck)
 	result := startPortCheckRPC(x.ctx, x, target.nodeID, 2053)
 
 	driveUDPPart(targetConn, senderConn)
@@ -299,7 +382,7 @@ func TestCheckPortsUsesProfilePublicPort(t *testing.T) {
 	x, target, targetConn := tcpCheckTarget(t)
 	x.exec(`UPDATE inbound SET enabled = 0 WHERE id = 'inb_hy2'`)
 	x.exec(`UPDATE profile SET settings_json = '{"port":19443,"client_port":443,"network":"tcp","reality":{"target":"www.example.org:443","server_names":["www.example.org"]}}' WHERE id = 'prf_vless'`)
-	_, senderConn := addPortCheckPeer(x, "sender", "provider-b", "DE", capUDPCheck, capTCPCheck)
+	_, senderConn := addPortCheckPeer(x, "sender", "provider-b", "DE", agentcap.UDPCheck, agentcap.TCPCheck)
 	result := startPortCheckRPC(x.ctx, x, target.nodeID, 2053)
 	driveUDPPart(targetConn, senderConn)
 	probe := waitTCPProbe(senderConn)
@@ -317,7 +400,7 @@ func TestCheckPortsUsesProfilePublicPort(t *testing.T) {
 
 func TestCheckPortsSaveTimeRunLeavesTheTCPHalfOut(t *testing.T) {
 	x, target, targetConn := tcpCheckTarget(t)
-	_, senderConn := addPortCheckPeer(x, "sender", "provider-b", "DE", capUDPCheck, capTCPCheck)
+	_, senderConn := addPortCheckPeer(x, "sender", "provider-b", "DE", agentcap.UDPCheck, agentcap.TCPCheck)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -357,7 +440,7 @@ func assertNoPortCommands(t *testing.T, conns ...*conn) {
 func TestCheckPortsAsSystemUsesThePanelAsTCPSenderOfLastResort(t *testing.T) {
 	x, target, targetConn := tcpCheckTarget(t)
 	x.f.sendUDP = func(context.Context, string, []uint16, [8]byte, int, int, int) (string, int, error) {
-		return "4", 300, nil
+		return "4", udpCheckSendCount, nil
 	}
 	var gotHost string
 	var gotTargets []tcpcheck.Target
@@ -373,7 +456,7 @@ func TestCheckPortsAsSystemUsesThePanelAsTCPSenderOfLastResort(t *testing.T) {
 	arm := waitUDPCount(targetConn, false)
 	replyPortCommand(targetConn, arm.RequestId, &agentv1.CommandResult{Ok: true})
 	stop := waitUDPCount(targetConn, true)
-	replyPortStop(targetConn, stop, "4", map[uint16]uint64{2053: 300, 443: 300}, map[uint16]uint64{2053: 300, 443: 300})
+	replyPortStop(targetConn, stop, "4", map[uint16]uint64{2053: udpCheckSendCount, 443: udpCheckSendCount}, map[uint16]uint64{2053: udpCheckSendCount, 443: udpCheckSendCount})
 	mark := waitHTTPMark(targetConn)
 	replyPortCommand(targetConn, mark.RequestId, &agentv1.CommandResult{Ok: true, Params: map[string]string{"http01": "serving"}})
 	if r := <-done; r.code != "" || r.sender != "panel" {
@@ -399,7 +482,7 @@ func TestTCPCheckWithoutAnySenderDoesNotRun(t *testing.T) {
 		t.Fatalf("no sender: rows %+v ran %v", rows, ran)
 	}
 	// a node without tcpcheck/1 is no sender
-	addPortCheckPeer(x, "old-peer", "provider-b", "DE", capUDPCheck)
+	addPortCheckPeer(x, "old-peer", "provider-b", "DE", agentcap.UDPCheck)
 	if rows, ran := x.f.runTCPCheck(x.ctx, node, false); ran || len(rows) != 0 {
 		t.Fatalf("old peer: rows %+v ran %v", rows, ran)
 	}
@@ -417,8 +500,8 @@ func TestTCPCheckTargetWithoutTheCapabilityStillGetsTLSRows(t *testing.T) {
 	x.exec(`INSERT INTO profile (id, protocol, name, settings_json, version, created_at, updated_at) VALUES
 		('prf_hy2', 'hysteria2', 'alice-hy2', '{"port":443,"network":"udp","tls":"acme","name":"node-a.example.com"}', 1, 1, 1)`)
 	x.exec(`INSERT INTO inbound (id, profile_id, node_id, spec_version, enabled, created_at, updated_at) VALUES ('inb_hy2', 'prf_hy2', ?, 1, 1, 1, 1)`, target.nodeID)
-	connectCaps(target, "old-target", capUDPCheck)
-	_, senderConn := addPortCheckPeer(x, "sender", "provider-b", "DE", capUDPCheck, capTCPCheck)
+	connectCaps(target, "old-target", agentcap.UDPCheck)
+	_, senderConn := addPortCheckPeer(x, "sender", "provider-b", "DE", agentcap.UDPCheck, agentcap.TCPCheck)
 	node, err := x.st.Node(x.ctx, target.nodeID)
 	if err != nil {
 		t.Fatal(err)
@@ -459,7 +542,7 @@ func TestTCPCheckPort80StatesFromTheTarget(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			x, target, targetConn := tcpCheckTarget(t)
-			_, senderConn := addPortCheckPeer(x, "sender", "provider-b", "DE", capUDPCheck, capTCPCheck)
+			_, senderConn := addPortCheckPeer(x, "sender", "provider-b", "DE", agentcap.UDPCheck, agentcap.TCPCheck)
 			node, err := x.st.Node(x.ctx, target.nodeID)
 			if err != nil {
 				t.Fatal(err)
@@ -497,8 +580,8 @@ func TestTCPCheckPort80StatesFromTheTarget(t *testing.T) {
 
 func TestTCPCheckTriesTheNextSenderWhenTheFirstCannotProbe(t *testing.T) {
 	x, target, targetConn := tcpCheckTarget(t)
-	_, firstConn := addPortCheckPeer(x, "sender-a", "provider-b", "DE", capUDPCheck, capTCPCheck)
-	_, secondConn := addPortCheckPeer(x, "sender-b", "provider-c", "FR", capUDPCheck, capTCPCheck)
+	_, firstConn := addPortCheckPeer(x, "sender-a", "provider-b", "DE", agentcap.UDPCheck, agentcap.TCPCheck)
+	_, secondConn := addPortCheckPeer(x, "sender-b", "provider-c", "FR", agentcap.UDPCheck, agentcap.TCPCheck)
 	if err := x.st.PutTCPChecks(x.ctx, target.nodeID, []storeTCP{{Port: 443, Role: "site", Verdict: "ours", Sender: "panel", CheckedAt: x.f.now()}}); err != nil {
 		t.Fatal(err)
 	}
@@ -531,7 +614,7 @@ func TestTCPCheckTriesTheNextSenderWhenTheFirstCannotProbe(t *testing.T) {
 
 func TestTCPCheckEveryProbeFailingKeepsTheLastStoredResult(t *testing.T) {
 	x, target, targetConn := tcpCheckTarget(t)
-	_, senderConn := addPortCheckPeer(x, "sender", "provider-b", "DE", capUDPCheck, capTCPCheck)
+	_, senderConn := addPortCheckPeer(x, "sender", "provider-b", "DE", agentcap.UDPCheck, agentcap.TCPCheck)
 	old := storeTCP{Port: 443, Role: "site", Verdict: "ours", Sender: "panel", CheckedAt: x.f.now()}
 	if err := x.st.PutTCPChecks(x.ctx, target.nodeID, []storeTCP{old}); err != nil {
 		t.Fatal(err)
@@ -615,8 +698,8 @@ func TestTCPCheckDoesNotReuseTheMarkAfterAnAmbiguousFailure(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			x, target, targetConn := tcpCheckTarget(t)
-			_, firstConn := addPortCheckPeer(x, "sender-a", "provider-b", "DE", capUDPCheck, capTCPCheck)
-			second, secondConn := addPortCheckPeer(x, "sender-b", "provider-c", "FR", capUDPCheck, capTCPCheck)
+			_, firstConn := addPortCheckPeer(x, "sender-a", "provider-b", "DE", agentcap.UDPCheck, agentcap.TCPCheck)
+			second, secondConn := addPortCheckPeer(x, "sender-b", "provider-c", "FR", agentcap.UDPCheck, agentcap.TCPCheck)
 			node, err := x.st.Node(x.ctx, target.nodeID)
 			if err != nil {
 				t.Fatal(err)
@@ -687,7 +770,7 @@ func TestTCPCheckClearsRowsWhenNoTCPPortIsLeft(t *testing.T) {
 func onlyPort80Target(t *testing.T) (*l3Env, store.NodeRow, *conn) {
 	t.Helper()
 	x, target, targetConn := tcpCheckTarget(t)
-	addPortCheckPeer(x, "sender", "provider-b", "DE", capUDPCheck, capTCPCheck)
+	addPortCheckPeer(x, "sender", "provider-b", "DE", agentcap.UDPCheck, agentcap.TCPCheck)
 	x.exec(`UPDATE profile SET settings_json = '{"port":443,"network":"udp","tls":"acme","name":"node-a.example.com","masquerade":{"tcp_port":0}}' WHERE id = 'prf_hy2'`)
 	x.exec(`UPDATE inbound SET enabled = 0 WHERE id = 'inb_vless'`)
 	if err := x.st.PutTCPChecks(x.ctx, target.nodeID, []storeTCP{{Port: 443, Role: "site", Verdict: "ours", Sender: "panel", CheckedAt: x.f.now()}}); err != nil {
@@ -735,7 +818,7 @@ func TestTCPCheckBusyPort80IsTheWholeResultWhenNothingElseIsProbed(t *testing.T)
 
 func TestTCPCheckBusyPort80DoesNotReplaceGoodTLSRows(t *testing.T) {
 	x, target, targetConn := tcpCheckTarget(t)
-	_, senderConn := addPortCheckPeer(x, "sender", "provider-b", "DE", capUDPCheck, capTCPCheck)
+	_, senderConn := addPortCheckPeer(x, "sender", "provider-b", "DE", agentcap.UDPCheck, agentcap.TCPCheck)
 	good := []storeTCP{
 		{Port: 443, Role: "site", Verdict: "ours", Sender: "panel", CheckedAt: x.f.now()},
 		{Port: 8443, Role: "vless", Verdict: "ours", Sender: "panel", CheckedAt: x.f.now()},
@@ -768,7 +851,7 @@ func TestTCPCheckBusyPort80DoesNotReplaceGoodTLSRows(t *testing.T) {
 
 func TestCheckPortsAdminCallWaitingBehindASaveTimeRunRunsItsOwnTCPHalf(t *testing.T) {
 	x, target, targetConn := tcpCheckTarget(t)
-	_, senderConn := addPortCheckPeer(x, "sender", "provider-b", "DE", capUDPCheck, capTCPCheck)
+	_, senderConn := addPortCheckPeer(x, "sender", "provider-b", "DE", agentcap.UDPCheck, agentcap.TCPCheck)
 	saved := make(chan struct{})
 	go func() {
 		defer close(saved)
@@ -779,9 +862,9 @@ func TestCheckPortsAdminCallWaitingBehindASaveTimeRunRunsItsOwnTCPHalf(t *testin
 	admin := startPortCheckRPC(x.ctx, x, target.nodeID, 2053)
 	waitPortCheckWaiter(t, x.f, target.nodeID)
 	send := waitUDPSend(senderConn)
-	replyPortCommand(senderConn, send.RequestId, &agentv1.CommandResult{Ok: true, Params: map[string]string{"family": "4", "sent": "300"}})
+	replyPortCommand(senderConn, send.RequestId, &agentv1.CommandResult{Ok: true, Params: map[string]string{"family": "4", "sent": strconv.Itoa(udpCheckSendCount)}})
 	stop := waitUDPCount(targetConn, true)
-	replyPortStop(targetConn, stop, "4", map[uint16]uint64{2053: 300, 443: 300}, map[uint16]uint64{2053: 300, 443: 300})
+	replyPortStop(targetConn, stop, "4", map[uint16]uint64{2053: udpCheckSendCount, 443: udpCheckSendCount}, map[uint16]uint64{2053: udpCheckSendCount, 443: udpCheckSendCount})
 	<-saved
 
 	// the waiter may not take the UDP-only result: it runs UDP and TCP of its own
@@ -798,7 +881,7 @@ func TestCheckPortsAdminCallWaitingBehindASaveTimeRunRunsItsOwnTCPHalf(t *testin
 
 func TestCheckPortsSaveTimeCallWaitingBehindAFullRunTakesItsResult(t *testing.T) {
 	x, target, targetConn := tcpCheckTarget(t)
-	sender, senderConn := addPortCheckPeer(x, "sender", "provider-b", "DE", capUDPCheck, capTCPCheck)
+	sender, senderConn := addPortCheckPeer(x, "sender", "provider-b", "DE", agentcap.UDPCheck, agentcap.TCPCheck)
 	full := startPortCheckRPC(x.ctx, x, target.nodeID, 2053)
 	arm := waitUDPCount(targetConn, false)
 	replyPortCommand(targetConn, arm.RequestId, &agentv1.CommandResult{Ok: true})
@@ -809,9 +892,9 @@ func TestCheckPortsSaveTimeCallWaitingBehindAFullRunTakesItsResult(t *testing.T)
 	}()
 	waitPortCheckWaiter(t, x.f, target.nodeID)
 	send := waitUDPSend(senderConn)
-	replyPortCommand(senderConn, send.RequestId, &agentv1.CommandResult{Ok: true, Params: map[string]string{"family": "4", "sent": "300"}})
+	replyPortCommand(senderConn, send.RequestId, &agentv1.CommandResult{Ok: true, Params: map[string]string{"family": "4", "sent": strconv.Itoa(udpCheckSendCount)}})
 	stop := waitUDPCount(targetConn, true)
-	replyPortStop(targetConn, stop, "4", map[uint16]uint64{2053: 300, 443: 300}, map[uint16]uint64{2053: 300, 443: 300})
+	replyPortStop(targetConn, stop, "4", map[uint16]uint64{2053: udpCheckSendCount, 443: udpCheckSendCount}, map[uint16]uint64{2053: udpCheckSendCount, 443: udpCheckSendCount})
 	mark := waitHTTPMark(targetConn)
 	replyPortCommand(targetConn, mark.RequestId, &agentv1.CommandResult{Ok: true, Params: map[string]string{"http01": "serving"}})
 	probe := waitTCPProbe(senderConn)
@@ -835,7 +918,7 @@ func TestCheckPortsSaveTimeCallWaitingBehindAFullRunTakesItsResult(t *testing.T)
 
 func TestGetNodeNamesTheSendersOfUDPAndTCPRows(t *testing.T) {
 	x, target, _ := tcpCheckTarget(t)
-	peer, _ := addPortCheckPeer(x, "sender", "provider-b", "DE", capUDPCheck, capTCPCheck)
+	peer, _ := addPortCheckPeer(x, "sender", "provider-b", "DE", agentcap.UDPCheck, agentcap.TCPCheck)
 	node, err := x.st.Node(x.ctx, target.nodeID)
 	if err != nil {
 		t.Fatal(err)
@@ -861,5 +944,49 @@ func TestGetNodeNamesTheSendersOfUDPAndTCPRows(t *testing.T) {
 	tcp := got.Msg.TcpChecks
 	if len(tcp) != 3 || tcp[0].Sender != "sender" || tcp[1].Sender != "unknown" || tcp[2].Sender != "panel" {
 		t.Errorf("TCP rows = %+v", tcp)
+	}
+}
+
+// The bridge on the entry's 443 verifies the entry by the name of what answers there. A Hysteria2 site gives the port up to
+// any TCP inbound, so the name is TrustTunnel's or MTProto's even where the Hysteria2 inbound has the lower id; MTProto with
+// another site has no name of the node's.
+func TestBridgeTLSNameIsTheOwnerOf443(t *testing.T) {
+	pin := "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+	const hy2 = `{"port":443,"network":"udp","tls":"acme","name":"hy2.example.com"}`
+	for name, tc := range map[string]struct {
+		protocol, settings, pin string
+		wantSNI, wantPin        string
+	}{
+		"hysteria2 alone":                   {"", "", "", "hy2.example.com", ""},
+		"trusttunnel":                       {"trusttunnel", `{"port":443,"network":"tcp","tls":"acme","name":"tt.example.com"}`, "", "tt.example.com", ""},
+		"trusttunnel with the reported pin": {"trusttunnel", `{"port":443,"network":"tcp","tls":"acme","name":"tt.example.com"}`, pin, "tt.example.com", pin},
+		"mtproto decoy":                     {"mtproto", `{"port":443,"network":"tcp","tls":"name","name":"tg.example.com","fallback":"decoy"}`, "", "tg.example.com", ""},
+		"mtproto with another site":         {"mtproto", `{"port":443,"network":"tcp","tls":"name","name":"www.example.org","fallback":"site"}`, "", "", ""},
+		"mtproto decoy on another port":     {"mtproto", `{"port":8443,"network":"tcp","tls":"name","name":"tg.example.com","fallback":"decoy"}`, "", "hy2.example.com", ""},
+		"trusttunnel on another port":       {"trusttunnel", `{"port":8443,"network":"tcp","tls":"acme","name":"tt.example.com"}`, "", "hy2.example.com", ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			reg, err := protocols.NewRegistry(tcpProto{fakeProto{"hysteria2", plugin.ClientHapp}}, tcpProto{fakeProto{"trusttunnel", plugin.ClientMihomo}},
+				tcpProto{fakeProto{"mtproto", plugin.ClientTelegram}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			x := newEnvWith(t, reg)
+			node := x.enroll("entry")
+			x.exec(`INSERT INTO profile (id, protocol, name, settings_json, version, created_at, updated_at) VALUES ('prf_hy2', 'hysteria2', 'hy2', ?, 1, 1, 1)`, hy2)
+			x.exec(`INSERT INTO inbound (id, profile_id, node_id, spec_version, enabled, created_at, updated_at) VALUES ('inb_a', 'prf_hy2', ?, 1, 1, 1, 1)`, node.nodeID)
+			if tc.protocol != "" {
+				x.exec(`INSERT INTO profile (id, protocol, name, settings_json, version, created_at, updated_at) VALUES ('prf_b', ?, 'b', ?, 1, 1, 1)`, tc.protocol, tc.settings)
+				x.exec(`INSERT INTO inbound (id, profile_id, node_id, spec_version, enabled, cert_pin_sha256, created_at, updated_at) VALUES ('inb_b', 'prf_b', ?, 1, 1, ?, 1, 1)`, node.nodeID, tc.pin)
+			}
+			entry, err := x.st.Node(x.ctx, node.nodeID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, ok := x.f.bridgeTLSName(x.ctx, entry)
+			if ok != (tc.wantSNI != "") || got.SNI != tc.wantSNI || got.Pin != tc.wantPin {
+				t.Fatalf("bridgeTLSName = %q pin %q ok %v, want %q pin %q", got.SNI, got.Pin, ok, tc.wantSNI, tc.wantPin)
+			}
+		})
 	}
 }

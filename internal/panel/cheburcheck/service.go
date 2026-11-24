@@ -41,7 +41,6 @@ const (
 	settingBackoff      = "cheburcheck.backoff_min"
 	settingStatus       = "cheburcheck.status"
 	settingTokenUnknown = "cheburcheck.token_unknown"
-	settingCountry      = "country_reachability.country"
 	tokenAAD            = "setting/cheburcheck.token"
 
 	defaultIntervalMin    = 180
@@ -55,6 +54,7 @@ const (
 	callSpacing     = 30 * time.Second
 	rateHoldStart   = 2 * time.Minute
 	rateHoldMax     = 30 * time.Minute
+	failHoldMax     = time.Hour // ceiling of the hold after repeated failures that are not a rate limit (403, 5xx, network)
 	probesOffHold   = 6 * time.Hour
 	testEvery       = 10 * time.Second
 	testTimeout     = 15 * time.Second
@@ -91,10 +91,9 @@ type Service struct {
 	log *slog.Logger
 	now func() time.Time
 
+	guard countryreach.RunGuard
+
 	mu       sync.Mutex
-	gen      uint64
-	inflight map[uint64]context.CancelFunc
-	next     uint64
 	lastTest time.Time
 	lastCall time.Time // VPS spacing; EdgeRoundLease holds the cross-isolate edge spacing.
 }
@@ -151,7 +150,7 @@ func New(cfg Config) (*Service, error) {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	return &Service{cfg: cfg, log: cfg.Log, now: cfg.Now, inflight: map[uint64]context.CancelFunc{}}, nil
+	return &Service{cfg: cfg, log: cfg.Log, now: cfg.Now}, nil
 }
 
 func (s *Service) Handler(opts ...connect.HandlerOption) (string, http.Handler) {
@@ -172,7 +171,7 @@ func (s *Service) load(ctx context.Context) (settings, error) {
 // one call with another source's.
 func StateKeys() []string {
 	return []string{settingEnabled, settingPublic, settingToken, settingInterval, settingOwnInterval, settingHoldUntil,
-		settingBackoff, settingStatus, settingTokenUnknown, settingCountry}
+		settingBackoff, settingStatus, settingTokenUnknown, countryreach.CountrySetting}
 }
 
 // StateFrom is State from the values of StateKeys.
@@ -180,11 +179,8 @@ func StateFrom(kv map[string]string) State { return (*Service)(nil).sourceState(
 
 func parseSettings(kv map[string]string) settings {
 	st := settings{enabled: kv[settingEnabled] == "1", public: kv[settingPublic] != "0", intervalMin: defaultIntervalMin,
-		ownIntervalMin: defaultOwnIntervalMin, country: countryreach.DefaultCountry, backoffMin: defaultBackoffMin, status: kv[settingStatus],
+		ownIntervalMin: defaultOwnIntervalMin, country: countryreach.ParseCountry(kv[countryreach.CountrySetting]), backoffMin: defaultBackoffMin, status: kv[settingStatus],
 		tokenUnknown: kv[settingTokenUnknown] == "1"}
-	if country := strings.ToUpper(kv[settingCountry]); len(country) == 2 {
-		st.country = country
-	}
 	if n, err := strconv.Atoi(kv[settingInterval]); err == nil && n >= minimumIntervalMin && n <= maximumIntervalMin {
 		st.intervalMin = n
 	}
@@ -197,7 +193,7 @@ func parseSettings(kv map[string]string) settings {
 	if n, err := strconv.ParseInt(kv[settingHoldUntil], 10, 64); err == nil && n > 0 {
 		st.holdUntil = time.Unix(n, 0)
 	}
-	if n, err := strconv.Atoi(kv[settingBackoff]); err == nil && n >= 2 && n <= 30 {
+	if n, err := strconv.Atoi(kv[settingBackoff]); err == nil && n >= 2 && n <= int(failHoldMax/time.Minute) {
 		st.backoffMin = n
 	}
 	return st
@@ -238,7 +234,7 @@ func (s *Service) latest(ctx context.Context, state State) (State, error) {
 func (s *Service) State(ctx context.Context) State {
 	st, err := s.load(ctx)
 	if err != nil {
-		s.log.Warn("cheburcheck: read settings", "err", err)
+		s.log.Warn("cheburcheck: read settings", "code", "cheburcheck_read_settings_failed", "err", err)
 		return State{}
 	}
 	return s.sourceState(st)
@@ -267,12 +263,12 @@ func unixOrZero(t time.Time) int64 {
 func (s *Service) current(ctx context.Context) (*adminv1.CheburcheckSettings, error) {
 	st, err := s.load(ctx)
 	if err != nil {
-		s.log.Error("cheburcheck: read settings", "err", err)
+		s.log.Error("cheburcheck: read settings", "code", "cheburcheck_read_settings_failed", "err", err)
 		return nil, errInternal
 	}
 	state, err := s.latest(ctx, s.sourceState(st))
 	if err != nil {
-		s.log.Error("cheburcheck: read latest rows", "err", err)
+		s.log.Error("cheburcheck: read latest rows", "code", "cheburcheck_read_rows_failed", "err", err)
 		return nil, errInternal
 	}
 	return protoSettings(st, state), nil
@@ -284,7 +280,7 @@ func (s *Service) token(st settings) vault.Redacted {
 	}
 	b, err := s.cfg.Vault.Open(st.sealed, tokenAAD)
 	if err != nil {
-		s.log.Warn("cheburcheck: stored token cannot be opened; it is ignored")
+		s.log.Warn("cheburcheck: stored token cannot be opened; it is ignored", "code", "cheburcheck_token_unreadable")
 		return ""
 	}
 	return vault.Redacted(b)
@@ -295,7 +291,7 @@ func (s *Service) Tick(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	gen := s.generation()
+	gen := s.guard.Generation()
 	st, err := s.load(ctx)
 	if err != nil {
 		return err
@@ -372,14 +368,19 @@ func (s *Service) Tick(ctx context.Context) error {
 	if next == nil || !s.takeCallSlot(ctx, now) {
 		return nil
 	}
+	return s.runDue(ctx, gen, st, *next)
+}
+
+// runDue checks one node on one source and stores the result: the call slot is already taken.
+func (s *Service) runDue(ctx context.Context, gen uint64, st settings, next dueCheck) error {
 	callCtx, cancel := context.WithTimeout(ctx, s.probeTimeout())
 	defer cancel()
-	callCtx, done, ok := s.track(callCtx, gen)
+	callCtx, done, ok := s.guard.Track(callCtx, gen, 0)
 	if !ok {
 		return nil
 	}
 	defer done()
-	run, phase, runErr := s.run(callCtx, *next)
+	run, phase, runErr := s.run(callCtx, next)
 	finished := s.now()
 	if runErr != nil {
 		if err := s.handleFailure(ctx, gen, st, next.source, phase, runErr); err != nil {
@@ -389,7 +390,7 @@ func (s *Service) Tick(ctx context.Context) error {
 			return nil
 		}
 		if phase != "probe" || (len(run.Results) == 0 && !isDeadline(runErr, callCtx)) {
-			return s.storeUnknown(ctx, gen, st, *next, finished, failureReason(runErr))
+			return s.storeUnknown(ctx, gen, st, next, finished, failureReason(runErr))
 		}
 	}
 	if callCtx.Err() != nil && ctx.Err() != nil {
@@ -538,99 +539,85 @@ func (s *Service) storeUnknown(ctx context.Context, gen uint64, st settings, d d
 	return err
 }
 
+// holdStep is the hold for this failure and the step stored for the next one: the stored step (2 minutes at first) is
+// clamped to [rateHoldStart, ceiling] and doubled up to the ceiling. A stored result without a failure resets it.
+func holdStep(backoffMin int, ceiling time.Duration) (delay time.Duration, next int) {
+	delay = min(max(time.Duration(backoffMin)*time.Minute, rateHoldStart), ceiling)
+	return delay, int(min(delay*2, ceiling) / time.Minute)
+}
+
 func (s *Service) handleFailure(ctx context.Context, gen uint64, st settings, source, phase string, err error) error {
 	var ae *apiError
 	api := errors.As(err, &ae)
 	values := map[string]string{}
+	var delay, ceiling time.Duration // the hold taken and the most it can grow to; the repeats of one status log quietly below the ceiling
 	switch {
 	case api && ae.Status == http.StatusTooManyRequests:
-		delay := time.Duration(st.backoffMin) * time.Minute
-		if delay < rateHoldStart {
-			delay = rateHoldStart
-		}
-		if delay > rateHoldMax {
-			delay = rateHoldMax
-		}
-		next := min(int(delay/time.Minute)*2, int(rateHoldMax/time.Minute))
+		var next int
+		ceiling = rateHoldMax
+		delay, next = holdStep(st.backoffMin, ceiling)
 		values[settingStatus] = "rate_limited"
 		values[settingHoldUntil] = strconv.FormatInt(s.now().Add(delay).Unix(), 10)
 		values[settingBackoff] = strconv.Itoa(next)
 	case api && ae.Status == http.StatusBadRequest && phase == "probe":
+		delay, ceiling = probesOffHold, probesOffHold
 		values[settingStatus] = "ip_probes_off"
-		values[settingHoldUntil] = strconv.FormatInt(s.now().Add(probesOffHold).Unix(), 10)
+		values[settingHoldUntil] = strconv.FormatInt(s.now().Add(delay).Unix(), 10)
 		values[settingBackoff] = strconv.Itoa(int(rateHoldStart / time.Minute))
 	case api && ae.Status == http.StatusNotFound && source == SourceOwn && phase == "probe":
 		values[settingStatus] = "token_unknown"
 		values[settingTokenUnknown] = "1"
 	default:
+		// 403 (the site refuses automated requests), 5xx, a dead network: the same site call would fail again at once,
+		// so the pause doubles with every failure in a row, like the rate limit's, up to an hour.
+		var next int
+		ceiling = failHoldMax
+		delay, next = holdStep(st.backoffMin, ceiling)
 		values[settingStatus] = "unreachable"
+		values[settingHoldUntil] = strconv.FormatInt(s.now().Add(delay).Unix(), 10)
+		values[settingBackoff] = strconv.Itoa(next)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if gen != s.gen {
+	saved := false
+	var saveErr error
+	s.guard.Do(gen, func() {
+		if ctx.Err() == nil {
+			saved, saveErr = true, s.cfg.Store.SetSettings(ctx, values)
+		}
+	})
+	if !saved {
 		return nil
 	}
-	if err := s.cfg.Store.SetSettings(ctx, values); err != nil {
-		s.log.Warn("cheburcheck: save failure state", "status", values[settingStatus], "err", err)
-		return err
+	if saveErr != nil {
+		s.log.Warn("cheburcheck: save failure state", "code", "cheburcheck_save_state_failed", "status", values[settingStatus], "err", saveErr)
+		return saveErr
 	}
-	s.log.Warn("cheburcheck: request failed", "status", values[settingStatus], "err", err)
+	// A change of state is a warning; the same state again is a debug line until the pause has grown to its ceiling,
+	// then one warning per hold, so a site that stays shut costs one line an hour instead of one a minute.
+	if st.status == values[settingStatus] && delay > 0 && delay < ceiling {
+		s.log.Debug("cheburcheck: request failed again", "code", "cheburcheck_request_failed", "status", values[settingStatus],
+			"hold_min", int(delay/time.Minute), "err", err)
+		return nil
+	}
+	s.log.Warn("cheburcheck: request failed", "code", "cheburcheck_request_failed", "status", values[settingStatus],
+		"hold_min", int(delay/time.Minute), "err", err)
 	return nil
 }
 
 func (s *Service) storeResult(ctx context.Context, gen uint64, st settings, row store.ExtCheck, clearStatus bool) (bool, error) {
-	s.mu.Lock()
+	var stored bool
+	var err error
 	// Edge cron and admin isolates have separate generations, so an in-flight cron call can still write after an admin change.
-	if gen != s.gen {
-		s.mu.Unlock()
-		return false, nil
-	}
-	if err := s.cfg.Store.InsertExtChecks(ctx, []store.ExtCheck{row}); err != nil {
-		s.mu.Unlock()
-		return false, err
-	}
-	if clearStatus && (st.status != "" || !st.holdUntil.IsZero() || st.backoffMin != defaultBackoffMin) {
-		clear := map[string]string{settingStatus: "", settingHoldUntil: "", settingBackoff: strconv.Itoa(defaultBackoffMin)}
-		if err := s.cfg.Store.SetSettings(ctx, clear); err != nil {
-			s.mu.Unlock()
-			return true, err
+	s.guard.Do(gen, func() {
+		if err = s.cfg.Store.InsertExtChecks(ctx, []store.ExtCheck{row}); err != nil {
+			return
 		}
-	}
-	s.mu.Unlock()
-	return true, nil
-}
-
-func (s *Service) generation() uint64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.gen
-}
-
-func (s *Service) track(ctx context.Context, gen uint64) (context.Context, func(), bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if gen != s.gen {
-		return nil, nil, false
-	}
-	cctx, cancel := context.WithCancel(ctx)
-	id := s.next
-	s.next++
-	s.inflight[id] = cancel
-	return cctx, func() {
-		s.mu.Lock()
-		delete(s.inflight, id)
-		s.mu.Unlock()
-		cancel()
-	}, true
-}
-
-func (s *Service) stop() {
-	s.mu.Lock()
-	s.gen++
-	for _, cancel := range s.inflight {
-		cancel()
-	}
-	s.mu.Unlock()
+		stored = true
+		if clearStatus && (st.status != "" || !st.holdUntil.IsZero() || st.backoffMin != defaultBackoffMin) {
+			clear := map[string]string{settingStatus: "", settingHoldUntil: "", settingBackoff: strconv.Itoa(defaultBackoffMin)}
+			err = s.cfg.Store.SetSettings(ctx, clear)
+		}
+	})
+	return stored, err
 }
 
 func (s *Service) changed(ctx context.Context) {
@@ -649,16 +636,8 @@ func fail(code connect.Code, message string) error {
 	return connect.NewError(code, errors.New(message))
 }
 
-func owner(ctx context.Context) (store.Admin, error) {
-	a, ok := auth.AdminFrom(ctx)
-	if !ok || strings.HasPrefix(a.ID, "token:") || strings.HasPrefix(a.ID, "mcp:") || auth.PrincipalFrom(ctx).Token || a.Role != store.RoleOwner {
-		return a, fail(connect.CodePermissionDenied, "owner access required")
-	}
-	return a, nil
-}
-
 func (r rpc) GetCheburcheck(ctx context.Context, _ *connect.Request[adminv1.GetCheburcheckRequest]) (*connect.Response[adminv1.GetCheburcheckResponse], error) {
-	if _, err := owner(ctx); err != nil {
+	if _, err := auth.OwnerSession(ctx); err != nil {
 		return nil, err
 	}
 	settings, err := r.s.current(ctx)
@@ -669,7 +648,7 @@ func (r rpc) GetCheburcheck(ctx context.Context, _ *connect.Request[adminv1.GetC
 }
 
 func (r rpc) UpdateCheburcheck(ctx context.Context, req *connect.Request[adminv1.UpdateCheburcheckRequest]) (*connect.Response[adminv1.UpdateCheburcheckResponse], error) {
-	admin, err := owner(ctx)
+	admin, err := auth.OwnerSession(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -708,15 +687,15 @@ func (r rpc) UpdateCheburcheck(ctx context.Context, req *connect.Request[adminv1
 		return nil, err
 	}
 	if len(values) > 0 {
-		s.stop()
+		s.guard.Stop()
 		if err := s.cfg.Store.SetSettings(ctx, values); err != nil {
-			s.log.Error("cheburcheck: save settings", "err", err)
+			s.log.Error("cheburcheck: save settings", "code", "cheburcheck_save_settings_failed", "err", err)
 			return nil, errInternal
 		}
 	}
 	params := `{"token_changed":` + strconv.FormatBool(tokenChanged) + `}`
 	if err := s.cfg.Store.Audit(ctx, s.now(), store.AuditEntry{Actor: admin.ID, Action: "cheburcheck_update", Params: params, Result: "ok"}); err != nil {
-		s.log.Warn("cheburcheck: audit", "err", err)
+		s.log.Warn("cheburcheck: audit", "code", "cheburcheck_audit_failed", "err", err)
 	}
 	s.changed(ctx)
 	current, err := s.current(ctx)
@@ -734,7 +713,7 @@ func boolSetting(v bool) string {
 }
 
 func (r rpc) DisconnectCheburcheck(ctx context.Context, _ *connect.Request[adminv1.DisconnectCheburcheckRequest]) (*connect.Response[adminv1.DisconnectCheburcheckResponse], error) {
-	admin, err := owner(ctx)
+	admin, err := auth.OwnerSession(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -742,19 +721,19 @@ func (r rpc) DisconnectCheburcheck(ctx context.Context, _ *connect.Request[admin
 	if err := s.cfg.StepUp(ctx); err != nil {
 		return nil, err
 	}
-	s.stop()
+	s.guard.Stop()
 	values := map[string]string{settingEnabled: "0", settingPublic: "1", settingToken: "", settingHoldUntil: "", settingBackoff: strconv.Itoa(defaultBackoffMin),
 		settingStatus: "", settingTokenUnknown: "0"}
 	if err := s.cfg.Store.SetSettings(ctx, values); err != nil {
-		s.log.Error("cheburcheck: disconnect", "err", err)
+		s.log.Error("cheburcheck: disconnect", "code", "cheburcheck_disconnect_failed", "err", err)
 		return nil, errInternal
 	}
 	if err := s.cfg.Store.DeleteExtChecks(ctx, SourcePublic, SourceOwn); err != nil {
-		s.log.Error("cheburcheck: delete rows", "err", err)
+		s.log.Error("cheburcheck: delete rows", "code", "cheburcheck_delete_rows_failed", "err", err)
 		return nil, errInternal
 	}
 	if err := s.cfg.Store.Audit(ctx, s.now(), store.AuditEntry{Actor: admin.ID, Action: "cheburcheck_disconnect", Result: "ok"}); err != nil {
-		s.log.Warn("cheburcheck: audit", "err", err)
+		s.log.Warn("cheburcheck: audit", "code", "cheburcheck_audit_failed", "err", err)
 	}
 	s.changed(ctx)
 	current, err := s.current(ctx)
@@ -765,7 +744,7 @@ func (r rpc) DisconnectCheburcheck(ctx context.Context, _ *connect.Request[admin
 }
 
 func (r rpc) TestCheburcheck(ctx context.Context, _ *connect.Request[adminv1.TestCheburcheckRequest]) (*connect.Response[adminv1.TestCheburcheckResponse], error) {
-	if _, err := owner(ctx); err != nil {
+	if _, err := auth.OwnerSession(ctx); err != nil {
 		return nil, err
 	}
 	s := r.s

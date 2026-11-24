@@ -1,5 +1,6 @@
 ---
 title: Mistgate documentation
+seoTitle: "Mistgate documentation: install, nodes, protocols, API"
 description: What is in the documentation, where to find it, and the order to read it in.
 ---
 
@@ -44,6 +45,9 @@ Mistgate is a self-hosted panel for your own VPN fleet: one binary for the panel
 - [Hysteria2](guide/hysteria2.md): Hysteria2 profile settings, certificates and obfuscation.
 - [VLESS REALITY](guide/vless.md): VLESS profiles over TCP and XHTTP, when to choose them over Hysteria2, how to pick a REALITY target, ports and apps.
 - [VLESS and Hysteria2 on one node](guide/vless-and-hysteria2.md): who listens where, what happens to the Hysteria2 site and to Let's Encrypt when VLESS takes TCP 443, and how to try VLESS with a few people.
+- [One 443 for everyone](guide/shared-port.md): how VLESS, TrustTunnel and MTProto share TCP 443 of one node by name, what cannot be shared, what a stranger sees, the DNS records, setting it up in the admin and through MCP, the card of the port and its limits.
+- [MTProto (Telegram proxy)](guide/mtproto.md): a proxy for the Telegram app only (experimental): the two choices of the name in the handshake, the person's key and link, relays, and its limits.
+- [TrustTunnel](guide/trusttunnel.md): a VPN over ordinary HTTPS with official apps on every platform (experimental): what it needs, the settings, the person's `tt://` key, and its limits.
 - [AmneziaWG](guide/amneziawg.md): AmneziaWG 2.0 and 3.1 profiles, userspace or the kernel module, devices and keys.
 - [WARP](guide/warp.md): sending a profile's traffic out through Cloudflare WARP.
 - [Relays through an entry node](guide/relays.md): when a relay helps people whose network blocks a node, what it cannot solve, what the entry sees, and how to add one.
@@ -54,11 +58,13 @@ Mistgate is a self-hosted panel for your own VPN fleet: one binary for the panel
 - [DNS](guide/dns.md): DNS presets for users and groups, and the DNS of the nodes.
 - [Torrent protection](guide/torrent-protection.md): the per-node BitTorrent blocker, what it catches and what its events show.
 - [Your own decoy site](guide/decoy-site.md): replace the built-in decoy page with a small site of your own, and a ready prompt for an AI agent that invents a unique one.
+- [Assistant](guide/assistant.md): a cloud model in the admin that answers about nodes, people and errors and prepares changes you apply; providers, where the data goes, memory and limits.
 
 ### Operations
 
 - [Health](operations/health.md): client-eye checks, the node doctor and alerts.
 - [Reachability](operations/reachability.md): whether the nodes open from inside a country: Globalping, the block lists, the TSPU probe, each node's week and the alert.
+- [Own probes](operations/probes.md): a router or a server of yours inside a country checks the nodes from its own network; Keenetic, install, update, remove, what it does and what the provider sees.
 - [Telegram alerts](operations/telegram-alerts.md): the bot, linking your chat, what is sent and to whom, and the panel watcher.
 - [Panel watcher](operations/panel-watcher.md): Cloudflare checks the panel once a minute and reports outages in Telegram.
 - [Updates](operations/updates.md): node self-update, updating a node now or on a schedule, rollbacks, and updating the panel.

@@ -1,6 +1,8 @@
 package fleet
 
 import (
+	"bytes"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -9,6 +11,7 @@ import (
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
 	agentv1 "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/internal/agentcap"
 	"github.com/mistgate/mistgate/internal/panel/store"
 )
 
@@ -38,7 +41,7 @@ func TestTorrentBlockerSettingRequiresCapabilityAndPropagates(t *testing.T) {
 		t.Fatal(err)
 	}
 	oldAgentSettings := nodeSettings(n, nil)
-	guardSettings := nodeSettings(n, []string{capTorrentGuard})
+	guardSettings := nodeSettings(n, []string{agentcap.TorrentGuard})
 	if oldAgentSettings.TorrentBlockerEnabled || guardSettings.TorrentBlockerEnabled {
 		t.Fatal("a disabled setting should be false for every agent")
 	}
@@ -50,11 +53,11 @@ func TestTorrentBlockerSettingRequiresCapabilityAndPropagates(t *testing.T) {
 	if nodeSettings(enabledNode, nil).TorrentBlockerEnabled {
 		t.Fatal("an old agent was sent the torrent blocker setting")
 	}
-	if settingsSig(guardSettings) == settingsSig(nodeSettings(enabledNode, []string{capTorrentGuard})) {
+	if settingsSig(guardSettings) == settingsSig(nodeSettings(enabledNode, []string{agentcap.TorrentGuard})) {
 		t.Fatal("enabling the blocker did not change the settings signature")
 	}
 
-	c, _, initial := connectCaps(a, "torrentguard", capTorrentGuard)
+	c, _, initial := connectCaps(a, "torrentguard", agentcap.TorrentGuard)
 	if initial.Settings == nil || initial.Settings.TorrentBlockerEnabled {
 		t.Fatalf("initial torrent blocker setting = %v", initial.Settings)
 	}
@@ -144,4 +147,57 @@ func TestTorrentAttemptEventResolvesDisplayName(t *testing.T) {
 		return
 	}
 	t.Fatal("torrent_attempt event was not stored")
+}
+
+func TestTorrentAttemptForUserWithoutNodeCredentialIsDropped(t *testing.T) {
+	e, core, ctx, state, now := coreFixture(t, "torrent-unserved-user")
+	e.fixture(state.NodeID)
+	connected := stepHello(t, core, ctx, state, now, hello("instance-torrent-unserved", 0, "").GetHello())
+	frame := &agentv1.ConnectRequest{Seq: 1, Message: &agentv1.ConnectRequest_Event{Event: &agentv1.Event{
+		Code: "torrent_attempt", TimeUnix: now.Unix(), Params: map[string]string{"user_id": "usr_bob"},
+	}}}
+	tr, err := coreStep(ctx, core, connected.State, SessionEvent{Kind: EventAgentFrame, At: now, Frame: frame})
+	if err != nil || tr.Close != nil {
+		t.Fatalf("unserved-user event: transition=%+v err=%v", tr, err)
+	}
+	if got := e.count(`SELECT count(*) FROM event WHERE node_id = ? AND code = 'torrent_attempt'`, state.NodeID); got != 0 {
+		t.Fatalf("stored %d torrent attempts for a user this node does not serve", got)
+	}
+	if len(tr.Frames) != 1 || tr.Frames[0].GetAck().GetUpToSeq() != 1 {
+		t.Fatalf("the dropped reliable event was not acknowledged: %+v", tr.Frames)
+	}
+}
+
+func TestAgentEventTokenBucketLimitsSequenceZeroEvents(t *testing.T) {
+	e, core, ctx, state, now := coreFixture(t, "event-rate-limit")
+	connected := stepHello(t, core, ctx, state, now, hello("instance-event-rate-limit", 0, "").GetHello())
+	state = connected.State
+	var logs bytes.Buffer
+	core.f.log = slog.New(slog.NewTextHandler(&logs, nil))
+	for range agentEventBurst + 1 {
+		frame := &agentv1.ConnectRequest{Message: &agentv1.ConnectRequest_Event{Event: &agentv1.Event{
+			Code: "de1_rate_probe", TimeUnix: now.Unix(),
+		}}}
+		tr, err := coreStep(ctx, core, state, SessionEvent{Kind: EventAgentFrame, At: now, Frame: frame})
+		if err != nil || tr.Close != nil {
+			t.Fatalf("rate-limited event: transition=%+v err=%v", tr, err)
+		}
+		state = tr.State
+	}
+	if got := e.count(`SELECT count(*) FROM event WHERE node_id = ? AND code = 'de1_rate_probe'`, state.NodeID); got != agentEventBurst {
+		t.Fatalf("stored %d sequence-zero events, want %d", got, agentEventBurst)
+	}
+	if state.DroppedEvents != 1 || !state.DroppedEventLogAt.Equal(now.Add(time.Minute)) {
+		t.Fatalf("dropped-entry summary state = count %d, deadline %v", state.DroppedEvents, state.DroppedEventLogAt)
+	}
+	if strings.Contains(logs.String(), "agent_events_dropped") {
+		t.Fatalf("drop summary logged before its minute ended: %s", logs.String())
+	}
+	tick, err := coreStep(ctx, core, state, SessionEvent{Kind: EventAlarm, At: state.DroppedEventLogAt})
+	if err != nil || tick.State.DroppedEvents != 0 || !tick.State.DroppedEventLogAt.IsZero() {
+		t.Fatalf("drop summary alarm = state %+v, err %v", tick.State, err)
+	}
+	if !strings.Contains(logs.String(), "agent_events_dropped") || !strings.Contains(logs.String(), "count=1") {
+		t.Fatalf("drop summary was not logged when its minute ended: %s", logs.String())
+	}
 }

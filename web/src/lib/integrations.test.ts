@@ -43,6 +43,7 @@ const token = (over: Partial<Token> = {}): Token => ({
   createdByName: "Owner",
   rateLimitPerMin: 120,
   hint: "ab12",
+  allowBulkUserChanges: false,
   ...over,
 });
 
@@ -122,8 +123,8 @@ describe("the countdown", () => {
 describe("words of an approval", () => {
   it("titles every tool that can plan a change, in both languages", () => {
     const tools = [
-      "user_create", "user_update", "user_disable", "user_enable", "user_reset_traffic", "device_revoke", "alert_mute", "node_fix", "rollout_start", "rollout_pause", "rollout_resume",
-      "rollout_cancel", "node_update_schedule", "node_update_schedule_cancel", "update_timezone", "node_rollback", "node_install", "node_server_password_rotate",
+      "user_create", "user_update", "user_disable", "user_enable", "user_reset_traffic", "device_revoke", "alert_mute", "alert_close", "node_fix", "rollout_start", "rollout_pause", "rollout_resume",
+      "rollout_cancel", "os_rollout_start", "os_rollout_cancel", "node_update_schedule", "node_update_schedule_cancel", "update_timezone", "node_rollback", "node_install", "node_server_password_rotate", "node_server_keys_add",
     ];
     for (const tool of tools) {
       expect(toolTitle(t, tool), tool).not.toBe(tool);
@@ -133,19 +134,20 @@ describe("words of an approval", () => {
   });
   it("labels every fact key the panel writes, and shows an unknown key as it came", () => {
     const keys = [
-      "name", "subscription_name", "quota", "term", "apps", "nodes", "count", "users", "effect", "user", "device", "last_seen", "alert", "duration", "node", "fix", "detail",
+      "name", "subscription_name", "quota", "term", "apps", "app_mistgate", "nodes", "count", "users", "effect", "user", "device", "last_seen", "alert", "duration", "node", "fix", "detail",
       "drops_sessions", "version", "rollout", "progress", "action", "current_version", "previous_version", "group", "quota_reset", "expires", "device_limit", "speed_limit", "device_speed_limit",
       "dns_preset", "used", "scheduled_at", "scheduled_version", "timezone", "existing_schedule", "from", "to",
-      "ssh", "username", "host_key", "host_key_algorithm", "address", "installation", "recovery",
+      "pending", "security", "kernel", "people_online", "reboot_required", "warning", "batch_size", "canary_position", "agent_version", "key_type", "fingerprint", "comment", "already_present",
+      "ssh", "username", "host_key", "host_key_algorithm", "panel_ssh_key", "address", "installation", "recovery",
     ];
     for (const k of keys) {
       expect(factLabel(t, k), k).not.toBe(k);
       for (const lang of langs) expect(dictionaries[lang][`approval.fact.${k}` as keyof typeof ru], `${lang} ${k}`).toBeTruthy();
     }
     expect(factLabel(t, "brand_new")).toBe("brand_new");
-    // rollout_start updates one node now: no batches, no canary, so no words for them
-    expect(factLabel(t, "batch_size")).toBe("batch_size");
-    expect(Object.keys(en).filter((k) => /^approval\.(fact\.batch_size|value\.canary|value\.default)$/.test(k))).toEqual([]);
+    for (const k of ["batch_size", "canary_position", "agent_version", "key_type", "fingerprint", "comment", "already_present"]) {
+      expect(factLabel(t, k), k).not.toBe(k);
+    }
   });
   // internal/panel/mcp/tools_profiles.go: everything profile_create, profile_update and profile_deploy send by key
   it("has words for every key of the profile tools, in every language", () => {
@@ -167,11 +169,21 @@ describe("words of an approval", () => {
     for (const c of ["step_up", "fleet", "bulk"]) expect(dangerText(t, c)).not.toBe(c);
     expect(dangerText(t, "x")).toBe("x");
   });
+  it("words bulk SSH key completion in every language", () => {
+    for (const lang of langs) {
+      const tr = Object.assign((key: keyof typeof en, vars?: Record<string, string | number>) => fill(dictionaries[lang][key], vars), {
+        n: (key: keyof typeof en, n: number, vars?: Record<string, string | number>) => fill(pickForm(dictionaries[lang][key], n, lang), { n, ...vars }),
+      }) as T;
+      expect(toolTitle(tr, "node_server_keys_add")).not.toBe("node_server_keys_add");
+      expect(outcomeText(tr, makeFmt(lang, tr), { state: ApprovalState.APPLIED, outcomeCode: "node_ssh_keys_add_completed", outcomeParams: {} })).not.toBeNull();
+    }
+  });
   it("words the panel's own values, and never touches text from data", () => {
     expect(factText(t, { key: "drops_sessions", value: "true", untrusted: false })).toBe("yes");
     expect(factText(t, { key: "progress", value: "2 of 5 nodes finished", untrusted: false })).toBe("2 of 5 nodes finished");
     expect(factText(t, { key: "action", value: "pause", untrusted: false })).toBe("Pause");
     expect(factText(t, { key: "effect", value: "the node restarts its agent", untrusted: false })).toBe("The node restarts its agent.");
+    expect(factText(t, { key: "already_present", value: "skipped", untrusted: false })).toBe("Skipped");
     expect(factText(t, { key: "version", value: "0.2.0-bbb", untrusted: false })).toBe("0.2.0-bbb");
     // a node or user named like a panel sentence stays exactly as written
     expect(factText(t, { key: "node", value: "pause", untrusted: true })).toBe("pause");
@@ -194,6 +206,14 @@ describe("coded facts and outcomes, in Russian", () => {
   const fact = (key: string, code: string, params: Record<string, string> = {}, untrustedParams: string[] = []) => ({ key, value: "the panel's English", untrusted: false, code, params, untrustedParams });
   const said = (f: ReturnType<typeof fact>) => factWords(tr, fmt, f).map((p) => (typeof p === "string" ? p : `[${p.data}]`)).join("");
 
+  it("words the OS update's facts in the owner's voice: you, the hoster, waiting to be installed", () => {
+    expect(said(fact("warning", "os_old_kernels"))).toBe("Старые ядра остаются установленными: если нода не загрузится, выбери прежнее ядро в консоли хостера.");
+    expect(said(fact("warning", "os_awg_module_missing"))).toBe("Модуль AmneziaWG не собран под новое ядро: нода откажется перезагружаться, пока модуля нет.");
+    expect(factLabel(tr, "pending")).toBe("Ожидают установки");
+    expect(factLabel(t, "pending")).toBe("Updates waiting");
+    expect(en["approval.value.os_awg_module_missing"]).toBe("The AmneziaWG module is not built for the new kernel: the node refuses to reboot until it is.");
+  });
+
   it("reads the plan's facts as the owner's sentences", () => {
     expect(said(fact("effect", "traffic_reset"))).toBe("Израсходованный трафик обнулится, остановленные квотой снова смогут подключаться.");
     expect(said(fact("duration", "seconds", { n: "3600" }))).toBe("1 ч");
@@ -204,6 +224,8 @@ describe("coded facts and outcomes, in Russian", () => {
     expect(said(fact("nodes", "some", { n: "3" }))).toBe("3 ноды");
     expect(said(fact("nodes", "all"))).toBe("все ноды");
     expect(said(fact("apps", "happ"))).toBe("только ссылка подписки");
+    expect(said(fact("app_mistgate", "change", { from: "on", to: "off" }))).toBe("включено → выключено"); // the Mistgate app switch has a fact of its own
+    expect(said(fact("app_mistgate", "off"))).toBe("выключено");
     expect(said(fact("quota", "change", { from: "0", to: "50000000000" }))).toBe("без лимита → 50 ГБ");
     expect(said(fact("quota_reset", "change", { from: "month", to: "rolling_month" }))).toBe("сброс 1-го числа → сброс каждые 30 дней");
     expect(said(fact("action", "pause"))).toBe("Пауза");

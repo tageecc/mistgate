@@ -34,26 +34,30 @@ var edgeTickJobs = map[string]string{
 
 // edgeDeferred describes background-job functions that stay VPS-only; a job can also have an edge phase above.
 var edgeDeferred = map[string]string{
-	"cloud-usage": "Cloud usage collection is VPS-only.",
-	"fleet":          "event-driven Run, local sessions, closeAll and recomputeAll remain VPS-only",
-	"health":         "client-eye checker and periodic UDP port rechecks",
-	"updates":        "installing a panel binary remains an edge deploy operation",
-	"backups":        "R2",
-	"mcp-plan-sweep": "MCP is not served on the edge",
-	"tspu-probe":     "the TSPU probe of the country check: a run takes minutes (a batch of commands to a node in the country), the cron has 15 minutes of wall time and 30 seconds of CPU; Get says it is unavailable and nothing runs",
+	"cloud-usage":         "Cloud usage collection is VPS-only.",
+	"fleet":               "event-driven Run, local sessions, closeAll and recomputeAll remain VPS-only",
+	"health":              "client-eye checker, periodic UDP port rechecks and the WARP reach check (a run asks every node, up to a minute each)",
+	"updates":             "installing a panel binary remains an edge deploy operation",
+	"backups":             "R2",
+	"mcp-plan-sweep":      "MCP is not served on the edge",
+	"assistant-retention": "assistant data is not written on the edge; assistant is VPS-only",
+	"scheduled-tasks":     "scheduled tasks run MCP tools and the assistant in process, which the edge does not serve",
+	"tspu-probe":          "the TSPU probe of the country check: a run takes minutes (a batch of commands to a node in the country), the cron has 15 minutes of wall time and 30 seconds of CPU; Get says it is unavailable and nothing runs",
 }
 
 // edgeDeferredFeatures maps every deferred function above to the admin features it takes away: the ids Me reports in
 // "unavailable" (internal/panel/edition). A test keeps the two lists in step, so a job cannot be deferred without the
 // admin saying so, nor a feature be listed with nothing behind it.
 var edgeDeferredFeatures = map[string][]string{
-	"cloud-usage": {edition.CloudUsage},
-	"fleet":          {edition.AgentLogs},
-	"health":         {edition.HealthChecks},
-	"updates":        {edition.PanelUpdate},
-	"backups":        {edition.Backups},
-	"mcp-plan-sweep": {edition.MCP},
-	"tspu-probe":     {edition.TSPUProbe},
+	"cloud-usage":         {edition.CloudUsage},
+	"fleet":               {edition.AgentLogs},
+	"health":              {edition.HealthChecks},
+	"updates":             {edition.PanelUpdate, edition.OSUpdates},
+	"backups":             {edition.Backups},
+	"mcp-plan-sweep":      {edition.MCP},
+	"assistant-retention": {edition.Assistant},
+	"scheduled-tasks":     {edition.Assistant},
+	"tspu-probe":          {edition.TSPUProbe},
 }
 
 // EdgeTick runs the scheduled work shared by the edge edition. Each pass gets a fresh timeout so one slow job does not

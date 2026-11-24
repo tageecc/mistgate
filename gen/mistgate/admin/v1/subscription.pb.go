@@ -285,8 +285,26 @@ type SubscriptionSettings struct {
 	HappPing HappPing `protobuf:"varint,12,opt,name=happ_ping,json=happPing,proto3,enum=mistgate.admin.v1.HappPing" json:"happ_ping,omitempty"`
 	// With happ_ping set: Happ pings the servers each time it opens (subscription-ping-onopen-enabled: 1, else 0).
 	HappPingOnOpen bool `protobuf:"varint,13,opt,name=happ_ping_on_open,json=happPingOnOpen,proto3" json:"happ_ping_on_open,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// AmneziaWG servers in what the subscription link hands out (today only the Mihomo profile carries them).
+	// Absent = true: settings stored before this switch existed keep today's behaviour.
+	LinkAwg *bool `protobuf:"varint,14,opt,name=link_awg,json=linkAwg,proto3,oneof" json:"link_awg,omitempty"`
+	// Include automatic server selection in Mihomo and sing-box subscription profiles; absent means on.
+	LinkAutoSelect *bool `protobuf:"varint,15,opt,name=link_auto_select,json=linkAutoSelect,proto3,oneof" json:"link_auto_select,omitempty"`
+	// Days without a connection or subscription fetch before a device stops counting. 0 disables idling; otherwise 7 to 365.
+	// Absent in an update = keep the stored setting.
+	DeviceIdleAfterDays *uint32 `protobuf:"varint,16,opt,name=device_idle_after_days,json=deviceIdleAfterDays,proto3,oneof" json:"device_idle_after_days,omitempty"`
+	// The owner's own response headers of a successful subscription answer (e.g. flclashx-servicename). In order: when two
+	// entries of one name both apply, the first wins. Refusals (device limit, a blocked device, no access) carry none of them.
+	ResponseHeaders []*ResponseHeader `protobuf:"bytes,17,rep,name=response_headers,json=responseHeaders,proto3" json:"response_headers,omitempty"`
+	// The owner's own Mihomo YAML profiles, one for each of the groups they name; a person of a group that no template names gets the
+	// panel's own profile. The list is replaced as a whole. Checked on save (see MihomoTemplate); at most 20 templates, 64 KiB each and
+	// 256 KiB in all.
+	MihomoTemplates []*MihomoTemplate `protobuf:"bytes,18,rep,name=mihomo_templates,json=mihomoTemplates,proto3" json:"mihomo_templates,omitempty"`
+	// The owner's own routing profiles for the apps Happ and INCY, one for each of the groups they name; a person gets one profile at most,
+	// by their main group. The list is replaced as a whole. Checked on save (see RoutingProfile); at most 20 profiles.
+	RoutingProfiles []*RoutingProfile `protobuf:"bytes,19,rep,name=routing_profiles,json=routingProfiles,proto3" json:"routing_profiles,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *SubscriptionSettings) Reset() {
@@ -410,6 +428,520 @@ func (x *SubscriptionSettings) GetHappPingOnOpen() bool {
 	return false
 }
 
+func (x *SubscriptionSettings) GetLinkAwg() bool {
+	if x != nil && x.LinkAwg != nil {
+		return *x.LinkAwg
+	}
+	return false
+}
+
+func (x *SubscriptionSettings) GetLinkAutoSelect() bool {
+	if x != nil && x.LinkAutoSelect != nil {
+		return *x.LinkAutoSelect
+	}
+	return false
+}
+
+func (x *SubscriptionSettings) GetDeviceIdleAfterDays() uint32 {
+	if x != nil && x.DeviceIdleAfterDays != nil {
+		return *x.DeviceIdleAfterDays
+	}
+	return 0
+}
+
+func (x *SubscriptionSettings) GetResponseHeaders() []*ResponseHeader {
+	if x != nil {
+		return x.ResponseHeaders
+	}
+	return nil
+}
+
+func (x *SubscriptionSettings) GetMihomoTemplates() []*MihomoTemplate {
+	if x != nil {
+		return x.MihomoTemplates
+	}
+	return nil
+}
+
+func (x *SubscriptionSettings) GetRoutingProfiles() []*RoutingProfile {
+	if x != nil {
+		return x.RoutingProfiles
+	}
+	return nil
+}
+
+// One routing profile of the owner, for Happ and INCY: what goes direct, through the VPN and to the block list, the app's DNS and the
+// geo files. The owner pastes a link (`happ://routing/onadd/...`, `incy://...`, `://routing/add/...`), the bare base64 or the JSON; a
+// save reads it, keeps only the fields the two apps document (the others are named in info.dropped_fields and left out) and stores the
+// JSON the panel writes out of them, so what the apps get is never the pasted text. An answer to Happ carries the profile as
+// `happ://routing/<add|onadd>/<base64>`, one to INCY as `incy://...`, in the `routing` header while the link is at most 3000 bytes, else
+// on a line of the subscription body. The person's own DNS preset replaces the DNS fields of the profile; the rules stay the owner's.
+// A save is refused (INVALID_ARGUMENT, the text names the field) for a text that is no profile, a field of the wrong type, a geo-file or
+// DoH address that is not https, a profile over 32 KiB, a name used twice, a group in two profiles or two profiles for all groups.
+type RoutingProfile struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// What the owner pasted, or the JSON the panel stored; always the stored JSON in a response.
+	Profile string `protobuf:"bytes,1,opt,name=profile,proto3" json:"profile,omitempty"`
+	// false = the app adds the profile and turns it on (`onadd`); true = it adds it and the person turns it on (`add`).
+	OnlyAdd bool `protobuf:"varint,2,opt,name=only_add,json=onlyAdd,proto3" json:"only_add,omitempty"`
+	// false = every group; true = only the people whose main group is in group_ids (none listed = nobody gets it).
+	OnlyGroups bool `protobuf:"varint,3,opt,name=only_groups,json=onlyGroups,proto3" json:"only_groups,omitempty"`
+	// Group ids, only with only_groups; at most 100. A group that is deleted later drops out the next time the settings are saved.
+	GroupIds []string `protobuf:"bytes,4,rep,name=group_ids,json=groupIds,proto3" json:"group_ids,omitempty"`
+	// What the profile holds, in numbers. Filled by the panel in a response, ignored in a request.
+	Info          *RoutingInfo `protobuf:"bytes,5,opt,name=info,proto3" json:"info,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RoutingProfile) Reset() {
+	*x = RoutingProfile{}
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RoutingProfile) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RoutingProfile) ProtoMessage() {}
+
+func (x *RoutingProfile) ProtoReflect() protoreflect.Message {
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RoutingProfile.ProtoReflect.Descriptor instead.
+func (*RoutingProfile) Descriptor() ([]byte, []int) {
+	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *RoutingProfile) GetProfile() string {
+	if x != nil {
+		return x.Profile
+	}
+	return ""
+}
+
+func (x *RoutingProfile) GetOnlyAdd() bool {
+	if x != nil {
+		return x.OnlyAdd
+	}
+	return false
+}
+
+func (x *RoutingProfile) GetOnlyGroups() bool {
+	if x != nil {
+		return x.OnlyGroups
+	}
+	return false
+}
+
+func (x *RoutingProfile) GetGroupIds() []string {
+	if x != nil {
+		return x.GroupIds
+	}
+	return nil
+}
+
+func (x *RoutingProfile) GetInfo() *RoutingInfo {
+	if x != nil {
+		return x.Info
+	}
+	return nil
+}
+
+// What a stored routing profile holds, for the admin to show in words.
+type RoutingInfo struct {
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	Name        string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	DirectSites uint32                 `protobuf:"varint,2,opt,name=direct_sites,json=directSites,proto3" json:"direct_sites,omitempty"`
+	DirectIp    uint32                 `protobuf:"varint,3,opt,name=direct_ip,json=directIp,proto3" json:"direct_ip,omitempty"`
+	ProxySites  uint32                 `protobuf:"varint,4,opt,name=proxy_sites,json=proxySites,proto3" json:"proxy_sites,omitempty"`
+	ProxyIp     uint32                 `protobuf:"varint,5,opt,name=proxy_ip,json=proxyIp,proto3" json:"proxy_ip,omitempty"`
+	BlockSites  uint32                 `protobuf:"varint,6,opt,name=block_sites,json=blockSites,proto3" json:"block_sites,omitempty"`
+	BlockIp     uint32                 `protobuf:"varint,7,opt,name=block_ip,json=blockIp,proto3" json:"block_ip,omitempty"`
+	// "DoH", "DoU" or "" (the app's own), and the address: the DoH URL, else the IP.
+	RemoteDnsType   string `protobuf:"bytes,8,opt,name=remote_dns_type,json=remoteDnsType,proto3" json:"remote_dns_type,omitempty"`
+	RemoteDns       string `protobuf:"bytes,9,opt,name=remote_dns,json=remoteDns,proto3" json:"remote_dns,omitempty"`
+	DomesticDnsType string `protobuf:"bytes,10,opt,name=domestic_dns_type,json=domesticDnsType,proto3" json:"domestic_dns_type,omitempty"`
+	DomesticDns     string `protobuf:"bytes,11,opt,name=domestic_dns,json=domesticDns,proto3" json:"domestic_dns,omitempty"`
+	// Entries of DnsHosts.
+	Hosts          uint32 `protobuf:"varint,12,opt,name=hosts,proto3" json:"hosts,omitempty"`
+	GeoipAddress   string `protobuf:"bytes,13,opt,name=geoip_address,json=geoipAddress,proto3" json:"geoip_address,omitempty"`
+	GeositeAddress string `protobuf:"bytes,14,opt,name=geosite_address,json=geositeAddress,proto3" json:"geosite_address,omitempty"`
+	// "true", "false" or "": what the app does with traffic no rule names.
+	GlobalProxy    string `protobuf:"bytes,15,opt,name=global_proxy,json=globalProxy,proto3" json:"global_proxy,omitempty"`
+	DomainStrategy string `protobuf:"bytes,16,opt,name=domain_strategy,json=domainStrategy,proto3" json:"domain_strategy,omitempty"`
+	FakeDns        string `protobuf:"bytes,17,opt,name=fake_dns,json=fakeDns,proto3" json:"fake_dns,omitempty"`
+	LastUpdated    string `protobuf:"bytes,18,opt,name=last_updated,json=lastUpdated,proto3" json:"last_updated,omitempty"`
+	UseChunkFiles  bool   `protobuf:"varint,19,opt,name=use_chunk_files,json=useChunkFiles,proto3" json:"use_chunk_files,omitempty"`
+	// Fields of the pasted text that the panel does not keep (at most 10, names only). Filled by PreviewRoutingProfile only.
+	DroppedFields []string `protobuf:"bytes,20,rep,name=dropped_fields,json=droppedFields,proto3" json:"dropped_fields,omitempty"`
+	// The stored JSON in bytes, and the bytes of the Happ link of it without the person's DNS (the header holds at most 3000).
+	ProfileBytes  uint32 `protobuf:"varint,21,opt,name=profile_bytes,json=profileBytes,proto3" json:"profile_bytes,omitempty"`
+	HeaderBytes   uint32 `protobuf:"varint,22,opt,name=header_bytes,json=headerBytes,proto3" json:"header_bytes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RoutingInfo) Reset() {
+	*x = RoutingInfo{}
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RoutingInfo) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RoutingInfo) ProtoMessage() {}
+
+func (x *RoutingInfo) ProtoReflect() protoreflect.Message {
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RoutingInfo.ProtoReflect.Descriptor instead.
+func (*RoutingInfo) Descriptor() ([]byte, []int) {
+	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *RoutingInfo) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *RoutingInfo) GetDirectSites() uint32 {
+	if x != nil {
+		return x.DirectSites
+	}
+	return 0
+}
+
+func (x *RoutingInfo) GetDirectIp() uint32 {
+	if x != nil {
+		return x.DirectIp
+	}
+	return 0
+}
+
+func (x *RoutingInfo) GetProxySites() uint32 {
+	if x != nil {
+		return x.ProxySites
+	}
+	return 0
+}
+
+func (x *RoutingInfo) GetProxyIp() uint32 {
+	if x != nil {
+		return x.ProxyIp
+	}
+	return 0
+}
+
+func (x *RoutingInfo) GetBlockSites() uint32 {
+	if x != nil {
+		return x.BlockSites
+	}
+	return 0
+}
+
+func (x *RoutingInfo) GetBlockIp() uint32 {
+	if x != nil {
+		return x.BlockIp
+	}
+	return 0
+}
+
+func (x *RoutingInfo) GetRemoteDnsType() string {
+	if x != nil {
+		return x.RemoteDnsType
+	}
+	return ""
+}
+
+func (x *RoutingInfo) GetRemoteDns() string {
+	if x != nil {
+		return x.RemoteDns
+	}
+	return ""
+}
+
+func (x *RoutingInfo) GetDomesticDnsType() string {
+	if x != nil {
+		return x.DomesticDnsType
+	}
+	return ""
+}
+
+func (x *RoutingInfo) GetDomesticDns() string {
+	if x != nil {
+		return x.DomesticDns
+	}
+	return ""
+}
+
+func (x *RoutingInfo) GetHosts() uint32 {
+	if x != nil {
+		return x.Hosts
+	}
+	return 0
+}
+
+func (x *RoutingInfo) GetGeoipAddress() string {
+	if x != nil {
+		return x.GeoipAddress
+	}
+	return ""
+}
+
+func (x *RoutingInfo) GetGeositeAddress() string {
+	if x != nil {
+		return x.GeositeAddress
+	}
+	return ""
+}
+
+func (x *RoutingInfo) GetGlobalProxy() string {
+	if x != nil {
+		return x.GlobalProxy
+	}
+	return ""
+}
+
+func (x *RoutingInfo) GetDomainStrategy() string {
+	if x != nil {
+		return x.DomainStrategy
+	}
+	return ""
+}
+
+func (x *RoutingInfo) GetFakeDns() string {
+	if x != nil {
+		return x.FakeDns
+	}
+	return ""
+}
+
+func (x *RoutingInfo) GetLastUpdated() string {
+	if x != nil {
+		return x.LastUpdated
+	}
+	return ""
+}
+
+func (x *RoutingInfo) GetUseChunkFiles() bool {
+	if x != nil {
+		return x.UseChunkFiles
+	}
+	return false
+}
+
+func (x *RoutingInfo) GetDroppedFields() []string {
+	if x != nil {
+		return x.DroppedFields
+	}
+	return nil
+}
+
+func (x *RoutingInfo) GetProfileBytes() uint32 {
+	if x != nil {
+		return x.ProfileBytes
+	}
+	return 0
+}
+
+func (x *RoutingInfo) GetHeaderBytes() uint32 {
+	if x != nil {
+		return x.HeaderBytes
+	}
+	return 0
+}
+
+// One Mihomo YAML profile of the owner. The panel puts the servers of the person at the start of its `proxies` and, while
+// link_auto_select is on and the template has no group of that name, adds a url-test group `Auto` over them at the end of its
+// `proxy-groups`; groups take the servers with `include-all-proxies` or `filter`. `dns` is added (resolvers of the person's preset,
+// respect-rules on) only when the template has none. Everything else is left as written, comments included. The panel never
+// fetches a URL of a template.
+//
+// A save is refused (INVALID_ARGUMENT, the text names the line) unless the text is one valid YAML document that parses in full (no
+// alias bomb, no repeated key), has a mapping at its root, `proxies` and `proxy-groups` that are lists (or absent) with named
+// entries, groups that refer only to names of the template, the core and `Auto`, and `use` that names its `proxy-providers`; a
+// group may be in one template only. Names are unique without regard to case.
+type MihomoTemplate struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 1 to 60 characters; how the editor and MCP call the template.
+	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	// The text, 1 byte to 64 KiB, UTF-8.
+	Yaml string `protobuf:"bytes,2,opt,name=yaml,proto3" json:"yaml,omitempty"`
+	// The groups whose people get this template (at most 100). A group that is deleted later drops out of the list the next time the
+	// settings are saved; a template without groups serves nobody.
+	GroupIds      []string `protobuf:"bytes,3,rep,name=group_ids,json=groupIds,proto3" json:"group_ids,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MihomoTemplate) Reset() {
+	*x = MihomoTemplate{}
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MihomoTemplate) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MihomoTemplate) ProtoMessage() {}
+
+func (x *MihomoTemplate) ProtoReflect() protoreflect.Message {
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MihomoTemplate.ProtoReflect.Descriptor instead.
+func (*MihomoTemplate) Descriptor() ([]byte, []int) {
+	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *MihomoTemplate) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *MihomoTemplate) GetYaml() string {
+	if x != nil {
+		return x.Yaml
+	}
+	return ""
+}
+
+func (x *MihomoTemplate) GetGroupIds() []string {
+	if x != nil {
+		return x.GroupIds
+	}
+	return nil
+}
+
+// One response header the owner adds to the subscription answer the apps fetch. The name is an HTTP token (RFC 9110) that is
+// none of the panel's own headers (GetSubscriptionSettingsResponse.reserved_header_names); the value has no control
+// characters; at most 20 entries, a name of at most 64 bytes, a value of at most 1000 bytes and 4096 bytes in all.
+type ResponseHeader struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Name  string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Value string                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	// Send the value as "base64:" plus its base64, the way the panel sends the title (apps that read text headers decode it).
+	Base64 bool `protobuf:"varint,3,opt,name=base64,proto3" json:"base64,omitempty"`
+	// The answer formats it goes with: SUB_FORMAT_BASE64_URIS, _MIHOMO_YAML, _XRAY_JSON or _SINGBOX_JSON. Empty = all of them.
+	Formats []SubFormat `protobuf:"varint,4,rep,packed,name=formats,proto3,enum=mistgate.admin.v1.SubFormat" json:"formats,omitempty"`
+	// false = every group; true = only the people of group_ids (none listed = nobody gets it).
+	OnlyGroups bool `protobuf:"varint,5,opt,name=only_groups,json=onlyGroups,proto3" json:"only_groups,omitempty"`
+	// Group ids, only with only_groups. A group that is deleted later drops out of the list the next time the settings are saved.
+	GroupIds      []string `protobuf:"bytes,6,rep,name=group_ids,json=groupIds,proto3" json:"group_ids,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ResponseHeader) Reset() {
+	*x = ResponseHeader{}
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ResponseHeader) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ResponseHeader) ProtoMessage() {}
+
+func (x *ResponseHeader) ProtoReflect() protoreflect.Message {
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ResponseHeader.ProtoReflect.Descriptor instead.
+func (*ResponseHeader) Descriptor() ([]byte, []int) {
+	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *ResponseHeader) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *ResponseHeader) GetValue() string {
+	if x != nil {
+		return x.Value
+	}
+	return ""
+}
+
+func (x *ResponseHeader) GetBase64() bool {
+	if x != nil {
+		return x.Base64
+	}
+	return false
+}
+
+func (x *ResponseHeader) GetFormats() []SubFormat {
+	if x != nil {
+		return x.Formats
+	}
+	return nil
+}
+
+func (x *ResponseHeader) GetOnlyGroups() bool {
+	if x != nil {
+		return x.OnlyGroups
+	}
+	return false
+}
+
+func (x *ResponseHeader) GetGroupIds() []string {
+	if x != nil {
+		return x.GroupIds
+	}
+	return nil
+}
+
 // What the owner offers for the link apps. A person's pick applies while it is offered; without one, their link apps get the
 // user's own preset, else the group's, else default_preset_id, else the instance default.
 type LinkDnsOptions struct {
@@ -424,7 +956,7 @@ type LinkDnsOptions struct {
 
 func (x *LinkDnsOptions) Reset() {
 	*x = LinkDnsOptions{}
-	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[1]
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -436,7 +968,7 @@ func (x *LinkDnsOptions) String() string {
 func (*LinkDnsOptions) ProtoMessage() {}
 
 func (x *LinkDnsOptions) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[1]
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -449,7 +981,7 @@ func (x *LinkDnsOptions) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LinkDnsOptions.ProtoReflect.Descriptor instead.
 func (*LinkDnsOptions) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{1}
+	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *LinkDnsOptions) GetPresetIds() []string {
@@ -489,7 +1021,7 @@ type PlatformApp struct {
 
 func (x *PlatformApp) Reset() {
 	*x = PlatformApp{}
-	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[2]
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -501,7 +1033,7 @@ func (x *PlatformApp) String() string {
 func (*PlatformApp) ProtoMessage() {}
 
 func (x *PlatformApp) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[2]
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -514,7 +1046,7 @@ func (x *PlatformApp) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlatformApp.ProtoReflect.Descriptor instead.
 func (*PlatformApp) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{2}
+	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *PlatformApp) GetPlatform() Platform {
@@ -588,7 +1120,7 @@ type UserPageOptions struct {
 
 func (x *UserPageOptions) Reset() {
 	*x = UserPageOptions{}
-	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[3]
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -600,7 +1132,7 @@ func (x *UserPageOptions) String() string {
 func (*UserPageOptions) ProtoMessage() {}
 
 func (x *UserPageOptions) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[3]
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -613,7 +1145,7 @@ func (x *UserPageOptions) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UserPageOptions.ProtoReflect.Descriptor instead.
 func (*UserPageOptions) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{3}
+	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *UserPageOptions) GetShowAnnouncement() bool {
@@ -669,7 +1201,7 @@ type ServeRule struct {
 
 func (x *ServeRule) Reset() {
 	*x = ServeRule{}
-	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[4]
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -681,7 +1213,7 @@ func (x *ServeRule) String() string {
 func (*ServeRule) ProtoMessage() {}
 
 func (x *ServeRule) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[4]
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -694,7 +1226,7 @@ func (x *ServeRule) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ServeRule.ProtoReflect.Descriptor instead.
 func (*ServeRule) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{4}
+	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *ServeRule) GetUaContains() string {
@@ -719,7 +1251,7 @@ type GetSubscriptionSettingsRequest struct {
 
 func (x *GetSubscriptionSettingsRequest) Reset() {
 	*x = GetSubscriptionSettingsRequest{}
-	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[5]
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -731,7 +1263,7 @@ func (x *GetSubscriptionSettingsRequest) String() string {
 func (*GetSubscriptionSettingsRequest) ProtoMessage() {}
 
 func (x *GetSubscriptionSettingsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[5]
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -744,7 +1276,7 @@ func (x *GetSubscriptionSettingsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetSubscriptionSettingsRequest.ProtoReflect.Descriptor instead.
 func (*GetSubscriptionSettingsRequest) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{5}
+	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{9}
 }
 
 type GetSubscriptionSettingsResponse struct {
@@ -762,13 +1294,19 @@ type GetSubscriptionSettingsResponse struct {
 	// People who have a live common (no device ID) place right now: the apps that report none are what STRICT turns away,
 	// so the confirmation of switching to it shows this number.
 	SharedLinkUsers uint32 `protobuf:"varint,6,opt,name=shared_link_users,json=sharedLinkUsers,proto3" json:"shared_link_users,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Live AmneziaWG credentials held by the subscription link's devices, across all users. Turning link_awg off drops
+	// each credential the next time its app fetches a Mihomo profile.
+	LinkAwgKeys uint32 `protobuf:"varint,7,opt,name=link_awg_keys,json=linkAwgKeys,proto3" json:"link_awg_keys,omitempty"`
+	// What an own response header may not be named, from the code that sets the headers: exact names, and prefixes written with a
+	// trailing "*" ("X-Hwid-*"). Compared without regard to case. The panel refuses such a name on save; the editor shows it first.
+	ReservedHeaderNames []string `protobuf:"bytes,8,rep,name=reserved_header_names,json=reservedHeaderNames,proto3" json:"reserved_header_names,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *GetSubscriptionSettingsResponse) Reset() {
 	*x = GetSubscriptionSettingsResponse{}
-	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[6]
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -780,7 +1318,7 @@ func (x *GetSubscriptionSettingsResponse) String() string {
 func (*GetSubscriptionSettingsResponse) ProtoMessage() {}
 
 func (x *GetSubscriptionSettingsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[6]
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -793,7 +1331,7 @@ func (x *GetSubscriptionSettingsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetSubscriptionSettingsResponse.ProtoReflect.Descriptor instead.
 func (*GetSubscriptionSettingsResponse) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{6}
+	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *GetSubscriptionSettingsResponse) GetSettings() *SubscriptionSettings {
@@ -838,6 +1376,20 @@ func (x *GetSubscriptionSettingsResponse) GetSharedLinkUsers() uint32 {
 	return 0
 }
 
+func (x *GetSubscriptionSettingsResponse) GetLinkAwgKeys() uint32 {
+	if x != nil {
+		return x.LinkAwgKeys
+	}
+	return 0
+}
+
+func (x *GetSubscriptionSettingsResponse) GetReservedHeaderNames() []string {
+	if x != nil {
+		return x.ReservedHeaderNames
+	}
+	return nil
+}
+
 // One server of the preview: what a server name is built from.
 type ServerSample struct {
 	state       protoimpl.MessageState `protogen:"open.v1"`
@@ -852,7 +1404,7 @@ type ServerSample struct {
 
 func (x *ServerSample) Reset() {
 	*x = ServerSample{}
-	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[7]
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -864,7 +1416,7 @@ func (x *ServerSample) String() string {
 func (*ServerSample) ProtoMessage() {}
 
 func (x *ServerSample) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[7]
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -877,7 +1429,7 @@ func (x *ServerSample) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ServerSample.ProtoReflect.Descriptor instead.
 func (*ServerSample) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{7}
+	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *ServerSample) GetNode() string {
@@ -918,7 +1470,7 @@ type UpdateSubscriptionSettingsRequest struct {
 
 func (x *UpdateSubscriptionSettingsRequest) Reset() {
 	*x = UpdateSubscriptionSettingsRequest{}
-	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[8]
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -930,7 +1482,7 @@ func (x *UpdateSubscriptionSettingsRequest) String() string {
 func (*UpdateSubscriptionSettingsRequest) ProtoMessage() {}
 
 func (x *UpdateSubscriptionSettingsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[8]
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -943,7 +1495,7 @@ func (x *UpdateSubscriptionSettingsRequest) ProtoReflect() protoreflect.Message 
 
 // Deprecated: Use UpdateSubscriptionSettingsRequest.ProtoReflect.Descriptor instead.
 func (*UpdateSubscriptionSettingsRequest) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{8}
+	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *UpdateSubscriptionSettingsRequest) GetSettings() *SubscriptionSettings {
@@ -962,7 +1514,7 @@ type UpdateSubscriptionSettingsResponse struct {
 
 func (x *UpdateSubscriptionSettingsResponse) Reset() {
 	*x = UpdateSubscriptionSettingsResponse{}
-	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[9]
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -974,7 +1526,7 @@ func (x *UpdateSubscriptionSettingsResponse) String() string {
 func (*UpdateSubscriptionSettingsResponse) ProtoMessage() {}
 
 func (x *UpdateSubscriptionSettingsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[9]
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -987,7 +1539,7 @@ func (x *UpdateSubscriptionSettingsResponse) ProtoReflect() protoreflect.Message
 
 // Deprecated: Use UpdateSubscriptionSettingsResponse.ProtoReflect.Descriptor instead.
 func (*UpdateSubscriptionSettingsResponse) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{9}
+	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *UpdateSubscriptionSettingsResponse) GetSettings() *SubscriptionSettings {
@@ -1012,7 +1564,7 @@ type ClientInfo struct {
 
 func (x *ClientInfo) Reset() {
 	*x = ClientInfo{}
-	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[10]
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1024,7 +1576,7 @@ func (x *ClientInfo) String() string {
 func (*ClientInfo) ProtoMessage() {}
 
 func (x *ClientInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[10]
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1037,7 +1589,7 @@ func (x *ClientInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ClientInfo.ProtoReflect.Descriptor instead.
 func (*ClientInfo) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{10}
+	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *ClientInfo) GetId() string {
@@ -1076,7 +1628,7 @@ type ListClientsRequest struct {
 
 func (x *ListClientsRequest) Reset() {
 	*x = ListClientsRequest{}
-	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[11]
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1088,7 +1640,7 @@ func (x *ListClientsRequest) String() string {
 func (*ListClientsRequest) ProtoMessage() {}
 
 func (x *ListClientsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[11]
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1101,7 +1653,7 @@ func (x *ListClientsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListClientsRequest.ProtoReflect.Descriptor instead.
 func (*ListClientsRequest) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{11}
+	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{15}
 }
 
 type ListClientsResponse struct {
@@ -1113,7 +1665,7 @@ type ListClientsResponse struct {
 
 func (x *ListClientsResponse) Reset() {
 	*x = ListClientsResponse{}
-	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[12]
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1125,7 +1677,7 @@ func (x *ListClientsResponse) String() string {
 func (*ListClientsResponse) ProtoMessage() {}
 
 func (x *ListClientsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[12]
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1138,7 +1690,7 @@ func (x *ListClientsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListClientsResponse.ProtoReflect.Descriptor instead.
 func (*ListClientsResponse) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{12}
+	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *ListClientsResponse) GetClients() []*ClientInfo {
@@ -1157,7 +1709,7 @@ type TestUserAgentRequest struct {
 
 func (x *TestUserAgentRequest) Reset() {
 	*x = TestUserAgentRequest{}
-	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[13]
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1169,7 +1721,7 @@ func (x *TestUserAgentRequest) String() string {
 func (*TestUserAgentRequest) ProtoMessage() {}
 
 func (x *TestUserAgentRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[13]
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1182,7 +1734,7 @@ func (x *TestUserAgentRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TestUserAgentRequest.ProtoReflect.Descriptor instead.
 func (*TestUserAgentRequest) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{13}
+	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *TestUserAgentRequest) GetUserAgent() string {
@@ -1205,7 +1757,7 @@ type TestUserAgentResponse struct {
 
 func (x *TestUserAgentResponse) Reset() {
 	*x = TestUserAgentResponse{}
-	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[14]
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1217,7 +1769,7 @@ func (x *TestUserAgentResponse) String() string {
 func (*TestUserAgentResponse) ProtoMessage() {}
 
 func (x *TestUserAgentResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[14]
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1230,7 +1782,7 @@ func (x *TestUserAgentResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TestUserAgentResponse.ProtoReflect.Descriptor instead.
 func (*TestUserAgentResponse) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{14}
+	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *TestUserAgentResponse) GetRuleIndex() int32 {
@@ -1254,11 +1806,500 @@ func (x *TestUserAgentResponse) GetBrowser() bool {
 	return false
 }
 
+type PreviewResponseHeadersRequest struct {
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	UserId    string                 `protobuf:"bytes,1,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
+	UserAgent string                 `protobuf:"bytes,2,opt,name=user_agent,json=userAgent,proto3" json:"user_agent,omitempty"`
+	// The list to preview: the editor's draft, or the saved one.
+	Headers       []*ResponseHeader `protobuf:"bytes,3,rep,name=headers,proto3" json:"headers,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PreviewResponseHeadersRequest) Reset() {
+	*x = PreviewResponseHeadersRequest{}
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PreviewResponseHeadersRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PreviewResponseHeadersRequest) ProtoMessage() {}
+
+func (x *PreviewResponseHeadersRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PreviewResponseHeadersRequest.ProtoReflect.Descriptor instead.
+func (*PreviewResponseHeadersRequest) Descriptor() ([]byte, []int) {
+	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *PreviewResponseHeadersRequest) GetUserId() string {
+	if x != nil {
+		return x.UserId
+	}
+	return ""
+}
+
+func (x *PreviewResponseHeadersRequest) GetUserAgent() string {
+	if x != nil {
+		return x.UserAgent
+	}
+	return ""
+}
+
+func (x *PreviewResponseHeadersRequest) GetHeaders() []*ResponseHeader {
+	if x != nil {
+		return x.Headers
+	}
+	return nil
+}
+
+// One header as it goes out.
+type SentHeader struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Name  string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	// As sent: with "base64:" and the encoded text when the entry asks for base64.
+	Value         string `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	Base64        bool   `protobuf:"varint,3,opt,name=base64,proto3" json:"base64,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SentHeader) Reset() {
+	*x = SentHeader{}
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SentHeader) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SentHeader) ProtoMessage() {}
+
+func (x *SentHeader) ProtoReflect() protoreflect.Message {
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SentHeader.ProtoReflect.Descriptor instead.
+func (*SentHeader) Descriptor() ([]byte, []int) {
+	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *SentHeader) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *SentHeader) GetValue() string {
+	if x != nil {
+		return x.Value
+	}
+	return ""
+}
+
+func (x *SentHeader) GetBase64() bool {
+	if x != nil {
+		return x.Base64
+	}
+	return false
+}
+
+type PreviewResponseHeadersResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The answer format the User-Agent gets (SUB_FORMAT_USER_PAGE for a browser: the page, not a subscription).
+	Format SubFormat `protobuf:"varint,1,opt,name=format,proto3,enum=mistgate.admin.v1.SubFormat" json:"format,omitempty"`
+	// The own headers that person's answer carries, in the order they are listed. Empty when the answer is not a subscription
+	// (see not_served) or no entry applies.
+	Headers []*SentHeader `protobuf:"bytes,2,rep,name=headers,proto3" json:"headers,omitempty"`
+	// Why there are none by design: "page" (a browser gets the user page), "decoy" (the User-Agent is served as an unknown link),
+	// "no_access" (the person's subscription is off, expired or over its quota: the answer carries a note and no own headers).
+	// "" = the answer is a subscription.
+	NotServed string `protobuf:"bytes,3,opt,name=not_served,json=notServed,proto3" json:"not_served,omitempty"`
+	// The person's group, for the preview's caption.
+	GroupName string `protobuf:"bytes,4,opt,name=group_name,json=groupName,proto3" json:"group_name,omitempty"`
+	// The saved routing profile is in the answer: its link is the `routing` entry of headers (Happ and INCY only). The header does not
+	// fit (the link is over 3000 bytes) and the link is on a line of the body: routing_in_body, and no `routing` entry.
+	RoutingInBody bool `protobuf:"varint,5,opt,name=routing_in_body,json=routingInBody,proto3" json:"routing_in_body,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PreviewResponseHeadersResponse) Reset() {
+	*x = PreviewResponseHeadersResponse{}
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PreviewResponseHeadersResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PreviewResponseHeadersResponse) ProtoMessage() {}
+
+func (x *PreviewResponseHeadersResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PreviewResponseHeadersResponse.ProtoReflect.Descriptor instead.
+func (*PreviewResponseHeadersResponse) Descriptor() ([]byte, []int) {
+	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *PreviewResponseHeadersResponse) GetFormat() SubFormat {
+	if x != nil {
+		return x.Format
+	}
+	return SubFormat_SUB_FORMAT_UNSPECIFIED
+}
+
+func (x *PreviewResponseHeadersResponse) GetHeaders() []*SentHeader {
+	if x != nil {
+		return x.Headers
+	}
+	return nil
+}
+
+func (x *PreviewResponseHeadersResponse) GetNotServed() string {
+	if x != nil {
+		return x.NotServed
+	}
+	return ""
+}
+
+func (x *PreviewResponseHeadersResponse) GetGroupName() string {
+	if x != nil {
+		return x.GroupName
+	}
+	return ""
+}
+
+func (x *PreviewResponseHeadersResponse) GetRoutingInBody() bool {
+	if x != nil {
+		return x.RoutingInBody
+	}
+	return false
+}
+
+type PreviewRoutingProfileRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// A link, a base64 text or the JSON of a profile.
+	Input         string `protobuf:"bytes,1,opt,name=input,proto3" json:"input,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PreviewRoutingProfileRequest) Reset() {
+	*x = PreviewRoutingProfileRequest{}
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PreviewRoutingProfileRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PreviewRoutingProfileRequest) ProtoMessage() {}
+
+func (x *PreviewRoutingProfileRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PreviewRoutingProfileRequest.ProtoReflect.Descriptor instead.
+func (*PreviewRoutingProfileRequest) Descriptor() ([]byte, []int) {
+	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *PreviewRoutingProfileRequest) GetInput() string {
+	if x != nil {
+		return x.Input
+	}
+	return ""
+}
+
+type PreviewRoutingProfileResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The entry for the list: profile as stored, only_add from the link (add = true), info with dropped_fields.
+	Profile       *RoutingProfile `protobuf:"bytes,1,opt,name=profile,proto3" json:"profile,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PreviewRoutingProfileResponse) Reset() {
+	*x = PreviewRoutingProfileResponse{}
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[23]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PreviewRoutingProfileResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PreviewRoutingProfileResponse) ProtoMessage() {}
+
+func (x *PreviewRoutingProfileResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[23]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PreviewRoutingProfileResponse.ProtoReflect.Descriptor instead.
+func (*PreviewRoutingProfileResponse) Descriptor() ([]byte, []int) {
+	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{23}
+}
+
+func (x *PreviewRoutingProfileResponse) GetProfile() *RoutingProfile {
+	if x != nil {
+		return x.Profile
+	}
+	return nil
+}
+
+type PreviewMihomoTemplateRequest struct {
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	UserId string                 `protobuf:"bytes,1,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
+	// The text of the draft, checked as a save checks it (and against the saved switch of automatic selection).
+	Yaml string `protobuf:"bytes,2,opt,name=yaml,proto3" json:"yaml,omitempty"`
+	// The groups the draft is for; none: the warning "unused". The person need not be in one of them.
+	GroupIds      []string `protobuf:"bytes,3,rep,name=group_ids,json=groupIds,proto3" json:"group_ids,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PreviewMihomoTemplateRequest) Reset() {
+	*x = PreviewMihomoTemplateRequest{}
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PreviewMihomoTemplateRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PreviewMihomoTemplateRequest) ProtoMessage() {}
+
+func (x *PreviewMihomoTemplateRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PreviewMihomoTemplateRequest.ProtoReflect.Descriptor instead.
+func (*PreviewMihomoTemplateRequest) Descriptor() ([]byte, []int) {
+	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{24}
+}
+
+func (x *PreviewMihomoTemplateRequest) GetUserId() string {
+	if x != nil {
+		return x.UserId
+	}
+	return ""
+}
+
+func (x *PreviewMihomoTemplateRequest) GetYaml() string {
+	if x != nil {
+		return x.Yaml
+	}
+	return ""
+}
+
+func (x *PreviewMihomoTemplateRequest) GetGroupIds() []string {
+	if x != nil {
+		return x.GroupIds
+	}
+	return nil
+}
+
+// One finding that does not stop a save (SubscriptionService words them by code). code is one of: no_server_group (no group takes the
+// servers of the person: include-all-proxies, or Auto), own_dns (the person's DNS preset is not applied to this template),
+// preset_rules_skipped (the preset has ad, split or country rules that a template does not get), own_auto (the template has its own
+// Auto, so the panel adds none), unknown_rule_target (arg: the last field of a rule that names no proxy or group), unused (no group).
+type MihomoWarning struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Code          string                 `protobuf:"bytes,1,opt,name=code,proto3" json:"code,omitempty"`
+	Arg           string                 `protobuf:"bytes,2,opt,name=arg,proto3" json:"arg,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MihomoWarning) Reset() {
+	*x = MihomoWarning{}
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[25]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MihomoWarning) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MihomoWarning) ProtoMessage() {}
+
+func (x *MihomoWarning) ProtoReflect() protoreflect.Message {
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[25]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MihomoWarning.ProtoReflect.Descriptor instead.
+func (*MihomoWarning) Descriptor() ([]byte, []int) {
+	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{25}
+}
+
+func (x *MihomoWarning) GetCode() string {
+	if x != nil {
+		return x.Code
+	}
+	return ""
+}
+
+func (x *MihomoWarning) GetArg() string {
+	if x != nil {
+		return x.Arg
+	}
+	return ""
+}
+
+type PreviewMihomoTemplateResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The profile: the servers of the person with their name, type, address and port only (no credential), around the template. When
+	// not_served is set, the profile the person gets instead (the panel's own).
+	Yaml     string           `protobuf:"bytes,1,opt,name=yaml,proto3" json:"yaml,omitempty"`
+	Warnings []*MihomoWarning `protobuf:"bytes,2,rep,name=warnings,proto3" json:"warnings,omitempty"`
+	// The person's group, for the preview's caption.
+	GroupName string `protobuf:"bytes,3,opt,name=group_name,json=groupName,proto3" json:"group_name,omitempty"`
+	// Why the person does not get the template: "no_access" (their subscription is off, expired or over its quota: the answer is a note)
+	// or "no_servers" (none of their servers can be in a Mihomo profile). "" = the template.
+	NotServed     string `protobuf:"bytes,4,opt,name=not_served,json=notServed,proto3" json:"not_served,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PreviewMihomoTemplateResponse) Reset() {
+	*x = PreviewMihomoTemplateResponse{}
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[26]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PreviewMihomoTemplateResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PreviewMihomoTemplateResponse) ProtoMessage() {}
+
+func (x *PreviewMihomoTemplateResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_mistgate_admin_v1_subscription_proto_msgTypes[26]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PreviewMihomoTemplateResponse.ProtoReflect.Descriptor instead.
+func (*PreviewMihomoTemplateResponse) Descriptor() ([]byte, []int) {
+	return file_mistgate_admin_v1_subscription_proto_rawDescGZIP(), []int{26}
+}
+
+func (x *PreviewMihomoTemplateResponse) GetYaml() string {
+	if x != nil {
+		return x.Yaml
+	}
+	return ""
+}
+
+func (x *PreviewMihomoTemplateResponse) GetWarnings() []*MihomoWarning {
+	if x != nil {
+		return x.Warnings
+	}
+	return nil
+}
+
+func (x *PreviewMihomoTemplateResponse) GetGroupName() string {
+	if x != nil {
+		return x.GroupName
+	}
+	return ""
+}
+
+func (x *PreviewMihomoTemplateResponse) GetNotServed() string {
+	if x != nil {
+		return x.NotServed
+	}
+	return ""
+}
+
 var File_mistgate_admin_v1_subscription_proto protoreflect.FileDescriptor
 
 const file_mistgate_admin_v1_subscription_proto_rawDesc = "" +
 	"\n" +
-	"$mistgate/admin/v1/subscription.proto\x12\x11mistgate.admin.v1\x1a\x1emistgate/admin/v1/common.proto\"\xc1\x05\n" +
+	"$mistgate/admin/v1/subscription.proto\x12\x11mistgate.admin.v1\x1a\x1emistgate/admin/v1/common.proto\"\xf1\b\n" +
 	"\x14SubscriptionSettings\x12\x14\n" +
 	"\x05title\x18\x01 \x01(\tR\x05title\x12\"\n" +
 	"\fannouncement\x18\x02 \x01(\tR\fannouncement\x12\x1f\n" +
@@ -1274,8 +2315,63 @@ const file_mistgate_admin_v1_subscription_proto_rawDesc = "" +
 	" \x01(\x0e2\".mistgate.admin.v1.LinkDeviceLimitH\x00R\x0flinkDeviceLimit\x88\x01\x01\x12<\n" +
 	"\blink_dns\x18\v \x01(\v2!.mistgate.admin.v1.LinkDnsOptionsR\alinkDns\x128\n" +
 	"\thapp_ping\x18\f \x01(\x0e2\x1b.mistgate.admin.v1.HappPingR\bhappPing\x12)\n" +
-	"\x11happ_ping_on_open\x18\r \x01(\bR\x0ehappPingOnOpenB\x14\n" +
-	"\x12_link_device_limit\"[\n" +
+	"\x11happ_ping_on_open\x18\r \x01(\bR\x0ehappPingOnOpen\x12\x1e\n" +
+	"\blink_awg\x18\x0e \x01(\bH\x01R\alinkAwg\x88\x01\x01\x12-\n" +
+	"\x10link_auto_select\x18\x0f \x01(\bH\x02R\x0elinkAutoSelect\x88\x01\x01\x128\n" +
+	"\x16device_idle_after_days\x18\x10 \x01(\rH\x03R\x13deviceIdleAfterDays\x88\x01\x01\x12L\n" +
+	"\x10response_headers\x18\x11 \x03(\v2!.mistgate.admin.v1.ResponseHeaderR\x0fresponseHeaders\x12L\n" +
+	"\x10mihomo_templates\x18\x12 \x03(\v2!.mistgate.admin.v1.MihomoTemplateR\x0fmihomoTemplates\x12L\n" +
+	"\x10routing_profiles\x18\x13 \x03(\v2!.mistgate.admin.v1.RoutingProfileR\x0froutingProfilesB\x14\n" +
+	"\x12_link_device_limitB\v\n" +
+	"\t_link_awgB\x13\n" +
+	"\x11_link_auto_selectB\x19\n" +
+	"\x17_device_idle_after_days\"\xb7\x01\n" +
+	"\x0eRoutingProfile\x12\x18\n" +
+	"\aprofile\x18\x01 \x01(\tR\aprofile\x12\x19\n" +
+	"\bonly_add\x18\x02 \x01(\bR\aonlyAdd\x12\x1f\n" +
+	"\vonly_groups\x18\x03 \x01(\bR\n" +
+	"onlyGroups\x12\x1b\n" +
+	"\tgroup_ids\x18\x04 \x03(\tR\bgroupIds\x122\n" +
+	"\x04info\x18\x05 \x01(\v2\x1e.mistgate.admin.v1.RoutingInfoR\x04info\"\xf4\x05\n" +
+	"\vRoutingInfo\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12!\n" +
+	"\fdirect_sites\x18\x02 \x01(\rR\vdirectSites\x12\x1b\n" +
+	"\tdirect_ip\x18\x03 \x01(\rR\bdirectIp\x12\x1f\n" +
+	"\vproxy_sites\x18\x04 \x01(\rR\n" +
+	"proxySites\x12\x19\n" +
+	"\bproxy_ip\x18\x05 \x01(\rR\aproxyIp\x12\x1f\n" +
+	"\vblock_sites\x18\x06 \x01(\rR\n" +
+	"blockSites\x12\x19\n" +
+	"\bblock_ip\x18\a \x01(\rR\ablockIp\x12&\n" +
+	"\x0fremote_dns_type\x18\b \x01(\tR\rremoteDnsType\x12\x1d\n" +
+	"\n" +
+	"remote_dns\x18\t \x01(\tR\tremoteDns\x12*\n" +
+	"\x11domestic_dns_type\x18\n" +
+	" \x01(\tR\x0fdomesticDnsType\x12!\n" +
+	"\fdomestic_dns\x18\v \x01(\tR\vdomesticDns\x12\x14\n" +
+	"\x05hosts\x18\f \x01(\rR\x05hosts\x12#\n" +
+	"\rgeoip_address\x18\r \x01(\tR\fgeoipAddress\x12'\n" +
+	"\x0fgeosite_address\x18\x0e \x01(\tR\x0egeositeAddress\x12!\n" +
+	"\fglobal_proxy\x18\x0f \x01(\tR\vglobalProxy\x12'\n" +
+	"\x0fdomain_strategy\x18\x10 \x01(\tR\x0edomainStrategy\x12\x19\n" +
+	"\bfake_dns\x18\x11 \x01(\tR\afakeDns\x12!\n" +
+	"\flast_updated\x18\x12 \x01(\tR\vlastUpdated\x12&\n" +
+	"\x0fuse_chunk_files\x18\x13 \x01(\bR\ruseChunkFiles\x12%\n" +
+	"\x0edropped_fields\x18\x14 \x03(\tR\rdroppedFields\x12#\n" +
+	"\rprofile_bytes\x18\x15 \x01(\rR\fprofileBytes\x12!\n" +
+	"\fheader_bytes\x18\x16 \x01(\rR\vheaderBytes\"U\n" +
+	"\x0eMihomoTemplate\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
+	"\x04yaml\x18\x02 \x01(\tR\x04yaml\x12\x1b\n" +
+	"\tgroup_ids\x18\x03 \x03(\tR\bgroupIds\"\xc8\x01\n" +
+	"\x0eResponseHeader\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value\x12\x16\n" +
+	"\x06base64\x18\x03 \x01(\bR\x06base64\x126\n" +
+	"\aformats\x18\x04 \x03(\x0e2\x1c.mistgate.admin.v1.SubFormatR\aformats\x12\x1f\n" +
+	"\vonly_groups\x18\x05 \x01(\bR\n" +
+	"onlyGroups\x12\x1b\n" +
+	"\tgroup_ids\x18\x06 \x03(\tR\bgroupIds\"[\n" +
 	"\x0eLinkDnsOptions\x12\x1d\n" +
 	"\n" +
 	"preset_ids\x18\x01 \x03(\tR\tpresetIds\x12*\n" +
@@ -1302,14 +2398,16 @@ const file_mistgate_admin_v1_subscription_proto_rawDesc = "" +
 	"\vua_contains\x18\x01 \x01(\tR\n" +
 	"uaContains\x124\n" +
 	"\x06format\x18\x02 \x01(\x0e2\x1c.mistgate.admin.v1.SubFormatR\x06format\" \n" +
-	"\x1eGetSubscriptionSettingsRequest\"\xcd\x02\n" +
+	"\x1eGetSubscriptionSettingsRequest\"\xa5\x03\n" +
 	"\x1fGetSubscriptionSettingsResponse\x12C\n" +
 	"\bsettings\x18\x01 \x01(\v2'.mistgate.admin.v1.SubscriptionSettingsR\bsettings\x12'\n" +
 	"\x0feffective_title\x18\x02 \x01(\tR\x0eeffectiveTitle\x12F\n" +
 	"\x0eserver_samples\x18\x03 \x03(\v2\x1f.mistgate.admin.v1.ServerSampleR\rserverSamples\x12!\n" +
 	"\fsample_group\x18\x04 \x01(\tR\vsampleGroup\x12%\n" +
 	"\x0enames_language\x18\x05 \x01(\tR\rnamesLanguage\x12*\n" +
-	"\x11shared_link_users\x18\x06 \x01(\rR\x0fsharedLinkUsers\"\x98\x01\n" +
+	"\x11shared_link_users\x18\x06 \x01(\rR\x0fsharedLinkUsers\x12\"\n" +
+	"\rlink_awg_keys\x18\a \x01(\rR\vlinkAwgKeys\x122\n" +
+	"\x15reserved_header_names\x18\b \x03(\tR\x13reservedHeaderNames\"\x98\x01\n" +
 	"\fServerSample\x12\x12\n" +
 	"\x04node\x18\x01 \x01(\tR\x04node\x12!\n" +
 	"\fcountry_code\x18\x02 \x01(\tR\vcountryCode\x12\x18\n" +
@@ -1336,7 +2434,43 @@ const file_mistgate_admin_v1_subscription_proto_rawDesc = "" +
 	"\n" +
 	"rule_index\x18\x01 \x01(\x05R\truleIndex\x124\n" +
 	"\x06format\x18\x02 \x01(\x0e2\x1c.mistgate.admin.v1.SubFormatR\x06format\x12\x18\n" +
-	"\abrowser\x18\x03 \x01(\bR\abrowser*8\n" +
+	"\abrowser\x18\x03 \x01(\bR\abrowser\"\x94\x01\n" +
+	"\x1dPreviewResponseHeadersRequest\x12\x17\n" +
+	"\auser_id\x18\x01 \x01(\tR\x06userId\x12\x1d\n" +
+	"\n" +
+	"user_agent\x18\x02 \x01(\tR\tuserAgent\x12;\n" +
+	"\aheaders\x18\x03 \x03(\v2!.mistgate.admin.v1.ResponseHeaderR\aheaders\"N\n" +
+	"\n" +
+	"SentHeader\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value\x12\x16\n" +
+	"\x06base64\x18\x03 \x01(\bR\x06base64\"\xf5\x01\n" +
+	"\x1ePreviewResponseHeadersResponse\x124\n" +
+	"\x06format\x18\x01 \x01(\x0e2\x1c.mistgate.admin.v1.SubFormatR\x06format\x127\n" +
+	"\aheaders\x18\x02 \x03(\v2\x1d.mistgate.admin.v1.SentHeaderR\aheaders\x12\x1d\n" +
+	"\n" +
+	"not_served\x18\x03 \x01(\tR\tnotServed\x12\x1d\n" +
+	"\n" +
+	"group_name\x18\x04 \x01(\tR\tgroupName\x12&\n" +
+	"\x0frouting_in_body\x18\x05 \x01(\bR\rroutingInBody\"4\n" +
+	"\x1cPreviewRoutingProfileRequest\x12\x14\n" +
+	"\x05input\x18\x01 \x01(\tR\x05input\"\\\n" +
+	"\x1dPreviewRoutingProfileResponse\x12;\n" +
+	"\aprofile\x18\x01 \x01(\v2!.mistgate.admin.v1.RoutingProfileR\aprofile\"h\n" +
+	"\x1cPreviewMihomoTemplateRequest\x12\x17\n" +
+	"\auser_id\x18\x01 \x01(\tR\x06userId\x12\x12\n" +
+	"\x04yaml\x18\x02 \x01(\tR\x04yaml\x12\x1b\n" +
+	"\tgroup_ids\x18\x03 \x03(\tR\bgroupIds\"5\n" +
+	"\rMihomoWarning\x12\x12\n" +
+	"\x04code\x18\x01 \x01(\tR\x04code\x12\x10\n" +
+	"\x03arg\x18\x02 \x01(\tR\x03arg\"\xaf\x01\n" +
+	"\x1dPreviewMihomoTemplateResponse\x12\x12\n" +
+	"\x04yaml\x18\x01 \x01(\tR\x04yaml\x12<\n" +
+	"\bwarnings\x18\x02 \x03(\v2 .mistgate.admin.v1.MihomoWarningR\bwarnings\x12\x1d\n" +
+	"\n" +
+	"group_name\x18\x03 \x01(\tR\tgroupName\x12\x1d\n" +
+	"\n" +
+	"not_served\x18\x04 \x01(\tR\tnotServed*8\n" +
 	"\bHappPing\x12\x19\n" +
 	"\x15HAPP_PING_UNSPECIFIED\x10\x00\x12\x11\n" +
 	"\rHAPP_PING_TCP\x10\x01*\x8e\x01\n" +
@@ -1359,12 +2493,15 @@ const file_mistgate_admin_v1_subscription_proto_rawDesc = "" +
 	"\x10SUB_FORMAT_DECOY\x10\x03\x12\x1a\n" +
 	"\x16SUB_FORMAT_MIHOMO_YAML\x10\x04\x12\x18\n" +
 	"\x14SUB_FORMAT_XRAY_JSON\x10\x05\x12\x1b\n" +
-	"\x17SUB_FORMAT_SINGBOX_JSON\x10\x062\xe6\x03\n" +
+	"\x17SUB_FORMAT_SINGBOX_JSON\x10\x062\xdd\x06\n" +
 	"\x13SubscriptionService\x12\x80\x01\n" +
 	"\x17GetSubscriptionSettings\x121.mistgate.admin.v1.GetSubscriptionSettingsRequest\x1a2.mistgate.admin.v1.GetSubscriptionSettingsResponse\x12\x89\x01\n" +
 	"\x1aUpdateSubscriptionSettings\x124.mistgate.admin.v1.UpdateSubscriptionSettingsRequest\x1a5.mistgate.admin.v1.UpdateSubscriptionSettingsResponse\x12\\\n" +
 	"\vListClients\x12%.mistgate.admin.v1.ListClientsRequest\x1a&.mistgate.admin.v1.ListClientsResponse\x12b\n" +
-	"\rTestUserAgent\x12'.mistgate.admin.v1.TestUserAgentRequest\x1a(.mistgate.admin.v1.TestUserAgentResponseB\xcc\x01\n" +
+	"\rTestUserAgent\x12'.mistgate.admin.v1.TestUserAgentRequest\x1a(.mistgate.admin.v1.TestUserAgentResponse\x12}\n" +
+	"\x16PreviewResponseHeaders\x120.mistgate.admin.v1.PreviewResponseHeadersRequest\x1a1.mistgate.admin.v1.PreviewResponseHeadersResponse\x12z\n" +
+	"\x15PreviewMihomoTemplate\x12/.mistgate.admin.v1.PreviewMihomoTemplateRequest\x1a0.mistgate.admin.v1.PreviewMihomoTemplateResponse\x12z\n" +
+	"\x15PreviewRoutingProfile\x12/.mistgate.admin.v1.PreviewRoutingProfileRequest\x1a0.mistgate.admin.v1.PreviewRoutingProfileResponseB\xcc\x01\n" +
 	"\x15com.mistgate.admin.v1B\x11SubscriptionProtoP\x01Z:github.com/mistgate/mistgate/gen/mistgate/admin/v1;adminv1\xa2\x02\x03MAX\xaa\x02\x11Mistgate.Admin.V1\xca\x02\x11Mistgate\\Admin\\V1\xe2\x02\x1dMistgate\\Admin\\V1\\GPBMetadata\xea\x02\x13Mistgate::Admin::V1b\x06proto3"
 
 var (
@@ -1380,59 +2517,87 @@ func file_mistgate_admin_v1_subscription_proto_rawDescGZIP() []byte {
 }
 
 var file_mistgate_admin_v1_subscription_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
-var file_mistgate_admin_v1_subscription_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
+var file_mistgate_admin_v1_subscription_proto_msgTypes = make([]protoimpl.MessageInfo, 27)
 var file_mistgate_admin_v1_subscription_proto_goTypes = []any{
 	(HappPing)(0),                              // 0: mistgate.admin.v1.HappPing
 	(LinkDeviceLimit)(0),                       // 1: mistgate.admin.v1.LinkDeviceLimit
 	(Platform)(0),                              // 2: mistgate.admin.v1.Platform
 	(SubFormat)(0),                             // 3: mistgate.admin.v1.SubFormat
 	(*SubscriptionSettings)(nil),               // 4: mistgate.admin.v1.SubscriptionSettings
-	(*LinkDnsOptions)(nil),                     // 5: mistgate.admin.v1.LinkDnsOptions
-	(*PlatformApp)(nil),                        // 6: mistgate.admin.v1.PlatformApp
-	(*UserPageOptions)(nil),                    // 7: mistgate.admin.v1.UserPageOptions
-	(*ServeRule)(nil),                          // 8: mistgate.admin.v1.ServeRule
-	(*GetSubscriptionSettingsRequest)(nil),     // 9: mistgate.admin.v1.GetSubscriptionSettingsRequest
-	(*GetSubscriptionSettingsResponse)(nil),    // 10: mistgate.admin.v1.GetSubscriptionSettingsResponse
-	(*ServerSample)(nil),                       // 11: mistgate.admin.v1.ServerSample
-	(*UpdateSubscriptionSettingsRequest)(nil),  // 12: mistgate.admin.v1.UpdateSubscriptionSettingsRequest
-	(*UpdateSubscriptionSettingsResponse)(nil), // 13: mistgate.admin.v1.UpdateSubscriptionSettingsResponse
-	(*ClientInfo)(nil),                         // 14: mistgate.admin.v1.ClientInfo
-	(*ListClientsRequest)(nil),                 // 15: mistgate.admin.v1.ListClientsRequest
-	(*ListClientsResponse)(nil),                // 16: mistgate.admin.v1.ListClientsResponse
-	(*TestUserAgentRequest)(nil),               // 17: mistgate.admin.v1.TestUserAgentRequest
-	(*TestUserAgentResponse)(nil),              // 18: mistgate.admin.v1.TestUserAgentResponse
-	(App)(0),                                   // 19: mistgate.admin.v1.App
+	(*RoutingProfile)(nil),                     // 5: mistgate.admin.v1.RoutingProfile
+	(*RoutingInfo)(nil),                        // 6: mistgate.admin.v1.RoutingInfo
+	(*MihomoTemplate)(nil),                     // 7: mistgate.admin.v1.MihomoTemplate
+	(*ResponseHeader)(nil),                     // 8: mistgate.admin.v1.ResponseHeader
+	(*LinkDnsOptions)(nil),                     // 9: mistgate.admin.v1.LinkDnsOptions
+	(*PlatformApp)(nil),                        // 10: mistgate.admin.v1.PlatformApp
+	(*UserPageOptions)(nil),                    // 11: mistgate.admin.v1.UserPageOptions
+	(*ServeRule)(nil),                          // 12: mistgate.admin.v1.ServeRule
+	(*GetSubscriptionSettingsRequest)(nil),     // 13: mistgate.admin.v1.GetSubscriptionSettingsRequest
+	(*GetSubscriptionSettingsResponse)(nil),    // 14: mistgate.admin.v1.GetSubscriptionSettingsResponse
+	(*ServerSample)(nil),                       // 15: mistgate.admin.v1.ServerSample
+	(*UpdateSubscriptionSettingsRequest)(nil),  // 16: mistgate.admin.v1.UpdateSubscriptionSettingsRequest
+	(*UpdateSubscriptionSettingsResponse)(nil), // 17: mistgate.admin.v1.UpdateSubscriptionSettingsResponse
+	(*ClientInfo)(nil),                         // 18: mistgate.admin.v1.ClientInfo
+	(*ListClientsRequest)(nil),                 // 19: mistgate.admin.v1.ListClientsRequest
+	(*ListClientsResponse)(nil),                // 20: mistgate.admin.v1.ListClientsResponse
+	(*TestUserAgentRequest)(nil),               // 21: mistgate.admin.v1.TestUserAgentRequest
+	(*TestUserAgentResponse)(nil),              // 22: mistgate.admin.v1.TestUserAgentResponse
+	(*PreviewResponseHeadersRequest)(nil),      // 23: mistgate.admin.v1.PreviewResponseHeadersRequest
+	(*SentHeader)(nil),                         // 24: mistgate.admin.v1.SentHeader
+	(*PreviewResponseHeadersResponse)(nil),     // 25: mistgate.admin.v1.PreviewResponseHeadersResponse
+	(*PreviewRoutingProfileRequest)(nil),       // 26: mistgate.admin.v1.PreviewRoutingProfileRequest
+	(*PreviewRoutingProfileResponse)(nil),      // 27: mistgate.admin.v1.PreviewRoutingProfileResponse
+	(*PreviewMihomoTemplateRequest)(nil),       // 28: mistgate.admin.v1.PreviewMihomoTemplateRequest
+	(*MihomoWarning)(nil),                      // 29: mistgate.admin.v1.MihomoWarning
+	(*PreviewMihomoTemplateResponse)(nil),      // 30: mistgate.admin.v1.PreviewMihomoTemplateResponse
+	(App)(0),                                   // 31: mistgate.admin.v1.App
 }
 var file_mistgate_admin_v1_subscription_proto_depIdxs = []int32{
-	6,  // 0: mistgate.admin.v1.SubscriptionSettings.apps:type_name -> mistgate.admin.v1.PlatformApp
-	7,  // 1: mistgate.admin.v1.SubscriptionSettings.user_page:type_name -> mistgate.admin.v1.UserPageOptions
-	8,  // 2: mistgate.admin.v1.SubscriptionSettings.rules:type_name -> mistgate.admin.v1.ServeRule
+	10, // 0: mistgate.admin.v1.SubscriptionSettings.apps:type_name -> mistgate.admin.v1.PlatformApp
+	11, // 1: mistgate.admin.v1.SubscriptionSettings.user_page:type_name -> mistgate.admin.v1.UserPageOptions
+	12, // 2: mistgate.admin.v1.SubscriptionSettings.rules:type_name -> mistgate.admin.v1.ServeRule
 	1,  // 3: mistgate.admin.v1.SubscriptionSettings.link_device_limit:type_name -> mistgate.admin.v1.LinkDeviceLimit
-	5,  // 4: mistgate.admin.v1.SubscriptionSettings.link_dns:type_name -> mistgate.admin.v1.LinkDnsOptions
+	9,  // 4: mistgate.admin.v1.SubscriptionSettings.link_dns:type_name -> mistgate.admin.v1.LinkDnsOptions
 	0,  // 5: mistgate.admin.v1.SubscriptionSettings.happ_ping:type_name -> mistgate.admin.v1.HappPing
-	2,  // 6: mistgate.admin.v1.PlatformApp.platform:type_name -> mistgate.admin.v1.Platform
-	19, // 7: mistgate.admin.v1.PlatformApp.kind:type_name -> mistgate.admin.v1.App
-	3,  // 8: mistgate.admin.v1.ServeRule.format:type_name -> mistgate.admin.v1.SubFormat
-	4,  // 9: mistgate.admin.v1.GetSubscriptionSettingsResponse.settings:type_name -> mistgate.admin.v1.SubscriptionSettings
-	11, // 10: mistgate.admin.v1.GetSubscriptionSettingsResponse.server_samples:type_name -> mistgate.admin.v1.ServerSample
-	4,  // 11: mistgate.admin.v1.UpdateSubscriptionSettingsRequest.settings:type_name -> mistgate.admin.v1.SubscriptionSettings
-	4,  // 12: mistgate.admin.v1.UpdateSubscriptionSettingsResponse.settings:type_name -> mistgate.admin.v1.SubscriptionSettings
-	3,  // 13: mistgate.admin.v1.ClientInfo.formats:type_name -> mistgate.admin.v1.SubFormat
-	14, // 14: mistgate.admin.v1.ListClientsResponse.clients:type_name -> mistgate.admin.v1.ClientInfo
-	3,  // 15: mistgate.admin.v1.TestUserAgentResponse.format:type_name -> mistgate.admin.v1.SubFormat
-	9,  // 16: mistgate.admin.v1.SubscriptionService.GetSubscriptionSettings:input_type -> mistgate.admin.v1.GetSubscriptionSettingsRequest
-	12, // 17: mistgate.admin.v1.SubscriptionService.UpdateSubscriptionSettings:input_type -> mistgate.admin.v1.UpdateSubscriptionSettingsRequest
-	15, // 18: mistgate.admin.v1.SubscriptionService.ListClients:input_type -> mistgate.admin.v1.ListClientsRequest
-	17, // 19: mistgate.admin.v1.SubscriptionService.TestUserAgent:input_type -> mistgate.admin.v1.TestUserAgentRequest
-	10, // 20: mistgate.admin.v1.SubscriptionService.GetSubscriptionSettings:output_type -> mistgate.admin.v1.GetSubscriptionSettingsResponse
-	13, // 21: mistgate.admin.v1.SubscriptionService.UpdateSubscriptionSettings:output_type -> mistgate.admin.v1.UpdateSubscriptionSettingsResponse
-	16, // 22: mistgate.admin.v1.SubscriptionService.ListClients:output_type -> mistgate.admin.v1.ListClientsResponse
-	18, // 23: mistgate.admin.v1.SubscriptionService.TestUserAgent:output_type -> mistgate.admin.v1.TestUserAgentResponse
-	20, // [20:24] is the sub-list for method output_type
-	16, // [16:20] is the sub-list for method input_type
-	16, // [16:16] is the sub-list for extension type_name
-	16, // [16:16] is the sub-list for extension extendee
-	0,  // [0:16] is the sub-list for field type_name
+	8,  // 6: mistgate.admin.v1.SubscriptionSettings.response_headers:type_name -> mistgate.admin.v1.ResponseHeader
+	7,  // 7: mistgate.admin.v1.SubscriptionSettings.mihomo_templates:type_name -> mistgate.admin.v1.MihomoTemplate
+	5,  // 8: mistgate.admin.v1.SubscriptionSettings.routing_profiles:type_name -> mistgate.admin.v1.RoutingProfile
+	6,  // 9: mistgate.admin.v1.RoutingProfile.info:type_name -> mistgate.admin.v1.RoutingInfo
+	3,  // 10: mistgate.admin.v1.ResponseHeader.formats:type_name -> mistgate.admin.v1.SubFormat
+	2,  // 11: mistgate.admin.v1.PlatformApp.platform:type_name -> mistgate.admin.v1.Platform
+	31, // 12: mistgate.admin.v1.PlatformApp.kind:type_name -> mistgate.admin.v1.App
+	3,  // 13: mistgate.admin.v1.ServeRule.format:type_name -> mistgate.admin.v1.SubFormat
+	4,  // 14: mistgate.admin.v1.GetSubscriptionSettingsResponse.settings:type_name -> mistgate.admin.v1.SubscriptionSettings
+	15, // 15: mistgate.admin.v1.GetSubscriptionSettingsResponse.server_samples:type_name -> mistgate.admin.v1.ServerSample
+	4,  // 16: mistgate.admin.v1.UpdateSubscriptionSettingsRequest.settings:type_name -> mistgate.admin.v1.SubscriptionSettings
+	4,  // 17: mistgate.admin.v1.UpdateSubscriptionSettingsResponse.settings:type_name -> mistgate.admin.v1.SubscriptionSettings
+	3,  // 18: mistgate.admin.v1.ClientInfo.formats:type_name -> mistgate.admin.v1.SubFormat
+	18, // 19: mistgate.admin.v1.ListClientsResponse.clients:type_name -> mistgate.admin.v1.ClientInfo
+	3,  // 20: mistgate.admin.v1.TestUserAgentResponse.format:type_name -> mistgate.admin.v1.SubFormat
+	8,  // 21: mistgate.admin.v1.PreviewResponseHeadersRequest.headers:type_name -> mistgate.admin.v1.ResponseHeader
+	3,  // 22: mistgate.admin.v1.PreviewResponseHeadersResponse.format:type_name -> mistgate.admin.v1.SubFormat
+	24, // 23: mistgate.admin.v1.PreviewResponseHeadersResponse.headers:type_name -> mistgate.admin.v1.SentHeader
+	5,  // 24: mistgate.admin.v1.PreviewRoutingProfileResponse.profile:type_name -> mistgate.admin.v1.RoutingProfile
+	29, // 25: mistgate.admin.v1.PreviewMihomoTemplateResponse.warnings:type_name -> mistgate.admin.v1.MihomoWarning
+	13, // 26: mistgate.admin.v1.SubscriptionService.GetSubscriptionSettings:input_type -> mistgate.admin.v1.GetSubscriptionSettingsRequest
+	16, // 27: mistgate.admin.v1.SubscriptionService.UpdateSubscriptionSettings:input_type -> mistgate.admin.v1.UpdateSubscriptionSettingsRequest
+	19, // 28: mistgate.admin.v1.SubscriptionService.ListClients:input_type -> mistgate.admin.v1.ListClientsRequest
+	21, // 29: mistgate.admin.v1.SubscriptionService.TestUserAgent:input_type -> mistgate.admin.v1.TestUserAgentRequest
+	23, // 30: mistgate.admin.v1.SubscriptionService.PreviewResponseHeaders:input_type -> mistgate.admin.v1.PreviewResponseHeadersRequest
+	28, // 31: mistgate.admin.v1.SubscriptionService.PreviewMihomoTemplate:input_type -> mistgate.admin.v1.PreviewMihomoTemplateRequest
+	26, // 32: mistgate.admin.v1.SubscriptionService.PreviewRoutingProfile:input_type -> mistgate.admin.v1.PreviewRoutingProfileRequest
+	14, // 33: mistgate.admin.v1.SubscriptionService.GetSubscriptionSettings:output_type -> mistgate.admin.v1.GetSubscriptionSettingsResponse
+	17, // 34: mistgate.admin.v1.SubscriptionService.UpdateSubscriptionSettings:output_type -> mistgate.admin.v1.UpdateSubscriptionSettingsResponse
+	20, // 35: mistgate.admin.v1.SubscriptionService.ListClients:output_type -> mistgate.admin.v1.ListClientsResponse
+	22, // 36: mistgate.admin.v1.SubscriptionService.TestUserAgent:output_type -> mistgate.admin.v1.TestUserAgentResponse
+	25, // 37: mistgate.admin.v1.SubscriptionService.PreviewResponseHeaders:output_type -> mistgate.admin.v1.PreviewResponseHeadersResponse
+	30, // 38: mistgate.admin.v1.SubscriptionService.PreviewMihomoTemplate:output_type -> mistgate.admin.v1.PreviewMihomoTemplateResponse
+	27, // 39: mistgate.admin.v1.SubscriptionService.PreviewRoutingProfile:output_type -> mistgate.admin.v1.PreviewRoutingProfileResponse
+	33, // [33:40] is the sub-list for method output_type
+	26, // [26:33] is the sub-list for method input_type
+	26, // [26:26] is the sub-list for extension type_name
+	26, // [26:26] is the sub-list for extension extendee
+	0,  // [0:26] is the sub-list for field type_name
 }
 
 func init() { file_mistgate_admin_v1_subscription_proto_init() }
@@ -1442,15 +2607,15 @@ func file_mistgate_admin_v1_subscription_proto_init() {
 	}
 	file_mistgate_admin_v1_common_proto_init()
 	file_mistgate_admin_v1_subscription_proto_msgTypes[0].OneofWrappers = []any{}
-	file_mistgate_admin_v1_subscription_proto_msgTypes[3].OneofWrappers = []any{}
 	file_mistgate_admin_v1_subscription_proto_msgTypes[7].OneofWrappers = []any{}
+	file_mistgate_admin_v1_subscription_proto_msgTypes[11].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_mistgate_admin_v1_subscription_proto_rawDesc), len(file_mistgate_admin_v1_subscription_proto_rawDesc)),
 			NumEnums:      4,
-			NumMessages:   15,
+			NumMessages:   27,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

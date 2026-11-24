@@ -1,6 +1,7 @@
 package fleet
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +11,8 @@ import (
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
 	agentv1 "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/internal/agentcap"
+	"github.com/mistgate/mistgate/internal/panel/protocols"
 	"github.com/mistgate/mistgate/internal/panel/store"
 	"github.com/mistgate/mistgate/internal/plugin"
 	"github.com/mistgate/mistgate/internal/statehash"
@@ -26,13 +29,59 @@ type relayEnv struct {
 }
 
 const (
-	relayInbound  = "inb_exit"
-	relayInbound2 = "inb_exit2"
+	relayInbound    = "inb_exit"
+	relayInbound2   = "inb_exit2"
+	relayInboundTCP = "inb_exit_tcp"
 )
+
+func TestInboundStateRefreshRequiresARealChange(t *testing.T) {
+	previous := []store.FleetInboundRow{{ID: "inb_de1", State: "active"}}
+	if inboundRunStateChanged(previous, []store.InboundApplied{{ID: "inb_de1", State: "active"}}) {
+		t.Fatal("an unchanged inbound state requested a fleet-wide refresh")
+	}
+	if !inboundRunStateChanged(previous, []store.InboundApplied{{ID: "inb_de1", State: "failed"}}) {
+		t.Fatal("a changed inbound state did not request a fleet-wide refresh")
+	}
+	if inboundRunStateChanged(previous, []store.InboundApplied{{ID: "inb_other", State: "failed"}}) {
+		t.Fatal("a reported inbound outside the node changed its relay state")
+	}
+}
+
+func TestRelayApplyTreatsInboundReadFailureAsChanged(t *testing.T) {
+	var calls []string
+	changed := relayInboundStateChanged([]store.InboundApplied{{ID: "inb_de1", State: "failed"}},
+		func() (bool, error) {
+			calls = append(calls, "has_relays")
+			return true, nil
+		},
+		func() ([]store.FleetInboundRow, error) {
+			calls = append(calls, "fleet_inbounds")
+			return nil, errors.New("read failed")
+		}, func(string, error) {})
+	if !changed {
+		t.Fatal("failed inbound-state read did not request a relay refresh")
+	}
+	if len(calls) != 2 || calls[0] != "has_relays" || calls[1] != "fleet_inbounds" {
+		t.Fatalf("relay read order = %v, want relay check before inbound rows", calls)
+	}
+	calls = nil
+	if relayInboundStateChanged([]store.InboundApplied{{ID: "inb_de1", State: "failed"}},
+		func() (bool, error) { calls = append(calls, "has_relays"); return false, nil },
+		func() ([]store.FleetInboundRow, error) { calls = append(calls, "fleet_inbounds"); return nil, nil }, func(string, error) {}) {
+		t.Fatal("node without relays requested a refresh")
+	}
+	if len(calls) != 1 || calls[0] != "has_relays" {
+		t.Fatalf("inbound rows were read for a node without relays: %v", calls)
+	}
+}
 
 func newRelayEnv(t *testing.T) *relayEnv {
 	t.Helper()
-	e := newEnv(t)
+	reg, err := protocols.NewRegistry(fakeProto{"fakehy", plugin.ClientHapp}, fakeProto{"fakewg", plugin.ClientAmnezia}, fakeProto{"vless", plugin.ClientHapp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newEnvWith(t, reg)
 	x := &relayEnv{env: e, entry: e.enroll("entry"), exit: e.enroll("exit")}
 	now := time.Now().Unix()
 	e.exec(`INSERT INTO profile (id, protocol, name, settings_json, version, created_at, updated_at) VALUES ('prf_hy', 'fakehy', 'hy', '{"port":4443}', 1, ?, ?)`, now, now)
@@ -80,8 +129,22 @@ func (c *conn) next(m *model) *agentv1.DesiredState {
 	if m.hash() != ds.StateHash {
 		c.t.Fatalf("the agent computes %s, the panel announced %s", m.hash(), ds.StateHash)
 	}
-	c.send(0, applied(ds, m.hash()))
+	result := applied(ds, m.hash())
+	result.GetApplyResult().Bridges = c.bridges
+	c.send(0, result)
 	return ds
+}
+
+// nextUntil is next for a state that several debounced recomputes may lead to: the setup of a test kicks the recompute more than
+// once, and on a loaded machine one of them can fire before the setup is done and send a delta of the half-built fleet first.
+// It applies and acknowledges deltas until ok accepts one (c.wait fails the test when none ever does).
+func (c *conn) nextUntil(m *model, ok func(*agentv1.DesiredState) bool) *agentv1.DesiredState {
+	c.t.Helper()
+	for {
+		if ds := c.next(m); ok(ds) {
+			return ds
+		}
+	}
 }
 
 // A node without the capability never gets forwards, and its hash is the hash of a state that has none; one with it does.
@@ -98,7 +161,7 @@ func TestRelaysReachOnlyAgentsThatListTheCapability(t *testing.T) {
 		t.Fatalf("a node without forwards hashes %s, want %s (the hash it had before forwards existed)", ds.StateHash, noForwards)
 	}
 
-	_, m, ds = connectCaps(x.entry, "new", "doctor/1", plugin.CapRelayForward)
+	_, m, ds = connectCaps(x.entry, "new", "doctor/1", agentcap.RelayForward)
 	want := &agentv1.RelayForwards{Items: []*agentv1.RelayForward{{RelayId: "rly_a", Network: "udp", Port: 8443, ToHost: "exit.example.com", ToPort: 4443}}}
 	if !proto.Equal(ds.Relays, want) {
 		t.Fatalf("forwards on the wire = %v, want %v", ds.Relays, want)
@@ -119,7 +182,7 @@ func TestRelaysReachOnlyAgentsThatListTheCapability(t *testing.T) {
 func TestRelayForwardsFollowTheSwitchAndTheServer(t *testing.T) {
 	x := newRelayEnv(t)
 	x.relay("rly_a", 8443, false)
-	c, m, ds := connectCaps(x.entry, "new", plugin.CapRelayForward)
+	c, m, ds := connectCaps(x.entry, "new", agentcap.RelayForward)
 	if ds.Relays != nil || ds.StateHash != statehash.State(nil) {
 		t.Fatalf("a relay that is off was sent: %v", ds.Relays)
 	}
@@ -176,13 +239,13 @@ func TestRelayForwardsSurviveAReconnect(t *testing.T) {
 	x := newRelayEnv(t)
 	x.relay("rly_a", 8443, true)
 	x.relayOf("rly_b", relayInbound2, 7443, false)
-	_, m, _ := connectCaps(x.entry, "first", plugin.CapRelayForward)
+	_, m, _ := connectCaps(x.entry, "first", agentcap.RelayForward)
 	if len(m.relays) != 1 {
 		t.Fatalf("held %v", m.relays)
 	}
 	c := x.entry.open()
 	h := hello("second", m.rev, m.hash())
-	h.GetHello().Capabilities = []string{plugin.CapRelayForward}
+	h.GetHello().Capabilities = []string{agentcap.RelayForward}
 	c.send(0, h)
 	c.wait(func(r *agentv1.ConnectResponse) bool { return r.GetHelloAck() != nil })
 	c.quiet(300 * time.Millisecond)
@@ -200,7 +263,7 @@ func TestRelayForwardsSurviveAReconnect(t *testing.T) {
 func TestRelayResultsAreStored(t *testing.T) {
 	x := newRelayEnv(t)
 	x.relay("rly_a", 8443, true)
-	c, m, ds := connectCaps(x.entry, "new", plugin.CapRelayForward)
+	c, m, ds := connectCaps(x.entry, "new", agentcap.RelayForward)
 	result := func(rs ...*agentv1.RelayResult) {
 		r := applied(ds, m.hash())
 		r.GetApplyResult().Relays = rs
@@ -229,7 +292,7 @@ func TestRelayResultsAreStored(t *testing.T) {
 func TestTheExitsReportMovesTheEntry(t *testing.T) {
 	x := newRelayEnv(t)
 	x.relay("rly_a", 8443, true)
-	c, m, _ := connectCaps(x.entry, "new", plugin.CapRelayForward)
+	c, m, _ := connectCaps(x.entry, "new", agentcap.RelayForward)
 	if len(m.relays) != 1 {
 		t.Fatalf("held %v", m.relays)
 	}
@@ -250,7 +313,7 @@ func TestRetiringANodeDeletesItsRelays(t *testing.T) {
 		t.Run(retire, func(t *testing.T) {
 			x := newRelayEnv(t)
 			x.relay("rly_a", 8443, true)
-			c, m, _ := connectCaps(x.entry, "new", plugin.CapRelayForward)
+			c, m, _ := connectCaps(x.entry, "new", agentcap.RelayForward)
 			node := x.exit
 			if retire == "entry" {
 				node = x.entry

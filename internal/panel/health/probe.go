@@ -53,6 +53,7 @@ type Target struct {
 // DialOptions bound a dial.
 type DialOptions struct {
 	HandshakeTimeout time.Duration
+	ProbeTimeout     time.Duration
 	testTLSPin       []byte // loopback TLS test only; deployed probes verify the normal certificate chain
 }
 
@@ -112,9 +113,35 @@ func classify(err error) (code, detail string) {
 	return "timeout", detail
 }
 
+func (s *Service) lockAWGProbe(ctx context.Context, inboundID string) (func(), bool) {
+	s.awgProbeMu.Lock()
+	if s.awgProbeLocks == nil {
+		s.awgProbeLocks = make(map[string]chan struct{})
+	}
+	gate := s.awgProbeLocks[inboundID]
+	if gate == nil {
+		gate = make(chan struct{}, 1)
+		s.awgProbeLocks[inboundID] = gate
+	}
+	s.awgProbeMu.Unlock()
+	select {
+	case gate <- struct{}{}:
+		return func() { <-gate }, true
+	case <-ctx.Done():
+		return nil, false
+	}
+}
+
 // attempt is one try: dial, probe, close. skipped reports a configuration the dialer has no client for (nothing
 // is recorded then).
 func (s *Service) attempt(ctx context.Context, t *target) (res Result, skipped bool) {
+	if t.in.Protocol == "awg" {
+		unlock, ok := s.lockAWGProbe(ctx, t.in.ID)
+		if !ok {
+			return Result{}, true
+		}
+		defer unlock()
+	}
 	cred, secret, err := s.probeCredSecret(ctx, t)
 	if err != nil {
 		s.log.Warn("health: probe credential unreadable", "inbound", t.in.ID, "err", err)
@@ -134,7 +161,7 @@ func (s *Service) attempt(ctx context.Context, t *target) (res Result, skipped b
 		clientPort = t.spec.Listen.Port
 	}
 	tn, err := s.cfg.Dialers[t.in.Protocol](rctx, Target{Node: dialNode, Inbound: t.in, Spec: t.spec, Settings: t.settings, ClientPort: clientPort, CredID: cred.CredID, Secret: secret},
-		DialOptions{HandshakeTimeout: s.cfg.HandshakeTimeout})
+		DialOptions{HandshakeTimeout: s.cfg.HandshakeTimeout, ProbeTimeout: s.cfg.ProbeTimeout})
 	if err != nil {
 		var pe *ProbeError
 		if errors.As(err, &pe) && pe.Skip {
@@ -144,6 +171,11 @@ func (s *Service) attempt(ctx context.Context, t *target) (res Result, skipped b
 		return Result{Status: adminv1.CheckStatus_CHECK_STATUS_FAILED, At: s.now(), ErrorCode: code, ErrorDetail: detail}, false
 	}
 	defer tn.Close()
+	if checked, ok := tn.(interface{ ProbeResult() Result }); ok {
+		res := checked.ProbeResult()
+		res.At = s.now()
+		return res, false
+	}
 	downloadURL := ""
 	if t.relay != nil {
 		downloadURL = s.cfg.ProbeDownloadURL
@@ -215,19 +247,29 @@ func (s *Service) probeWithDownload(ctx context.Context, tn Tunnel, node store.N
 		}
 	}
 
-	if resp, err := getProbe(ctx, hc, s.cfg.ProbeTraceURL, true); err != nil {
-		failRequest("trace", err)
-	} else {
-		latencyTrace = uint32(max(time.Since(start).Milliseconds(), 1))
-		ip, loc := exitFromTrace(resp.Body)
-		resp.Body.Close()
-		switch {
-		case resp.StatusCode != http.StatusOK:
-			fail("http_status", "trace answered %d", resp.StatusCode)
-		case ip == "":
-			fail("http_status", "trace has no exit ip")
-		default:
-			okTrace, res.ExitIP, res.ExitCountry = true, ip, loc
+	// The bounded transfer comes before the trace. A transport that carries every request of the round in one flow (XHTTP) spends
+	// the 16 KB a freezing filter lets through on the requests that came first: with the trace ahead of the transfer the round
+	// would die in the trace with a code that says nothing about a freeze. A tunnel that carried the first request and then
+	// stalls on the next one is a stalled flow, whichever request meets the stall.
+	downloadCode, downloadDetail := "", ""
+	if downloadURL != "" && ok204 {
+		downloadCode, downloadDetail = relayDownloadProbe(ctx, hc, downloadURL)
+	}
+	if downloadCode == "" { // after a stalled transfer the tunnel is dead: the trace would only repeat it
+		if resp, err := getProbe(ctx, hc, s.cfg.ProbeTraceURL, true); err != nil {
+			failRequest("trace", err)
+		} else {
+			latencyTrace = uint32(max(time.Since(start).Milliseconds(), 1))
+			ip, loc := exitFromTrace(resp.Body)
+			resp.Body.Close()
+			switch {
+			case resp.StatusCode != http.StatusOK:
+				fail("http_status", "trace answered %d", resp.StatusCode)
+			case ip == "":
+				fail("http_status", "trace has no exit ip")
+			default:
+				okTrace, res.ExitIP, res.ExitCountry = true, ip, loc
+			}
 		}
 	}
 
@@ -259,11 +301,9 @@ func (s *Service) probeWithDownload(ctx context.Context, tn Tunnel, node store.N
 	if res.Status != adminv1.CheckStatus_CHECK_STATUS_OK && len(bad) > 0 {
 		res.ErrorCode, res.ErrorDetail = bad[0].Code, bad[0].Detail
 	}
-	if downloadURL != "" && ok204 && okTrace {
-		if code, detail := relayDownloadProbe(ctx, hc, downloadURL); code != "" {
-			res.Status = adminv1.CheckStatus_CHECK_STATUS_FAILED
-			res.ErrorCode, res.ErrorDetail = code, detail
-		}
+	if downloadCode != "" {
+		res.Status = adminv1.CheckStatus_CHECK_STATUS_FAILED
+		res.ErrorCode, res.ErrorDetail = downloadCode, downloadDetail
 	}
 	if u, ok := tn.(udpStatser); ok {
 		sent, lost := u.UDPStats()
@@ -277,7 +317,9 @@ func (s *Service) probeWithDownload(ctx context.Context, tn Tunnel, node store.N
 func relayDownloadProbe(ctx context.Context, hc *http.Client, url string) (string, string) {
 	resp, err := getProbe(ctx, hc, url, false)
 	if err != nil {
-		return "exit_unreachable", "download: " + probeErrText(err)
+		// The round's first request went through this tunnel, so a request that now fails (a timeout, or a helper that hangs up on a
+		// stalled flow, which the VLESS classifier reads as a rejected credential) is a flow that worked and then stopped.
+		return "freeze", "download did not start: " + probeErrText(err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()

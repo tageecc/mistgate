@@ -7,12 +7,14 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	pb "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/internal/agentcap"
 	"github.com/mistgate/mistgate/internal/node/doctor"
 	"github.com/mistgate/mistgate/internal/node/engine"
 	"github.com/mistgate/mistgate/internal/node/unit"
@@ -60,6 +62,20 @@ func resultIDs(r *pb.DoctorReport) string {
 	return strings.Join(ids, ",")
 }
 
+func TestDoctorEnvUsesConfiguredSecurityUpdatesLauncher(t *testing.T) {
+	launches := 0
+	h := newHarness(t, harnessOpts{noStart: true, cfg: func(c *Config) {
+		c.SecurityUpdatesLauncher = func(context.Context) error { launches++; return nil }
+	}})
+	env := h.a.doctorEnv()
+	if env.LaunchSecurityUpdates == nil {
+		t.Fatal("doctor env has no security updates launcher")
+	}
+	if err := env.LaunchSecurityUpdates(context.Background()); err != nil || launches != 1 {
+		t.Fatalf("launcher call: err=%v launches=%d", err, launches)
+	}
+}
+
 func TestHelloAdvertisesTheDoctor(t *testing.T) {
 	h := newHarness(t, harnessOpts{})
 	hello := <-h.panel.hellos
@@ -89,7 +105,7 @@ func TestHelloAdvertisesUnitRefreshOnlyWithLauncher(t *testing.T) {
 			hello := <-h.panel.hellos
 			found := false
 			for _, c := range hello.Capabilities {
-				found = found || c == unit.CapabilityRefresh
+				found = found || c == agentcap.UnitRefresh
 			}
 			if found != tc.launcher {
 				t.Fatalf("unit-refresh capability present=%v, want %v; capabilities=%v", found, tc.launcher, hello.Capabilities)
@@ -395,6 +411,54 @@ func TestDoctorInboundsDescribeTheAppliedState(t *testing.T) {
 	}
 }
 
+// A REALITY inbound that shows a site chosen on its node has a name in its TLS block and no certificate mode: the doctor has no
+// certificate to read (no TLS mode, no TLS port) and checks the target by that name.
+func TestDoctorInboundsOfATargetSetOnTheNodeHaveNoCertificate(t *testing.T) {
+	h := newHarness(t, harnessOpts{extra: map[string]engine.Factory{"vless": newFakeEngine("vless").factory()}})
+	h.waitConnected()
+	state := inb("v1", 0, 0, cred("c1"))
+	state.Spec.Protocol = "vless"
+	state.Spec.Listen = &pb.Listen{Network: "tcp", Port: 443}
+	state.Spec.Tls = &pb.Tls{ServerName: "shop.example.com"}
+	state.Spec.SettingsJson = `{"transport":"tcp","security":"reality","reality":{"target":"shop.example.com:443","server_names":["shop.example.com"]}}`
+	h.panel.push(fullState(1, state))
+	h.panel.nextApply()
+	got := h.a.doctorInbounds()
+	if len(got) != 1 || got[0].TLSMode != "" || got[0].TLSPort != 0 || got[0].RealityTarget != "shop.example.com:443" || got[0].RealityName != "shop.example.com" {
+		t.Fatalf("doctor inbound = %+v, want no TLS mode or port and the target by its name", got)
+	}
+}
+
+// The doctor is told about the UDP socket that TrustTunnel's HTTP/3 adds to the TCP listener, and only while h3 is on.
+func TestDoctorInboundsCarryTheSideListenOfTrustTunnelHTTP3(t *testing.T) {
+	h := newHarness(t, harnessOpts{extra: map[string]engine.Factory{"trusttunnel": newFakeEngine("trusttunnel").factory()}})
+	h.waitConnected()
+	state := inb("tt1", 0, 0, cred("c1"))
+	state.Spec.Protocol = "trusttunnel"
+	state.Spec.Listen = &pb.Listen{Network: "tcp", Port: 8443}
+	state.Spec.Tls = &pb.Tls{Mode: pb.TlsMode_TLS_MODE_ACME_DOMAIN, ServerName: "example.com"}
+	state.Spec.SettingsJson = `{"h3":true}`
+	h.panel.push(fullState(1, state))
+	h.panel.nextApply()
+	got := h.a.doctorInbounds()
+	if len(got) != 1 || got[0].Network != "tcp" || got[0].Port != 8443 || got[0].TLSPort != 8443 ||
+		!reflect.DeepEqual(got[0].SideListens, []doctor.InboundListen{{Network: "udp", Port: 8443}}) {
+		t.Fatalf("doctor inbound with h3 = %+v, want the UDP side listen and the certificate port", got)
+	}
+
+	off := inb("tt1", 0, 0, cred("c1"))
+	off.Spec.Protocol = "trusttunnel"
+	off.Spec.Listen = &pb.Listen{Network: "tcp", Port: 8443}
+	off.Spec.Tls = state.Spec.Tls
+	off.Spec.SettingsJson = `{"h3":false}`
+	off.Spec.SpecVersion = 2
+	h.panel.push(fullState(2, off))
+	h.panel.nextApply()
+	if got := h.a.doctorInbounds(); len(got) != 1 || len(got[0].SideListens) != 0 {
+		t.Fatalf("doctor inbound without h3 = %+v, want no side listen", got)
+	}
+}
+
 // An ACME certificate that arrives (or renews) after the last apply is judged by the live value the engine reports, for the
 // inbounds whose certificate the doctor cannot read itself (design/vless.md section 7.3).
 func TestDoctorInboundsTakeTheLiveCertificateExpiry(t *testing.T) {
@@ -439,6 +503,18 @@ func TestTLSPortOf(t *testing.T) {
 		{mk("vless", `{"security":"reality","reality":{"target":"self"}}`, plugin.TLSAcmeDomain), 0},
 		{mk("vless", `{"security":"reality","reality":{"target":"www.example.org:443"}}`, 0), 0},
 		{mk("vless", `not json`, plugin.TLSAcmeDomain), 0},
+		// TrustTunnel: its TCP port serves the certificate, with or without HTTP/3 beside it
+		{func() plugin.InboundSpec {
+			sp := mk("trusttunnel", `{"h3":true}`, plugin.TLSAcmeDomain)
+			sp.Listen = plugin.Listen{Network: "tcp", Port: 8443}
+			return sp
+		}(), 8443},
+		{func() plugin.InboundSpec {
+			sp := mk("trusttunnel", `{}`, plugin.TLSSelfSigned)
+			sp.Listen = plugin.Listen{Network: "tcp", Port: 443}
+			return sp
+		}(), 443},
+		{mk("trusttunnel", `{}`, 0), 0},
 	} {
 		if got := tlsPortOf(tc.spec); got != tc.want {
 			t.Errorf("%s %s mode %d: %d, want %d", tc.spec.Protocol, tc.spec.Settings, tc.spec.TLS.Mode, got, tc.want)

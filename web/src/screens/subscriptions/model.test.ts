@@ -1,10 +1,11 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { SubFormat } from "@/gen/mistgate/admin/v1/subscription_pb";
 import { en } from "@/i18n/en";
 import { ru } from "@/i18n/ru";
 import { zh } from "@/i18n/zh";
 import { DnsCategory, DnsClient, DnsServerKind, DnsTransport } from "@/gen/mistgate/admin/v1/dns_pb";
-import { appResults, formatDescKey, formatKey, ruleFormats, catalogOf, chipCountry, chipLabel, chipOf, cleanSplit, countryName, geoChoices, toggleGeo, cutAnnounce, dnsChips, describePreset, flagOf, move, parseSuffixes, presetLook, presetName, presetProblem, presetSubtitle, previewUrl, providerName, renderName, serverNames, serverProblem, transportOrder, unicodeSuffix, validDownload, validSupportLink, variantLabel, variantServer, type ClientSupport, type Provider } from "./model";
+import { addCategories, appResults, builtinNames, formatDescKey, formatKey, ruleFormats, catalogOf, chipCountry, chipLabel, chipOf, cleanSplit, countryName, geoCategories, geoChoices, parseCategories, removeCategory, toggleGeo, cutAnnounce, dnsChips, describePreset, flagOf, move, parseSuffixes, presetName, presetProblem, presetSubtitle, previewUrl, splitFirst, providerName, renderName, serverNames, serverProblem, transportOrder, unicodeSuffix, validDownload, validSupportLink, variantLabel, variantServer, type ClientSupport, type Provider } from "./model";
 
 describe("move", () => {
   it("moves one element and leaves the input alone", () => {
@@ -199,6 +200,10 @@ describe("presetName", () => {
     expect(presetName({ id: "dns_builtin_adblock", name: "Мой блок" }, "zh")).toBe("Мой блок");
     expect(presetName({ id: "dns_custom", name: "Офис" }, "zh")).toBe("Офис");
   });
+  it("says what the user page says: both read the one file the Go test pins", () => {
+    const file = JSON.parse(readFileSync(`${process.cwd()}/../internal/panel/dns/testdata/builtin_names.json`, "utf8")) as typeof builtinNames;
+    expect(builtinNames).toEqual(file);
+  });
 });
 
 describe("variantLabel", () => {
@@ -320,11 +325,15 @@ describe("the subtitle and the look of a catalog preset", () => {
     const custom = [{ kind: DnsServerKind.PLAIN, address: "1.1.1.1", providerVariant: "" }];
     expect(presetSubtitle({ servers: custom, split: [], splitDirect: false, preferredTransport: DnsTransport.DOH }, direct, catalog, name)).toBe("Cloudflare");
   });
-  it("takes the glyph of the category unless the preset has its own", () => {
-    expect(presetLook({ id: "dns_builtin_cloudflare_family", category: DnsCategory.FAMILY }).glyph).toBe("family");
-    expect(presetLook({ id: "dns_builtin_ru_split", category: DnsCategory.REGIONAL }).tone).toBe("sky");
-    expect(presetLook({ id: "dns_custom", category: DnsCategory.REGIONAL }).glyph).toBe("map");
-    expect(presetLook({ id: "dns_x", category: DnsCategory.UNSPECIFIED })).toEqual({ glyph: "server", tone: "muted" });
+  it("names the built-in that blocks ads on the device in the three languages", () => {
+    const stock = { id: "dns_builtin_ads_device", name: "Без рекламы на устройстве" };
+    expect(presetName(stock, "ru")).toBe("Без рекламы на устройстве");
+    expect(presetName(stock, "en")).toBe("No ads on the device");
+    expect(presetName(stock, "zh")).toBe("设备端拦截广告");
+    expect(presetName({ ...stock, name: "Мой без рекламы" }, "en")).toBe("Мой без рекламы");
+    for (const dict of [en, ru, zh] as Record<string, string>[]) {
+      for (const k of ["subs.dns.blockAds", "subs.dns.blockAdsHint", "subs.dns.blockAdsTag", "subs.dns.awgNoBlock"]) expect(dict[k]).toBeTruthy();
+    }
   });
 });
 
@@ -360,6 +369,7 @@ describe("DNS chips", () => {
     expect(presetName({ id: "dns_builtin_cn_split", name: "Китай: китайские сайты напрямую" }, "en")).toBe("China: Chinese sites direct");
     expect(presetName({ id: "dns_builtin_cn_split", name: "Китай: китайские сайты напрямую" }, "zh")).toBe("中国：国内网站直连");
     expect(presetName({ id: "dns_builtin_cn_split", name: "Китай: китайские сайты напрямую" }, "ru")).toBe("Китай: китайские сайты напрямую");
+    expect(presetName({ id: "dns_builtin_ru_geo", name: "Россия: российские сайты напрямую (список сообщества)" }, "en")).toBe("Russia: Russian sites direct (community list)");
   });
 });
 
@@ -387,10 +397,36 @@ describe("format labels", () => {
 
 describe("the country lists of a split rule in the editor", () => {
   const server = { kind: DnsServerKind.PLAIN, address: "223.5.5.5", providerVariant: "" };
-  it("offers China, and any other code a rule already holds so it can be turned off", () => {
-    expect(geoChoices([])).toEqual(["cn"]);
-    expect(geoChoices(["cn"])).toEqual(["cn"]);
-    expect(geoChoices(["ir"])).toEqual(["cn", "ir"]);
+  it("offers China and Russia, and any other code a rule already holds so it can be turned off", () => {
+    expect(geoChoices([])).toEqual(["cn", "ru"]);
+    expect(geoChoices(["cn"])).toEqual(["cn", "ru"]);
+    expect(geoChoices(["ir"])).toEqual(["cn", "ru", "ir"]);
+  });
+  it("keeps the site categories of a rule out of the country pills", () => {
+    expect(geoChoices(["geosite:telegram", "ir"])).toEqual(["cn", "ru", "ir"]);
+    expect(geoChoices(["geosite:telegram"])).toEqual(["cn", "ru"]);
+  });
+  it("reads the categories typed in one go: lower-cased, with or without the prefix, no repeats, the badly written apart", () => {
+    expect(parseCategories(" Telegram, geosite:Category-Media-RU;telegram  geolocation-!cn google@cn")).toEqual({
+      ok: ["telegram", "category-media-ru", "geolocation-!cn", "google@cn"],
+      bad: [],
+    });
+    expect(parseCategories("a_b -x !x geosite: " + "a".repeat(65) + " ok1")).toEqual({ ok: ["ok1"], bad: ["a_b", "-x", "!x", "geosite:", "a".repeat(65)] });
+    expect(parseCategories("  ")).toEqual({ ok: [], bad: [] });
+  });
+  it("adds and removes a category in the geo list without touching the countries, and a category alone is a complete rule", () => {
+    const geo = addCategories(["cn"], ["telegram", "category-media-ru"]);
+    expect(geo).toEqual(["cn", "geosite:telegram", "geosite:category-media-ru"]);
+    expect(addCategories(geo, ["telegram"])).toEqual(geo);
+    expect(geoCategories(geo)).toEqual(["telegram", "category-media-ru"]);
+    expect(removeCategory(geo, "telegram")).toEqual(["cn", "geosite:category-media-ru"]);
+    const server = { kind: DnsServerKind.PLAIN, address: "77.88.8.8", providerVariant: "" };
+    const alone = { suffixes: [], geo: addCategories([], ["telegram"]), servers: [server] };
+    expect(presetProblem({ name: "a", servers: [server], split: [alone] })).toBeNull();
+    expect(presetProblem({ name: "a", servers: [server], split: [{ ...alone, geo: removeCategory(alone.geo, "telegram") }] })).toBe("subs.dns.needSuffix");
+    expect(cleanSplit([alone])[0]!.geo).toEqual(["geosite:telegram"]);
+    // the subtitle names it as written, not as a country
+    expect(splitFirst([alone], (c) => countryName(c, Object.assign((k: string) => k, { locale: "en" }) as unknown as Parameters<typeof countryName>[1]))).toBe("geosite:telegram");
   });
   it("switches a country on and off without touching the others, and comes back to the same list", () => {
     expect(toggleGeo([], "cn")).toEqual(["cn"]);
@@ -421,8 +457,25 @@ describe("the country lists of a split rule in the editor", () => {
     for (const dict of [en, ru, zh] as Record<string, string>[]) {
       expect(dict["subs.dns.geo"]).toBeTruthy();
       expect(dict["subs.dns.geoHint"]).toMatch(/geosite/);
+      expect(dict["subs.dns.geoSite"]).toMatch(/geosite/);
+      expect(dict["subs.dns.geoSiteHint"]).toBeTruthy();
+      expect(dict["subs.dns.geoSiteBad"]).toContain("{s}");
     }
     expect(ru["subs.dns.directHint" as keyof typeof ru]).not.toMatch(/России/);
     expect(en["subs.dns.directHint" as keyof typeof en]).not.toMatch(/Russia/);
+  });
+});
+
+describe("what a preset sends direct, first", () => {
+  const server = { kind: DnsServerKind.PLAIN, address: "77.88.8.8", providerVariant: "" };
+  const country = (c: string) => (c === "cn" ? "China" : c);
+  it("is the first suffix, shown as people write it, the first rule that has any", () => {
+    expect(splitFirst([{ suffixes: [".xn--p1ai", ".ru"], geo: [], servers: [server] }], country)).toBe(".рф");
+    expect(splitFirst([{ suffixes: [], geo: [], servers: [server] }, { suffixes: [".ru"], geo: [], servers: [server] }], country)).toBe(".ru");
+  });
+  it("is the country of a rule of country lists only, and nothing when there is no rule", () => {
+    expect(splitFirst([{ suffixes: [], geo: ["cn"], servers: [server] }], country)).toBe("China");
+    expect(splitFirst([], country)).toBe("");
+    expect(splitFirst([{ suffixes: [], geo: [], servers: [server] }], country)).toBe("");
   });
 });

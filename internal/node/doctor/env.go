@@ -55,12 +55,18 @@ type Env struct {
 	LookupVia func(ctx context.Context, server, host string) error
 	// ServedCert returns the leaf certificate a TLS listener at addr (host:port) serves for sni.
 	ServedCert func(ctx context.Context, addr, sni string) (*x509.Certificate, error)
+	// ProbeTarget handshakes TLS 1.3 with a REALITY target (reality_target check); nil = the real handshake.
+	ProbeTarget func(ctx context.Context, addr, serverName string) TargetFacts
+	// TargetRoots are the roots a target's certificate must lead to; nil = the system roots.
+	TargetRoots *x509.CertPool
 	// Docker lists the containers through the read-only socket API; an error means "no docker here".
 	Docker func(ctx context.Context) ([]Container, error)
 
 	// Agent side.
 	Settings func() Settings
 	Inbounds func() []Inbound
+	// OwnedIPv6 are the addresses the agent holds for the panel with the state of each (hostctl.IPv6Addr*); nil = none.
+	OwnedIPv6 func() []OwnedAddr
 	// Samples returns the stats ring samples of the last window, oldest first.
 	Samples func(window time.Duration) []Sample
 	// Offset is the panel clock minus the local clock in seconds, measured at Hello.
@@ -82,6 +88,12 @@ type Env struct {
 	// LaunchUnitRefresh queues the fixed transient refresh job. beforeLaunch sends the started result after systemd-run
 	// accepts the job and before the helper's ack file lets it restart this service.
 	LaunchUnitRefresh func(context.Context, func()) error
+	// LaunchSecurityUpdates starts the fixed transient root job that installs and enables unattended security updates.
+	// Nil means this agent cannot launch the job outside its service sandbox.
+	LaunchSecurityUpdates func(context.Context) error
+	// LaunchInstallNftables starts the fixed transient root job that installs the nftables package (nftinstall).
+	// Nil means this agent cannot launch it outside its service sandbox.
+	LaunchInstallNftables func(context.Context) error
 	// Warp is the WARP manager's view (warp_path check); nil = this build has no WARP manager.
 	Warp func(ctx context.Context) WarpInfo
 	// HostPath lists clashes of the host with the tunnel path (a routing table or rule preference another tool uses, a
@@ -99,6 +111,10 @@ type Env struct {
 	RecheckWarp    func(ctx context.Context) (checked, thresholdDown bool, err error) // thresholdDown also covers a scheduled check that just crossed the threshold
 	Fixer          hostctl.Fixer                                                      // nil = journal/resolver fixes unsupported
 	ForwardFixer   hostctl.ForwardExceptionFixer                                      // nil = the narrow FORWARD exception fix is unsupported
+
+	// AwgModuleRepair starts the bounded root repair unit. The agent re-applies inbounds after the unit finishes.
+	// nil = this build cannot (awg_module_repair is then not offered).
+	AwgModuleRepair func(ctx context.Context) error
 
 	// Set by Run: the previous result of a check.
 	Prev func(id string) (Result, bool)
@@ -122,17 +138,24 @@ type Settings struct {
 	ClientIPv6Disabled bool     // NodeSettings.client_ipv6_disabled
 }
 
+// OwnedAddr is one IPv6 address the agent holds for the panel (NodeSettings.ipv6_addresses).
+type OwnedAddr struct {
+	Addr  string
+	State string // hostctl.IPv6AddrOK, ...
+}
+
 // Inbound is one inbound as the doctor sees it.
 type Inbound struct {
-	ID       string
-	Protocol string
-	Network  string // "udp" | "tcp"
-	Port     int
-	HopFrom  int // 0 = no hop range
-	HopTo    int
-	Enabled  bool
-	Egress   string // "direct" | "warp"
-	TLSMode  string // "acme_domain" | "acme_ip" | "self_signed" | ""
+	ID          string
+	Protocol    string
+	Network     string // "udp" | "tcp"
+	Port        int
+	SideListens []InboundListen
+	HopFrom     int // 0 = no hop range
+	HopTo       int
+	Enabled     bool
+	Egress      string // "direct" | "warp"
+	TLSMode     string // "acme_domain" | "acme_ip" | "self_signed" | ""
 	// ServerName is the TLS server name (or IP for acme_ip).
 	ServerName string
 	State      string // "starting" | "running" | "failed" | "stopped"
@@ -147,6 +170,15 @@ type Inbound struct {
 	TLSPort int
 	// TLSDown is why the engine says that listener is not up ("masq_tcp: ... address already in use"), "" = up.
 	TLSDown string
+	// RealityTarget and RealityName are the site a VLESS REALITY inbound shows to strangers ("host:port") and the name it is
+	// asked for; both "" for every inbound that shows the node's own site or has no REALITY.
+	RealityTarget, RealityName string
+}
+
+// InboundListen is an auxiliary socket owned by the inbound, such as TrustTunnel's same-number UDP HTTP/3 listener.
+type InboundListen struct {
+	Network string
+	Port    int
 }
 
 // Sample is one stats-interval host sample kept by the agent (Ring).
@@ -155,6 +187,8 @@ type Sample struct {
 	CPU     float64 // total busy %
 	Softirq float64 // softirq %
 	Load1   float64
+	// Steal is the share the hypervisor gave to other guests, % (inside CPU).
+	Steal float64
 }
 
 // Container is a docker container as far as foreign_vpn cares.

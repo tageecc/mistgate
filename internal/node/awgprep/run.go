@@ -46,6 +46,10 @@ type Runner func(ctx context.Context, w io.Writer, dir string, cmd ...string) (s
 type Sys struct {
 	WriteFile  func(path, body string) error
 	RemoveFile func(path string) error
+	// ReadFile reads a file (the module source's compat.h). Nil = unavailable.
+	ReadFile func(path string) ([]byte, error)
+	// SourceDirs lists the DKMS module source trees (/usr/src/amneziawg-*). Nil = none.
+	SourceDirs func() []string
 	Exists     func(path string) bool
 	// Probe asks the kernel for the genetlink family: version and maxattr, or an error when it is not loaded.
 	Probe func() (genlVersion uint32, maxAttr uint32, err error)
@@ -53,6 +57,20 @@ type Sys struct {
 	AptBusy func() bool
 	// Sleep waits d or until ctx ends. Nil = the real clock.
 	Sleep func(ctx context.Context, d time.Duration)
+	// TryBuilderLock is the shared non-blocking lock for module builders. Nil = no lock (a test fake).
+	TryBuilderLock func() (release func(), acquired bool, err error)
+	// KernelRelease returns the running kernel. Nil = unavailable.
+	KernelRelease func() string
+}
+
+// configureAll finishes an interrupted dpkg run the way the OS job does: it keeps every configuration file as it is.
+var configureAll = []string{"dpkg", "--force-confdef", "--force-confold", "--configure", "-a"}
+
+func (s Sys) sourceDirs() []string {
+	if s.SourceDirs == nil {
+		return nil
+	}
+	return s.SourceDirs()
 }
 
 func (s Sys) sleep(ctx context.Context, d time.Duration) {
@@ -84,6 +102,9 @@ func lockBusy(out string) bool {
 	return false
 }
 
+// IsAptLockOutput reports whether apt or dpkg said that another package manager holds a lock.
+func IsAptLockOutput(out string) bool { return lockBusy(out) }
+
 // ctxFailure is the Failure of a run whose context ended, or nil while it is alive.
 func ctxFailure(ctx context.Context, limit time.Duration) *Failure {
 	switch {
@@ -97,7 +118,8 @@ func ctxFailure(ctx context.Context, limit time.Duration) *Failure {
 
 // Run executes the plan (steps already have {src} replaced by src) and then verifies the module: the module is loaded
 // (/sys/module, not modinfo: on ARM two trees can hold one name), speaks genl v3 with room for the 3.1 attributes, and
-// is loaded at boot (modules-load.d). Nothing is rolled back on failure; the error says where it stopped. limit is only
+// is loaded at boot (modules-load.d). Nothing is rolled back on failure, except the module's own packages when it did
+// not build (buildFailure); the error says where it stopped. limit is only
 // used to word a timeout (the caller owns the deadline of ctx).
 func Run(ctx context.Context, w io.Writer, steps []Step, src string, run Runner, sys Sys, limit time.Duration, progress Progress) error {
 	for i, s := range steps {
@@ -139,11 +161,33 @@ func Run(ctx context.Context, w io.Writer, steps []Step, src string, run Runner,
 				}
 			}
 		}
-		var out string
+		if s.Prep != nil {
+			if err := s.Prep(src, w); err != nil {
+				return &Failure{
+					Code:   CodeStepFailed,
+					Detail: fmt.Sprintf("step %d of %d failed: %s (%v)", i+1, len(steps), s.Desc, err),
+					Long:   fmt.Sprintf("step %d (%s) failed before it started: %v (nothing is rolled back; fix the cause and run the command again)", i+1, s.Desc, err),
+				}
+			}
+		}
+		var out, unknownSource string
 		if len(cmd) > 0 {
 			fmt.Fprintf(w, "  $ %s\n", strings.Join(cmd, " "))
 			var err error
 			out, err = run(ctx, w, s.Dir, cmd...)
+			if err != nil && ctxFailure(ctx, limit) == nil && (s.Build || dkmsBuildFailed(out)) && OwnDKMSFailure(out) {
+				// The module's own DKMS build failed. A source Mistgate knows to be bad is repaired and the step goes once more;
+				// only when it fails again does the removal below apply.
+				rs := FixCompat(sys, sys.sourceDirs(), false, w)
+				if CompatChanged(rs) {
+					fmt.Fprintf(w, "\nthe module source was repaired: finishing dpkg, then step %d once more\n  $ %s\n", i+1, strings.Join(configureAll, " "))
+					_, _ = run(ctx, w, "", configureAll...)
+					fmt.Fprintf(w, "  $ %s\n", strings.Join(cmd, " "))
+					out, err = run(ctx, w, s.Dir, cmd...)
+				} else {
+					unknownSource = CompatUnknownSHA(rs)
+				}
+			}
 			if err != nil {
 				if f := ctxFailure(ctx, limit); f != nil {
 					return f
@@ -151,9 +195,17 @@ func Run(ctx context.Context, w io.Writer, steps []Step, src string, run Runner,
 				f := &Failure{Code: CodeStepFailed,
 					Detail: fmt.Sprintf("step %d of %d failed: %s (%v)", i+1, len(steps), s.Desc, err),
 					Long:   fmt.Sprintf("step %d (%s) failed: %v (nothing is rolled back; fix the cause and run the command again)", i+1, strings.Join(cmd, " "), err)}
-				if lockBusy(out) {
+				switch {
+				case lockBusy(out):
 					f.Code = CodeAptLock
 					f.Detail = fmt.Sprintf("step %d of %d: another package manager (apt, dpkg, unattended-upgrades) prevented access to the package lock", i+1, len(steps))
+				case s.Build || dkmsBuildFailed(out):
+					f = buildFailure(ctx, w, run, s, i+1, cmd, out)
+					if unknownSource != "" {
+						// first: the status file keeps only the start of the sentence
+						f.Detail = UnknownSourceNote(unknownSource) + "; " + f.Detail
+						f.Long += "; " + UnknownSourceNote(unknownSource)
+					}
 				}
 				return f
 			}
@@ -169,6 +221,47 @@ func Run(ctx context.Context, w io.Writer, steps []Step, src string, run Runner,
 		}
 	}
 	return Verify(w, sys)
+}
+
+// dkmsBuildFailed reports apt output in which the module's DKMS build failed: dkms says "Bad return status for module
+// build" and dpkg leaves amneziawg-dkms half-configured (also when an earlier run's package is configured again).
+func dkmsBuildFailed(out string) bool {
+	return strings.Contains(out, "error processing package amneziawg-dkms") ||
+		strings.Contains(out, "amneziawg") && strings.Contains(out, "Bad return status for module build")
+}
+
+// buildFailure is step i failing because the module does not compile for this kernel (an API change it has no answer
+// for yet). The step's Undo, when it has one, removes the half-configured package the failed build left: without that
+// the host's apt refuses every later install.
+func buildFailure(ctx context.Context, w io.Writer, run Runner, s Step, i int, cmd []string, out string) *Failure {
+	f := &Failure{Code: CodeBuildFailed, Detail: "the AmneziaWG module does not build for this kernel; the node stays on userspace",
+		Long: fmt.Sprintf("step %d (%s) failed: the AmneziaWG module does not build for this kernel (the compiler's errors are above, or in /var/lib/dkms/amneziawg/*/build/make.log)", i, strings.Join(cmd, " "))}
+	if len(s.Undo) == 0 {
+		f.Long += "; nothing else is rolled back"
+		return f
+	}
+	// Only the module's own build, for the kernel that is running, is undone. apt may configure, on the side, the headers of a
+	// newer kernel whose DKMS build fails while the module for the running kernel is installed and serves: removing the packages
+	// then would take a working module away.
+	if k := DKMSFailureKernel(out); k != "" && s.RunKernel != "" && k != s.RunKernel {
+		f.Detail = fmt.Sprintf("the AmneziaWG module does not build for kernel %s; the module for the running kernel (%s) was not touched and nothing was removed", k, s.RunKernel)
+		f.Long += fmt.Sprintf("; the failed build was for kernel %s, not the running %s: its packages were left as they are (apt may refuse other installs until the headers of %s are configured or removed)", k, s.RunKernel, k)
+		return f
+	}
+	if !OwnDKMSFailure(out) {
+		f.Detail = "the AmneziaWG module could not be installed, and the failure is not clearly the module's own build; nothing was removed"
+		f.Long += "; nothing was removed: the output does not show the module's own DKMS build failing"
+		return f
+	}
+	fmt.Fprintf(w, "\nthe module did not build: removing its half-installed packages\n  $ %s\n", strings.Join(s.Undo, " "))
+	if _, err := run(ctx, w, "", s.Undo...); err != nil {
+		f.Detail = "the AmneziaWG module does not build for this kernel, and removing its half-installed packages failed: apt-get purge amneziawg amneziawg-dkms"
+		f.Long += fmt.Sprintf("; removing its packages failed too (%v): run %s by hand, apt refuses other installs until then", err, strings.Join(s.Undo, " "))
+		return f
+	}
+	f.Detail = "the AmneziaWG module does not build for this kernel; its packages were removed again and the node stays on userspace"
+	f.Long += "; its packages were removed again, apt is usable"
+	return f
 }
 
 // Verify is also the whole of --verify-only. A module that works but cannot be set to load at boot is a failure: the

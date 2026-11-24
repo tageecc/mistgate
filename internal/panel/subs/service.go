@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 
 	"connectrpc.com/connect"
@@ -20,6 +22,7 @@ import (
 	"github.com/mistgate/mistgate/internal/panel/instance"
 	"github.com/mistgate/mistgate/internal/panel/protocols"
 	"github.com/mistgate/mistgate/internal/panel/store"
+	"github.com/mistgate/mistgate/internal/panel/subhdr"
 	"github.com/mistgate/mistgate/internal/panel/subsettings"
 	"github.com/mistgate/mistgate/internal/plugin"
 )
@@ -34,7 +37,9 @@ type Service struct {
 	brand    func(ctx context.Context) (instance.Settings, error)
 	dns      DefaultPresets // nil = no DNS module: default_dns_preset_id stays empty
 	log      *slog.Logger
-	notify   StateNotifier // told when a switch to STRICT revoked devices; nil = nobody to tell
+	notify   StateNotifier    // told when a switch to STRICT revoked devices; nil = nobody to tell
+	preview  ProfilePreviewer // the views of the Mihomo template preview; nil = the preview is not available
+	routing  Routing          // the Happ routing of the DNS module, for the preview of what an app gets; nil = none
 }
 
 // StateNotifier is told that credentials left the database and the nodes must hear about it; the fleet implements it.
@@ -42,6 +47,12 @@ type StateNotifier interface{ StateChanged() }
 
 // NotifyWith sets who hears about devices that a switch of the device limit to STRICT revoked.
 func (s *Service) NotifyWith(n StateNotifier) { s.notify = n }
+
+// PreviewWith sets where the views of the Mihomo template preview come from (the access module).
+func (s *Service) PreviewWith(p ProfilePreviewer) { s.preview = p }
+
+// RoutingWith sets the DNS module's routing (the same one the handler is given), which the preview of what the apps receive uses.
+func (s *Service) RoutingWith(r Routing) { s.routing = r }
 
 // NewService builds the service; settings is the cache the public handler reads too, brand the loader of the
 // instance brand (for effective_title).
@@ -58,7 +69,7 @@ func (s *Service) Handler() (string, http.Handler) {
 }
 
 func (s *Service) internal(what string, err error) error {
-	s.log.Error("subscription settings: "+what, "err", err)
+	s.log.Error("subscription settings: "+what, "code", "subscription_settings_operation_failed", "err", err)
 	return connect.NewError(connect.CodeInternal, errors.New("internal error"))
 }
 
@@ -83,7 +94,7 @@ func (s *Service) effectiveTitle(ctx context.Context, set *adminv1.SubscriptionS
 	}
 	b, err := s.brand(ctx)
 	if err != nil {
-		s.log.Warn("read brand", "err", err)
+		s.log.Warn("read brand", "code", "subscription_brand_read_failed", "err", err)
 	}
 	return b.BrandName()
 }
@@ -96,12 +107,18 @@ func (s *Service) GetSubscriptionSettings(ctx context.Context, _ *connect.Reques
 	if err := s.fillDNS(ctx, set); err != nil {
 		return nil, s.internal("default dns preset", err)
 	}
-	resp := &adminv1.GetSubscriptionSettingsResponse{Settings: set, EffectiveTitle: s.effectiveTitle(ctx, set)}
+	subsettings.FillRoutingInfo(set)
+	resp := &adminv1.GetSubscriptionSettingsResponse{Settings: set, EffectiveTitle: s.effectiveTitle(ctx, set), ReservedHeaderNames: subhdr.ReservedNames()}
 	shared, err := s.st.Access().SharedLinkUsers(ctx)
 	if err != nil {
 		return nil, s.internal("shared link users", err)
 	}
 	resp.SharedLinkUsers = uint32(shared)
+	linkAWGKeys, err := s.st.Access().CountLinkAWGKeys(ctx)
+	if err != nil {
+		return nil, s.internal("link AWG keys", err)
+	}
+	resp.LinkAwgKeys = uint32(linkAWGKeys)
 	if resp.SampleGroup, resp.ServerSamples, err = s.nameSamples(ctx); err != nil {
 		return nil, s.internal("server name samples", err)
 	}
@@ -137,7 +154,7 @@ func (s *Service) nameSamples(ctx context.Context) (string, []*adminv1.ServerSam
 	var candidates []sample
 	for _, f := range full {
 		p, ok := s.reg.Get(f.Profile.Protocol)
-		if !ok || !slices.Contains(g.ProfileIDs, f.Profile.ID) || !f.Inbound.Enabled || f.Node.State != "active" ||
+		if !ok || !slices.Contains(g.ProfileIDs, f.Profile.ID) || !g.GetsNode(f.Node.ID) || !f.Inbound.Enabled || f.Node.State != "active" ||
 			(f.Inbound.State != "pending" && f.Inbound.State != "active") || !protocols.AllowedForApps(p, plugin.ClientHapp) {
 			continue
 		}
@@ -182,6 +199,10 @@ func (s *Service) UpdateSubscriptionSettings(ctx context.Context, req *connect.R
 	if !ok {
 		return nil, connect.NewError(connect.CodeUnauthenticated, errors.New("not signed in"))
 	}
+	// Before anything is written, so a refused request changes nothing (the DNS offer below is saved first).
+	if err := s.ownerOnly(ctx, admin, req.Msg.GetSettings()); err != nil {
+		return nil, err
+	}
 	// The document is checked before anything is written, so an invalid one leaves the DNS offer as it was. Then the DNS offer
 	// is written before the settings: a deleted preset or an invalid offer must not leave the settings saved (and shared devices
 	// revoked) after a refused request.
@@ -209,33 +230,267 @@ func (s *Service) UpdateSubscriptionSettings(ctx context.Context, req *connect.R
 			return nil, s.internal("set default dns preset", err)
 		}
 	}
-	set, revoked, err := s.settings.UpdateRevoking(ctx, req.Msg.Settings)
+	next, err := s.settingGroups(ctx, req.Msg.Settings)
+	if errors.Is(err, subsettings.ErrInvalid) {
+		return nil, connect.NewError(connect.CodeInvalidArgument, err)
+	} else if err != nil {
+		return nil, s.internal("groups of the settings", err)
+	}
+	set, revoked, err := s.settings.UpdateRevoking(ctx, next)
 	if errors.Is(err, subsettings.ErrInvalid) {
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
 	} else if err != nil {
 		return nil, s.internal("save", err)
 	}
+	set = proto.Clone(set).(*adminv1.SubscriptionSettings) // the cache keeps its own copy: the info is for this answer only
 	if err := s.fillDNS(ctx, set); err != nil {
 		return nil, s.internal("default dns preset", err)
 	}
+	subsettings.FillRoutingInfo(set)
 	if revoked > 0 && s.notify != nil {
 		s.notify.StateChanged() // the shared places are gone from the database: the nodes drop their credentials
 	}
 	// The audit row says that the settings changed and how big they are, never their texts.
-	params, _ := json.Marshal(map[string]any{"apps": len(set.Apps), "rules": len(set.Rules), "link_device_limit": store.LinkModeOf(linkModeWord(set)), "shared_revoked": revoked})
+	params, _ := json.Marshal(map[string]any{
+		"apps": len(set.Apps), "rules": len(set.Rules), "response_headers": len(set.ResponseHeaders), "mihomo_templates": len(set.MihomoTemplates), "routing_profiles": len(set.RoutingProfiles), "link_device_limit": store.LinkModeOf(linkModeWord(set)),
+		"link_awg": subsettings.LinkAWG(set), "link_auto_select": subsettings.LinkAutoSelect(set), "shared_revoked": revoked,
+	})
 	entry := store.AuditEntry{Actor: admin.ID, Action: "subscription_settings_update", Result: "ok", Params: string(params)}
 	if ip := auth.ClientIPFrom(ctx); ip.IsValid() {
 		entry.IP = ip.String()
 	}
 	if err := s.st.Audit(ctx, time.Now(), entry); err != nil {
-		s.log.Warn("audit", "action", entry.Action, "err", err)
+		s.log.Warn("audit", "code", "subscription_audit_write_failed", "action", entry.Action, "err", err)
 	}
 	return connect.NewResponse(&adminv1.UpdateSubscriptionSettingsResponse{Settings: set}), nil
 }
 
+// errMihomoOwnerOnly is the refusal of a change of the Mihomo templates by anybody but the owner (an admin token acts as the owner;
+// so does the apply of an operator's plan of subscription_mihomo_template_set that the owner approved).
+// A template is the whole config its people get, with the providers and rules it names: more than the rest of the settings.
+var errMihomoOwnerOnly = connect.NewError(connect.CodePermissionDenied, errors.New("mihomo_templates_owner_only: only the owner can change the Mihomo templates"))
+
+// errRoutingOwnerOnly is the same refusal for the routing profiles of Happ and INCY (the apply of an approved plan of
+// subscription_routing_set passes): a profile decides where the traffic of its people goes.
+var errRoutingOwnerOnly = connect.NewError(connect.CodePermissionDenied, errors.New("routing_profiles_owner_only: only the owner can change the routing profiles"))
+
+// ownerOnly refuses a save that changes the Mihomo templates or the routing profiles when the caller is not the owner. The rest of
+// the settings stay open to a helper, which is how the form sends them: the whole document, those lists as it read them.
+func (s *Service) ownerOnly(ctx context.Context, admin store.Admin, set *adminv1.SubscriptionSettings) error {
+	if admin.Role == store.RoleOwner {
+		return nil
+	}
+	tool := auth.ApprovedPlanTool(ctx) // an approved plan frees the one list its tool is for
+	checkTemplates, checkRouting := tool != auth.MihomoTemplateTool, tool != auth.RoutingProfileTool
+	if !checkTemplates && !checkRouting {
+		return nil
+	}
+	stored, err := subsettings.Load(ctx, s.st)
+	if err != nil {
+		return s.internal("settings for the owner check", err)
+	}
+	differs := func(skip func(id string) bool) (templates, routing bool) {
+		templates = checkTemplates && templatesDiffer(set.GetMihomoTemplates(), stored.GetMihomoTemplates(), skip)
+		routing = checkRouting && subsettings.RoutingProfilesDiffer(set.GetRoutingProfiles(), stored.GetRoutingProfiles(), skip)
+		return
+	}
+	if t, r := differs(nil); !t && !r {
+		return nil
+	}
+	// A group that was deleted since may still stand in the stored list: a save drops it (settingGroups), so it is not a change.
+	groups, err := s.st.Access().Groups(ctx)
+	if err != nil {
+		return s.internal("groups for the owner check", err)
+	}
+	live := make(map[string]bool, len(groups))
+	for _, g := range groups {
+		live[g.ID] = true
+	}
+	t, r := differs(func(id string) bool { return !live[id] })
+	switch {
+	case t:
+		return errMihomoOwnerOnly
+	case r:
+		return errRoutingOwnerOnly
+	}
+	return nil
+}
+
+// templatesDiffer says whether two lists give people different profiles: a template by name (as saved: trimmed, any case), its text
+// and its groups as a set (those that skip says to leave out). The order of the list is not compared: a group has one template at
+// most, so no order decides which one a person gets.
+func templatesDiffer(a, b []*adminv1.MihomoTemplate, skip func(id string) bool) bool {
+	if len(a) != len(b) {
+		return true
+	}
+	byName := make(map[string]*adminv1.MihomoTemplate, len(b))
+	for _, t := range b {
+		byName[strings.ToLower(strings.TrimSpace(t.GetName()))] = t
+	}
+	groups := func(t *adminv1.MihomoTemplate) []string {
+		ids := slices.DeleteFunc(slices.Clone(t.GetGroupIds()), func(id string) bool { return skip != nil && skip(id) })
+		slices.Sort(ids)
+		return slices.Compact(ids)
+	}
+	for _, t := range a {
+		o, ok := byName[strings.ToLower(strings.TrimSpace(t.GetName()))]
+		if !ok || o.GetYaml() != t.GetYaml() || !slices.Equal(groups(o), groups(t)) {
+			return true
+		}
+	}
+	return false
+}
+
+// settingGroups checks the groups the own response headers and the Mihomo templates name. A group that does not exist is refused,
+// unless the stored settings already name it in the same list: it was deleted since, and drops out of the list here, so that a save
+// from another tab of the admin does not fail over it (the person of a deleted group cannot exist, so the entry never applied to
+// anyone). It returns the settings to store (a copy when anything changed).
+func (s *Service) settingGroups(ctx context.Context, set *adminv1.SubscriptionSettings) (*adminv1.SubscriptionSettings, error) {
+	used := false
+	for _, e := range set.GetResponseHeaders() {
+		used = used || len(e.GetGroupIds()) > 0
+	}
+	for _, t := range set.GetMihomoTemplates() {
+		used = used || len(t.GetGroupIds()) > 0
+	}
+	for _, e := range set.GetRoutingProfiles() {
+		used = used || len(e.GetGroupIds()) > 0
+	}
+	if !used {
+		return set, nil
+	}
+	groups, err := s.st.Access().Groups(ctx)
+	if err != nil {
+		return nil, err
+	}
+	live := make(map[string]bool, len(groups))
+	for _, g := range groups {
+		live[g.ID] = true
+	}
+	stored, err := subsettings.Load(ctx, s.st)
+	if err != nil {
+		return nil, err
+	}
+	hadHeader, hadTemplate, hadRouting := map[string]bool{}, map[string]bool{}, map[string]bool{}
+	for _, e := range stored.GetRoutingProfiles() {
+		for _, id := range e.GroupIds {
+			hadRouting[id] = true
+		}
+	}
+	for _, e := range stored.GetResponseHeaders() {
+		for _, id := range e.GroupIds {
+			hadHeader[id] = true
+		}
+	}
+	for _, t := range stored.GetMihomoTemplates() {
+		for _, id := range t.GroupIds {
+			hadTemplate[id] = true
+		}
+	}
+	out := proto.Clone(set).(*adminv1.SubscriptionSettings)
+	for i, e := range out.ResponseHeaders {
+		e.GroupIds = slices.DeleteFunc(e.GroupIds, func(id string) bool { return !live[id] && hadHeader[id] })
+		for _, id := range e.GroupIds {
+			if !live[id] {
+				return nil, fmt.Errorf("%w: response_headers[%d].group_ids: no such group", subsettings.ErrInvalid, i)
+			}
+		}
+	}
+	for i, t := range out.MihomoTemplates {
+		t.GroupIds = slices.DeleteFunc(t.GroupIds, func(id string) bool { return !live[id] && hadTemplate[id] })
+		for _, id := range t.GroupIds {
+			if !live[id] {
+				return nil, fmt.Errorf("%w: mihomo_templates[%d].group_ids: no such group", subsettings.ErrInvalid, i)
+			}
+		}
+	}
+	for i, e := range out.RoutingProfiles {
+		e.GroupIds = slices.DeleteFunc(e.GroupIds, func(id string) bool { return !live[id] && hadRouting[id] })
+		for _, id := range e.GroupIds {
+			if !live[id] {
+				return nil, fmt.Errorf("%w: routing_profiles[%d].group_ids: no such group", subsettings.ErrInvalid, i)
+			}
+		}
+	}
+	return out, nil
+}
+
+// PreviewRoutingProfile reads what the owner pasted as a save does, and returns the entry that would be stored with what it holds.
+func (s *Service) PreviewRoutingProfile(_ context.Context, req *connect.Request[adminv1.PreviewRoutingProfileRequest]) (*connect.Response[adminv1.PreviewRoutingProfileResponse], error) {
+	e, err := subsettings.RoutingProfileOf(req.Msg.GetInput())
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInvalidArgument, err)
+	}
+	return connect.NewResponse(&adminv1.PreviewRoutingProfileResponse{Profile: e}), nil
+}
+
+// PreviewResponseHeaders says which of the own headers of the list one person's answer carries for a User-Agent: the answer
+// format that User-Agent is served by the saved rules, the person's group and whether their subscription serves them at all.
+func (s *Service) PreviewResponseHeaders(ctx context.Context, req *connect.Request[adminv1.PreviewResponseHeadersRequest]) (*connect.Response[adminv1.PreviewResponseHeadersResponse], error) {
+	m := req.Msg
+	if len(m.UserAgent) > 1024 {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("user agent is too long"))
+	}
+	list, err := subsettings.CheckResponseHeaders(m.Headers)
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInvalidArgument, err)
+	}
+	u, err := s.st.Access().User(ctx, m.UserId)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, connect.NewError(connect.CodeNotFound, errors.New("no such person"))
+	} else if err != nil {
+		return nil, s.internal("preview user", err)
+	}
+	_, format, _ := Choose(s.settings.Get(ctx), m.UserAgent)
+	resp := &adminv1.PreviewResponseHeadersResponse{Format: format}
+	if g, err := s.st.Access().Group(ctx, u.GroupID); err == nil {
+		resp.GroupName = g.Name
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return nil, s.internal("preview group", err)
+	}
+	switch {
+	case format == adminv1.SubFormat_SUB_FORMAT_USER_PAGE:
+		resp.NotServed = "page"
+	case format == adminv1.SubFormat_SUB_FORMAT_DECOY:
+		resp.NotServed = "decoy"
+	case access.SubscriptionStatus(u, time.Now()) != access.StatusActive:
+		resp.NotServed = "no_access"
+	default:
+		for _, h := range subsettings.ResponseHeadersFor(&adminv1.SubscriptionSettings{ResponseHeaders: list}, u.GroupID, format) {
+			resp.Headers = append(resp.Headers, &adminv1.SentHeader{Name: h.Name, Value: h.Value, Base64: h.Base64})
+		}
+		// The saved routing profile goes with the link list to Happ and INCY, as the handler does it.
+		if app := routingApp(m.UserAgent); app != "" && format == adminv1.SubFormat_SUB_FORMAT_BASE64_URIS {
+			rt := routingFor(ctx, s.settings.Get(ctx), u.GroupID, u.ID, app, s.routing, s.previewPreset(ctx, u.ID), s.log)
+			if rt.Header != "" {
+				resp.Headers = append(resp.Headers, &adminv1.SentHeader{Name: "routing", Value: rt.Header})
+			}
+			resp.RoutingInBody = rt.Body != ""
+		}
+	}
+	return connect.NewResponse(resp), nil
+}
+
+// previewPreset is the person's DNS preset for the routing preview (nil when the DNS module is not wired or has none).
+func (s *Service) previewPreset(ctx context.Context, userID string) func() *dns.Preset {
+	return func() *dns.Preset {
+		e, _ := s.routing.(Effective)
+		if e == nil {
+			return nil
+		}
+		p, err := e.LinkEffective(ctx, userID)
+		if err != nil {
+			return nil
+		}
+		return &p
+	}
+}
+
 // clientNames are the display names of the client ids the plugins refer to.
 var clientNames = map[plugin.ClientID]string{
-	plugin.ClientHapp: "Happ", plugin.ClientAmnezia: "AmneziaVPN", plugin.ClientMihomo: "Mihomo / Clash Meta", plugin.ClientSingbox: "sing-box",
+	plugin.ClientHapp: "Happ", plugin.ClientAmnezia: "AmneziaVPN", plugin.ClientTelegram: "Telegram",
+	plugin.ClientMihomo: "Mihomo / Clash Meta", plugin.ClientSingbox: "sing-box",
+	plugin.ClientTrustTunnel: "TrustTunnel", plugin.ClientMistgate: "Mistgate",
 }
 
 // formatOf maps a plugin wire format to the serving format of the settings; 0 = not a serving format (yet).

@@ -4,14 +4,16 @@ import (
 	"context"
 	"time"
 
+	"github.com/mistgate/mistgate/internal/panel/retention"
 	"github.com/mistgate/mistgate/internal/panel/store"
 )
 
 // Retention (see also the 00002 schema comments): raw check rounds live 25 h after the finished days
 // were rolled up, daily aggregates 90 days, resolved alerts 90 days, events 90 days (info) or 400 days
-// (warning, error). The sweep runs at start, after a minute, and hourly.
-// traffic_bucket and node_traffic_hour (00002: 400 days) are not pruned here; their tables have no
-// time index, so a DELETE would scan them while holding the only writer. Add an index in a migration first.
+// (warning, error), audit rows 400 days (audit_ts serves the scan), the journal 7 days, host load 90 days, the hourly traffic
+// tables 400 days. These are the defaults: the owner's retention.* settings (internal/panel/retention) replace them, read in one
+// batched call per sweep. The sweep runs at start, after a minute, and hourly. traffic_bucket is pruned through
+// traffic_bucket_hour (migration 00106), node_traffic_hour through its own hour index.
 
 const (
 	retentionEvery = time.Hour
@@ -45,59 +47,60 @@ func (s *Service) Retention(ctx context.Context) { s.sweep(ctx) }
 func (s *Service) sweep(ctx context.Context) {
 	now := s.now()
 	if err := s.st.RollupDaily(ctx, now); err != nil && ctx.Err() == nil {
-		s.log.Warn("health: daily rollup", "err", err)
+		s.log.Warn("health: daily rollup", "code", "daily_rollup_failed", "err", err)
 	}
-	if n, err := s.st.PruneHealth(ctx, now, sampleKeep, dailyKeep, alertKeep); err != nil && ctx.Err() == nil {
-		s.log.Warn("health: prune", "err", err)
-	} else if n > 0 {
-		s.log.Info("health: pruned rows", "count", n)
-	}
-	if n, err := s.st.PruneEvents(ctx, now, infoEvents, warnEvents, eventBatch); err != nil && ctx.Err() == nil {
-		s.log.Warn("health: prune events", "err", err)
-	} else if n > 0 {
-		s.log.Info("health: pruned events", "count", n)
+	if pol, err := s.retentionPolicy(ctx); err != nil {
+		if ctx.Err() == nil {
+			s.log.Warn("health: read retention settings", "code", "retention_settings_unreadable", "err", err)
+		}
+	} else {
+		s.sweepPolicyPrunes(ctx, now, pol)
 	}
 	if n, err := s.st.PruneCountryChecks(ctx, now.Add(-countryKeep)); err != nil && ctx.Err() == nil {
-		s.log.Warn("health: prune country checks", "err", err)
+		s.log.Warn("health: prune country checks", "code", "prune_country_checks_failed", "err", err)
 	} else if n > 0 {
 		s.log.Info("health: pruned country checks", "count", n)
 	}
 	if n, err := s.st.PruneBlocklistChecks(ctx, now.Add(-countryKeep)); err != nil && ctx.Err() == nil {
-		s.log.Warn("health: prune block-list checks", "err", err)
+		s.log.Warn("health: prune block-list checks", "code", "prune_blocklist_checks_failed", "err", err)
 	} else if n > 0 {
 		s.log.Info("health: pruned block-list checks", "count", n)
 	}
 	if n, err := s.st.PruneTSPUChecks(ctx, now.Add(-countryKeep)); err != nil && ctx.Err() == nil {
-		s.log.Warn("health: prune TSPU checks", "err", err)
+		s.log.Warn("health: prune TSPU checks", "code", "prune_tspu_checks_failed", "err", err)
 	} else if n > 0 {
 		s.log.Info("health: pruned TSPU checks", "count", n)
 	}
 	if n, err := s.st.PruneExtChecks(ctx, now.Add(-countryKeep)); err != nil && ctx.Err() == nil {
-		s.log.Warn("health: prune external checks", "err", err)
+		s.log.Warn("health: prune external checks", "code", "prune_external_checks_failed", "err", err)
 	} else if n > 0 {
 		s.log.Info("health: pruned external checks", "count", n)
 	}
 	if n, err := s.st.PruneClientProbeReports(ctx, now.Add(-countryKeep)); err != nil && ctx.Err() == nil {
-		s.log.Warn("health: prune kl!ck reports", "err", err)
+		s.log.Warn("health: prune kl!ck reports", "code", "prune_client_reports_failed", "err", err)
 	} else if n > 0 {
 		s.log.Info("health: pruned kl!ck reports", "count", n)
 	}
 	// The connection counters (link_hour) are hour buckets; retain them for the maximum RPC window.
 	if n, err := s.st.PruneLinkHours(ctx, now.Add(-linkKeep)); err != nil && ctx.Err() == nil {
-		s.log.Warn("health: prune connection counters", "err", err)
+		s.log.Warn("health: prune connection counters", "code", "prune_link_hours_failed", "err", err)
 	} else if n > 0 {
 		s.log.Info("health: pruned connection counters", "count", n)
 	}
-	if n, err := s.st.PruneNodeJournal(ctx, now.Add(-time.Duration(store.NodeJournalKeepHours)*time.Hour)); err != nil && ctx.Err() == nil {
-		s.log.Warn("health: prune node journal", "err", err)
-	} else if n > 0 {
-		s.log.Info("health: pruned node journal", "count", n)
-	}
+	s.sweepProbes(ctx, now)        // path probes, 7 days; VPS only
+	s.sweepDebugCaptures(ctx, now) // debug captures of a node, 24 hours; VPS only
+	s.sweepClientDebug(ctx, now)   // logs people sent for support, 7 days; VPS only
+	s.sweepScheduledRuns(ctx, now) // runs of the scheduled tasks: the last 50 of a task, 30 days; VPS only
 	// A device revoked long ago is only a row now (stats of its past traffic never needed it); a blocked one stays.
 	if n, err := s.st.PruneRevokedDevices(ctx, now.Add(-deviceKeep), eventBatch); err != nil && ctx.Err() == nil {
-		s.log.Warn("health: prune devices", "err", err)
+		s.log.Warn("health: prune devices", "code", "prune_devices_failed", "err", err)
 	} else if n > 0 {
 		s.log.Info("health: pruned revoked devices", "count", n)
+	}
+	if n, err := s.st.RevokeOrphanPathCreds(ctx, now); err != nil && ctx.Err() == nil {
+		s.log.Warn("health: revoke orphan AWG paths", "code", "revoke_orphan_awg_paths_failed", "err", err)
+	} else if n > 0 {
+		s.log.Info("health: revoked orphan AWG paths", "count", n)
 	}
 	// the in-memory map of the last fixes only matters for five minutes
 	s.fixMu.Lock()
@@ -107,4 +110,63 @@ func (s *Service) sweep(ctx context.Context) {
 		}
 	}
 	s.fixMu.Unlock()
+}
+
+func (s *Service) sweepPolicyPrunes(ctx context.Context, now time.Time, pol retention.Policy) {
+	if n, err := s.st.PruneHealth(ctx, now, pol.Duration(retention.CheckSamplesHours), pol.Duration(retention.CheckDailyDays), pol.Duration(retention.AlertsDays)); err != nil && ctx.Err() == nil {
+		s.log.Warn("health: prune", "code", "prune_health_failed", "err", err)
+	} else if n > 0 {
+		s.log.Info("health: pruned rows", "count", n)
+	}
+	if n, err := s.st.PruneEvents(ctx, now, pol.Duration(retention.EventsInfoDays), pol.Duration(retention.EventsWarnDays), eventBatch); err != nil && ctx.Err() == nil {
+		s.log.Warn("health: prune events", "code", "prune_events_failed", "err", err)
+	} else if n > 0 {
+		s.log.Info("health: pruned events", "count", n)
+	}
+	if n, err := s.st.PruneAudit(ctx, now.Add(-pol.Duration(retention.AuditDays)), eventBatch); err != nil && ctx.Err() == nil {
+		s.log.Warn("health: prune audit", "code", "prune_audit_failed", "err", err)
+	} else if n > 0 {
+		s.log.Info("health: pruned audit rows", "count", n)
+	}
+	if n, err := s.st.PruneNodeJournal(ctx, now.Add(-pol.Duration(retention.JournalDays))); err != nil && ctx.Err() == nil {
+		s.log.Warn("health: prune node journal", "code", "prune_node_journal_failed", "err", err)
+	} else if n > 0 {
+		s.log.Info("health: pruned node journal", "count", n)
+	}
+	if n, err := s.st.PruneNodeHostHours(ctx, now.Add(-pol.Duration(retention.HostHistoryDays))); err != nil && ctx.Err() == nil {
+		s.log.Warn("health: prune host load", "code", "prune_host_hours_failed", "err", err)
+	} else if n > 0 {
+		s.log.Info("health: pruned host load hours", "count", n)
+	}
+	if n, err := s.st.PruneTrafficBuckets(ctx, now.Add(-pol.Duration(retention.TrafficBucketDays))); err != nil && ctx.Err() == nil {
+		s.log.Warn("health: prune traffic buckets", "code", "prune_traffic_buckets_failed", "err", err)
+	} else if n > 0 {
+		s.log.Info("health: pruned traffic buckets", "count", n)
+	}
+	if n, err := s.st.PruneNodeTrafficHours(ctx, now.Add(-pol.Duration(retention.NodeTrafficHourDays))); err != nil && ctx.Err() == nil {
+		s.log.Warn("health: prune node traffic", "code", "prune_node_traffic_hours_failed", "err", err)
+	} else if n > 0 {
+		s.log.Info("health: pruned node traffic hours", "count", n)
+	}
+	if !s.cfg.Edge { // The edge edition rejects network stats, so these D1 deletes cannot remove any rows.
+		if n, err := s.st.PruneNetworkHours(ctx, now.Add(-pol.Duration(retention.NetworksDays))); err != nil && ctx.Err() == nil {
+			s.log.Warn("health: prune network counters", "code", "prune_network_hours_failed", "err", err)
+		} else if n > 0 {
+			s.log.Info("health: pruned network counter hours", "count", n)
+		}
+		if n, err := s.st.PruneUserNetworks(ctx, now.Add(-pol.Duration(retention.NetworksDays))); err != nil && ctx.Err() == nil {
+			s.log.Warn("health: prune recent networks", "code", "prune_user_networks_failed", "err", err)
+		} else if n > 0 {
+			s.log.Info("health: pruned recent networks", "count", n)
+		}
+	}
+}
+
+// retentionPolicy reads the owner's retention settings in one call. A read error means policy-driven prunes must wait.
+func (s *Service) retentionPolicy(ctx context.Context) (retention.Policy, error) {
+	stored, err := s.st.SettingValues(ctx, retention.Keys())
+	if err != nil {
+		return retention.Policy{}, err
+	}
+	return retention.Parse(stored), nil
 }

@@ -277,6 +277,17 @@ func TestRevokeAPITokenRacePreservesFirstRevocation(t *testing.T) {
 
 func rewriteAccessGroup(t *testing.T, s *Store, id, name string) {
 	t.Helper()
+	var hasShareColumn int
+	if err := s.R.QueryRowContext(context.Background(), `SELECT count(*) FROM pragma_table_info('node') WHERE name = 'hold_new_groups'`).Scan(&hasShareColumn); err != nil {
+		t.Fatal(err)
+	}
+	if hasShareColumn == 0 {
+		// These migration tests intentionally build an older schema and exercise the store only to seed a row.
+		if _, err := s.W.ExecContext(context.Background(), `INSERT INTO user_group (id, name, created_at, color) VALUES (?, ?, ?, 'lavender')`, id, name, unix(t0)); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
 	if err := s.Access().CreateGroup(context.Background(), AccessGroup{ID: id, Name: name, CreatedAt: t0}); err != nil {
 		t.Fatal(err)
 	}
@@ -287,6 +298,24 @@ func rewriteAccessUser(t *testing.T, s *Store, id, name, groupID string) {
 	u := AccessUser{ID: id, Name: name, GroupID: groupID, Status: "active", AppHapp: true, AppAmnezia: true,
 		AllNodes: true, QuotaReset: "month", PeriodStart: t0, DeviceLimit: 5, SubTokenHash: []byte(id + "-hash"),
 		SubTokenEnc: []byte("sealed"), CreatedAt: t0}
+	var hasTrustTunnelColumn int
+	if err := s.R.QueryRowContext(context.Background(), `SELECT count(*) FROM pragma_table_info('user') WHERE name = 'app_trusttunnel'`).Scan(&hasTrustTunnelColumn); err != nil {
+		t.Fatal(err)
+	}
+	if hasTrustTunnelColumn == 0 {
+		// These migration tests intentionally build an older schema and exercise the store only to seed a row.
+		_, err := s.W.ExecContext(context.Background(), `INSERT INTO user
+			(id, name, subscription_name, group_id, disabled, status, app_happ, app_amnezia, app_telegram, app_mistgate_off, all_nodes,
+			 quota_bytes, quota_reset, period_start, used_bytes, expires_at, device_limit, speed_limit_bps, device_speed_limit_bps,
+			 sub_token_hash, sub_token_enc, created_at, dns_preset_id)
+			VALUES (?, ?, ?, ?, 0, ?, 1, 1, 0, 0, 1, 0, ?, ?, 0, NULL, ?, 0, 0, ?, ?, ?, NULL)`,
+			u.ID, u.Name, u.SubscriptionName, u.GroupID, u.Status, u.QuotaReset, unix(u.PeriodStart), u.DeviceLimit,
+			u.SubTokenHash, u.SubTokenEnc, unix(u.CreatedAt))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
 	if err := s.Access().CreateUser(context.Background(), u, AccessDevice{}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -406,9 +435,10 @@ func TestUpdateUserRaceKeepsUniqueName(t *testing.T) {
 				results <- err
 				return
 			}
+			was := u
 			u.Name = "Shared"
 			<-start
-			results <- a.UpdateUser(ctx, u, false)
+			results <- a.UpdateUser(ctx, u, was, false, AccessGroupChange{})
 		}(id)
 	}
 	close(start)

@@ -11,6 +11,7 @@ import (
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
 	agentv1 "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/internal/agentcap"
 	"github.com/mistgate/mistgate/internal/panel/store"
 )
 
@@ -613,7 +614,7 @@ func TestUsersImpactedIsSuppressedByHeldActiveCheckFailed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d := e.s.derive(e.ctx, e.clock.Now(), sn, indexLiveRows(liveRows), rows, acceptsByNode(accepts), signals, portChecks, mustActiveAlerts(t, e))
+	d := e.s.derive(e.ctx, e.clock.Now(), sn, indexLiveRows(liveRows), rows, acceptsByNode(accepts), signals, portChecks, nil, mustActiveAlerts(t, e))
 	if !d.holdKeys[key{kCheckFailed, "de1", first}] {
 		t.Fatal("test did not leave CHECK_FAILED in the held state")
 	}
@@ -813,7 +814,7 @@ func TestNodeDownAndBlip(t *testing.T) {
 	want(t, e.active(), "doctor_warn/de1/disk_space")
 	_ = a
 
-	e.fl.set("de1", liveState{up: false, caps: []string{capDoctor}})
+	e.fl.set("de1", liveState{up: false, caps: []string{agentcap.Doctor}})
 	e.clock.Advance(5 * time.Minute) // a blip
 	e.evaluate()
 	want(t, e.active(), "doctor_warn/de1/disk_space")
@@ -826,7 +827,7 @@ func TestNodeDownAndBlip(t *testing.T) {
 		t.Fatalf("node_down: %+v", nd)
 	}
 
-	e.fl.set("de1", liveState{up: true, caps: []string{capDoctor}, lastSeen: e.clock.Now()})
+	e.fl.set("de1", liveState{up: true, caps: []string{agentcap.Doctor}, lastSeen: e.clock.Now()})
 	e.evaluate()
 	want(t, e.active(), "doctor_warn/de1/disk_space")
 	found := false
@@ -928,6 +929,34 @@ func TestCertExpiryFromDoctorNeverDuplicatesAsDoctorAlert(t *testing.T) {
 	}
 }
 
+// reality_target (doctor Ш5): a broken target is a doctor alert like any other, worded by the hint; a report of an agent
+// that does not have the check yet has no such row and raises nothing, and drops what an older report of a newer agent
+// raised, exactly as for every other check.
+func TestRealityTargetFromDoctor(t *testing.T) {
+	e := newEnv(t)
+	e.node("de1", "hetzner", true)
+	e.report("de1", false, res("disk_space", dOK, ""), res("resolver", dOK, "")) // an older agent: no such check
+	want(t, e.active())
+
+	e.report("de1", false, res("disk_space", dOK, ""), withCode(res("reality_target", dFail, "", "hint", "no_mlkem", "inbound_id", "inb_x", "target", "a.example.com:443", "server_name", "a.example.com"), "reality_target.no_mlkem"))
+	got := e.active()
+	want(t, got, "doctor_fail/de1/reality_target")
+	al := got["doctor_fail/de1/reality_target"]
+	if al.Severity != sevCritical || al.WhyKey != "health.doctor.reality_target.why.no_mlkem" || al.Params["target"] != "a.example.com:443" || al.Params["detail_code"] != "reality_target.no_mlkem" {
+		t.Fatalf("alert: %+v", al)
+	}
+
+	e.report("de1", false, res("reality_target", dWarn, "", "hint", "expiring", "days_left", "4"))
+	got = e.active()
+	want(t, got, "doctor_warn/de1/reality_target")
+	if got["doctor_warn/de1/reality_target"].WhyKey != "health.doctor.reality_target.why.expiring" || got["doctor_warn/de1/reality_target"].Severity != sevWarning {
+		t.Fatalf("alert: %+v", got["doctor_warn/de1/reality_target"])
+	}
+
+	e.report("de1", false, res("disk_space", dOK, "")) // the full report of an agent without the check replaces the rows
+	want(t, e.active())
+}
+
 func TestKernelHeadersIsInfoWithoutAmneziaWG(t *testing.T) {
 	e := newEnv(t)
 	e.node("de1", "hetzner", true)
@@ -952,6 +981,7 @@ func TestUnitGenerationSeverityTracksGuardAndTunUse(t *testing.T) {
 		{name: "generation two with userspace awg", gen: "2", more: []*agentv1.DoctorResult{res("awg_backend", dOK, "", "backend", "userspace")}, want: sevWarning},
 		{name: "generation two with userspace warp", gen: "2", more: []*agentv1.DoctorResult{res("warp_path", dOK, "", "backend", "userspace")}, want: sevWarning},
 		{name: "generation two with a tun failure", gen: "2", more: []*agentv1.DoctorResult{res("awg_backend", dFail, "", "hint", "unit_outdated")}, want: sevWarning},
+		{name: "current generation with userspace awg", gen: "3", more: []*agentv1.DoctorResult{res("awg_backend", dOK, "", "backend", "userspace")}, want: sevInfo},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := newEnv(t)
@@ -998,10 +1028,10 @@ func TestStaleDoctorReportHoldsItsAlerts(t *testing.T) {
 func TestStateDriftFollowsTheFleet(t *testing.T) {
 	e := newEnv(t)
 	e.node("de1", "hetzner", true)
-	e.fl.set("de1", liveState{up: true, caps: []string{capDoctor}, drift: true})
+	e.fl.set("de1", liveState{up: true, caps: []string{agentcap.Doctor}, drift: true})
 	e.evaluate()
 	want(t, e.active(), "state_drift/de1/")
-	e.fl.set("de1", liveState{up: true, caps: []string{capDoctor}})
+	e.fl.set("de1", liveState{up: true, caps: []string{agentcap.Doctor}})
 	e.evaluate()
 	want(t, e.active())
 }
@@ -1437,7 +1467,7 @@ func TestGuardSupersedesEarlierNodeAlerts(t *testing.T) {
 // The doctor list is shown in the order of agent.proto CHECK IDS, the L3 checks included; an id the panel does not
 // know yet goes after them.
 func TestDoctorRowsFollowTheCheckIDOrder(t *testing.T) {
-	ids := []string{"warp_path", "aa_new", "awg_backend", "kernel_headers", "disk_space"}
+	ids := []string{"reality_target", "warp_path", "aa_new", "awg_backend", "kernel_headers", "disk_space"}
 	rows := make([]store.DoctorRow, len(ids))
 	for i, id := range ids {
 		rows[i].CheckID = id
@@ -1447,7 +1477,7 @@ func TestDoctorRowsFollowTheCheckIDOrder(t *testing.T) {
 	for _, r := range rows {
 		got = append(got, r.CheckID)
 	}
-	if want := "disk_space kernel_headers awg_backend warp_path aa_new"; strings.Join(got, " ") != want {
+	if want := "disk_space kernel_headers awg_backend warp_path reality_target aa_new"; strings.Join(got, " ") != want {
 		t.Fatalf("order %v, want %s", got, want)
 	}
 }
@@ -1456,7 +1486,7 @@ func TestPortLossyAlertOpensForBadLatestInboundVerdict(t *testing.T) {
 	for _, tc := range []struct {
 		verdict string
 		got     uint32
-	}{{"lossy", 286}, {"broken", 100}} {
+	}{{"lossy", 143}, {"broken", 100}} {
 		t.Run(tc.verdict, func(t *testing.T) {
 			e := newEnv(t)
 			e.node("de1", "provider-a", true)
@@ -1465,7 +1495,7 @@ func TestPortLossyAlertOpensForBadLatestInboundVerdict(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			check := store.PortCheck{NodeID: node.ID, Address: node.Address, Port: 8443, Sent: 300, Got: tc.got,
+			check := store.PortCheck{NodeID: node.ID, Address: node.Address, Port: 8443, Sent: 150, Got: tc.got,
 				Verdict: tc.verdict, Sender: "panel", CheckedAt: e.clock.Now()}
 			if err := e.st.PutPortChecks(e.ctx, []store.PortCheck{check}); err != nil {
 				t.Fatal(err)
@@ -1474,10 +1504,51 @@ func TestPortLossyAlertOpensForBadLatestInboundVerdict(t *testing.T) {
 
 			alert, ok := e.active()["port_lossy/de1/"+inbound]
 			if !ok || alert.Severity != sevWarning || alert.WhyKey != "health.alert.port_lossy.why" ||
-				alert.Params["profile"] == "" || alert.Params["port"] != "8443" || alert.Params["sent"] != "300" ||
+				alert.Params["profile"] == "" || alert.Params["port"] != "8443" || alert.Params["sent"] != "150" ||
 				alert.Params["got"] != strconv.FormatUint(uint64(tc.got), 10) || alert.Params["sender"] != "panel" ||
 				alert.Params["checked_unix"] != strconv.FormatInt(check.CheckedAt.Unix(), 10) {
 				t.Fatalf("port_lossy alert = %+v, found %v", alert, ok)
+			}
+		})
+	}
+}
+
+func TestPortLossyAlertUsesLatestProtocolProbeForTheInbound(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		status    int
+		probeAge  time.Duration
+		wantAlert bool
+	}{
+		{name: "passed after port check", status: int(cOK), probeAge: time.Minute},
+		{name: "failed after port check", status: int(cFail), probeAge: time.Minute, wantAlert: true},
+		{name: "passed shortly before port check", status: int(cOK), probeAge: -5 * time.Minute},
+		{name: "passed long before port check", status: int(cOK), probeAge: -30 * time.Minute, wantAlert: true},
+		{name: "no stored result", wantAlert: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.node("de1", "provider-a", true)
+			inbound := e.inbound("de1", 8443)
+			node, err := e.st.Node(e.ctx, "de1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkedAt := e.clock.Now()
+			check := store.PortCheck{NodeID: node.ID, Address: node.Address, Port: 8443, Sent: 150, Got: 104,
+				Verdict: "broken", Sender: "panel", CheckedAt: checkedAt}
+			if err := e.st.PutPortChecks(e.ctx, []store.PortCheck{check}); err != nil {
+				t.Fatal(err)
+			}
+			if tc.status != 0 {
+				if err := e.st.InsertSample(e.ctx, store.CheckSample{InboundID: inbound, At: checkedAt.Add(tc.probeAge), Status: tc.status}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			e.evaluate()
+			_, got := e.active()["port_lossy/de1/"+inbound]
+			if got != tc.wantAlert {
+				t.Fatalf("port_lossy present = %v, want %v", got, tc.wantAlert)
 			}
 		})
 	}
@@ -1494,8 +1565,8 @@ func TestPortLossyAlertUsesEnabledInboundCurrentPorts(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := e.st.PutPortChecks(e.ctx, []store.PortCheck{
-		{NodeID: node.ID, Address: node.Address, Port: 8443, Sent: 300, Got: 100, Verdict: "broken", Sender: "panel", CheckedAt: e.clock.Now()},
-		{NodeID: node.ID, Address: node.Address, Port: 2053, Sent: 300, Got: 100, Verdict: "broken", Sender: "panel", CheckedAt: e.clock.Now()},
+		{NodeID: node.ID, Address: node.Address, Port: 8443, Sent: 150, Got: 100, Verdict: "broken", Sender: "panel", CheckedAt: e.clock.Now()},
+		{NodeID: node.ID, Address: node.Address, Port: 2053, Sent: 150, Got: 100, Verdict: "broken", Sender: "panel", CheckedAt: e.clock.Now()},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1515,7 +1586,7 @@ func TestPortLossyAlertResolvesOnCleanRecheckDespiteStickyBadAt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bad := store.PortCheck{NodeID: node.ID, Address: node.Address, Port: 8443, Sent: 300, Got: 100,
+	bad := store.PortCheck{NodeID: node.ID, Address: node.Address, Port: 8443, Sent: 150, Got: 100,
 		Verdict: "broken", Sender: "panel", CheckedAt: e.clock.Now()}
 	if err := e.st.PutPortChecks(e.ctx, []store.PortCheck{bad}); err != nil {
 		t.Fatal(err)
@@ -1525,7 +1596,7 @@ func TestPortLossyAlertResolvesOnCleanRecheckDespiteStickyBadAt(t *testing.T) {
 
 	e.clock.Advance(time.Minute)
 	clean := bad
-	clean.Got, clean.Verdict, clean.CheckedAt = 300, "ok", e.clock.Now()
+	clean.Got, clean.Verdict, clean.CheckedAt = 150, "ok", e.clock.Now()
 	if err := e.st.PutPortChecks(e.ctx, []store.PortCheck{clean}); err != nil {
 		t.Fatal(err)
 	}
@@ -1549,7 +1620,7 @@ func TestPortLossyAlertResolvesWhenInboundMovesPorts(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := e.st.PutPortChecks(e.ctx, []store.PortCheck{{NodeID: node.ID, Address: node.Address, Port: 8443,
-		Sent: 300, Got: 100, Verdict: "broken", Sender: "panel", CheckedAt: e.clock.Now()}}); err != nil {
+		Sent: 150, Got: 100, Verdict: "broken", Sender: "panel", CheckedAt: e.clock.Now()}}); err != nil {
 		t.Fatal(err)
 	}
 	e.evaluate()
@@ -1575,8 +1646,8 @@ func TestPortLossyAlertResolvesAndReopensWhenNewPortIsAlsoBad(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := e.st.PutPortChecks(e.ctx, []store.PortCheck{
-		{NodeID: node.ID, Address: node.Address, Port: 8443, Sent: 300, Got: 100, Verdict: "broken", Sender: "panel", CheckedAt: e.clock.Now()},
-		{NodeID: node.ID, Address: node.Address, Port: 2053, Sent: 300, Got: 100, Verdict: "broken", Sender: "panel", CheckedAt: e.clock.Now()},
+		{NodeID: node.ID, Address: node.Address, Port: 8443, Sent: 150, Got: 100, Verdict: "broken", Sender: "panel", CheckedAt: e.clock.Now()},
+		{NodeID: node.ID, Address: node.Address, Port: 2053, Sent: 150, Got: 100, Verdict: "broken", Sender: "panel", CheckedAt: e.clock.Now()},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1602,7 +1673,7 @@ func TestPortLossyAlertResolvesWhenNodeIsRetired(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := e.st.PutPortChecks(e.ctx, []store.PortCheck{{NodeID: node.ID, Address: node.Address, Port: 8443,
-		Sent: 300, Got: 100, Verdict: "broken", Sender: "panel", CheckedAt: e.clock.Now()}}); err != nil {
+		Sent: 150, Got: 100, Verdict: "broken", Sender: "panel", CheckedAt: e.clock.Now()}}); err != nil {
 		t.Fatal(err)
 	}
 	e.evaluate()
@@ -1631,7 +1702,7 @@ func TestPortLossyAlertResolvesWhenInboundIsDisabledOrRemoved(t *testing.T) {
 				t.Fatal(err)
 			}
 			if err := e.st.PutPortChecks(e.ctx, []store.PortCheck{{NodeID: node.ID, Address: node.Address, Port: 8443,
-				Sent: 300, Got: 100, Verdict: "broken", Sender: "panel", CheckedAt: e.clock.Now()}}); err != nil {
+				Sent: 150, Got: 100, Verdict: "broken", Sender: "panel", CheckedAt: e.clock.Now()}}); err != nil {
 				t.Fatal(err)
 			}
 			e.evaluate()
@@ -1662,12 +1733,101 @@ func TestPortLossyAlertCanCoexistWithClientEyeFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := e.st.PutPortChecks(e.ctx, []store.PortCheck{{NodeID: node.ID, Address: node.Address, Port: 8443,
-		Sent: 300, Got: 100, Verdict: "broken", Sender: "panel", CheckedAt: e.clock.Now()}}); err != nil {
+		Sent: 150, Got: 100, Verdict: "broken", Sender: "panel", CheckedAt: e.clock.Now()}}); err != nil {
 		t.Fatal(err)
 	}
 	e.fail(inbound, "timeout")
 	e.fail(inbound, "timeout")
 	want(t, e.active(), "check_failed/de1/"+inbound, "port_lossy/de1/"+inbound)
+}
+
+func TestPortLossyAlertExplainsConfirmedRun(t *testing.T) {
+	e := newEnv(t)
+	e.node("alice", "provider-a", true)
+	e.node("bob", "provider-b", true)
+	e.node("nl1", "provider-c", true)
+	inbound := e.inbound("nl1", 8443)
+	node, err := e.st.Node(e.ctx, "nl1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := store.PortCheck{NodeID: node.ID, Address: node.Address, Port: 8443, Sent: 150, Got: 140,
+		Verdict: "lossy", Sender: "alice", SenderVerdict: "lossy", ConfirmSender: "bob", ConfirmSent: 150,
+		ConfirmGot: 150, ConfirmVerdict: "ok", CheckedAt: e.clock.Now()}
+	if err := e.st.PutPortChecks(e.ctx, []store.PortCheck{check}); err != nil {
+		t.Fatal(err)
+	}
+	e.evaluate()
+	alert, ok := e.active()["port_lossy/nl1/"+inbound]
+	if !ok || alert.WhyKey != "health.alert.port_lossy.why.confirmed" || alert.Params["confirm_sender"] != "bob" ||
+		alert.Params["confirm_got"] != "150" || alert.Params["confirm_sent"] != "150" {
+		t.Fatalf("confirmed port alert = %+v, found=%v", alert, ok)
+	}
+}
+
+func TestPathLossyAlertOpensAndResolvesFromItsStoredRow(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		gone bool
+	}{
+		{name: "row removed", gone: true},
+		{name: "older than 30 hours"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.node("minsk1", "provider-a", true)
+			e.node("nl1", "provider-b", true)
+			e.node("de1", "provider-c", true)
+			senderID, targetID, otherID := "minsk1", "nl1", "de1"
+			e.exec(`UPDATE node SET country_code = 'BY' WHERE id = ?`, senderID)
+			e.exec(`UPDATE node SET country_code = 'NL' WHERE id = ?`, targetID)
+			e.exec(`UPDATE node SET country_code = 'DE' WHERE id = ?`, otherID)
+			checked := e.clock.Now()
+			loss := store.UDPPathLoss{SenderID: senderID, TargetID: targetID, Ports: "2053, 2083", Sent: 150, Got: 118,
+				OtherSenderID: otherID, OtherGot: 150, CheckedAt: checked}
+			if err := e.st.UpdateUDPPathLosses(e.ctx, targetID, []string{senderID, otherID}, []store.UDPPathLoss{loss}); err != nil {
+				t.Fatal(err)
+			}
+			e.evaluate()
+			alert, ok := e.active()["path_lossy/"+senderID+"/"+targetID]
+			if !ok || alert.Severity != sevWarning || alert.TitleKey != "health.alert.path_lossy.title" ||
+				alert.WhyKey != "health.alert.path_lossy.why" || alert.Params["node"] != "minsk1" || alert.Params["target"] != "nl1" ||
+				alert.Params["target_id"] != targetID || alert.Params["ports"] != "2053, 2083" || alert.Params["region"] != "cis" ||
+				alert.Params["other_region"] != "other" {
+				t.Fatalf("path-loss alert = %+v, found=%v", alert, ok)
+			}
+			response, err := (rpc{e.s}).ListAlerts(e.ctx, req(&adminv1.ListAlertsRequest{}))
+			var pathAlert *adminv1.Alert
+			if err == nil {
+				for _, candidate := range response.Msg.Active {
+					if candidate.GetKind() == adminv1.AlertKind_ALERT_KIND_PATH_LOSSY {
+						pathAlert = candidate
+						break
+					}
+				}
+			}
+			if err != nil || pathAlert == nil || strings.Join(pathAlert.GetActions(), ",") != "open_node,mute" {
+				t.Fatalf("path-loss alert actions = %+v, %v", response, err)
+			}
+			if tc.gone {
+				if err := e.st.UpdateUDPPathLosses(e.ctx, targetID, []string{senderID, otherID}, nil); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				loss.CheckedAt = e.clock.Now().Add(-31 * time.Hour)
+				if err := e.st.UpdateUDPPathLosses(e.ctx, targetID, []string{senderID, otherID}, []store.UDPPathLoss{loss}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			e.evaluate()
+			if _, ok := e.active()["path_lossy/"+senderID+"/"+targetID]; ok {
+				t.Fatal("path-loss alert stayed open after its row was removed or aged out")
+			}
+			if history := e.history(); len(history) == 0 || history[0].Resolution != "cleared" {
+				t.Fatalf("path-loss alert history = %+v", history)
+			}
+		})
+	}
 }
 
 // A profile the node could not start (state failed) is not probed, but its open check_failed alert must not end as
@@ -1785,7 +1945,7 @@ func TestPanelOutageIsOneAlertNotNodeDownEverywhere(t *testing.T) {
 	}
 	silent := e.clock.Now()
 	for _, id := range ids {
-		e.fl.set(id, liveState{up: false, caps: []string{capDoctor}, lastSeen: silent})
+		e.fl.set(id, liveState{up: false, caps: []string{agentcap.Doctor}, lastSeen: silent})
 	}
 	e.clock.Advance(11 * time.Minute)
 	e.evaluate()
@@ -1798,7 +1958,7 @@ func TestPanelOutageIsOneAlertNotNodeDownEverywhere(t *testing.T) {
 
 	// the link is back: the panel alert ends, no node was ever reported down
 	for _, id := range ids {
-		e.fl.set(id, liveState{up: true, caps: []string{capDoctor}, lastSeen: e.clock.Now()})
+		e.fl.set(id, liveState{up: true, caps: []string{agentcap.Doctor}, lastSeen: e.clock.Now()})
 	}
 	e.evaluate()
 	want(t, e.active())
@@ -1813,7 +1973,7 @@ func TestSilentNodesStayNodeDownWhenTheyAreNotMostOfTheFleet(t *testing.T) {
 	}
 	silent := e.clock.Now()
 	for _, id := range ids[:3] { // 3 providers, but 3 of 5 nodes
-		e.fl.set(id, liveState{up: false, caps: []string{capDoctor}, lastSeen: silent})
+		e.fl.set(id, liveState{up: false, caps: []string{agentcap.Doctor}, lastSeen: silent})
 	}
 	e.clock.Advance(11 * time.Minute)
 	e.evaluate()
@@ -1870,6 +2030,7 @@ func TestDoctorSkipThatCannotJudgeYetKeepsTheAlert(t *testing.T) {
 		keep bool
 	}{
 		{"cpu_softirq.collecting", true},
+		{"cpu_steal.collecting", true},
 		{"dstate_tasks.interrupted", true},
 		{"skip.timeout", true},
 		{"skip.internal", true},
@@ -1877,12 +2038,16 @@ func TestDoctorSkipThatCannotJudgeYetKeepsTheAlert(t *testing.T) {
 		{"ipv6.disabled", false},
 	} {
 		t.Run(tc.code, func(t *testing.T) {
+			check, _, _ := strings.Cut(tc.code, ".")
+			if check == "skip" || check == "ipv6" || check == "dstate_tasks" {
+				check = "cpu_softirq"
+			}
 			e := newEnv(t)
 			e.node("de1", "hetzner", true)
-			e.report("de1", false, res("cpu_softirq", dWarn, "", "softirq_pct", "62"), res("disk_space", dOK, ""))
-			want(t, e.active(), "doctor_warn/de1/cpu_softirq")
-			e.report("de1", false, withCode(res("cpu_softirq", dSkip, ""), tc.code), res("disk_space", dOK, ""))
-			if _, open := e.active()["doctor_warn/de1/cpu_softirq"]; open != tc.keep {
+			e.report("de1", false, res(check, dWarn, "", "softirq_pct", "62"), res("disk_space", dOK, ""))
+			want(t, e.active(), "doctor_warn/de1/"+check)
+			e.report("de1", false, withCode(res(check, dSkip, ""), tc.code), res("disk_space", dOK, ""))
+			if _, open := e.active()["doctor_warn/de1/"+check]; open != tc.keep {
 				t.Errorf("skip %q: alert open = %v, want %v", tc.code, open, tc.keep)
 			}
 		})
@@ -1920,5 +2085,230 @@ func TestMutedAlertReopensWithItsMute(t *testing.T) {
 	last := seen[len(seen)-1]
 	if last.Resolved || !last.Alert.MutedUntil.After(e.clock.Now()) {
 		t.Fatalf("expected a re-open that carries the mute, got %+v", last)
+	}
+}
+
+// A closed alert stays closed while its condition holds: no new alert, no transition, no event. After the problem has gone
+// for longer than the re-open window and comes back, it alerts again.
+func TestDismissedAlertStaysClosedUntilTheProblemStops(t *testing.T) {
+	var seen []Transition
+	e := newEnv(t, func(c *Config) { c.OnTransition = func(tr Transition) { seen = append(seen, tr) } })
+	e.node("de1", "hetzner", true)
+	a := e.inbound("de1", 443)
+	b := e.inbound("de1", 8443)
+	e.pass(a)
+	e.fail(b, "timeout")
+	e.fail(b, "timeout")
+	al := e.active()["check_failed/de1/"+b]
+	if al.ID == "" {
+		t.Fatal("no alert opened")
+	}
+	if _, err := e.st.DismissAlert(e.ctx, al.ID, e.clock.Now()); err != nil {
+		t.Fatal(err)
+	}
+	seen = nil
+	events := len(e.events("de1"))
+	for range 4 {
+		e.clock.Advance(10 * time.Minute)
+		e.fail(b, "timeout")
+	}
+	want(t, e.active())
+	if len(seen) != 0 || len(e.events("de1")) != events {
+		t.Fatalf("a closed alert announced: transitions=%+v events=%d (was %d)", seen, len(e.events("de1")), events)
+	}
+	if h := e.history(); len(h) != 1 || h[0].ID != al.ID || h[0].Resolution != "dismissed" {
+		t.Fatalf("history = %+v", h)
+	}
+	// the problem stops, and returns after more than the re-open window
+	e.pass(b)
+	e.clock.Advance(2 * time.Hour)
+	e.fail(b, "timeout")
+	e.fail(b, "timeout")
+	now := e.active()["check_failed/de1/"+b]
+	if now.ID == "" || now.ID == al.ID {
+		t.Fatalf("no new alert after the problem returned: %+v", now)
+	}
+	if len(seen) == 0 || seen[len(seen)-1].Resolved {
+		t.Fatalf("the new alert was not announced: %+v", seen)
+	}
+}
+
+// A node_down alert says how busy the node was when it went silent, and keeps those numbers while the silence goes on.
+func TestNodeDownAlertCarriesTheTrafficOfItsOpening(t *testing.T) {
+	e := newEnv(t)
+	e.node("node-a", "provider", false)
+	now := e.clock.Now()
+	stale := now.Add(-2 * time.Hour)
+	e.exec(`UPDATE node SET last_seen_at = ?, last_connected_at = ? WHERE id = 'node-a'`, stale.Unix(), stale.Unix())
+	e.fl.set("node-a", liveState{lastSeen: stale})
+	hour := now.Truncate(time.Hour).Unix()
+	e.exec(`INSERT INTO node_traffic_hour (node_id, protocol, hour_start, bytes_up, bytes_down) VALUES
+		('node-a', 'vless', ?, 100, 200), ('node-a', 'vless', ?, 1000, 2000), ('node-a', 'vless', ?, 10000, 20000)`,
+		hour-3*3600, hour-30*3600, hour-200*3600)
+
+	e.evaluate()
+	got := e.active()["node_down/node-a/"]
+	if got.Kind != kNodeDown || got.Params[paramTraffic24h] != "300" || got.Params[paramTraffic7d] != "3300" {
+		t.Fatalf("node_down alert params = %v, want traffic_24h_bytes 300 and traffic_7d_bytes 3300", got.Params)
+	}
+
+	// hours pass and more traffic is recorded: the alert keeps the numbers of its opening
+	e.clock.Advance(30 * time.Hour)
+	e.exec(`INSERT INTO node_traffic_hour (node_id, protocol, hour_start, bytes_up, bytes_down) VALUES ('node-a', 'vless', ?, 50, 50)`, hour+3600)
+	e.evaluate()
+	got = e.active()["node_down/node-a/"]
+	if got.Params[paramTraffic24h] != "300" || got.Params[paramTraffic7d] != "3300" {
+		t.Fatalf("node_down alert params after 30 hours = %v, want the numbers of its opening", got.Params)
+	}
+}
+
+// Only the alerts that say a node is silent or cut off from a country get the numbers; an alert of another kind, and one
+// that no node owns (the panel's own link), do not.
+func TestTrafficVolumeIsOnlyForTheNodeAlertsItNames(t *testing.T) {
+	e := newEnv(t)
+	e.node("node-a", "provider", false)
+	hour := e.clock.Now().Truncate(time.Hour).Unix()
+	e.exec(`INSERT INTO node_traffic_hour (node_id, protocol, hour_start, bytes_up, bytes_down) VALUES ('node-a', 'vless', ?, 7, 8)`, hour)
+	d := &derived{conds: map[key]cond{}}
+	for _, k := range []key{{kCountryBlocked, "node-a", ""}, {kCountryBlocked, "node-a", "partial"}, {kCheckFailed, "node-a", "inb"}, {kNodeDown, "", panelLinkSubject}} {
+		d.conds[k] = cond{key: k, params: map[string]string{"node": "de1"}}
+	}
+	e.s.withTrafficVolume(e.ctx, e.clock.Now(), d, nil)
+	for k, c := range d.conds {
+		has := c.params[paramTraffic24h] == "15" && c.params[paramTraffic7d] == "15"
+		if want := k.kind == kCountryBlocked; has != want || c.params["node"] != "de1" {
+			t.Errorf("%v: params %v, traffic numbers wanted %v", k, c.params, want)
+		}
+	}
+}
+
+// putPortCheck stores the latest UDP delivery check of a node port as of the test clock.
+func (e *env) putPortCheck(node string, port uint16, verdict, sender string) {
+	e.t.Helper()
+	got := uint32(150)
+	if verdict != "ok" {
+		got = 100
+	}
+	check := store.PortCheck{NodeID: node, Address: node + ".example.com", Port: port, Sent: 150, Got: got, Verdict: verdict, Sender: sender, CheckedAt: e.clock.Now()}
+	if err := e.st.PutPortChecks(e.ctx, []store.PortCheck{check}); err != nil {
+		e.t.Fatal(err)
+	}
+}
+
+// A UDP timeout is the panel's own path when a clean delivery check from another node reached the port after the series
+// of failures began; an older, lossy or panel-sent check says nothing, and the old diagnosis stays.
+func TestUDPTimeoutIsThePanelsPathWhenAnotherNodeReachesThePort(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		before       bool // the check is taken before the first failed round
+		verdict, who string
+		why          string
+		severity     int
+	}{
+		{"clean check from another node after the series began", false, "ok", "nl1", "panel_udp_path", sevWarning},
+		{"clean check older than the series", true, "ok", "nl1", "udp_blocked", sevCritical},
+		{"lossy check after the series began", false, "lossy", "nl1", "udp_blocked", sevCritical},
+		{"clean check sent by the panel", false, "ok", "panel", "udp_blocked", sevCritical},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.node("de1", "hetzner", true)
+			e.node("nl1", "ovh", true)
+			a, v := e.inbound("de1", 8443), e.vlessInbound("de1", 443) // a is the only hy2 inbound of the node
+			e.pass(a)
+			e.pass(v)
+			if tc.before {
+				e.putPortCheck("de1", 8443, tc.verdict, tc.who)
+			}
+			e.clock.Advance(time.Minute)
+			e.fail(a, "timeout")
+			if !tc.before {
+				e.putPortCheck("de1", 8443, tc.verdict, tc.who)
+			}
+			e.fail(a, "timeout")
+			// a lossy check also opens its own port_lossy alert; only check_failed is judged here
+			al, ok := e.active()["check_failed/de1/"+a]
+			if !ok || al.WhyKey != "health.alert.check_failed.why."+tc.why || al.Severity != tc.severity {
+				t.Fatalf("alert (found %v): why %s severity %d, want %s %d", ok, al.WhyKey, al.Severity, tc.why, tc.severity)
+			}
+		})
+	}
+}
+
+// Every UDP profile of a node timing out is no_traffic and udp_all_blocked until other nodes' clean checks reach all
+// of its ports: then it is one warning per profile about the panel's path, and the node is not "without traffic".
+func TestAllUDPTimeoutsWithCleanPortChecksAreThePanelsPath(t *testing.T) {
+	for _, bothClean := range []bool{true, false} {
+		e := newEnv(t)
+		e.node("de1", "hetzner", true)
+		e.node("nl1", "ovh", true)
+		a, b := e.inbound("de1", 443), e.inbound("de1", 8443)
+		e.fail(a, "timeout")
+		e.fail(b, "timeout")
+		e.putPortCheck("de1", 443, "ok", "nl1")
+		if bothClean {
+			e.putPortCheck("de1", 8443, "ok", "nl1")
+		} else {
+			e.putPortCheck("de1", 8443, "lossy", "nl1")
+		}
+		e.fail(a, "timeout")
+		e.fail(b, "timeout")
+		got := e.active()
+		if !bothClean {
+			if nt := got["no_traffic/de1/"]; nt.WhyKey != "health.alert.no_traffic.why.udp_all_blocked" || nt.Severity != sevCritical {
+				t.Fatalf("one port without a clean check: %+v", nt)
+			}
+			continue
+		}
+		want(t, got, "check_failed/de1/"+a, "check_failed/de1/"+b)
+		for _, in := range []string{a, b} {
+			if al := got["check_failed/de1/"+in]; al.WhyKey != "health.alert.check_failed.why.panel_udp_path" || al.Severity != sevWarning {
+				t.Fatalf("%s: %+v", in, al)
+			}
+		}
+		if noTraffic, _, _, _ := e.s.NodeHealth("de1"); noTraffic {
+			t.Fatal("node marked without traffic")
+		}
+	}
+}
+
+// A series of UDP timeouts without a fresh clean check asks for one delivery check of the node, at most once an hour.
+func TestUDPTimeoutsAskForOneDeliveryCheckAnHour(t *testing.T) {
+	e := newEnv(t)
+	e.node("de1", "hetzner", true)
+	calls := make(chan string, 10)
+	e.s.cfg.CheckPortsUDP = func(_ context.Context, node string, _ []uint16) ([]store.PortCheck, string, string) {
+		calls <- node
+		return nil, "", ""
+	}
+	a := e.inbound("de1", 8443)
+	e.fail(a, "timeout")
+	select {
+	case node := <-calls:
+		t.Fatalf("asked for a check after one failed round: %s", node)
+	case <-time.After(50 * time.Millisecond):
+	}
+	e.fail(a, "timeout")
+	select {
+	case node := <-calls:
+		if node != "de1" {
+			t.Fatalf("check of %s", node)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no delivery check was asked for")
+	}
+	e.fail(a, "timeout")
+	e.fail(a, "timeout")
+	select {
+	case node := <-calls:
+		t.Fatalf("second check inside the hour: %s", node)
+	case <-time.After(100 * time.Millisecond):
+	}
+	e.clock.Advance(61 * time.Minute)
+	e.fail(a, "timeout")
+	select {
+	case <-calls:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no delivery check an hour later")
 	}
 }

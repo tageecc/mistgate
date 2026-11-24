@@ -224,7 +224,7 @@ func TestLinkHandshakeRefusals(t *testing.T) {
 		})
 	})
 	t.Run("unknown node", func(t *testing.T) {
-		assertLinkRefused(t, e, server.URL, "node_unknown", a, func(ch *agentv1.LinkChallenge) (string, []byte) {
+		assertLinkRefused(t, e, server.URL, "nod_aaaaaaaaaaaaaaaaaaaaaaaaaa", a, func(ch *agentv1.LinkChallenge) (string, []byte) {
 			return ch.Audience, ch.Nonce
 		})
 	})
@@ -356,14 +356,31 @@ func TestLinkAcceptStep(t *testing.T) {
 		return b
 	}
 	agentNonce := bytes.Repeat([]byte{7}, 32)
-	pc, accept, ok := e.f.linkAccept(e.ctx, a.nodeID, audience, nonce, auth(a.nodeID, a.key, agentNonce))
-	if !ok || pc.serial != a.leaf.SerialNumber.Text(16) {
-		t.Fatalf("linkAccept refused the node's own proof: ok=%v serial=%q", ok, pc.serial)
+	pc, accept, keys, ok := e.f.linkAccept(e.ctx, a.nodeID, audience, nonce, auth(a.nodeID, a.key, agentNonce))
+	if !ok || pc.serial != a.leaf.SerialNumber.Text(16) || keys != nil {
+		t.Fatalf("linkAccept of an older agent's proof: ok=%v serial=%q sealed=%v", ok, pc.serial, keys != nil)
 	}
 	var accepted agentv1.LinkAccept
 	caKey := e.f.ca.cert.PublicKey.(*ecdsa.PublicKey)
 	if err := proto.Unmarshal(accept, &accepted); err != nil || !agentlink.Verify(caKey, agentlink.PanelDigest(a.nodeID, audience, nonce, agentNonce), accepted.Signature) {
 		t.Fatalf("accept frame does not verify with the CA: %v", err)
+	}
+
+	// A new agent asks for sealing in its nonce: the panel signs the sealed digest only, and both ends derive the same keys.
+	sealNonce, err := agentlink.SealNonce()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, accept, keys, ok = e.f.linkAccept(e.ctx, a.nodeID, audience, nonce, auth(a.nodeID, a.key, sealNonce))
+	if !ok || keys == nil || proto.Unmarshal(accept, &accepted) != nil {
+		t.Fatalf("linkAccept of a sealing agent: ok=%v sealed=%v", ok, keys != nil)
+	}
+	if !agentlink.Verify(caKey, agentlink.SealedPanelDigest(a.nodeID, audience, nonce, sealNonce), accepted.Signature) ||
+		agentlink.Verify(caKey, agentlink.PanelDigest(a.nodeID, audience, nonce, sealNonce), accepted.Signature) {
+		t.Fatal("a sealed accept must verify as sealed and only as sealed")
+	}
+	if agentKeys, err := agentlink.SealKeys(a.key, caKey, a.nodeID, audience, nonce, sealNonce); err != nil || !bytes.Equal(agentKeys, keys) {
+		t.Fatalf("the agent derives other keys: %v", err)
 	}
 	for name, authFrame := range map[string][]byte{
 		"wrong key":      auth(a.nodeID, other.key, agentNonce),
@@ -372,13 +389,14 @@ func TestLinkAcceptStep(t *testing.T) {
 		"long nonce":     auth(a.nodeID, a.key, append(bytes.Clone(agentNonce), 0)),
 		"not a LinkAuth": {0xff, 0xff},
 	} {
-		if _, f, ok := e.f.linkAccept(e.ctx, a.nodeID, audience, nonce, authFrame); ok || f != nil {
+		if _, f, _, ok := e.f.linkAccept(e.ctx, a.nodeID, audience, nonce, authFrame); ok || f != nil {
 			t.Errorf("%s: linkAccept accepted", name)
 		}
 	}
 }
 
 func TestLinkMarker(t *testing.T) {
+	const nodeID = "nod_aaaaaaaaaaaaaaaaaaaaaaaaaa"
 	serve := func(method, path, upgrade string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(method, path, nil)
 		if upgrade != "" {
@@ -388,16 +406,17 @@ func TestLinkMarker(t *testing.T) {
 		LinkMarker().ServeHTTP(w, r)
 		return w
 	}
-	if w := serve(http.MethodGet, "/link/nod_x", "websocket"); w.Code != http.StatusNoContent || w.Header().Get(LinkMarkerHeader) != "nod_x" {
+	if w := serve(http.MethodGet, "/link/"+nodeID, "websocket"); w.Code != http.StatusNoContent || w.Header().Get(LinkMarkerHeader) != nodeID {
 		t.Fatalf("upgrade: status %d, header %q", w.Code, w.Header().Get(LinkMarkerHeader))
 	}
 	for name, w := range map[string]*httptest.ResponseRecorder{
-		"no upgrade":     serve(http.MethodGet, "/link/nod_x", ""),
-		"POST":           serve(http.MethodPost, "/link/nod_x", "websocket"),
-		"other path":     serve(http.MethodGet, "/other/nod_x", "websocket"),
+		"no upgrade":     serve(http.MethodGet, "/link/"+nodeID, ""),
+		"POST":           serve(http.MethodPost, "/link/"+nodeID, "websocket"),
+		"other path":     serve(http.MethodGet, "/other/"+nodeID, "websocket"),
 		"nested id":      serve(http.MethodGet, "/link/a/b", "websocket"),
 		"empty id":       serve(http.MethodGet, "/link/", "websocket"),
-		"other protocol": serve(http.MethodGet, "/link/nod_x", "h2c"),
+		"malformed id":   serve(http.MethodGet, "/link/nod_fabricated", "websocket"),
+		"other protocol": serve(http.MethodGet, "/link/"+nodeID, "h2c"),
 	} {
 		if w.Code != http.StatusNotFound || w.Header().Get(LinkMarkerHeader) != "" {
 			t.Errorf("%s: status %d, header %q", name, w.Code, w.Header().Get(LinkMarkerHeader))

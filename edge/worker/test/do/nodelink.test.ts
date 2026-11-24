@@ -131,6 +131,17 @@ describe("NodeLink handshake", () => {
     }
   });
 
+  it("hands the seal keys of the accept to the open step as they are, and stores none of them itself", async () => {
+    const seal = new Uint8Array(64).fill(5);
+    const fake = script({ accept: () => ({ ok: true, frame: text("accept"), certSerial: "c1", certNotAfterUnix: 2_000_000_000, seal }) });
+    const id = newNode();
+    await login(id);
+    const opened = (steps(fake)[0]?.args as LinkStepIn).event as { kind: string; seal?: Uint8Array };
+    expect(opened.kind).toBe("open");
+    expect([...(opened.seal ?? [])]).toEqual([...seal]);
+    expect((await keysOf(id)).sort()).toEqual(["gen", "live", "state"]);
+  });
+
   it("completes the close handshake when the agent closes", async () => {
     const fake = script();
     const c = await login(newNode());
@@ -727,7 +738,8 @@ describe("the front door forward", () => {
 
   it("hands a 204 + marker answer's upgrade to the node's object, which takes its node id from its name, not from the client", async () => {
     const fake = script();
-    const res = await fetchFront("https://panel.test/p/link/nod_front", { headers: { Upgrade: "websocket", "X-Mistgate-Link": "nod_other" } });
+    const nodeId = `nod_${"a".repeat(26)}`;
+    const res = await fetchFront(`https://panel.test/p/link/${nodeId}`, { headers: { Upgrade: "websocket", "X-Mistgate-Link": `nod_${"b".repeat(26)}` } });
     expect(res.status).toBe(101);
     expect(res.headers.get("x-mistgate-link")).toBeNull();
     const c = new Client(res.webSocket!);
@@ -737,7 +749,7 @@ describe("the front door forward", () => {
     expect(fake.calls.find((x) => x.op === "challenge")?.args).toEqual({ audience: "panel.test" }); // not calls[0]: an earlier test's late closed step can come first
     c.send("auth");
     await c.until(() => fake.calls.some((x) => x.op === "accept"), "the accept call");
-    expect(fake.calls.find((x) => x.op === "accept")?.args).toMatchObject({ nodeId: "nod_front" }); // not the client's nod_other
+    expect(fake.calls.find((x) => x.op === "accept")?.args).toMatchObject({ nodeId }); // not the client's node id
   });
 
   it("leaves every other panel answer alone", async () => {

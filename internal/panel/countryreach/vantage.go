@@ -22,11 +22,16 @@ type Vantage struct {
 	ASN       string `json:"asn,omitempty"`
 	Kind      string `json:"kind,omitempty"`
 	State     string `json:"state"`
+	At        int64  `json:"at,omitempty"`
+	Why       string `json:"why,omitempty"`
 	DPIHop    int    `json:"dpi_hop,omitempty"`
 	TargetHop int    `json:"target_hop,omitempty"`
 	ICMPOK    bool   `json:"icmp_ok,omitempty"`
 	TCPOK     bool   `json:"tcp_ok,omitempty"`
 	TLS       bool   `json:"tls,omitempty"`
+	// ProbeName and Port are an own probe's: the name the owner gave it, and the port of the node's target the reason (Why) comes from.
+	ProbeName string `json:"probe_name,omitempty"`
+	Port      uint16 `json:"port,omitempty"`
 }
 
 // ExtDetail is the source-neutral JSON stored with an external check.

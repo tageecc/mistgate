@@ -1,10 +1,13 @@
 package fleet
 
 import (
+	"errors"
 	"math"
+	"sort"
 	"time"
 
 	agentv1 "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/internal/agentcap"
 	"github.com/mistgate/mistgate/internal/logscrub"
 	"github.com/mistgate/mistgate/internal/panel/store"
 )
@@ -17,16 +20,21 @@ const (
 	// believed to be longer than that.
 	maxBatchSpan = time.Hour
 	// rejectEventEvery limits the stats_rejected events of one stream (the table has no retention).
-	rejectEventEvery = time.Minute
+	rejectEventEvery       = time.Minute
+	statsPoisonRetryWindow = 5 * time.Minute
 )
 
 // guardedStats is a StatsBatch after the sanity checks.
 type guardedStats struct {
-	traffic  []store.FleetTraffic
-	links    []store.FleetLink // connection counters, at most maxStatsDeltas rows
-	journal  []store.FleetJournal
-	rejected int    // deltas dropped
-	reason   string // why, for the event; "" when nothing was dropped
+	traffic          []store.FleetTraffic
+	links            []store.FleetLink // connection counters, at most maxStatsDeltas rows
+	networks         []store.FleetNetwork
+	personNetworks   []store.FleetPersonNetwork
+	networksDBSHA256 string
+	journal          []store.FleetJournal
+	rejected         int           // deltas dropped
+	reason           string        // why, for the event; "" when nothing was dropped
+	creditedSpan     time.Duration // creditedSpan is the panel-time credit charged if the store accepts this batch.
 }
 
 // guardStats checks the numbers of a batch before they reach used_bytes. A node is trusted with its own
@@ -38,23 +46,43 @@ type guardedStats struct {
 //   - repeated (credential, inbound) pairs are added with saturation before they are judged.
 //
 // The sessions, health and metrics of the batch are not affected, and the stream goes on.
-func (f *Fleet) guardStats(st *agentv1.StatsBatch) guardedStats {
-	elapsed := time.Duration(st.IntervalEndUnix-st.IntervalStartUnix) * time.Second
-	elapsed = min(max(elapsed, time.Second), maxBatchSpan)
+func (f *Fleet) guardStatsForSession(st *agentv1.StatsBatch, streamCaps []string, available time.Duration) guardedStats {
+	span := min(claimedStatsSpan(st), max(available, time.Duration(0)))
+	guarded := f.guardStatsElapsed(st, streamCaps, span)
+	guarded.creditedSpan = span
+	return guarded
+}
+
+func claimedStatsSpan(st *agentv1.StatsBatch) time.Duration {
+	if st.IntervalEndUnix <= st.IntervalStartUnix {
+		return time.Second
+	}
+	// Unsigned subtraction preserves the positive difference even when the supplied endpoints cross zero.
+	seconds := uint64(st.IntervalEndUnix) - uint64(st.IntervalStartUnix)
+	if seconds > uint64(maxBatchSpan/time.Second) {
+		return maxBatchSpan
+	}
+	return time.Duration(max(seconds, uint64(1))) * time.Second
+}
+
+func (f *Fleet) guardStatsElapsed(st *agentv1.StatsBatch, streamCaps []string, elapsed time.Duration) guardedStats {
+	elapsed = min(max(elapsed, 0), maxBatchSpan)
 	rate := f.cfg.MaxNodeBytesPerSec
 	if rate == 0 {
 		rate = defaultMaxNodeBytesPerSec
 	}
-	budget := satMul(rate, uint64(elapsed/time.Second))
+	budget := satMulDuration(rate, elapsed)
 
 	links := f.guardLinks(st)
+	networks, personNetworks, networksDBSHA256 := f.guardNetworks(st, streamCaps)
 	journal := f.guardJournal(st)
 	if len(st.Traffic) > maxStatsDeltas {
-		return guardedStats{links: links, journal: journal, rejected: len(st.Traffic), reason: "too_many_deltas"}
+		return guardedStats{links: links, networks: networks, personNetworks: personNetworks, networksDBSHA256: networksDBSHA256,
+			journal: journal, rejected: len(st.Traffic), reason: "too_many_deltas"}
 	}
 	type key struct{ cred, inbound string }
 	at := map[key]int{}
-	out := guardedStats{links: links, journal: journal}
+	out := guardedStats{links: links, networks: networks, personNetworks: personNetworks, networksDBSHA256: networksDBSHA256, journal: journal}
 	for _, d := range st.Traffic {
 		k := key{d.CredId, d.InboundId}
 		i, dup := at[k]
@@ -79,9 +107,111 @@ func (f *Fleet) guardStats(st *agentv1.StatsBatch) guardedStats {
 	}
 	out.traffic = kept
 	if total > budget {
-		return guardedStats{links: links, journal: journal, rejected: len(st.Traffic), reason: "batch_over_limit"}
+		return guardedStats{links: links, networks: networks, personNetworks: personNetworks, networksDBSHA256: networksDBSHA256,
+			journal: journal, rejected: len(st.Traffic), reason: "batch_over_limit"}
 	}
 	return out
+}
+
+func satMulDuration(rate uint64, elapsed time.Duration) uint64 {
+	if elapsed <= 0 {
+		return 0
+	}
+	nanosPerSecond := uint64(time.Second)
+	seconds := uint64(elapsed / time.Second)
+	remainder := uint64(elapsed % time.Second)
+	whole := satMul(rate, seconds)
+	frac := satAdd(satMul(rate/nanosPerSecond, remainder), (rate%nanosPerSecond)*remainder/nanosPerSecond)
+	return satAdd(whole, frac)
+}
+
+// guardNetworks makes the owner switch effective even when an agent sends rows it should not send.
+func (f *Fleet) guardNetworks(st *agentv1.StatsBatch, caps []string) ([]store.FleetNetwork, []store.FleetPersonNetwork, string) {
+	if !store.CapabilityPresent(caps, agentcap.Nets) {
+		return nil, nil, ""
+	}
+	mode := f.NetworkMode()
+	digest := validNetworksDigest(st.GetNetworksDbSha256())
+	if mode == 0 {
+		return nil, nil, digest
+	}
+	type networkKey struct {
+		inbound string
+		asn     uint32
+	}
+	rows := make(map[networkKey]store.FleetNetwork, len(st.GetNetworks()))
+	overflow := map[string]bool{}
+	nonZero := 0
+	dropped := 0
+	for _, row := range st.GetNetworks() {
+		if row == nil || row.GetInboundId() == "" || len(row.GetInboundId()) > 64 {
+			dropped++
+			continue
+		}
+		key := networkKey{inbound: row.GetInboundId(), asn: row.GetAsn()}
+		if key.asn == 0 && overflow[key.inbound] {
+			dropped++ // the node sends one overflow row for each inbound
+			continue
+		}
+		if _, exists := rows[key]; !exists {
+			if key.asn != 0 {
+				if nonZero == 512 {
+					dropped++
+					continue
+				}
+				nonZero++
+			} else {
+				overflow[key.inbound] = true
+			}
+		}
+		out := rows[key]
+		out.InboundID, out.ASN = key.inbound, key.asn
+		out.Attempts = clampNetworkCounter(out.Attempts, row.GetAttempts())
+		out.Unfinished = clampNetworkCounter(out.Unfinished, row.GetUnfinished())
+		out.Connects = clampNetworkCounter(out.Connects, row.GetConnects())
+		out.Broken = clampNetworkCounter(out.Broken, row.GetBroken())
+		out.People = max(out.People, min(row.GetPeople(), uint32(store.MaxLinkCount)))
+		rows[key] = out
+	}
+	keys := make([]networkKey, 0, len(rows))
+	for key := range rows {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].inbound != keys[j].inbound {
+			return keys[i].inbound < keys[j].inbound
+		}
+		return keys[i].asn < keys[j].asn
+	})
+	networks := make([]store.FleetNetwork, 0, len(keys))
+	for _, key := range keys {
+		networks = append(networks, rows[key])
+	}
+	var people []store.FleetPersonNetwork
+	if mode == 2 {
+		input := st.GetPersonNetworks()
+		if len(input) > 2048 {
+			dropped += len(input) - 2048
+			input = input[:2048]
+		}
+		people = make([]store.FleetPersonNetwork, 0, len(input))
+		for _, row := range input {
+			if row == nil || row.GetCredId() == "" || row.GetInboundId() == "" || len(row.GetCredId()) > 64 || len(row.GetInboundId()) > 64 {
+				dropped++
+				continue
+			}
+			people = append(people, store.FleetPersonNetwork{CredID: row.GetCredId(), InboundID: row.GetInboundId(), ASN: row.GetAsn(),
+				Connects: min(row.GetConnects(), uint32(store.MaxLinkCount))})
+		}
+	}
+	if dropped > 0 && f.log != nil {
+		f.log.Warn("network counters over the row limit or malformed, the rest dropped", "code", "network_stats_dropped", "rows", dropped)
+	}
+	return networks, people, digest
+}
+
+func clampNetworkCounter(current, added uint32) uint32 {
+	return uint32(min(uint64(current)+uint64(min(added, uint32(store.MaxLinkCount))), uint64(store.MaxLinkCount)))
 }
 
 const (
@@ -94,7 +224,7 @@ const (
 func (f *Fleet) guardJournal(st *agentv1.StatsBatch) []store.FleetJournal {
 	entries := st.GetJournal()
 	if len(entries) > maxJournalEntries && f.log != nil {
-		f.log.Warn("node journal over the row limit, the rest dropped", "rows", len(entries), "limit", maxJournalEntries)
+		f.log.Warn("node journal over the row limit, the rest dropped", "code", "node_journal_over_row_limit", "rows", len(entries), "limit", maxJournalEntries)
 	}
 	if len(entries) > maxJournalEntries {
 		entries = entries[:maxJournalEntries]
@@ -136,7 +266,7 @@ func (f *Fleet) guardJournal(st *agentv1.StatsBatch) []store.FleetJournal {
 func (f *Fleet) guardLinks(st *agentv1.StatsBatch) []store.FleetLink {
 	rows := st.Links
 	if len(rows) > maxStatsDeltas {
-		f.log.Warn("connection counters over the row limit, the rest dropped", "rows", len(rows), "limit", maxStatsDeltas)
+		f.log.Warn("connection counters over the row limit, the rest dropped", "code", "connection_counters_over_row_limit", "rows", len(rows), "limit", maxStatsDeltas)
 		rows = rows[:maxStatsDeltas]
 	}
 	out := make([]store.FleetLink, 0, len(rows))
@@ -147,9 +277,33 @@ func (f *Fleet) guardLinks(st *agentv1.StatsBatch) []store.FleetLink {
 		out = append(out, store.FleetLink{CredID: l.CredId, InboundID: l.InboundId, Connects: l.Connects, Rejects: l.Rejects,
 			Drops: l.Drops, Stalls: l.Stalls, OnlineS: l.OnlineS, UnknownKeys: l.UnknownKeys, Hellos: l.Hellos, Handshakes: l.Handshakes,
 			ClientCloses: l.ClientCloses, Freezes: l.Freezes, Quiet: l.Quiet, Accepted: l.Accepted, HellosForeign: l.HellosForeign,
-			RttMSSum: l.RttMsSum, RttSamples: l.RttSamples, PktsSent: l.PktsSent, PktsLost: l.PktsLost})
+			RttMSSum: l.RttMsSum, RttSamples: l.RttSamples, PktsSent: l.PktsSent, PktsLost: l.PktsLost,
+			HsUnfinished: l.HsUnfinished, TLSAlertsSent: l.TlsAlertsSent, TLSAlertsRecv: l.TlsAlertsRecv, TLSCertRefused: l.TlsCertRefused,
+			RealityFallback: l.RealityFallback, AuthFailed: l.AuthFailed, TCPStalls: l.TcpStalls, TCPStalls16K: l.TcpStalls_16K,
+			Initiations: l.Initiations, Responses: l.Responses, ResponsesUnmatched: l.ResponsesUnmatched,
+			HelloPQ: l.HelloPq, HelloClassic: l.HelloClassic, HelloUnknown: l.HelloUnknown, Tunnel: tunnelRefusals(l)})
+	}
+	// The panel's own TLS checks of a REALITY port were counted as wrong keys and fallbacks by the node (ownProbes): take each
+	// off the inbound row, so every reader (the page, the API, MCP) sees strangers only. Not below zero.
+	for i := range out {
+		if l := &out[i]; l.CredID == "" && l.AuthFailed > 0 {
+			n := f.ownProbes.take(l.InboundID, l.AuthFailed, f.now())
+			l.AuthFailed -= n
+			l.RealityFallback -= min(n, l.RealityFallback)
+		}
 	}
 	return out
+}
+
+// tunnelRefusals are the trusttunnel-refusals/1 counters of a row, in the order of plugin.TunnelRefusal. Only the inbound's own
+// row carries them: a credential's row that does is a node that attributes a refusal to someone, and they are left out.
+func tunnelRefusals(l *agentv1.LinkCounters) (out [14]uint32) {
+	if l.CredId != "" {
+		return out
+	}
+	return [14]uint32{l.TunnelBlocked, l.TunnelNoIpv4, l.TunnelConnRefused, l.TunnelConnUnreachable, l.TunnelConnDns, l.TunnelConnOther,
+		l.TunnelTimeout, l.TunnelOtherDeadlines, l.TunnelOtherAuthority, l.TunnelOtherIcmp, l.TunnelOtherDial, l.TunnelStreamClosed,
+		l.TunnelStreamCredGone, l.TunnelStreamConnLimit}
 }
 
 func satAdd(a, b uint64) uint64 {
@@ -167,6 +321,31 @@ func satMul(a, b uint64) uint64 {
 }
 
 type stuckSeq struct {
-	instance string
-	seq      uint64
+	instance       string
+	seq            uint64
+	firstFailureAt time.Time
+}
+
+func permanentStatsIngestError(err error) bool {
+	if errors.Is(err, store.ErrNotFound) {
+		return true
+	}
+	var coded interface{ Code() int }
+	if !errors.As(err, &coded) {
+		return false
+	}
+	// SQLite reports primary result codes in the low byte and extended result codes above it.
+	switch coded.Code() & 0xff {
+	case 18, // SQLITE_TOOBIG
+		19, // SQLITE_CONSTRAINT
+		20, // SQLITE_MISMATCH
+		25: // SQLITE_RANGE
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldDropStatsBatch(err error, firstFailureAt, now time.Time) bool {
+	return permanentStatsIngestError(err) || !now.Before(firstFailureAt.Add(statsPoisonRetryWindow))
 }

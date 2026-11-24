@@ -2,8 +2,12 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"slices"
+	"strings"
 	"time"
+
+	"connectrpc.com/connect"
 
 	"github.com/mistgate/mistgate/internal/panel/store"
 )
@@ -22,20 +26,27 @@ const (
 	ChannelAPI Channel = "api"
 	// ChannelMCP is a call the MCP layer makes in process on behalf of an agent.
 	ChannelMCP Channel = "mcp"
+	// ChannelAssistant is the in-process MCP call made for a signed-in assistant turn.
+	ChannelAssistant Channel = "assistant"
 )
 
 // Principal describes the token behind a request. The zero value is a signed-in admin (a cookie session).
 type Principal struct {
-	Token     bool   // false: an admin signed in with a cookie session
-	TokenID   string // "tok_..." when Token
-	Profile   string // store.ProfileReadonly | ProfileOperator | ProfileAdmin
-	Channel   Channel
-	Name      string    // the token's name
-	ExpiresAt time.Time // when the token stops working
+	Token                bool   // false: an admin signed in with a cookie session
+	TokenID              string // "tok_..." when Token
+	Profile              string // store.ProfileReadonly | ProfileOperator | ProfileAdmin
+	Channel              Channel
+	Name                 string    // the token's name
+	ExpiresAt            time.Time // when the token stops working
+	Assistant            bool      // a hidden per-admin identity; never accepted from bearer auth
+	AllowBulkUserChanges bool      // owner-authorized exemption from the hourly user-change cap
 }
 
 // ActorID is the id the audit log shows for the principal: "token:<id>" for the API channel, "mcp:<id>" for MCP.
 func (p Principal) ActorID() string {
+	if p.Assistant && p.Name != "" {
+		return p.Name
+	}
 	if p.Channel == ChannelMCP {
 		return "mcp:" + p.TokenID
 	}
@@ -67,7 +78,7 @@ func channelFrom(ctx context.Context) Channel {
 // request already paid it). The token is still verified against the database on every call. Only ChannelMCP
 // has an effect, and only code that holds the context can set it: a network request cannot.
 func WithChannel(ctx context.Context, c Channel) context.Context {
-	if c != ChannelMCP {
+	if c != ChannelMCP && c != ChannelAssistant {
 		return ctx
 	}
 	return context.WithValue(ctx, channelKey{}, c)
@@ -96,6 +107,49 @@ func (s *Service) WithApprovedStepUp(ctx context.Context, planID string) context
 	return context.WithValue(ctx, grantKey{}, approvedGrant{s: s, planID: planID})
 }
 
+// HasApprovedUserChangePlan reports whether this exact MCP procedure is running inside an owner-approved user-change
+// plan. The access service uses it to exempt the approved apply from the token's unattended hourly budget.
+func HasApprovedUserChangePlan(ctx context.Context) bool {
+	p := PrincipalFrom(ctx)
+	g, ok := ctx.Value(grantKey{}).(approvedGrant)
+	procedure := procedureFrom(ctx)
+	if !ok || g.s == nil || g.planID == "" || !p.Token || p.Assistant || p.Channel != ChannelMCP || procedure == "" {
+		return false
+	}
+	plan, err := g.s.st.GetMCPPlan(ctx, g.planID)
+	if err != nil || plan.TokenID != p.TokenID || plan.Status != store.PlanApplying || !plan.NeedsApproval ||
+		plan.DecidedBy == "" || plan.DecidedAt.IsZero() {
+		return false
+	}
+	// The procedures the plan's own grant opens count too: a group or profile change reaches the user service only
+	// through the owner's approval, and counting its members would refuse an approved plan on any group of more
+	// than ten people.
+	return slices.Contains(userChangePlanProcedures[plan.Tool], procedure) || GrantAllows(plan.Tool, procedure)
+}
+
+// MihomoTemplateTool is the MCP tool whose owner-approved plan may change the Mihomo templates of the subscription settings
+// through a token that is not the owner's (an operator token): the owner's approval of that plan is the owner's own decision.
+const MihomoTemplateTool = "subscription_mihomo_template_set"
+
+// RoutingProfileTool is the same for the routing profiles of Happ and INCY: the owner's approval of a plan of this tool is what lets
+// an operator token change them.
+const RoutingProfileTool = "subscription_routing_set"
+
+// ApprovedPlanTool is the MCP tool whose plan this call is applying, when the plan is one the owner approved and its tool may call
+// this procedure (the same test as the grant that let the call through); "" for any other call, a signed-in admin's included.
+func ApprovedPlanTool(ctx context.Context) string {
+	p := PrincipalFrom(ctx)
+	g, ok := ctx.Value(grantKey{}).(approvedGrant)
+	if !ok || g.s == nil || !p.Token || !g.s.grantAllows(ctx, p.TokenID, procedureFrom(ctx)) {
+		return ""
+	}
+	plan, err := g.s.st.GetMCPPlan(ctx, g.planID)
+	if err != nil {
+		return ""
+	}
+	return plan.Tool
+}
+
 // grantAllows reports whether the approved grant in ctx is valid for tokenID calling the procedure in ctx.
 func (s *Service) grantAllows(ctx context.Context, tokenID, procedure string) bool {
 	g, ok := ctx.Value(grantKey{}).(approvedGrant)
@@ -110,8 +164,18 @@ func (s *Service) grantAllows(ctx context.Context, tokenID, procedure string) bo
 		plan.DecidedBy == "" || plan.DecidedAt.IsZero() {
 		return false
 	}
-	return slices.Contains(grantProcedures[plan.Tool], procedure)
+	return GrantAllows(plan.Tool, procedure)
 }
+
+// GrantAllows reports whether the approved plan of the MCP tool (its name without the _plan / _apply suffix) may call the
+// procedure: the one lookup of the grants table, for the middleware and for the tests that hold the tool registry against it.
+func GrantAllows(tool, procedure string) bool {
+	return slices.Contains(grantProcedures[tool], procedure)
+}
+
+// GrantedProcedures lists the procedures the approved plan of the MCP tool may call, for the tests that hold the tool registry
+// against the grants table.
+func GrantedProcedures(tool string) []string { return slices.Clone(grantProcedures[tool]) }
 
 // planningAllows reports whether ctx is an MCP planning call (WithPlanning on the MCP channel).
 func planningAllows(ctx context.Context) bool {
@@ -122,4 +186,23 @@ func planningAllows(ctx context.Context) bool {
 func procedureFrom(ctx context.Context) string {
 	p, _ := ctx.Value(procedureKey{}).(string)
 	return p
+}
+
+// SignedInSession is the admin signed in with a cookie session. An API or MCP token is refused here whatever its profile
+// and whatever the procedure table says: the second lock of the RPCs that no token may reach.
+func SignedInSession(ctx context.Context) (store.Admin, error) {
+	a, ok := AdminFrom(ctx)
+	if !ok || strings.HasPrefix(a.ID, "token:") || strings.HasPrefix(a.ID, "mcp:") || PrincipalFrom(ctx).Token {
+		return store.Admin{}, connect.NewError(connect.CodePermissionDenied, errors.New("a signed-in admin is required"))
+	}
+	return a, nil
+}
+
+// OwnerSession is the owner signed in with a cookie session: a helper, a readonly admin and every token are refused.
+func OwnerSession(ctx context.Context) (store.Admin, error) {
+	a, err := SignedInSession(ctx)
+	if err != nil || a.Role != store.RoleOwner {
+		return store.Admin{}, connect.NewError(connect.CodePermissionDenied, errors.New("owner access required"))
+	}
+	return a, nil
 }

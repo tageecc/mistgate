@@ -8,7 +8,7 @@ import "mistgate/admin/v1/tspu_probe.proto";
 // Health screen (Alerts / Checks / Doctor tabs), the Doctor tab of the node page and the synthetic-check
 // pills of the node Overview tab. Conventions: common.proto.
 //
-// Roles (internal/panel/auth/policy.go): the three reads are open to every role; MuteAlert, RunChecksNow and
+// Roles (internal/panel/auth/policy.go): the three reads are open to every role; MuteAlert, DismissAlert, RunChecksNow and
 // RunDoctor need owner or helper; ApplyFix needs the owner (it changes the host), except that the panel may
 // let a helper apply restart_inbound with an in-handler role check.
 //
@@ -25,12 +25,19 @@ service HealthService {
   // "muted until" caption), or unmute it. Muting never hides the alert from the list and never stops the
   // panel from resolving it.
   rpc MuteAlert(MuteAlertRequest) returns (MuteAlertResponse);
+  // Close an active alert ("dismissed" in the history): it is resolved now, with no notification, and stays
+  // closed while the same condition continues. It opens again only after the problem has stopped for longer
+  // than the re-open window and then returns, or when its severity rises. With reopen the call undoes a close
+  // (the Undo of the toast). FAILED_PRECONDITION: the alert is already resolved (reopen: it is not closed
+  // any more, or another alert of the same key is active).
+  rpc DismissAlert(DismissAlertRequest) returns (DismissAlertResponse);
 
   // Node x profile matrix of the synthetic checks, with the last result and the last 24 h per cell.
   rpc GetChecks(GetChecksRequest) returns (GetChecksResponse);
   // "Check now": schedule an immediate round for every inbound of one node (or of the fleet). Returns at
   // once; the results show up in GetChecks within seconds. Rate limit: one round per inbound per 30 s
-  // (RESOURCE_EXHAUSTED with the seconds left in the message).
+  // (RESOURCE_EXHAUSTED with the seconds left in the message). For one node it also asks the country check ("From Russia")
+  // for a round out of turn, see RunChecksNowResponse.country_now.
   rpc RunChecksNow(RunChecksNowRequest) returns (RunChecksNowResponse);
 
   // The last DoctorReport of one node, or of every node, with its age. Never contacts a node.
@@ -139,6 +146,36 @@ enum AlertKind {
   // (a transfer stalls after the first kilobytes). Opens after the usual failure streak, is superseded while the exit's
   // own check alert or the entry's node_down is open, and closes on recovery.
   ALERT_KIND_RELAY_DOWN = 19;
+  // A two-sender UDP check found loss from one sender but delivery from the other. WARNING. node_id = lossy sender,
+  // subject = target node id, params{node, target, target_id, ports, sent, got, other, other_got, region, other_region,
+  // checked_unix}. The condition expires 30 hours after the latest check or when that path-loss row is removed.
+  ALERT_KIND_PATH_LOSSY = 20;
+  // The node's agent crashed and restarted three or more times in 30 minutes (agent_started events whose params say the
+  // previous run ended without a clean exit: prev_exit = unclean). WARNING. node_id = the node, subject = "agent",
+  // params{count, window_min, last_unix}. Closes once the window holds fewer than three crash restarts.
+  ALERT_KIND_AGENT_CRASH_LOOP = 21;
+  // A scheduled task of the owner (mistgate.tasks.v1, the VPS edition) found a problem: a condition of a check task held, or an
+  // assistant task's verdict said so. WARNING. node_id = "", subject = the task id, params{task, task_id, task_kind, summary,
+  // telegram}. Closes when a later run of the task is clean, or when the task is disabled or deleted.
+  ALERT_KIND_SCHEDULED_CHECK = 22;
+  // A scheduled task failed three or more runs in a row (a tool refused, the provider did not answer, no verdict ...). WARNING.
+  // node_id = "", subject = the task id, params{task, task_id, task_kind, count, reason, telegram}. Closes with the next run that
+  // works, or when the task is disabled or deleted.
+  ALERT_KIND_SCHEDULED_TASK_FAILING = 23;
+  // An OS update of one node (UpdateService.StartOsRollout) stopped: the node refused the job, the job failed, the node would not
+  // reboot, it did not return in 15 minutes or failed the check after the reboot. WARNING, CRITICAL when the node did not return.
+  // node_id = the node, subject = the rollout id, params{rollout_id, node, reason, code}: reason is the step's error key
+  // (os.step.err.*), code the node's own code (os.job.err.*). Open while the rollout is PAUSED; closes when the owner cancels it.
+  // Produced from the updates module through a health condition source.
+  ALERT_KIND_OS_UPDATE_FAILED = 24;
+  // A site that the owner's WARP reach list names showed a block page through this node's WARP in two runs, with no "ok" between them (WarpReachService.
+  // GetWarpReachSettings; the node fetches the sites through its tunnel, GetWarpResponse.reach). WARNING. node_id = the node,
+  // subject = the domain, params{domain, colo, http_status, streak}: colo is the Cloudflare colo of the node's WARP exit at the
+  // run that said so. Some sites refuse WARP at one colo and not at another; the owner can restart WARP to get another exit.
+  // Closes when a run says "ok" for that domain (a timeout or an error does not close it), when the owner takes the domain off the list or turns
+  // the check off. It also closes when no run renews the result for 3 hours (the node is offline, or its WARP is not up). One
+  // alert per node and domain.
+  ALERT_KIND_WARP_REACH = 25;
 }
 
 message Alert {
@@ -204,6 +241,17 @@ message MuteAlertRequest {
 }
 
 message MuteAlertResponse {
+  Alert alert = 1;
+}
+
+message DismissAlertRequest {
+  string alert_id = 1;
+  // true = undo a close of the alert (re-open it); false = close an active alert.
+  bool reopen = 2;
+}
+
+message DismissAlertResponse {
+  // The alert after the call: resolved with resolution "dismissed", or active again after a reopen.
   Alert alert = 1;
 }
 
@@ -307,6 +355,41 @@ message CheckCell {
   // them every 10 minutes, so the newest are missing for up to that long. 0 = none counted.
   uint32 node_sent_hour = 11;
   uint32 node_lost_hour = 12;
+  // The last 24 hours of rounds (the window of `history`) of the rounds whose tunnel came up. Unset without any.
+  CheckStats stats_24h = 13;
+  // Finished UTC days from the daily rollup, oldest first; only when GetChecksRequest.daily_days > 0.
+  repeated CheckDay daily = 14;
+}
+
+// Percentiles of the two parts of a round and the jitter over a window; 0 = not measured. Nearest rank, measured on the
+// panel's server.
+message CheckStats {
+  // Rounds that came up (OK or DEGRADED) in the window.
+  uint32 rounds = 1;
+  uint32 connect_p50_ms = 2;
+  uint32 connect_p95_ms = 3;
+  uint32 response_p50_ms = 4;
+  uint32 response_p95_ms = 5;
+  // Population standard deviation of response_ms.
+  uint32 jitter_ms = 6;
+}
+
+// One finished UTC day of one inbound (health_check_daily). The connect and response figures are 0 for a day rolled up
+// before the panel kept them.
+message CheckDay {
+  int64 day_unix = 1 [jstype = JS_NUMBER];
+  uint32 ok = 2;
+  uint32 degraded = 3;
+  uint32 failed = 4;
+  // Of latency_ms, the cold time of the whole round.
+  uint32 latency_p50_ms = 5;
+  uint32 latency_p95_ms = 6;
+  uint32 connect_p50_ms = 7;
+  uint32 connect_p95_ms = 8;
+  uint32 response_p50_ms = 9;
+  uint32 response_p95_ms = 10;
+  // Standard deviation of response_ms.
+  uint32 jitter_ms = 11;
 }
 
 message CheckRow {
@@ -321,6 +404,8 @@ message CheckRow {
 message GetChecksRequest {
   // Empty = every node (the Health tab); set = only that node (the node Overview pills).
   string node_id = 1;
+  // Attach the last N finished days (at most 90) of the daily rollup to every cell; 0 = none.
+  uint32 daily_days = 2;
 }
 
 message GetChecksResponse {
@@ -341,6 +426,9 @@ message GetChecksResponse {
   // The newest run of the TSPU probe (tspu_probe.proto): its status, time, probe node and dpi_hop. Unset while that source is
   // off or has not run yet. The per-node rows are in country_checks.
   TspuProbeRun tspu_run = 7;
+  // The state of the last round of the country check that "Check now" asked out of turn, for every node that had one (with
+  // node_id only that node). A running round has running set. Empty on the Cloudflare edition.
+  repeated CountryNow country_now = 8;
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -437,8 +525,9 @@ message CountryCheck {
   // The same node over IPv6, measured by Globalping from the same country (every other field above is IPv4 and does not change
   // with it). Present only while the IPv6 checks of Globalping are on (GlobalpingSettings.ipv6). A node that is not measured
   // over IPv6 has verdict UNKNOWN and a reason: "no_ipv6" (no global IPv6 address), "ipv6_broken" (it has an address, but
-  // outbound IPv6 does not work at the hoster), "agent_old" (the node agent predates the IPv6 facts), "not_checked" (no report
-  // or no round yet), "no_probes" (Globalping has no IPv6 probes in the country), plus the failures of any round
+  // outbound IPv6 does not work at the hoster), "agent_old" (the node agent predates the IPv6 facts), "entry_off" (the IPv6
+  // entry is off and the node's IPv4 is seen from the country, so IPv6 is not measured), "not_checked" (no report or no round
+  // yet), "no_probes" (Globalping has no IPv6 probes in the country), plus the failures of any round
   // ("rate_limited", "source_error", "timeout", "too_few_probes"). Never nested further.
   CountryCheck ipv6 = 23;
 }
@@ -472,6 +561,48 @@ message RunChecksNowResponse {
   uint32 scheduled = 1;
   // Inbounds skipped by the rate limit, node offline or protocol without a client.
   uint32 skipped = 2;
+  // The round of the country check asked out of turn for the node of the request: which source runs and which is skipped and
+  // why. Unset for a request of the whole fleet (it asks no country round) and on the Cloudflare edition. A press that came
+  // too early is not an error: every source is skipped with the reason "too_early" and retry_after_s says when to ask again.
+  CountryNow country_now = 3;
+}
+
+// A round of the country check out of turn, asked by RunChecksNow for one node, and what became of it. The panel keeps
+// the time of the last one per node: a node is asked at most once in 10 minutes. Globalping, which counts its tests, only
+// takes the tests left after the planned rounds of the rest of its hour have been set aside (it never eats their budget).
+// The TSPU probe, cheburcheck and the owner's own probes are asked for the node; bsbord only runs on its schedule; the
+// block lists and the kl!ck reports are read again from what the panel already holds, with no request to anyone.
+message CountryNow {
+  string node_id = 1;
+  // A round is running in the background now.
+  bool running = 2;
+  // When the last round started (unix seconds); 0 = none yet.
+  int64 started_unix = 3 [jstype = JS_NUMBER];
+  // The earliest the next one may start (unix seconds); 0 = now.
+  int64 next_unix = 4 [jstype = JS_NUMBER];
+  // Set only in the answer of a press that came too early: the seconds until next_unix.
+  uint32 retry_after_s = 5;
+  // One entry per source, in a fixed order (globalping, tspu, cheburcheck, cheburcheck_own, probes, bsbord, lists, klick).
+  repeated CountryNowSource sources = 6;
+  // Globalping tests left for a round out of turn when the last round was asked (after the planned rounds' reserve), what the
+  // round of this node costs and when that was read (unix seconds). Unset until Globalping has been asked.
+  optional uint32 globalping_left = 7;
+  uint32 globalping_cost = 8;
+  int64 globalping_at_unix = 9 [jstype = JS_NUMBER];
+  // When the sources above were last asked, unix seconds. It is later than started_unix when the last press found nothing to ask
+  // (every source off, no budget): the sources then say why.
+  int64 asked_unix = 10 [jstype = JS_NUMBER];
+}
+
+message CountryNowSource {
+  // A source id of the combined verdict (countryreach: globalping, tspu, cheburcheck, cheburcheck_own, probes, bsbord, lists)
+  // or "klick".
+  string source = 1;
+  // "running", "done", "failed", "skipped" or "reread" (nothing to ask: what is stored is shown again).
+  string state = 2;
+  // Why it was skipped or failed: off, too_early, no_budget, budget_unknown, rate_limited, no_probe, probe_node, busy, held, node_offline,
+  // no_address, no_ports, schedule_only, interrupted, error. Empty otherwise.
+  string reason = 3;
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -630,6 +761,10 @@ message CountryVantage {
   uint32 dpi_hop = 9;
   bool icmp_ok = 10;
   bool tcp_ok = 11;
+  string why = 12;
+  // Own probes only: the name the owner gave the probe, and the port of the node's target the reason (why) comes from.
+  string probe_name = 13;
+  uint32 port = 14;
 }
 
 // One source's newest fresh verdict, including unknown when that source ran without a usable result.

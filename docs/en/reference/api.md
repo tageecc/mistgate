@@ -40,6 +40,7 @@ The API is defined in `proto/mistgate/admin/v1/`. Generated code is in the repos
 | `WarpService` | `warp.proto` | WARP accounts of nodes |
 | `AwgService` | `awg.proto` | Helpers of the AmneziaWG profile editor |
 | `BackupService` | `backup.proto` | Encrypted panel backups |
+| `TrustTunnelService` | `trusttunnel.proto` | A person's TrustTunnel key and `tt://` links (package `mistgate.trusttunnel.v1`; the admin's write level, closed to API tokens and MCP) |
 | `TelegramService` | `telegram.proto` | The Telegram bot and each admin's chat (owner and signed-in admins only; closed to API tokens and MCP) |
 | `ApiTokenService`, `ApprovalService` | `integrations.proto` | API tokens and the owner's approvals |
 | `CheburcheckService`, `BsbordService` | `cheburcheck.proto`, `bsbord.proto` | The cheburcheck and bsbord sources of the [country check](../operations/reachability.md): settings, status and test, and for bsbord the unit list and the price check (owner only; changing or disconnecting a source, and the price check, need a step-up; closed to API tokens and MCP) |
@@ -54,7 +55,7 @@ The comments in the proto files are the reference for every field. Conventions (
 
 ## API tokens
 
-The owner creates tokens in **Integrations → API tokens → New token** (a fresh step-up is needed):
+The owner creates tokens in **AI → MCP and tokens → New token** (a fresh step-up is needed):
 
 | Field | Rule |
 |---|---|
@@ -166,6 +167,39 @@ func main() {
 
 For another language, generate a client from `proto/` with `buf generate` and the Connect or gRPC plugin of that language.
 
+## The Telegram proxy
+
+The [MTProto](../guide/mtproto.md) profiles and a person's Telegram key use these parts of `ProfileService` and `UserService`:
+
+- `ProtocolInfo.experimental` (from `ProfileService.ListProtocols`): true for a protocol that is new and not proven in the field yet. MTProto sets it.
+- `AppToggles.telegram`, in `CreateUser` and `UpdateUser`, is the person's Telegram switch. Turning it on makes the person's key, and turning it off revokes it. At least one of `happ` and `amnezia` must stay on.
+- `ListUsers` takes the filter `USER_FILTER_TELEGRAM`: the people whose Telegram switch is on, whatever their key or the MTProto profiles. Each user in the list carries `access_telegram` (the switch is on and an MTProto server is usable for them) and `telegram_issued` (a key was made).
+- `GetTelegramLinks` reads a person's proxy: `has_key`, `key_device_id`, `key_issued_unix` and the `tg://proxy` links, one per node and profile, with `ipv6`, `relay` and `via` marking the node's IPv6 twin and a relay's twin. It writes nothing. A link carries the person's secret, so treat the answer like a password.
+- `IssueTelegramKey` makes the key when the person has none (it needs the switch on and a person who is not disabled; the device limit does not apply), `RotateTelegramKey` gives it a new secret so that every earlier link stops working (`not_found` "key" without one), and `RevokeTelegramKey` revokes it and leaves the switch on. Each answers with the person's proxy as `GetTelegramLinks` does. The key is a device of the person of kind `DEVICE_KIND_TELEGRAM_KEY`, and `RevokeDevice` removes it too.
+
+All four calls are for the owner and helpers, and closed to API tokens, like the other calls that return a credential.
+
+## A person in several groups
+
+A person has one main group (`User.group_id`, with `group_name` and `group_color`) and any number of extra groups: `User.extra_group_ids`, with `extra_group_names` and `extra_group_colors` in step with them (ordered by name). The main group alone decides the DNS preset, the Mihomo template, the response headers and the colour; an extra group only adds access, by the rule of [A person in several groups](../guide/users-and-groups.md#a-person-in-several-groups).
+
+- `UpdateUserRequest.add_group_ids` and `remove_group_ids` change the extra groups by deltas, so two changes made at once do not undo each other and a repeat does nothing. `group_id` is still the main group; with `group_id` = B and `add_group_ids` = [A] the person gets B as the main group and keeps A as an extra one, and without A the old main group is left. The refusals are `INVALID_ARGUMENT` with `group_in_both`, `main_group` (the main group cannot be removed) and `too_many_groups` (16 groups at most, the main one counted), and `NOT_FOUND` for a group that does not exist.
+- `UpdateUserResponse.impact` (with `dry_run` too) says what the new set of groups does: the profiles gained and lost, and `AccessImpact.gained_node_ids` and `lost_node_ids`, the nodes where the person starts to get something and where they stop getting anything. A change counts as one change of the person against a token's [limit](#limits).
+- `ListUsersRequest.group_id` finds the people who have the group as the main or as an extra group, each once.
+- `Group.user_count` counts the people whose main group it is and `Group.extra_user_count` the people who have it as an extra group. `DeleteGroup` is refused (`group_not_empty`) only while people have the group as their main one; the extra members just leave it. The audit row `user_update` carries `groups_added` and `groups_removed`, `group_delete` the number of extra members who left (`extra_left`).
+- Old clients keep working: a client that only knows `group_id` changes the main group, as before. A script that walks `ListUsers(group_id=X)` and sets `group_id=Y` on everybody now moves the extra members as well and makes Y their main group: filter on `User.group_id` in such a script.
+
+## TrustTunnel
+
+The [TrustTunnel](../guide/trusttunnel.md) profiles and a person's key use `ProfileService`, `UserService` and a service of their own, `mistgate.trusttunnel.v1.TrustTunnelService`:
+
+- `ProtocolInfo.experimental` is true for TrustTunnel, as for MTProto.
+- `AppToggles.trust_tunnel`, in `CreateUser` and `UpdateUser`, is the person's TrustTunnel switch. Turning it on makes the person's key when the person is active, and turning it off revokes it. At least one of `happ` and `amnezia` must stay on.
+- `GetTrustTunnelLinks` reads a person's links: `has_key`, `key_device_id`, `key_issued_unix` and the `tt://` links, one per node and profile, with `ipv6`, `relay` and `via` marking twins. A link that cannot be made (a self-signed server) has an empty `url` and a `note`. It writes nothing.
+- `IssueTrustTunnelKey` makes the key when the person has none (the switch must be on and the person active; the key takes a place in the device limit, and at the limit the call fails with `device_limit`), and `RevokeTrustTunnelKey` revokes it and leaves the switch on. Each answers as `GetTrustTunnelLinks` does.
+
+A `tt://` link carries the person's secret, so all three calls are the admin's write level and closed to API tokens and MCP, like the other calls that return a credential. In the Cloudflare edition they answer `unavailable_in_edition`.
+
 ## Token profiles
 
 A profile acts as an admin role: **Read only** as read-only, **Operator** as helper, **Admin** as owner. On top of the role, a token may call only the procedures on a fixed allow-list (`internal/panel/auth/policy_tokens.go`); everything else is refused whatever the profile. Nothing on the list returns a credential.
@@ -181,30 +215,35 @@ A profile acts as an admin role: **Read only** as read-only, **Operator** as hel
 | `ProfileService.ListProfiles`, `ProfileService.GetProfile` (secrets masked) | yes | yes | yes |
 | `ProfileService.ListProtocols`, `ProfileService.PreviewProfile` | yes | yes | yes |
 | `SubscriptionService.GetSubscriptionSettings`, `ListClients`, `TestUserAgent` | yes | yes | yes |
-| `UpdateService.GetUpdates` | yes | yes | yes |
+| `UpdateService.GetUpdates`, `GetOsUpdates` | yes | yes | yes |
 | `UserService.CreateUser`, `UpdateUser`, `SetUsersEnabled`, `ExtendUsers`, `ResetUserTraffic`, `RevokeDevice` | no | yes | yes |
-| `HealthService.MuteAlert`, `RunChecksNow`, `RunDoctor` | no | yes | yes |
+| `HealthService.MuteAlert`, `DismissAlert`, `RunChecksNow`, `RunDoctor` | no | yes | yes |
 | `AuthService.ListAudit` | no | no | yes |
 | `HealthService.ApplyFix` | no | no | only through an approved MCP plan |
 | `UpdateService.StartRollout`, `PauseRollout`, `ResumeRollout`, `CancelRollout`, `RollbackNode` | no | no | only through an approved MCP plan |
-| `UpdateService.ScheduleNodeUpdate`, `CancelNodeUpdateSchedule`, `SetUpdateTimezone` | no | no | only through an approved MCP plan |
+| `UpdateService.StartOsRollout`, `CancelOsRollout` | no | no | only through an approved MCP plan |
+| `UpdateService.RefreshOsUpdates` | no | no | no (the owner's click in the admin) |
+| `UpdateService.ScheduleNodeUpdate`, `CancelNodeUpdateSchedule`, `SetUpdateTimezone`, `SetUpdateDownloadTimeout` | no | no | only through an approved MCP plan |
 | `ProvisioningService.ListNodeServerAccess` (connection metadata, never a password) | no | no | yes |
 | `ProvisioningService.GetSSHFingerprint` | no | no | only while the MCP server makes a `node_install` plan |
 | `ProvisioningService.StartNodeProvision`, `RotateNodeServerPassword` | no | no | only through an approved MCP plan |
-| `SubscriptionService.UpdateSubscriptionSettings` (one app of the user page) | no | only through an approved MCP plan | only through an approved MCP plan |
+| `SubscriptionService.UpdateSubscriptionSettings` (the shared settings: an app of the user page, texts, own response headers, own Mihomo templates, own routing profiles for Happ and INCY; a save that changes a template or a routing profile is the owner's: a helper gets `PERMISSION_DENIED` `mihomo_templates_owner_only` or `routing_profiles_owner_only`, a token only through the owner's approval of a `subscription_mihomo_template_set` or `subscription_routing_set` plan) | no | only through an approved MCP plan | only through an approved MCP plan |
+| `SubscriptionService.PreviewRoutingProfile` | no | no | no (the admin's reading of a pasted profile; an agent sees the profiles in `subscription_settings_get` and which one a person gets in `subscription_preview`) |
+| `SubscriptionService.PreviewMihomoTemplate` | no | no | no (the admin's preview; an agent reads a template with `subscription_mihomo_template_get` and sees which one a person gets in `subscription_preview`) |
 | `ProfileService.CreateProfile`, `UpdateProfile`, `DeleteProfile`, `CreateInbound`, `DeleteInbound`; `GroupService.UpdateGroup` | no | no | only through an approved MCP plan |
 
-Closed to every token: deleting users, the subscription link, devices and their keys, unblocking a device (`UserService.UnblockDevice`; a token can block one with `RevokeDevice` and `block`, but only an admin lifts the block), node enrollment, settings, restarts, logs and retirement, preparing the AmneziaWG kernel module, the admin's own SSH install steps (checking a server, retrying a job, revealing or forgetting saved access), creating groups, DNS presets and subscription settings (except the user page's app list through an approved plan), WARP, backups, panel updates and bundle rescans, brand settings, tokens, approvals, the admins' own account (passkeys, password, sessions, step-up) and the captcha settings.
+Closed to every token: deleting users, the subscription link, the Telegram proxy and TrustTunnel keys and links, devices and their keys, unblocking a device (`UserService.UnblockDevice`; a token can block one with `RevokeDevice` and `block`, but only an admin lifts the block), node enrollment, settings, restarts, logs and retirement, preparing the AmneziaWG kernel module, taking a profile off several nodes at once with or without deleting it (`ProfileService.RemoveProfileFromNodes`), the admin's own SSH install steps (checking a server, retrying a job, revealing or forgetting saved access), creating groups, DNS presets and subscription settings (except the user page's app list through an approved plan), WARP, backups, panel updates and bundle rescans, brand settings, tokens, approvals, the admins' own account (passkeys, password, sessions, step-up) and the captcha settings.
 
 ## Changes that need the owner
 
 A token never passes step-up. Procedures that need a step-up, or that change what runs on the nodes, are never callable with a token directly; over the plain API they answer 403 "this needs the owner's approval; it is not available over the API".
 
-They are reachable only through the [MCP server](mcp.md) with an Admin token (the user page's app list from the Operator profile up): the agent plans the change, the owner reads the plan in **Integrations → Waiting for you** and approves it (with a step-up of their own), and only then does the agent's apply carry out the approved plan. The approval is checked in the database on every call, and the grant allows only the procedures listed on that plan. A plan expires 10 minutes after it was made.
+They are reachable only through the [MCP server](mcp.md) with an Admin token (the user page's app list from the Operator profile up): the agent plans the change, the owner reads the plan in **AI → Waiting for you** and approves it (with a step-up of their own), and only then does the agent's apply carry out the approved plan. The approval is checked in the database on every call, and the grant allows only the procedures listed on that plan. A plan expires 10 minutes after it was made.
 
 ## Limits
 
 - **Requests per minute per token**: as set on the token (1 to 600, default 120), with a burst of up to 30. Over the limit: 429 with `Retry-After`.
+- **User changes per token**: in one hour, counted from the token's first such change, a token may take access away from, or rewrite, at most 10 people: disable them, reset their traffic, revoke or block a device, edit a person, move a group's people, or change a group so that what its people get changes. Every person in every call counts; a call that changes nothing is free, and creating, extending and enabling people are not counted. A call over the limit is refused whole: 429 with the code `token_user_change_limit` and `limit`, `used`, `asked` and `retry_after_seconds` (when one call asks for more than the whole limit it is 0 and the message also carries `reason=over_hourly_limit`: split the call or ask the owner). The owner can lift the limit for one token in **AI → MCP and tokens** (**Limit** in the token's row, or the switch when creating it); it needs a fresh step-up. Through MCP a plan over the limit waits for the owner's approval instead of being refused. Existing tokens are limited after the update.
 - **Per client network** on the admin surface: 30 requests per second with a burst of 200, for cookies and tokens alike.
 - **Request size**: 64 KiB to 1 MiB depending on the service.
 - **Lifetime**: every token expires (at most 365 days).
@@ -215,7 +254,7 @@ Every token call writes a row to the audit log: "called <procedure>", the HTTP s
 
 ## What responses never contain
 
-- `CreateUser` called with a token returns the user without the subscription link and the page password. `GetSubscriptionLink` is closed to tokens.
+- `CreateUser` called with a token returns the user without the subscription link and the page password. `GetSubscriptionLink` is closed to tokens. `UpdateUser` takes `page_password_action` (`CHANGE`, `REMOVE` or `RESTORE`) for the person's page password: a new password for the same link, the page open on the link alone, the password asked again with a new one. It counts as one change of the person for a token's hourly limit, a repeat that changes nothing is free, and no response carries the password (the owner reads it with `GetSubscriptionLink`). `User.page_open` says that the password was removed.
 - Profile secrets come back masked (`••••`), for every caller.
 - Device keys and configurations (`DeviceService`) and WARP accounts are closed to tokens.
 - A device's ID (HWID) is never stored or returned: `Device.fingerprint` is the first six characters of its hash, enough to tell two identical phones apart.

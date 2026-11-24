@@ -10,14 +10,15 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file mistgate/admin/v1/common.proto.
  */
 export const file_mistgate_admin_v1_common: GenFile = /*@__PURE__*/
-  fileDesc("Ch5taXN0Z2F0ZS9hZG1pbi92MS9jb21tb24ucHJvdG8SEW1pc3RnYXRlLmFkbWluLnYxIogBCgxTdGF0dXNSZWFzb24SDAoEY29kZRgBIAEoCRI7CgZwYXJhbXMYAiADKAsyKy5taXN0Z2F0ZS5hZG1pbi52MS5TdGF0dXNSZWFzb24uUGFyYW1zRW50cnkaLQoLUGFyYW1zRW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4ASIwCg1Qcm90b2NvbENvdW50EhAKCHByb3RvY29sGAEgASgJEg0KBXVzZXJzGAIgASgNIqYDCgdJbmJvdW5kEgoKAmlkGAEgASgJEhIKCnByb2ZpbGVfaWQYAiABKAkSFAoMcHJvZmlsZV9uYW1lGAMgASgJEhAKCHByb3RvY29sGAQgASgJEg8KB25vZGVfaWQYBSABKAkSEQoJbm9kZV9uYW1lGAYgASgJEgwKBHBvcnQYByABKA0SFwoPdGxzX3NlcnZlcl9uYW1lGAggASgJEi4KBXN0YXRlGAkgASgOMh8ubWlzdGdhdGUuYWRtaW4udjEuSW5ib3VuZFN0YXRlEhIKCmxhc3RfZXJyb3IYCiABKAkSFwoPY2VydF9waW5fc2hhMjU2GAsgASgJEh8KE2NlcnRfbm90X2FmdGVyX3VuaXgYDCABKANCAjACEjAKA2F3ZxgNIAEoCzIjLm1pc3RnYXRlLmFkbWluLnYxLkF3Z0luYm91bmRTdGF0dXMSDgoGZWdyZXNzGA4gASgJEhUKDXBvcnRfb3ZlcnJpZGUYDyABKA0SIAoYdGxzX3NlcnZlcl9uYW1lX292ZXJyaWRlGBAgASgJEg8KB2VuYWJsZWQYESABKAgihAIKEEF3Z0luYm91bmRTdGF0dXMSDwoHYmFja2VuZBgBIAEoCRIXCg9iYWNrZW5kX3ZlcnNpb24YAiABKAkSEAoIaWZhY2VfdXAYAyABKAgSDQoFcGVlcnMYBCABKA0SGAoQcGVlcnNfaGFuZHNoYWtlbhgFIAEoDRIUCgxwZWVyc19vbmxpbmUYBiABKA0SIQoVbmV3ZXN0X2hhbmRzaGFrZV91bml4GAcgASgDQgIwAhIaCg51ZHBfcnhfcGFja2V0cxgIIAEoBEICMAISGwoTdW5rbm93bl9wZWVyX2V2ZW50cxgJIAEoDRIZCg1yZXBvcnRlZF91bml4GAogASgDQgIwAiKNAQoLV2FycFN1bW1hcnkSKwoFc3RhdGUYASABKA4yHC5taXN0Z2F0ZS5hZG1pbi52MS5XYXJwU3RhdGUSLQoGc291cmNlGAIgASgOMh0ubWlzdGdhdGUuYWRtaW4udjEuV2FycFNvdXJjZRIMCgRjb2xvGAMgASgJEhQKDGFjY291bnRfdHlwZRgEIAEoCSKmAQoJUG9ydENoZWNrEg8KB25vZGVfaWQYASABKAkSDAoEcG9ydBgCIAEoDRIPCgd2ZXJkaWN0GAMgASgJEgwKBHNlbnQYBCABKA0SCwoDZ290GAUgASgNEhgKDGNoZWNrZWRfdW5peBgGIAEoA0ICMAISFAoIYmFkX3VuaXgYByABKANCAjACEg4KBnNlbmRlchgIIAEoCRIOCgZyZWFzb24YCSABKAkikAEKCFRjcENoZWNrEgwKBHBvcnQYASABKA0SDAoEcm9sZRgCIAEoCRIMCgRhbHBuGAMgASgIEg8KB3Byb2ZpbGUYBCABKAkSDwoHdmVyZGljdBgFIAEoCRIOCgZyZWFzb24YBiABKAkSDgoGc2VuZGVyGAcgASgJEhgKDGNoZWNrZWRfdW5peBgIIAEoA0ICMAIi7QIKCExpbmtIb3VyEhsKD2hvdXJfc3RhcnRfdW5peBgBIAEoA0ICMAISEAoIY29ubmVjdHMYAiABKA0SDwoHcmVqZWN0cxgDIAEoDRINCgVkcm9wcxgEIAEoDRIOCgZzdGFsbHMYBSABKA0SFAoIb25saW5lX3MYBiABKARCAjACEhQKDHVua25vd25fa2V5cxgHIAEoDRIOCgZoZWxsb3MYCCABKA0SEgoKaGFuZHNoYWtlcxgJIAEoDRIVCg1jbGllbnRfY2xvc2VzGAogASgNEg8KB2ZyZWV6ZXMYCyABKA0SDQoFcXVpZXQYDCABKA0SEAoIYWNjZXB0ZWQYDSABKA0SFgoOaGVsbG9zX2ZvcmVpZ24YDiABKA0SDgoGcnR0X21zGA8gASgNEhUKDWxvc3NfcGVybWlsbGUYECABKA0SEwoLcnR0X3NhbXBsZXMYESABKA0SFQoJcGt0c19zZW50GBIgASgEQgIwAirVAQoKTm9kZVN0YXR1cxIbChdOT0RFX1NUQVRVU19VTlNQRUNJRklFRBAAEhcKE05PREVfU1RBVFVTX1BFTkRJTkcQARIWChJOT0RFX1NUQVRVU19PTkxJTkUQAhIUChBOT0RFX1NUQVRVU19ET1dOEAMSFAoQTk9ERV9TVEFUVVNfQkxJUBAEEhoKFk5PREVfU1RBVFVTX05PX1RSQUZGSUMQBRIYChROT0RFX1NUQVRVU19VUERBVElORxAGEhcKE05PREVfU1RBVFVTX1JFVElSRUQQByo5CgNBcHASEwoPQVBQX1VOU1BFQ0lGSUVEEAASDAoIQVBQX0hBUFAQARIPCgtBUFBfQU1ORVpJQRACKpgBCgxJbmJvdW5kU3RhdGUSHQoZSU5CT1VORF9TVEFURV9VTlNQRUNJRklFRBAAEhkKFUlOQk9VTkRfU1RBVEVfUEVORElORxABEhgKFElOQk9VTkRfU1RBVEVfQUNUSVZFEAISGAoUSU5CT1VORF9TVEFURV9GQUlMRUQQAxIaChZJTkJPVU5EX1NUQVRFX0RJU0FCTEVEEAQq1AEKCVdhcnBTdGF0ZRIaChZXQVJQX1NUQVRFX1VOU1BFQ0lGSUVEEAASHQoZV0FSUF9TVEFURV9OT1RfQ09ORklHVVJFRBABEhYKEldBUlBfU1RBVEVfVU5LTk9XThACEhoKFldBUlBfU1RBVEVfVU5BVkFJTEFCTEUQAxIXChNXQVJQX1NUQVRFX1NUQVJUSU5HEAQSEQoNV0FSUF9TVEFURV9VUBAFEhMKD1dBUlBfU1RBVEVfRE9XThAGEhcKE1dBUlBfU1RBVEVfRElTQUJMRUQQBypfCgpXYXJwU291cmNlEhsKF1dBUlBfU09VUkNFX1VOU1BFQ0lGSUVEEAASGgoWV0FSUF9TT1VSQ0VfUkVHSVNURVJFRBABEhgKFFdBUlBfU09VUkNFX0lNUE9SVEVEEAJCxgEKFWNvbS5taXN0Z2F0ZS5hZG1pbi52MUILQ29tbW9uUHJvdG9QAVo6Z2l0aHViLmNvbS9taXN0Z2F0ZS9taXN0Z2F0ZS9nZW4vbWlzdGdhdGUvYWRtaW4vdjE7YWRtaW52MaICA01BWKoCEU1pc3RnYXRlLkFkbWluLlYxygIRTWlzdGdhdGVcQWRtaW5cVjHiAh1NaXN0Z2F0ZVxBZG1pblxWMVxHUEJNZXRhZGF0YeoCE01pc3RnYXRlOjpBZG1pbjo6VjFiBnByb3RvMw");
+  fileDesc("Ch5taXN0Z2F0ZS9hZG1pbi92MS9jb21tb24ucHJvdG8SEW1pc3RnYXRlLmFkbWluLnYxIogBCgxTdGF0dXNSZWFzb24SDAoEY29kZRgBIAEoCRI7CgZwYXJhbXMYAiADKAsyKy5taXN0Z2F0ZS5hZG1pbi52MS5TdGF0dXNSZWFzb24uUGFyYW1zRW50cnkaLQoLUGFyYW1zRW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4ASIwCg1Qcm90b2NvbENvdW50EhAKCHByb3RvY29sGAEgASgJEg0KBXVzZXJzGAIgASgNIo0ECgdJbmJvdW5kEgoKAmlkGAEgASgJEhIKCnByb2ZpbGVfaWQYAiABKAkSFAoMcHJvZmlsZV9uYW1lGAMgASgJEhAKCHByb3RvY29sGAQgASgJEg8KB25vZGVfaWQYBSABKAkSEQoJbm9kZV9uYW1lGAYgASgJEgwKBHBvcnQYByABKA0SFwoPdGxzX3NlcnZlcl9uYW1lGAggASgJEi4KBXN0YXRlGAkgASgOMh8ubWlzdGdhdGUuYWRtaW4udjEuSW5ib3VuZFN0YXRlEhIKCmxhc3RfZXJyb3IYCiABKAkSFwoPY2VydF9waW5fc2hhMjU2GAsgASgJEh8KE2NlcnRfbm90X2FmdGVyX3VuaXgYDCABKANCAjACEjAKA2F3ZxgNIAEoCzIjLm1pc3RnYXRlLmFkbWluLnYxLkF3Z0luYm91bmRTdGF0dXMSDgoGZWdyZXNzGA4gASgJEhUKDXBvcnRfb3ZlcnJpZGUYDyABKA0SIAoYdGxzX3NlcnZlcl9uYW1lX292ZXJyaWRlGBAgASgJEg8KB2VuYWJsZWQYESABKAgSHwoXZGlyZWN0X2luX3N1YnNjcmlwdGlvbnMYEiABKAgSCwoDY2RuGBMgASgIEh8KF3JlYWxpdHlfdGFyZ2V0X292ZXJyaWRlGBQgASgJEhYKDnJlYWxpdHlfdGFyZ2V0GBUgASgJIoQCChBBd2dJbmJvdW5kU3RhdHVzEg8KB2JhY2tlbmQYASABKAkSFwoPYmFja2VuZF92ZXJzaW9uGAIgASgJEhAKCGlmYWNlX3VwGAMgASgIEg0KBXBlZXJzGAQgASgNEhgKEHBlZXJzX2hhbmRzaGFrZW4YBSABKA0SFAoMcGVlcnNfb25saW5lGAYgASgNEiEKFW5ld2VzdF9oYW5kc2hha2VfdW5peBgHIAEoA0ICMAISGgoOdWRwX3J4X3BhY2tldHMYCCABKARCAjACEhsKE3Vua25vd25fcGVlcl9ldmVudHMYCSABKA0SGQoNcmVwb3J0ZWRfdW5peBgKIAEoA0ICMAIijQEKC1dhcnBTdW1tYXJ5EisKBXN0YXRlGAEgASgOMhwubWlzdGdhdGUuYWRtaW4udjEuV2FycFN0YXRlEi0KBnNvdXJjZRgCIAEoDjIdLm1pc3RnYXRlLmFkbWluLnYxLldhcnBTb3VyY2USDAoEY29sbxgDIAEoCRIUCgxhY2NvdW50X3R5cGUYBCABKAkixwIKCVBvcnRDaGVjaxIPCgdub2RlX2lkGAEgASgJEgwKBHBvcnQYAiABKA0SDwoHdmVyZGljdBgDIAEoCRIMCgRzZW50GAQgASgNEgsKA2dvdBgFIAEoDRIYCgxjaGVja2VkX3VuaXgYBiABKANCAjACEhQKCGJhZF91bml4GAcgASgDQgIwAhIOCgZzZW5kZXIYCCABKAkSDgoGcmVhc29uGAkgASgJEhYKDnNlbmRlcl92ZXJkaWN0GAogASgJEhYKDmNvbmZpcm1fc2VuZGVyGAsgASgJEhQKDGNvbmZpcm1fc2VudBgMIAEoDRITCgtjb25maXJtX2dvdBgNIAEoDRIXCg9jb25maXJtX3ZlcmRpY3QYDiABKAkSDQoFYmxhbWUYDyABKAkSHAoQcHJvdG9jb2xfb2tfdW5peBgQIAEoA0ICMAIikAEKCFRjcENoZWNrEgwKBHBvcnQYASABKA0SDAoEcm9sZRgCIAEoCRIMCgRhbHBuGAMgASgIEg8KB3Byb2ZpbGUYBCABKAkSDwoHdmVyZGljdBgFIAEoCRIOCgZyZWFzb24YBiABKAkSDgoGc2VuZGVyGAcgASgJEhgKDGNoZWNrZWRfdW5peBgIIAEoA0ICMAIigQgKCExpbmtIb3VyEhsKD2hvdXJfc3RhcnRfdW5peBgBIAEoA0ICMAISEAoIY29ubmVjdHMYAiABKA0SDwoHcmVqZWN0cxgDIAEoDRINCgVkcm9wcxgEIAEoDRIOCgZzdGFsbHMYBSABKA0SFAoIb25saW5lX3MYBiABKARCAjACEhQKDHVua25vd25fa2V5cxgHIAEoDRIOCgZoZWxsb3MYCCABKA0SEgoKaGFuZHNoYWtlcxgJIAEoDRIVCg1jbGllbnRfY2xvc2VzGAogASgNEg8KB2ZyZWV6ZXMYCyABKA0SDQoFcXVpZXQYDCABKA0SEAoIYWNjZXB0ZWQYDSABKA0SFgoOaGVsbG9zX2ZvcmVpZ24YDiABKA0SDgoGcnR0X21zGA8gASgNEhUKDWxvc3NfcGVybWlsbGUYECABKA0SEwoLcnR0X3NhbXBsZXMYESABKA0SFQoJcGt0c19zZW50GBIgASgEQgIwAhIVCg1oc191bmZpbmlzaGVkGBMgASgNEhcKD3Rsc19hbGVydHNfc2VudBgUIAEoDRIXCg90bHNfYWxlcnRzX3JlY3YYFSABKA0SGAoQdGxzX2NlcnRfcmVmdXNlZBgWIAEoDRIYChByZWFsaXR5X2ZhbGxiYWNrGBcgASgNEhMKC2F1dGhfZmFpbGVkGBggASgNEhIKCnRjcF9zdGFsbHMYGSABKA0SFgoOdGNwX3N0YWxsc18xNmsYGiABKA0SEwoLaW5pdGlhdGlvbnMYGyABKA0SEQoJcmVzcG9uc2VzGBwgASgNEhsKE3Jlc3BvbnNlc191bm1hdGNoZWQYHSABKA0SFgoOdHVubmVsX2Jsb2NrZWQYHiABKA0SFgoOdHVubmVsX25vX2lwdjQYHyABKA0SGwoTdHVubmVsX2Nvbm5fcmVmdXNlZBggIAEoDRIfChd0dW5uZWxfY29ubl91bnJlYWNoYWJsZRghIAEoDRIXCg90dW5uZWxfY29ubl9kbnMYIiABKA0SGQoRdHVubmVsX2Nvbm5fb3RoZXIYIyABKA0SFgoOdHVubmVsX3RpbWVvdXQYJCABKA0SHgoWdHVubmVsX290aGVyX2RlYWRsaW5lcxglIAEoDRIeChZ0dW5uZWxfb3RoZXJfYXV0aG9yaXR5GCYgASgNEhkKEXR1bm5lbF9vdGhlcl9pY21wGCcgASgNEhkKEXR1bm5lbF9vdGhlcl9kaWFsGCggASgNEhwKFHR1bm5lbF9zdHJlYW1fY2xvc2VkGCkgASgNEh8KF3R1bm5lbF9zdHJlYW1fY3JlZF9nb25lGCogASgNEiAKGHR1bm5lbF9zdHJlYW1fY29ubl9saW1pdBgrIAEoDSLFAQoOSGVsbG9LZXhEZXZpY2USEQoJZGV2aWNlX2lkGAEgASgJEg8KB3VzZXJfaWQYAiABKAkSEQoJdXNlcl9uYW1lGAMgASgJEg4KBmNsaWVudBgEIAEoCRIQCghwbGF0Zm9ybRgFIAEoCRIQCghoZWxsb19wcRgGIAEoDRIVCg1oZWxsb19jbGFzc2ljGAcgASgNEhUKDWhlbGxvX3Vua25vd24YCCABKA0SGgoObGFzdF9ob3VyX3VuaXgYCSABKANCAjACIlAKC05vZGVTaGFyaW5nEi4KBG1vZGUYASABKA4yIC5taXN0Z2F0ZS5hZG1pbi52MS5Ob2RlU2hhcmVNb2RlEhEKCWdyb3VwX2lkcxgCIAMoCSIxCgZRckNvZGUSCQoBbhgBIAEoDRIMCgRiaXRzGAIgASgMEg4KBndpbmRvdxgDIAEoASrVAQoKTm9kZVN0YXR1cxIbChdOT0RFX1NUQVRVU19VTlNQRUNJRklFRBAAEhcKE05PREVfU1RBVFVTX1BFTkRJTkcQARIWChJOT0RFX1NUQVRVU19PTkxJTkUQAhIUChBOT0RFX1NUQVRVU19ET1dOEAMSFAoQTk9ERV9TVEFUVVNfQkxJUBAEEhoKFk5PREVfU1RBVFVTX05PX1RSQUZGSUMQBRIYChROT0RFX1NUQVRVU19VUERBVElORxAGEhcKE05PREVfU1RBVFVTX1JFVElSRUQQByphCgNBcHASEwoPQVBQX1VOU1BFQ0lGSUVEEAASDAoIQVBQX0hBUFAQARIPCgtBUFBfQU1ORVpJQRACEhAKDEFQUF9URUxFR1JBTRADEhQKEEFQUF9UUlVTVF9UVU5ORUwQBCqYAQoMSW5ib3VuZFN0YXRlEh0KGUlOQk9VTkRfU1RBVEVfVU5TUEVDSUZJRUQQABIZChVJTkJPVU5EX1NUQVRFX1BFTkRJTkcQARIYChRJTkJPVU5EX1NUQVRFX0FDVElWRRACEhgKFElOQk9VTkRfU1RBVEVfRkFJTEVEEAMSGgoWSU5CT1VORF9TVEFURV9ESVNBQkxFRBAEKtQBCglXYXJwU3RhdGUSGgoWV0FSUF9TVEFURV9VTlNQRUNJRklFRBAAEh0KGVdBUlBfU1RBVEVfTk9UX0NPTkZJR1VSRUQQARIWChJXQVJQX1NUQVRFX1VOS05PV04QAhIaChZXQVJQX1NUQVRFX1VOQVZBSUxBQkxFEAMSFwoTV0FSUF9TVEFURV9TVEFSVElORxAEEhEKDVdBUlBfU1RBVEVfVVAQBRITCg9XQVJQX1NUQVRFX0RPV04QBhIXChNXQVJQX1NUQVRFX0RJU0FCTEVEEAcqXwoKV2FycFNvdXJjZRIbChdXQVJQX1NPVVJDRV9VTlNQRUNJRklFRBAAEhoKFldBUlBfU09VUkNFX1JFR0lTVEVSRUQQARIYChRXQVJQX1NPVVJDRV9JTVBPUlRFRBACKn8KDU5vZGVTaGFyZU1vZGUSHwobTk9ERV9TSEFSRV9NT0RFX1VOU1BFQ0lGSUVEEAASFwoTTk9ERV9TSEFSRV9NT0RFX0FMTBABEhoKFk5PREVfU0hBUkVfTU9ERV9MSVNURUQQAhIYChROT0RFX1NIQVJFX01PREVfTk9ORRADQsYBChVjb20ubWlzdGdhdGUuYWRtaW4udjFCC0NvbW1vblByb3RvUAFaOmdpdGh1Yi5jb20vbWlzdGdhdGUvbWlzdGdhdGUvZ2VuL21pc3RnYXRlL2FkbWluL3YxO2FkbWludjGiAgNNQViqAhFNaXN0Z2F0ZS5BZG1pbi5WMcoCEU1pc3RnYXRlXEFkbWluXFYx4gIdTWlzdGdhdGVcQWRtaW5cVjFcR1BCTWV0YWRhdGHqAhNNaXN0Z2F0ZTo6QWRtaW46OlYxYgZwcm90bzM");
 
 /**
  * Why a status is what it is. The UI localizes `code`; `params` fill the placeholders.
  * Codes: agent_silent {minutes}, host_blip {minutes}, enrollment_pending {expires_in_minutes, expires_unix},
  * enrollment_expired (PENDING without a usable install command), inbound_failed {inbound, error, profile, failed,
  * total} (failed of the node's total enabled profiles do not run), state_drift, clock_skew {seconds}, no_profiles
- * (ONLINE, nothing else wrong, but no enabled profile: nobody gets the node).
+ * (ONLINE, nothing else wrong, but no enabled profile: nobody gets the node), inbound_no_way_in {profile, node, reason}
+ * (hiding the direct server leaves no usable IPv6 twin, CDN host or relay; reason is "awg", "acme_ip" or "no_usable_relay").
  * The health checks add no_traffic {failed, total} (status NO_TRAFFIC: agent on, synthetic
  * checks failing) and doctor_fail {check} (status stays ONLINE, reason shows the worst FAIL of the doctor).
  *
@@ -175,6 +176,36 @@ export type Inbound = Message<"mistgate.admin.v1.Inbound"> & {
    * @generated from field: bool enabled = 17;
    */
   enabled: boolean;
+
+  /**
+   * Whether the server at the node's own address is included in subscriptions. The inbound keeps running when false.
+   *
+   * @generated from field: bool direct_in_subscriptions = 18;
+   */
+  directInSubscriptions: boolean;
+
+  /**
+   * Whether clients reach this inbound through its CDN host instead of the node's address.
+   *
+   * @generated from field: bool cdn = 19;
+   */
+  cdn: boolean;
+
+  /**
+   * Protocol "vless", REALITY only: the target this node shows instead of the profile's, as "host:port" ("" = the profile's own; the
+   * host is also the one name REALITY accepts here, so it is the tls_server_name of this inbound).
+   *
+   * @generated from field: string reality_target_override = 20;
+   */
+  realityTargetOverride: string;
+
+  /**
+   * The target REALITY forwards strangers to as this inbound has it built: "self" (the node's own site), "host:port", or "" for an
+   * inbound that is not VLESS REALITY. The edit window and the neighbour card say what strangers see now and after a change.
+   *
+   * @generated from field: string reality_target = 21;
+   */
+  realityTarget: string;
 };
 
 /**
@@ -357,6 +388,55 @@ export type PortCheck = Message<"mistgate.admin.v1.PortCheck"> & {
    * @generated from field: string reason = 9;
    */
   reason: string;
+
+  /**
+   * The first sender's verdict before comparison with a confirmation sender.
+   *
+   * @generated from field: string sender_verdict = 10;
+   */
+  senderVerdict: string;
+
+  /**
+   * "panel" or the name of the confirmation node; empty when there was no confirmation run.
+   *
+   * @generated from field: string confirm_sender = 11;
+   */
+  confirmSender: string;
+
+  /**
+   * Packets sent by the confirmation sender for this port; 0 when there was no confirmation run.
+   *
+   * @generated from field: uint32 confirm_sent = 12;
+   */
+  confirmSent: number;
+
+  /**
+   * Packets counted by the target from the confirmation sender; 0 when there was no confirmation run.
+   *
+   * @generated from field: uint32 confirm_got = 13;
+   */
+  confirmGot: number;
+
+  /**
+   * The confirmation sender's verdict after the relative-loss rule; empty when there was no confirmation run.
+   *
+   * @generated from field: string confirm_verdict = 14;
+   */
+  confirmVerdict: string;
+
+  /**
+   * "node" when both runs found loss, "path" when only one did, or empty when unconfirmed or both were clean.
+   *
+   * @generated from field: string blame = 15;
+   */
+  blame: string;
+
+  /**
+   * Unix time of the latest successful panel protocol probe through an enabled inbound on this port; 0 if its latest result failed or none is stored.
+   *
+   * @generated from field: int64 protocol_ok_unix = 16 [jstype = JS_NUMBER];
+   */
+  protocolOkUnix: bigint;
 };
 
 /**
@@ -535,6 +615,136 @@ export type LinkHour = Message<"mistgate.admin.v1.LinkHour"> & {
    * @generated from field: uint64 pkts_sent = 18 [jstype = JS_NUMBER];
    */
   pktsSent: bigint;
+
+  /**
+   * Agents that list "links/3" (see InboundConnections); device rows carry only the per-key ones (tcp_stalls,
+   * tcp_stalls_16k, initiations, responses, responses_unmatched).
+   *
+   * @generated from field: uint32 hs_unfinished = 19;
+   */
+  hsUnfinished: number;
+
+  /**
+   * @generated from field: uint32 tls_alerts_sent = 20;
+   */
+  tlsAlertsSent: number;
+
+  /**
+   * @generated from field: uint32 tls_alerts_recv = 21;
+   */
+  tlsAlertsRecv: number;
+
+  /**
+   * @generated from field: uint32 tls_cert_refused = 22;
+   */
+  tlsCertRefused: number;
+
+  /**
+   * @generated from field: uint32 reality_fallback = 23;
+   */
+  realityFallback: number;
+
+  /**
+   * @generated from field: uint32 auth_failed = 24;
+   */
+  authFailed: number;
+
+  /**
+   * @generated from field: uint32 tcp_stalls = 25;
+   */
+  tcpStalls: number;
+
+  /**
+   * @generated from field: uint32 tcp_stalls_16k = 26;
+   */
+  tcpStalls16k: number;
+
+  /**
+   * @generated from field: uint32 initiations = 27;
+   */
+  initiations: number;
+
+  /**
+   * @generated from field: uint32 responses = 28;
+   */
+  responses: number;
+
+  /**
+   * @generated from field: uint32 responses_unmatched = 29;
+   */
+  responsesUnmatched: number;
+
+  /**
+   * TrustTunnel agents with "trusttunnel-refusals/1", inbound rows (see InboundConnections).
+   *
+   * @generated from field: uint32 tunnel_blocked = 30;
+   */
+  tunnelBlocked: number;
+
+  /**
+   * @generated from field: uint32 tunnel_no_ipv4 = 31;
+   */
+  tunnelNoIpv4: number;
+
+  /**
+   * @generated from field: uint32 tunnel_conn_refused = 32;
+   */
+  tunnelConnRefused: number;
+
+  /**
+   * @generated from field: uint32 tunnel_conn_unreachable = 33;
+   */
+  tunnelConnUnreachable: number;
+
+  /**
+   * @generated from field: uint32 tunnel_conn_dns = 34;
+   */
+  tunnelConnDns: number;
+
+  /**
+   * @generated from field: uint32 tunnel_conn_other = 35;
+   */
+  tunnelConnOther: number;
+
+  /**
+   * @generated from field: uint32 tunnel_timeout = 36;
+   */
+  tunnelTimeout: number;
+
+  /**
+   * @generated from field: uint32 tunnel_other_deadlines = 37;
+   */
+  tunnelOtherDeadlines: number;
+
+  /**
+   * @generated from field: uint32 tunnel_other_authority = 38;
+   */
+  tunnelOtherAuthority: number;
+
+  /**
+   * @generated from field: uint32 tunnel_other_icmp = 39;
+   */
+  tunnelOtherIcmp: number;
+
+  /**
+   * @generated from field: uint32 tunnel_other_dial = 40;
+   */
+  tunnelOtherDial: number;
+
+  /**
+   * @generated from field: uint32 tunnel_stream_closed = 41;
+   */
+  tunnelStreamClosed: number;
+
+  /**
+   * @generated from field: uint32 tunnel_stream_cred_gone = 42;
+   */
+  tunnelStreamCredGone: number;
+
+  /**
+   * @generated from field: uint32 tunnel_stream_conn_limit = 43;
+   */
+  tunnelStreamConnLimit: number;
 };
 
 /**
@@ -543,6 +753,133 @@ export type LinkHour = Message<"mistgate.admin.v1.LinkHour"> & {
  */
 export const LinkHourSchema: GenMessage<LinkHour> = /*@__PURE__*/
   messageDesc(file_mistgate_admin_v1_common, 7);
+
+/**
+ * One device's ClientHello counts over the window (GetFleetConnectionsResponse.hello_kex_classic, GetUserConnectionResponse.hello_kex).
+ * A device is pq in a window when every hello counted had an X25519MLKEM768 key share before any X25519 share (the condition a
+ * strict REALITY library demands), classic when one lacked it: that library turns the device away. unknown ones could not be read
+ * (cut short, spread over several records, malformed). Counted by the nodes on the current core, per connection.
+ *
+ * @generated from message mistgate.admin.v1.HelloKexDevice
+ */
+export type HelloKexDevice = Message<"mistgate.admin.v1.HelloKexDevice"> & {
+  /**
+   * @generated from field: string device_id = 1;
+   */
+  deviceId: string;
+
+  /**
+   * @generated from field: string user_id = 2;
+   */
+  userId: string;
+
+  /**
+   * @generated from field: string user_name = 3;
+   */
+  userName: string;
+
+  /**
+   * The device as the panel knows it now (the app and platform of its last subscription fetch).
+   *
+   * @generated from field: string client = 4;
+   */
+  client: string;
+
+  /**
+   * @generated from field: string platform = 5;
+   */
+  platform: string;
+
+  /**
+   * @generated from field: uint32 hello_pq = 6;
+   */
+  helloPq: number;
+
+  /**
+   * @generated from field: uint32 hello_classic = 7;
+   */
+  helloClassic: number;
+
+  /**
+   * @generated from field: uint32 hello_unknown = 8;
+   */
+  helloUnknown: number;
+
+  /**
+   * Start of the newest hour with a hello counter.
+   *
+   * @generated from field: int64 last_hour_unix = 9 [jstype = JS_NUMBER];
+   */
+  lastHourUnix: bigint;
+};
+
+/**
+ * Describes the message mistgate.admin.v1.HelloKexDevice.
+ * Use `create(HelloKexDeviceSchema)` to create a new message.
+ */
+export const HelloKexDeviceSchema: GenMessage<HelloKexDevice> = /*@__PURE__*/
+  messageDesc(file_mistgate_admin_v1_common, 8);
+
+/**
+ * A share asked for: the mode, and for LISTED the groups that receive the node (at least one; empty for ALL and NONE).
+ *
+ * @generated from message mistgate.admin.v1.NodeSharing
+ */
+export type NodeSharing = Message<"mistgate.admin.v1.NodeSharing"> & {
+  /**
+   * @generated from field: mistgate.admin.v1.NodeShareMode mode = 1;
+   */
+  mode: NodeShareMode;
+
+  /**
+   * @generated from field: repeated string group_ids = 2;
+   */
+  groupIds: string[];
+};
+
+/**
+ * Describes the message mistgate.admin.v1.NodeSharing.
+ * Use `create(NodeSharingSchema)` to create a new message.
+ */
+export const NodeSharingSchema: GenMessage<NodeSharing> = /*@__PURE__*/
+  messageDesc(file_mistgate_admin_v1_common, 9);
+
+/**
+ * A QR code the panel draws itself: the server encodes (internal/qr) and says which modules are dark, the page makes the
+ * shapes. The same data as the person's page gets (subs page_qr), so both draw the one code with the logo in the middle.
+ *
+ * @generated from message mistgate.admin.v1.QrCode
+ */
+export type QrCode = Message<"mistgate.admin.v1.QrCode"> & {
+  /**
+   * Modules a side, 4*version+17.
+   *
+   * @generated from field: uint32 n = 1;
+   */
+  n: number;
+
+  /**
+   * n*n modules row by row, eight to a byte, the first in the high bit, 1 = dark; the last byte is padded with zeros.
+   *
+   * @generated from field: bytes bits = 2;
+   */
+  bits: Uint8Array;
+
+  /**
+   * Side, in modules, of the clear square in the middle for the logo; 0: no logo (the code is too small to spare the error
+   * correction). A multiple of 0.5.
+   *
+   * @generated from field: double window = 3;
+   */
+  window: number;
+};
+
+/**
+ * Describes the message mistgate.admin.v1.QrCode.
+ * Use `create(QrCodeSchema)` to create a new message.
+ */
+export const QrCodeSchema: GenMessage<QrCode> = /*@__PURE__*/
+  messageDesc(file_mistgate_admin_v1_common, 10);
 
 /**
  * Status of a node as the admin UI shows it.
@@ -630,6 +967,20 @@ export enum App {
    * @generated from enum value: APP_AMNEZIA = 2;
    */
   AMNEZIA = 2,
+
+  /**
+   * Telegram clients: MTProto proxy links (tg://proxy).
+   *
+   * @generated from enum value: APP_TELEGRAM = 3;
+   */
+  TELEGRAM = 3,
+
+  /**
+   * Official TrustTunnel apps: one tt:// key per person.
+   *
+   * @generated from enum value: APP_TRUST_TUNNEL = 4;
+   */
+  TRUST_TUNNEL = 4,
 }
 
 /**
@@ -772,4 +1123,50 @@ export enum WarpSource {
  */
 export const WarpSourceSchema: GenEnum<WarpSource> = /*@__PURE__*/
   enumDesc(file_mistgate_admin_v1_common, 4);
+
+/**
+ * How a node is handed out to groups. A group receives every node that is not on its disabled list (Group.disabled_node_ids).
+ * A node the owner holds back is on that list of every group that was not given it, and a group made later starts with it
+ * there too; so the mode is read off the node: ALL when nothing is held back, LISTED while some group receives it, NONE when
+ * no group does. Set with GroupService.SetNodeSharing, or at the node's creation (CreateEnrollmentRequest.sharing,
+ * StartNodeProvisionRequest.sharing); read in Node.sharing and, per group, in Group.disabled_node_ids.
+ *
+ * @generated from enum mistgate.admin.v1.NodeShareMode
+ */
+export enum NodeShareMode {
+  /**
+   * Only in a request that makes a node: the panel decides. The first node of the panel that is not retired goes to every group
+   * (ALL), each later one to no group (NONE). Never in a response.
+   *
+   * @generated from enum value: NODE_SHARE_MODE_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * Every group, groups made later too. A group can still turn the node off for itself (UpdateGroup.disabled_node_ids).
+   *
+   * @generated from enum value: NODE_SHARE_MODE_ALL = 1;
+   */
+  ALL = 1,
+
+  /**
+   * Only the listed groups; a group made later does not get the node.
+   *
+   * @generated from enum value: NODE_SHARE_MODE_LISTED = 2;
+   */
+  LISTED = 2,
+
+  /**
+   * No group, and no group made later, until the owner gives the node to one. A legitimate state: nothing alerts on it.
+   *
+   * @generated from enum value: NODE_SHARE_MODE_NONE = 3;
+   */
+  NONE = 3,
+}
+
+/**
+ * Describes the enum mistgate.admin.v1.NodeShareMode.
+ */
+export const NodeShareModeSchema: GenEnum<NodeShareMode> = /*@__PURE__*/
+  enumDesc(file_mistgate_admin_v1_common, 5);
 

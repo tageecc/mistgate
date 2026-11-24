@@ -1,0 +1,354 @@
+import { Code, ConnectError } from "@connectrpc/connect";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, type ReactNode } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { ToastProvider } from "@/components/ui/toast";
+import { Role } from "@/gen/mistgate/admin/v1/auth_pb";
+import { App, NodeStatus } from "@/gen/mistgate/admin/v1/common_pb";
+import { SubFormat } from "@/gen/mistgate/admin/v1/subscription_pb";
+import { hy2, vless } from "./schema.fixtures";
+import { ProfileEditorScreen } from "./page";
+
+const createProfile = vi.fn();
+const updateProfile = vi.fn();
+const createInbound = vi.fn();
+const updateGroup = vi.fn();
+const navigate = vi.fn();
+let params: Record<string, string> = {};
+let search: Record<string, string> = {};
+let profileProtocol = "hysteria2";
+let role = Role.OWNER;
+let savedElsewhere = false; // the profile was saved from another window: version 2, port 8443
+let qc: QueryClient;
+
+// the plugin's schema with the domain field (the trimmed fixture has none)
+const schema = JSON.stringify({ ...JSON.parse(hy2), properties: { ...JSON.parse(hy2).properties, sni: { type: "string", title: "SNI", "x-group": "basics", "x-order": 30, "x-critical": true } } });
+const defaults = JSON.stringify({ port: 443, tls_mode: "acme_domain", sni: "", obfs: { type: "salamander", password: "••••" }, masquerade: { type: "decoy" }, up_mbps: 0, udp: true });
+const awgSchema = JSON.stringify({
+  type: "object",
+  properties: {
+    version: { type: "string", enum: ["3.1", "2.0"], title: "Protocol version", "x-group": "basics", "x-order": 10 },
+    port: { type: "integer", title: "UDP port", "x-group": "basics", "x-order": 20 },
+    subnet4: { type: "string", title: "Client network (IPv4)", "x-group": "basics", "x-order": 50 },
+    subnet6: { type: "string", title: "Client network (IPv6)", "x-group": "basics", "x-order": 60 },
+  },
+});
+const mtprotoSchema = JSON.stringify({ type: "object", properties: { port: { type: "integer", title: "Port", "x-group": "basics", "x-order": 10, "x-critical": true } } });
+const vlessDefaults = JSON.stringify({ port: 443, transport: "xhttp", security: "reality", reality: { target_kind: "self", target: "", server_names: [], short_ids: [], fingerprint: "chrome" }, xhttp: { path: "", host: "", mode: "auto", x_padding_bytes: "100-1000" }, egress: "direct" });
+const awgDefaults = JSON.stringify({ version: "3.1", port: 10819, mtu: 1280, subnet4: "10.66.4.0/22", subnet6: "fd66:66:0:1::/64", obfuscation: { preset: "dns" } });
+
+// what the server says of a draft: VLESS over XHTTP is not in sing-box, everything else works in the four formats
+const formatsOf = ({ protocol, settingsJson }: { protocol: string; settingsJson: string }) => {
+  const xhttp = protocol === "vless" && (JSON.parse(settingsJson) as { transport?: string }).transport === "xhttp";
+  return [SubFormat.BASE64_URIS, SubFormat.MIHOMO_YAML, SubFormat.XRAY_JSON, SubFormat.SINGBOX_JSON].map((format) =>
+    format === SubFormat.SINGBOX_JSON && xhttp ? { format, ok: false, note: "xhttp" } : { format, ok: true, note: "" },
+  );
+};
+
+vi.mock("@/lib/api", async (orig) => ({
+  ...(await orig<object>()),
+  profiles: {
+    listProtocols: () => Promise.resolve({ protocols: [
+      { id: "hysteria2", displayName: "Hysteria2", settingsSchemaJson: schema, defaultSettingsJson: defaults, apps: [App.HAPP] },
+      { id: "awg", displayName: "AmneziaWG", settingsSchemaJson: awgSchema, defaultSettingsJson: awgDefaults, apps: [App.AMNEZIA] },
+      { id: "mtproto", displayName: "MTProto", settingsSchemaJson: mtprotoSchema, defaultSettingsJson: JSON.stringify({ port: 443 }), apps: [App.TELEGRAM] },
+      { id: "vless", displayName: "VLESS", settingsSchemaJson: vless, defaultSettingsJson: vlessDefaults, apps: [App.HAPP] },
+    ] }),
+    listProfiles: () => Promise.resolve({ profiles: [{ id: "p_old", name: "hy2 · 443", protocol: "hysteria2" }] }),
+    previewProfile: (r: { protocol: string; settingsJson: string }) =>
+      Promise.resolve({ errors: [], warnings: [], clientPreview: "hysteria2://…", clientLabel: "Subscription link · URI list", formats: formatsOf(r) }),
+    getProfile: () =>
+      Promise.resolve({
+        profile: { id: "p_old", name: "hy2 · 443", protocol: profileProtocol, version: savedElsewhere ? 2 : 1, nodeCount: 2, userCount: 12, summary: "", warnings: [], formats: [] },
+        settingsJson: profileProtocol === "vless" ? vlessDefaults : savedElsewhere ? defaults.replace('"port":443', '"port":8443') : defaults,
+        inbounds: [],
+      }),
+    createProfile: (...a: unknown[]) => createProfile(...a),
+    updateProfile: (...a: unknown[]) => updateProfile(...a),
+    createInbound: (...a: unknown[]) => createInbound(...a),
+  },
+  groups: {
+    listGroups: () =>
+      Promise.resolve({
+        groups: [
+          { id: "grp_all", name: "Все", profileIds: ["p_old"], userCount: 9, dnsPresetId: "", happNodes: 2, amneziaNodes: 0 },
+          { id: "grp_t", name: "test", profileIds: [], userCount: 1, dnsPresetId: "", happNodes: 0, amneziaNodes: 0 },
+        ],
+      }),
+    updateGroup: (...a: unknown[]) => updateGroup(...a),
+  },
+  nodes: {
+    getFleetConnections: () => Promise.resolve({ nodes: [] }),
+    listNodes: () =>
+      Promise.resolve({
+        nodes: [
+          { id: "nod_1", name: "de1", status: NodeStatus.ONLINE, countryCode: "DE", address: "de1.example.com", protocols: ["hysteria2"], awgBackend: "auto" },
+          { id: "nod_2", name: "fi1", status: NodeStatus.ONLINE, countryCode: "FI", address: "203.0.113.10", protocols: [], awgBackend: "auto" },
+        ],
+      }),
+  },
+  subscriptions: { getSubscriptionSettings: () => Promise.resolve({ settings: { updateIntervalHours: 6, apps: [{ kind: App.HAPP, name: "Happ" }, { kind: App.AMNEZIA, name: "AmneziaVPN" }] }, effectiveTitle: "" }) },
+  dns: { listDnsPresets: () => Promise.resolve({ presets: [], providers: [], clientSupport: [] }) },
+  health: { getChecks: () => Promise.resolve({ nowUnix: 1, intervalS: 300, columns: [], rows: [], countryChecks: [] }) },
+  relays: { listRelays: () => Promise.resolve({ relays: [] }) },
+  auth: { me: () => Promise.resolve({ admin: { id: "adm_1", role } }) },
+  awgApi: { listMimicryPresets: () => Promise.resolve({ presets: [], domains: [] }) },
+}));
+vi.mock("@tanstack/react-router", () => ({
+  useBlocker: () => ({ status: "idle" }),
+  useParams: () => params,
+  useSearch: () => search,
+  useNavigate: () => navigate,
+  Link: ({ children, to, className }: { children?: ReactNode; to: string; className?: string }) => (
+    <a href={to} className={className}>
+      {children}
+    </a>
+  ),
+}));
+
+beforeAll(() => {
+  (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+});
+
+let root: Root | null = null;
+let host: HTMLDivElement | null = null;
+beforeEach(() => {
+  params = {};
+  search = {};
+  profileProtocol = "hysteria2";
+  role = Role.OWNER;
+  savedElsewhere = false;
+});
+afterEach(() => {
+  act(() => root?.unmount());
+  host?.remove();
+  root = host = null;
+  for (const m of [createProfile, updateProfile, createInbound, updateGroup, navigate]) m.mockReset();
+});
+
+async function mount() {
+  host = document.createElement("div");
+  document.body.append(host);
+  root = createRoot(host);
+  qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  await act(async () =>
+    root!.render(
+      <QueryClientProvider client={qc}>
+        <ToastProvider>
+          <ProfileEditorScreen />
+        </ToastProvider>
+      </QueryClientProvider>,
+    ),
+  );
+  await settle();
+}
+const settle = async () => {
+  for (let i = 0; i < 8; i++) await act(async () => void (await new Promise((r) => setTimeout(r, 0))));
+};
+const text = () => document.body.textContent ?? "";
+const button = (label: string) => [...document.querySelectorAll("button")].find((b) => b.textContent?.trim() === label);
+const radio = (label: string) => [...document.querySelectorAll<HTMLElement>("[role=radio]")].find((r) => r.textContent?.trim() === label);
+const click = (b: Element | undefined | null) => act(async () => void b?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+const type = (el: HTMLInputElement, value: string) =>
+  act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(el, value);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+const portField = () => document.querySelector<HTMLInputElement>("input[aria-label='UDP port'], input[aria-label='Port']")!;
+
+describe("who may change a profile", () => {
+  it("the owner has the save bar after a change and the delete section", async () => {
+    params = { id: "p_old" };
+    await mount();
+    expect(text()).toContain("Delete profile");
+    expect(text()).not.toContain("Only the owner can change profiles");
+    await type(portField(), "9443");
+    expect(button("Save")).toBeDefined();
+  });
+
+  it.each([Role.HELPER, Role.READONLY])("role %i reads the form: no Save, no Delete, the fields are out of reach, and the page says why", async (r) => {
+    role = r;
+    params = { id: "p_old" };
+    await mount();
+    expect(text()).toContain("Only the owner can change profiles");
+    expect(button("Save")).toBeUndefined();
+    expect(text()).not.toContain("Delete profile");
+    expect(portField().closest("[inert]")).not.toBeNull();
+    expect(portField().value).toBe("443"); // still readable
+  });
+});
+
+describe("a profile saved in another window while this one is being edited", () => {
+  it("keeps what was typed, says the profile changed, and takes the saved one only on Reload", async () => {
+    params = { id: "p_old" };
+    await mount();
+    await type(portField(), "9443");
+    savedElsewhere = true;
+    await act(async () => void (await qc.invalidateQueries({ queryKey: ["profiles"] })));
+    await settle();
+    expect(portField().value).toBe("9443");
+    expect(text()).toContain("The profile was changed elsewhere");
+    await click(button("Reload"));
+    await settle();
+    expect(portField().value).toBe("8443");
+    expect(text()).not.toContain("The profile was changed elsewhere");
+  });
+
+  it("does not hold back its own save: the form takes the version this window saved", async () => {
+    params = { id: "p_old" };
+    updateProfile.mockImplementation(() => {
+      savedElsewhere = true; // the server now holds version 2 with the typed port
+      return Promise.resolve({});
+    });
+    await mount();
+    await type(portField(), "8443");
+    await click(button("Save"));
+    await settle();
+    await click([...document.querySelectorAll("[role=dialog] button")].find((b) => b.textContent?.trim() === "Apply changes"));
+    await settle();
+    expect(updateProfile).toHaveBeenCalled();
+    expect(text()).not.toContain("The profile was changed elsewhere");
+    expect(document.querySelector(".pf-save.ok")?.textContent).toContain("Saved"); // no changes left: the bar only says so
+    expect(portField().value).toBe("8443");
+  });
+
+  it("shows the saved profile at once when nothing was typed", async () => {
+    params = { id: "p_old" };
+    await mount();
+    savedElsewhere = true;
+    await act(async () => void (await qc.invalidateQueries({ queryKey: ["profiles"] })));
+    await settle();
+    expect(portField().value).toBe("8443");
+  });
+});
+
+describe("a VLESS profile", () => {
+  beforeEach(() => {
+    params = { id: "p_old" };
+    profileProtocol = "vless";
+  });
+  const field = (label: string) => document.querySelector<HTMLInputElement>(`input[aria-label="${label}"]`);
+  const openAdvanced = () => click([...document.querySelectorAll("button")].find((b) => b.textContent?.trim().startsWith("Advanced")));
+
+  it("hides the XHTTP block when the transport is TCP, and brings it back for XHTTP", async () => {
+    await mount();
+    await settle();
+    await openAdvanced();
+    expect(field("Path")).not.toBeNull();
+    expect(field("Padding bytes")).not.toBeNull();
+    await click(radio("TCP (RAW + Vision)"));
+    expect(field("Path")).toBeNull();
+    expect(field("Host header")).toBeNull();
+    expect(field("Padding bytes")).toBeNull();
+    expect(text()).toContain("Exit"); // the rest of the group stays
+    await click(radio("XHTTP"));
+    expect(field("Path")).not.toBeNull();
+  });
+
+  it("says in which formats the draft works, live: XHTTP leaves sing-box out, TCP brings it back", async () => {
+    const formats = () => [...document.querySelectorAll(".pr-fm > span")].map((x) => `${x.className ? `${x.className}:` : ""}${x.textContent}`).join(" | ");
+    // the preview follows the form after a 350 ms pause
+    const debounce = () => act(async () => void (await new Promise((r) => setTimeout(r, 400))));
+    await mount();
+    expect(formats()).toBe("Link list | Mihomo | Xray JSON | no:sing-box");
+    await click(radio("TCP (RAW + Vision)"));
+    await debounce();
+    await settle();
+    expect(formats()).toBe("Link list | Mihomo | Xray JSON | sing-box");
+  });
+
+  it("shows the node's own site as the target at first, without the fields of another site, and brings them with the other segment", async () => {
+    await mount();
+    await settle();
+    expect(radio("This node’s site")?.getAttribute("aria-checked")).toBe("true");
+    expect(radio("Another site")?.getAttribute("aria-checked")).toBe("false");
+    expect(field("Target host:port")).toBeNull();
+    expect(text()).not.toContain("Server names");
+    expect(text()).toContain("Short IDs"); // the rest of the group stays
+    await click(radio("Another site"));
+    expect(field("Target host:port")).not.toBeNull();
+    expect(text()).toContain("Server names");
+    await click(radio("This node’s site"));
+    expect(field("Target host:port")).toBeNull();
+  });
+
+  it("says under port 443 what happens next to Hysteria2 for the node's own site, with the guide, and what it takes for another site", async () => {
+    await mount();
+    await settle();
+    const own = "On a node with Hysteria2 this profile takes TCP 443 from its site and shows the same site through REALITY. Nodes need a domain.";
+    expect(text()).toContain(own);
+    await click(radio("Another site"));
+    expect(text()).not.toContain(own);
+    const hint = "On a node with Hysteria2 this profile takes TCP 443: the Hysteria2 site there is off while it does";
+    expect(text()).toContain(hint);
+    expect(document.querySelector('a[href="https://mistgate.app/guide/vless-and-hysteria2/"]')?.textContent).toBe("VLESS and Hysteria2 on one node");
+    await type(field("TCP port")!, "8443");
+    expect(text()).not.toContain(hint);
+    expect(document.querySelector('a[href="https://mistgate.app/guide/vless-and-hysteria2/"]')).toBeNull();
+  });
+});
+
+describe("critical changes of a Hysteria2 profile", () => {
+  it("say that the server stops working for everyone who has it until the app refreshes the subscription", async () => {
+    params = { id: "p_old" };
+    updateProfile.mockResolvedValue({ impact: { inboundsRestarted: 2, usersOnline: 1, devicesNeedReissue: 0, criticalFields: ["/port"], affectedUserNames: ["anna", "boris"] } });
+    await mount();
+    await type(portField(), "9443");
+    await click(button("Save"));
+    await settle();
+    const dialog = [...document.querySelectorAll("[role=dialog]")].at(-1)!.textContent!;
+    expect(dialog).toContain("This server stops working for 12 users until their app refreshes the subscription (up to 6 h).");
+    expect(dialog).toContain("Ask them to refresh the subscription by hand, or make a copy of the profile on a new port");
+    expect(dialog).toContain("The profile restarts on 2 nodes.");
+  });
+});
+
+describe("critical changes of an MTProto profile", () => {
+  it("say the Telegram link stops working until the person adds the new one: no subscription refresh to wait for", async () => {
+    params = { id: "p_old" };
+    profileProtocol = "mtproto";
+    updateProfile.mockResolvedValue({ impact: { inboundsRestarted: 1, usersOnline: 0, devicesNeedReissue: 0, criticalFields: ["/port"], affectedUserNames: ["anna", "boris"] } });
+    await mount();
+    await type(document.querySelector<HTMLInputElement>("input[aria-label='TCP port']")!, "8443");
+    await click(button("Save"));
+    await settle();
+    const dialog = [...document.querySelectorAll("[role=dialog]")].at(-1)!.textContent!;
+    expect(dialog).toContain("The Telegram link stops working for 12 people until they add the new one from their page.");
+    expect(dialog).toContain("Send them the new link");
+    expect(dialog).not.toContain("subscription");
+  });
+});
+
+describe("a port change the UDP check refuses", () => {
+  const lossy = `port_lossy: port=9443&node=de1&sent=300&got=189&at=${Math.floor(Date.now() / 1000) - 120}&sender=de2&free=4443`;
+  const refuseUnlessAnyway = (r: { allowLossyPort?: boolean }) => (r.allowLossyPort ? Promise.resolve({}) : Promise.reject(new ConnectError(lossy, Code.FailedPrecondition)));
+
+  it("says which node loses packets, offers the clean port, and 'Save anyway' sends allowLossyPort", async () => {
+    params = { id: "p_old" };
+    updateProfile.mockImplementation(refuseUnlessAnyway);
+    await mount();
+    await type(portField(), "9443");
+    await click(button("Save"));
+    await settle();
+    expect(text()).toContain("Port 9443 loses 37 % of UDP packets on de1 (checked from de2, 2 min ago).");
+    expect(button("Take 4443")).toBeDefined();
+    expect(updateProfile.mock.calls.every(([r]) => !(r as { allowLossyPort?: boolean }).allowLossyPort)).toBe(true);
+    await click(button("Save anyway"));
+    await settle();
+    expect(updateProfile.mock.calls.at(-1)?.[0]).toMatchObject({ profileId: "p_old", allowLossyPort: true });
+    expect(text()).not.toContain("loses 37 %");
+  });
+
+  it("'Take' puts the clean port into the form and clears the refusal", async () => {
+    params = { id: "p_old" };
+    updateProfile.mockImplementation(refuseUnlessAnyway);
+    await mount();
+    await type(portField(), "9443");
+    await click(button("Save"));
+    await settle();
+    await click(button("Take 4443"));
+    expect(portField().value).toBe("4443");
+    expect(text()).not.toContain("loses 37 %");
+  });
+});

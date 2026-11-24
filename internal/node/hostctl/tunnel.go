@@ -17,11 +17,14 @@ import (
 //   - an MSS clamp to the route MTU towards and from a tunnel interface;
 //   - client isolation: a forwarded packet may not leave through another (or the same) tunnel interface, so client
 //     A never reaches client B, not even across profiles (found on a test stand);
-//   - an input policy for packets that arrive on a tunnel interface and are for the node itself: only an echo
-//     request to the tunnel's own address is answered, everything else is dropped. A client must not reach sshd, the
-//     decoy site or a management port through the tunnel, nor the node address of another profile;
-//   - with "IPv6 for clients" off (Tunnel.RejectV6): IPv6 from a tunnel towards the uplink is rejected with ICMPv6
-//     admin-prohibited (chain nov6), not dropped, so apps move to IPv4 immediately;
+//   - an input policy for packets that arrive on a tunnel interface and are for the node itself: an echo request to the
+//     tunnel's own address is answered, every other packet to a tunnel address (its own or another profile's) is
+//     dropped, TCP 443 and the enabled client inbounds' ports are allowed at the host's other (public) addresses, and
+//     everything else is dropped. The agent leaves SSH and its own AWG UDP listeners out of the allowlist;
+//   - with "IPv6 for clients" off (Tunnel.RejectV6): IPv6 from a tunnel towards the uplink is rejected (chain nov6), not
+//     dropped, so apps move to IPv4 immediately: TCP gets a RST (the only answer every stack and every userspace TCP
+//     stack, Mihomo's included, turns into an instant failure; an ICMP error alone makes a Linux client wait for the first
+//     SYN retransmission), the rest an ICMPv6 admin-prohibited (a fatal error for UDP sockets, unlike no-route);
 //   - one named counter per UDP port, AwgHealth.udp_rx_packets: 0 = the provider or a firewall, > 0 without a
 //     handshake = the obfuscation parameters.
 
@@ -50,19 +53,27 @@ type Tunnel struct {
 	// ViaWarp: the egress of this tunnel is WARP. No masquerade here, the WARP table does it.
 	ViaWarp bool
 	// RejectV6: "IPv6 for clients" is off on this node. IPv6 forwarded from this tunnel to anything but a tunnel
-	// interface is answered with ICMPv6 admin-prohibited, so the app falls back to IPv4 at once. The client keeps its
-	// IPv6 address and ::/0 route (without them its real IPv6 would leave outside the tunnel). Not rendered for a ViaWarp
+	// interface is answered with a TCP RST (TCP) or ICMPv6 admin-prohibited (the rest), so the app falls back to IPv4 at
+	// once. The panel gives a client no IPv6 address of the tunnel here, but a config issued earlier still has one: it
+	// keeps the ::/0 route (without it its real IPv6 would leave outside the tunnel). Not rendered for a ViaWarp
 	// tunnel (the exit is Cloudflare's, not this node's uplink) or one without an IPv6 subnet.
 	RejectV6 bool
+}
+
+// PublishedPort is a client-facing listener that packets from a tunnel may reach on the host's other addresses.
+// Network must be "tcp" or "udp"; Port is uint32 so the renderer can reject values outside 1..65535.
+type PublishedPort struct {
+	Network string
+	Port    uint32
 }
 
 // TunnelHost is the part of the host that the L3 protocols need beyond Host. The Linux host implements it, the stub
 // accepts and does nothing; a caller type-asserts (`th, ok := host.(TunnelHost)`).
 type TunnelHost interface {
-	// SetTunnels atomically replaces the tunnel table with the rules of ts (no tunnels = the table is deleted) and
-	// turns forwarding on: net.ipv4.ip_forward, and IPv6 forwarding when a tunnel has an IPv6 subnet. A call with the
-	// set that is already installed does nothing (the counters keep counting).
-	SetTunnels(ctx context.Context, ts []Tunnel) error
+	// SetTunnels atomically replaces the tunnel table with the rules of ts and the published listeners (no tunnels =
+	// the table is deleted), and turns forwarding on: net.ipv4.ip_forward, and IPv6 forwarding when a tunnel has an IPv6
+	// subnet. A call with the set that is already installed does nothing (the counters keep counting).
+	SetTunnels(ctx context.Context, ts []Tunnel, published []PublishedPort) error
 	// TunnelCounters returns, per UDP port of an installed tunnel, the datagrams received since the tunnel was first
 	// installed by this process (a replacement of the table does not reset them).
 	TunnelCounters(ctx context.Context) (map[uint16]uint64, error)
@@ -101,7 +112,8 @@ func ifaceNameOK(s string) bool {
 	return true
 }
 
-// The verdict of the nov6 chain: reject answers at once, drop is the fallback for a kernel without nft reject.
+// The verdict of the nov6 chain: reject answers at once (a RST for TCP, ICMPv6 admin-prohibited for the rest; icmpx maps
+// to the ICMPv6 code for an IPv6 packet), drop is the fallback for a kernel without nft reject.
 const (
 	v6Reject = "reject with icmpx type admin-prohibited"
 	v6Drop   = "drop"
@@ -109,9 +121,65 @@ const (
 
 // RenderTunnels returns the nft script that atomically replaces the tunnel table. `add` + `delete` first makes it work
 // whether or not the table exists; nft applies a whole -f file as one transaction. No tunnels renders the delete only.
-func RenderTunnels(ts []Tunnel) (string, error) { return renderTunnels(ts, v6Reject) }
+// TCP 443 is always included for a panel that shares the node's address; other published listeners are explicit.
+func RenderTunnels(ts []Tunnel, published []PublishedPort) (string, error) {
+	return renderTunnels(ts, v6Reject, published)
+}
 
-func renderTunnels(ts []Tunnel, v6verdict string) (string, error) {
+func normalizePublishedPorts(ports []PublishedPort) ([]PublishedPort, error) {
+	seen := map[PublishedPort]bool{{Network: "tcp", Port: 443}: true}
+	for _, p := range ports {
+		if p.Port < 1 || p.Port > 65535 {
+			return nil, fmt.Errorf("published %s port %d: port must be 1..65535", p.Network, p.Port)
+		}
+		if p.Network != "tcp" && p.Network != "udp" {
+			return nil, fmt.Errorf("published port %d: network must be tcp or udp", p.Port)
+		}
+		seen[p] = true
+	}
+	out := make([]PublishedPort, 0, len(seen))
+	for p := range seen {
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Network != out[j].Network {
+			return out[i].Network < out[j].Network
+		}
+		return out[i].Port < out[j].Port
+	})
+	return out, nil
+}
+
+func publishedPortList(ports []PublishedPort, network string) string {
+	var values []string
+	for _, p := range ports {
+		if p.Network == network {
+			values = append(values, fmt.Sprint(p.Port))
+		}
+	}
+	if len(values) < 2 {
+		return strings.Join(values, "") // one port needs no set: 443 alone renders as before
+	}
+	return "{ " + strings.Join(values, ", ") + " }"
+}
+
+func equalPublishedPorts(a, b []PublishedPort) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func renderTunnels(ts []Tunnel, v6verdict string, published []PublishedPort) (string, error) {
+	ports, err := normalizePublishedPorts(published)
+	if err != nil {
+		return "", err
+	}
 	sorted := append([]Tunnel(nil), ts...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Iface < sorted[j].Iface })
 	for i, t := range sorted {
@@ -149,16 +217,39 @@ func renderTunnels(ts []Tunnel, v6verdict string) (string, error) {
 			fmt.Fprintf(&b, "\t\tiifname %q ip6 daddr %s icmpv6 type echo-request accept\n", t.Iface, t.Addr6)
 		}
 	}
+	// The tunnels' own addresses serve nothing but the echo above: through a tunnel a client reaches no service at a
+	// node address of its own or of another profile.
+	addrs4, addrs6 := make([]string, 0, len(sorted)), []string{}
+	for _, t := range sorted {
+		addrs4 = append(addrs4, t.Addr4.String())
+		if t.Subnet6.IsValid() {
+			addrs6 = append(addrs6, t.Addr6.String())
+		}
+	}
+	fmt.Fprintf(&b, "\t\tiifname %s ip daddr { %s } drop\n", wild, strings.Join(addrs4, ", "))
+	if len(addrs6) > 0 {
+		fmt.Fprintf(&b, "\t\tiifname %s ip6 daddr { %s } drop\n", wild, strings.Join(addrs6, ", "))
+	}
+	// Only listeners published to clients on the host's other addresses are reachable through a tunnel. TCP 443 stays
+	// available for a panel that shares the node's address; the agent passes enabled inbounds, except SSH and AWG UDP ports.
+	fmt.Fprintf(&b, "\t\tiifname %s tcp dport %s accept\n", wild, publishedPortList(ports, "tcp"))
+	if udp := publishedPortList(ports, "udp"); udp != "" {
+		fmt.Fprintf(&b, "\t\tiifname %s udp dport %s accept\n", wild, udp)
+	}
 	fmt.Fprintf(&b, "\t\tiifname %s drop\n\t}\n", wild)
 
 	// Forward: no client-to-client traffic, and the MSS clamp in both directions of a tunnel.
 	fmt.Fprintf(&b, "\tchain isolate {\n\t\ttype filter hook forward priority filter; policy accept;\n\t\tiifname %s oifname %s drop\n\t}\n", wild, wild)
 	// "IPv6 for clients" off: reject (not drop) what a tunnel sends to the uplink over IPv6. icmpx maps to ICMPv6
-	// "communication administratively prohibited" for IPv6 packets.
+	// "communication administratively prohibited" for IPv6 packets. TCP gets its RST first.
 	var noV6 strings.Builder
 	for _, t := range sorted {
 		if t.RejectV6 && t.Subnet6.IsValid() && !t.ViaWarp {
-			fmt.Fprintf(&noV6, "\t\tiifname %q oifname != %s meta nfproto ipv6 %s\n", t.Iface, wild, v6verdict)
+			rule := fmt.Sprintf("\t\tiifname %q oifname != %s meta nfproto ipv6 ", t.Iface, wild)
+			if v6verdict == v6Reject {
+				fmt.Fprintf(&noV6, "%smeta l4proto tcp reject with tcp reset\n", rule)
+			}
+			fmt.Fprintf(&noV6, "%s%s\n", rule, v6verdict)
 		}
 	}
 	if noV6.Len() > 0 {

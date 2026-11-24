@@ -9,19 +9,15 @@ import (
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
 	agentv1 "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
-	"github.com/mistgate/mistgate/internal/node/unit"
+	"github.com/mistgate/mistgate/internal/agentcap"
 	"github.com/mistgate/mistgate/internal/panel/store"
 )
 
 // The node doctor on the panel side: storage of the latest report of each node, the views built
 // from it, and the relay of RunDoctor / ApplyFix through the fleet.
 
-// capDoctor is the Hello capability of an agent that can run the doctor (agent.proto "DOCTOR").
-const capDoctor = "doctor/1"
-const capUnitRefresh = unit.CapabilityRefresh
-
 // fixIDs are the fixes the agent has (agent.proto "FIX IDS"). A fix id anywhere else is ignored.
-var fixIDs = []string{"journald_vacuum", "apply_baseline", "restart_inbound", "set_resolver", "reconnect_warp", "refresh_unit", "allow_forwarding"}
+var fixIDs = []string{"journald_vacuum", "apply_baseline", "restart_inbound", "set_resolver", "reconnect_warp", "refresh_unit", "allow_forwarding", "enable_security_updates", "awg_module_repair", "install_nftables"}
 
 func knownFix(id string) string {
 	if slices.Contains(fixIDs, id) {
@@ -59,7 +55,11 @@ func (s *Service) DoctorReport(ctx context.Context, nodeID string, r *agentv1.Do
 		}
 		port, portErr := strconv.ParseUint(x.Params["port"], 10, 16)
 		bytes, byteErr := strconv.ParseUint(x.Params["bytes"], 10, 64)
-		packets, packetErr := strconv.ParseUint(x.Params["packets"], 10, 64)
+		// a relay in the reverse way is counted by the entry's listener (bytes and bytes_back): it has no packet count to give
+		packets, packetErr := uint64(0), error(nil)
+		if v, has := x.Params["packets"]; has {
+			packets, packetErr = strconv.ParseUint(v, 10, 64)
+		}
 		if portErr == nil && port > 0 && byteErr == nil && packetErr == nil {
 			countedUnix := now.Unix()
 			if x.MeasuredUnix > 0 && x.MeasuredUnix <= now.Add(5*time.Minute).Unix() {
@@ -161,10 +161,10 @@ func (s *Service) nextReport(nodeID string) <-chan struct{} {
 // node cannot apply it now (offline, or an agent that predates the doctor). ts are the node's inbounds (the profile
 // names of the params), acc its accepted warnings.
 func (s *Service) nodeDoctor(ctx context.Context, n store.NodeRow, live store.NodeLiveRow, rows []store.DoctorRow, now time.Time, ts []*target, acc map[string]store.DoctorAccept, summaries map[string]store.NodeHealthSummary) *adminv1.NodeDoctor {
-	canFix := live.Connected && slices.Contains(live.AgentCaps, capDoctor)
-	canRefreshUnit := canFix && slices.Contains(live.AgentCaps, capUnitRefresh)
+	canFix := live.Connected && slices.Contains(live.AgentCaps, agentcap.Doctor)
+	canRefreshUnit := canFix && slices.Contains(live.AgentCaps, agentcap.UnitRefresh)
 	nd := &adminv1.NodeDoctor{NodeId: n.ID, NodeName: n.Name, NodeStatus: s.fl.NodeStatusWithLive(ctx, n, live, summaries),
-		AgentSupported: canFix || len(rows) > 0 || slices.Contains(live.AgentCaps, capDoctor), HasReport: len(rows) > 0,
+		AgentSupported: canFix || len(rows) > 0 || slices.Contains(live.AgentCaps, agentcap.Doctor), HasReport: len(rows) > 0,
 		AgentVersion: n.AgentVersion, LastSeenUnix: fleetUnix(live.LastSeenAt)}
 	if len(rows) == 0 {
 		return nd
@@ -184,6 +184,10 @@ func (s *Service) nodeDoctor(ctx context.Context, n store.NodeRow, live store.No
 		}
 		if canFix && (r.FixID != "refresh_unit" || canRefreshUnit) {
 			it.FixId = r.FixID
+		}
+		if r.CheckID == "awg_backend" && r.DetailCode == "awg_backend.unavailable" && r.Params["hint"] == "no_module" &&
+			!slices.Contains(live.AgentCaps, agentcap.AWGFallback) {
+			it.Params["switch_auto"] = "1" // the UI offers one click: UpdateNode awg_backend = auto
 		}
 		if a, ok := accepted(r, acc); ok {
 			it.AcceptedUnix, it.AcceptedBy, it.AcceptedByName = fleetUnix(a.At), a.By, a.ByName

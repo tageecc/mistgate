@@ -20,6 +20,10 @@ const (
 	// that matters (CheckRelay stores its own result), but the raw response is not a free tool for a script (for example,
 	// GetSSHFingerprint probes a host and GetWarp contains node network details). Never over /api.
 	TokenAccessPlanning = 3
+	// TokenAccessDraft: an in-process MCP call made while planning, with no approved plan (WithPlanning), or inside an approved plan of the
+	// procedure's tool. The handler itself refuses a call that has no approved plan whatever changes what a node or the panel serves
+	// (AddDecoySiteVersion: only a draft), so a token saves drafts freely and a live site only through the owner.
+	TokenAccessDraft = 4
 )
 
 // tokenProcedures is the allow-list for tokens. Adding a line is a deliberate act with a test
@@ -38,7 +42,10 @@ var tokenProcedures = map[string]int{
 	adminv1connect.UserServiceListUsersProcedure:                       TokenAccessDirect,
 	adminv1connect.UserServiceGetUserProcedure:                         TokenAccessDirect,
 	adminv1connect.GroupServiceListGroupsProcedure:                     TokenAccessDirect,
+	adminv1connect.GroupServiceCreateGroupProcedure:                    TokenAccessDirect,
+	adminv1connect.GroupServiceDeleteGroupProcedure:                    TokenAccessDirect,
 	adminv1connect.GroupServiceUpdateGroupProcedure:                    TokenAccessApproved,
+	adminv1connect.GroupServiceSetNodeSharingProcedure:                 TokenAccessApproved,
 	adminv1connect.ProfileServiceListProtocolsProcedure:                TokenAccessDirect,
 	adminv1connect.ProfileServiceListProfilesProcedure:                 TokenAccessDirect,
 	adminv1connect.ProfileServiceGetProfileProcedure:                   TokenAccessDirect,
@@ -46,22 +53,57 @@ var tokenProcedures = map[string]int{
 	adminv1connect.SubscriptionServiceGetSubscriptionSettingsProcedure: TokenAccessDirect, // the shared page: names, texts, public app links
 	adminv1connect.SubscriptionServiceListClientsProcedure:             TokenAccessDirect,
 	adminv1connect.SubscriptionServiceTestUserAgentProcedure:           TokenAccessDirect,
+	adminv1connect.DnsServiceListDnsPresetsProcedure:                   TokenAccessDirect,
+	adminv1connect.BackupServiceGetBackupSettingsProcedure:             TokenAccessDirect, // the status only: the handler leaves the storage out of a token's answer (backup_status)
 	adminv1connect.UpdateServiceGetUpdatesProcedure:                    TokenAccessDirect,
+	adminv1connect.UpdateServiceGetOsUpdatesProcedure:                  TokenAccessDirect,
 	adminv1connect.WarpServiceGetWarpProcedure:                         TokenAccessPlanning,
 	adminv1connect.WarpServiceRestartWarpProcedure:                     TokenAccessDirect,
 	adminv1connect.ProvisioningServiceGetSSHFingerprintProcedure:       TokenAccessPlanning, // node_install_plan only
+	adminv1connect.ProvisioningServiceGetPanelSSHKeyProcedure:          TokenAccessPlanning, // node_install_plan and both SSH key add plans
 	adminv1connect.ProvisioningServiceListNodeServerAccessProcedure:    TokenAccessDirect,
+	adminv1connect.ProvisioningServiceListNodeServerKeysProcedure:      TokenAccessDirect,
+	adminv1connect.ProvisioningServiceAddNodeServerKeyProcedure:        TokenAccessApproved, // node_server_key_add and node_server_keys_add
+	adminv1connect.ProvisioningServiceRemoveNodeServerKeyProcedure:     TokenAccessApproved,
 	adminv1connect.ProvisioningServiceStartNodeProvisionProcedure:      TokenAccessApproved,
 	// The country verdicts of GetChecks over time (the Reachability page), read like them.
 	adminv1connect.CountryReachabilityServiceGetReachabilityHistoryProcedure: TokenAccessDirect,
 	// The kl!ck reports per node, operator and region: counts and the names the app saw, no address or person.
 	adminv1connect.ClientProbeServiceGetClientProbeProcedure: TokenAccessDirect,
+	// Whether desktop client API discovery is enabled; no token, link or device data is returned.
+	adminv1connect.ClientApiServiceGetClientApiProcedure: TokenAccessDirect,
+	// Which devices receive REALITY and whether their app sends a post-quantum handshake: the person, the app string the device reported
+	// and counts; no link, no key, no address.
+	adminv1connect.ClientCompatServiceListOutdatedDevicesProcedure: TokenAccessDirect,
 	// What the nodes saw of connection attempts (agent.proto LinkCounters): counts per key and inbound, no address.
 	adminv1connect.NodeServiceGetNodeConnectionsProcedure:  TokenAccessDirect,
 	adminv1connect.UserServiceGetUserConnectionProcedure:   TokenAccessDirect,
 	adminv1connect.NodeServiceGetFleetConnectionsProcedure: TokenAccessDirect,
+	adminv1connect.NodeServiceGetNetworksProcedure:         TokenAccessDirect,
 	// The nodes' saved journal (agent.proto JournalEntry): warnings and errors, addresses cut on the node and in the panel.
 	adminv1connect.NodeServiceGetNodeJournalProcedure: TokenAccessDirect,
+	// What a node runs against what the panel wants, its host load per hour and the lossy UDP paths between nodes: hashes cut to
+	// 12 characters, states, counts and node names; no address, certificate pin or key.
+	adminv1connect.NodeServiceGetNodeRuntimeProcedure:     TokenAccessDirect,
+	adminv1connect.NodeServiceGetNodeHostHistoryProcedure: TokenAccessDirect,
+	adminv1connect.NodeServiceGetPathLossProcedure:        TokenAccessDirect,
+	// Probes between the owner's own nodes (operator profile and up): path_probe, node_trace, node_dns_check. They send bounded test
+	// traffic between fleet nodes, never to a host a caller names, and return node names, timings and counts: no address.
+	PathProbeProcedure:    TokenAccessDirect,
+	NodeTraceProcedure:    TokenAccessDirect,
+	NodeDnsCheckProcedure: TokenAccessDirect,
+	// path_speed moves bulk traffic between two nodes (up to 32 MB, once per node at a time, a few a day): only through the owner's approval.
+	PathSpeedProcedure: TokenAccessApproved,
+	// the kept figures of those tests (node names and numbers): read directly, so a later turn can read what the owner approved
+	PathSpeedResultsProcedure: TokenAccessDirect,
+	// the channel measure fills the links of a node and its partners for half a minute: only through the owner's approval; its plan and
+	// its status are reads of names and figures
+	ChannelMeasurePlanProcedure:   TokenAccessDirect,
+	ChannelMeasureStartProcedure:  TokenAccessApproved,
+	ChannelMeasureStatusProcedure: TokenAccessDirect,
+	// the neighbour scan (node_neighbor_sites): reads the last result or has the node walk its /24; the owner's call, and a token of the
+	// admin profile (the owner's role) only; the names it returns are text of other servers' certificates, which the MCP tool marks as such
+	NodeSniScanProcedure: TokenAccessDirect,
 	// Day-to-day changes (level write: the operator profile and up).
 	adminv1connect.UserServiceCreateUserProcedure:       TokenAccessDirect,
 	adminv1connect.UserServiceUpdateUserProcedure:       TokenAccessDirect,
@@ -70,9 +112,15 @@ var tokenProcedures = map[string]int{
 	adminv1connect.UserServiceResetUserTrafficProcedure: TokenAccessDirect,
 	adminv1connect.UserServiceRevokeDeviceProcedure:     TokenAccessDirect,
 	adminv1connect.HealthServiceMuteAlertProcedure:      TokenAccessDirect,
+	adminv1connect.HealthServiceDismissAlertProcedure:   TokenAccessDirect,
 	adminv1connect.HealthServiceRunChecksNowProcedure:   TokenAccessDirect,
 	adminv1connect.HealthServiceRunDoctorProcedure:      TokenAccessDirect,
 	adminv1connect.NodeServiceCheckPortsProcedure:       TokenAccessDirect,
+	// The outside check of an IPv6 address of a node (node_ipv6_check): test packets between the owner's nodes. Narrowed to the admin
+	// profile by its level; MCP only, because the raw response carries the address that was checked.
+	adminv1connect.NodeServiceCheckIpv6Procedure: TokenAccessPlanning,
+	// Turning the entry on or off changes what people's subscriptions hold: only through the owner's approval (node_ipv6_plan / apply).
+	adminv1connect.NodeServiceUpdateIpv6EntryProcedure: TokenAccessApproved,
 	// Owner level (the admin profile): the audit log, which names admins, tokens and addresses.
 	adminv1connect.AuthServiceListAuditProcedure: TokenAccessDirect,
 	// Relays (relay.proto), through the MCP tools relays_list, relay_candidates, relay_check and relay_plan/apply only. The reads
@@ -88,22 +136,33 @@ var tokenProcedures = map[string]int{
 	// Only through the owner's approval; no-change planning requests may also use WithPlanning. See Service.WithApprovedStepUp.
 	adminv1connect.HealthServiceApplyFixProcedure:                       TokenAccessApproved,
 	adminv1connect.ProfileServiceCreateProfileProcedure:                 TokenAccessApproved,
+	adminv1connect.NodeServiceUpdateNodeProcedure:                       TokenAccessApproved,
 	adminv1connect.ProfileServiceUpdateProfileProcedure:                 TokenAccessApproved,
 	adminv1connect.ProfileServiceDeleteProfileProcedure:                 TokenAccessApproved,
 	adminv1connect.ProfileServiceCreateInboundProcedure:                 TokenAccessApproved,
+	adminv1connect.ProfileServiceUpdateInboundProcedure:                 TokenAccessApproved,
 	adminv1connect.ProfileServiceDeleteInboundProcedure:                 TokenAccessApproved,
 	adminv1connect.UpdateServiceStartRolloutProcedure:                   TokenAccessApproved,
 	adminv1connect.UpdateServicePauseRolloutProcedure:                   TokenAccessApproved,
 	adminv1connect.UpdateServiceResumeRolloutProcedure:                  TokenAccessApproved,
 	adminv1connect.UpdateServiceCancelRolloutProcedure:                  TokenAccessApproved,
+	adminv1connect.UpdateServiceStartOsRolloutProcedure:                 TokenAccessApproved,
+	adminv1connect.UpdateServicePauseOsRolloutProcedure:                 TokenAccessApproved,
+	adminv1connect.UpdateServiceResumeOsRolloutProcedure:                TokenAccessApproved,
+	adminv1connect.UpdateServiceCancelOsRolloutProcedure:                TokenAccessApproved,
 	adminv1connect.UpdateServiceRollbackNodeProcedure:                   TokenAccessApproved,
 	adminv1connect.UpdateServiceScheduleNodeUpdateProcedure:             TokenAccessApproved,
 	adminv1connect.UpdateServiceCancelNodeUpdateScheduleProcedure:       TokenAccessApproved,
 	adminv1connect.UpdateServiceSetUpdateTimezoneProcedure:              TokenAccessApproved,
+	adminv1connect.UpdateServiceSetUpdateDownloadTimeoutProcedure:       TokenAccessApproved,
 	adminv1connect.ProvisioningServiceRotateNodeServerPasswordProcedure: TokenAccessApproved,
 	adminv1connect.WarpServiceRegisterWarpProcedure:                     TokenAccessApproved,
 	// What every user's page shows: one app at a time, through subscription_app_upsert / _remove (level write).
 	adminv1connect.SubscriptionServiceUpdateSubscriptionSettingsProcedure: TokenAccessApproved,
+	// DNS presets are owner-only API procedures and only used by the corresponding MCP plan/apply tools.
+	adminv1connect.DnsServiceCreateDnsPresetProcedure: TokenAccessApproved,
+	adminv1connect.DnsServiceUpdateDnsPresetProcedure: TokenAccessApproved,
+	adminv1connect.DnsServiceDeleteDnsPresetProcedure: TokenAccessApproved,
 }
 
 // stepUpProcedures lists exactly the procedures whose handlers call RequireStepUp. A token cannot call them
@@ -120,27 +179,42 @@ var stepUpProcedures = map[string]bool{
 	adminv1connect.UpdateServicePauseRolloutProcedure:                   true,
 	adminv1connect.UpdateServiceResumeRolloutProcedure:                  true,
 	adminv1connect.UpdateServiceCancelRolloutProcedure:                  true,
+	adminv1connect.UpdateServiceStartOsRolloutProcedure:                 true,
+	adminv1connect.UpdateServicePauseOsRolloutProcedure:                 true,
+	adminv1connect.UpdateServiceResumeOsRolloutProcedure:                true,
+	adminv1connect.UpdateServiceCancelOsRolloutProcedure:                true,
 	adminv1connect.UpdateServiceRollbackNodeProcedure:                   true,
 	adminv1connect.UpdateServiceRescanBundleProcedure:                   true,
 	adminv1connect.UpdateServiceInstallPanelUpdateProcedure:             true,
 	adminv1connect.UpdateServiceScheduleNodeUpdateProcedure:             true,
 	adminv1connect.UpdateServiceCancelNodeUpdateScheduleProcedure:       true,
 	adminv1connect.UpdateServiceSetUpdateTimezoneProcedure:              true,
+	adminv1connect.UpdateServiceSetUpdateChannelProcedure:               true,
+	adminv1connect.UpdateServiceSetUpdateDownloadTimeoutProcedure:       true,
+	adminv1connect.UpdateServiceSetUpdateDownloadSourcesProcedure:       true,
 	adminv1connect.ProvisioningServiceCheckSSHProcedure:                 true,
 	adminv1connect.ProvisioningServiceStartNodeProvisionProcedure:       true,
 	adminv1connect.ProvisioningServiceRetryNodeProvisionProcedure:       true,
 	adminv1connect.ProvisioningServiceRotateNodeServerPasswordProcedure: true,
 	adminv1connect.ProvisioningServiceRevealNodeServerPasswordProcedure: true,
 	adminv1connect.ProvisioningServiceForgetNodeServerAccessProcedure:   true,
+	adminv1connect.ProvisioningServiceAddNodeServerKeyProcedure:         true,
+	adminv1connect.ProvisioningServiceRemoveNodeServerKeyProcedure:      true,
+	adminv1connect.ProvisioningServiceAttachNodeServerAccessProcedure:   true,
 	adminv1connect.WarpServiceRegisterWarpProcedure:                     true,
 	adminv1connect.WarpServiceImportWarpProcedure:                       true,
+	adminv1connect.WarpServiceSetWarpLicenseProcedure:                   true,
 	adminv1connect.WarpServiceDeleteWarpProcedure:                       true,
 	adminv1connect.ApiTokenServiceCreateApiTokenProcedure:               true,
+	adminv1connect.ApiTokenServiceSetApiTokenBulkProcedure:              true,
 	adminv1connect.ApiTokenServiceRevokeApiTokenProcedure:               true,
 	adminv1connect.ApprovalServiceApproveProcedure:                      true,
 	adminv1connect.BackupServiceUpdateBackupSettingsProcedure:           true,
 	adminv1connect.BackupServiceTestBackupStorageProcedure:              true,
 	adminv1connect.BackupServiceCreateBackupProcedure:                   true,
+	adminv1connect.BackupServicePrepareRestoreProcedure:                 true,
+	adminv1connect.BackupServiceConfirmRestoreProcedure:                 true,
+	adminv1connect.BackupServiceDeleteKeptDataProcedure:                 true,
 	adminv1connect.TelegramServiceSetTelegramBotProcedure:               true,
 	adminv1connect.TelegramServiceBeginTelegramLinkProcedure:            true,
 	adminv1connect.GlobalpingServiceUpdateGlobalpingProcedure:           true,
@@ -155,11 +229,25 @@ var stepUpProcedures = map[string]bool{
 	adminv1connect.TspuProbeServiceDisconnectTspuProbeProcedure:         true,
 	adminv1connect.ClientProbeServiceUpdateClientProbeProcedure:         true,
 	adminv1connect.ClientProbeServiceDisconnectClientProbeProcedure:     true,
+	adminv1connect.ClientApiServiceUpdateClientApiProcedure:             true,
+	adminv1connect.ClientCompatServiceUpdateClientCompatProcedure:       true,
 
 	// the password + authenticator-code login (credentials.go)
 	adminv1connect.AuthServiceChangePasswordProcedure:         true,
 	adminv1connect.AuthServiceBeginTotpEnrollmentProcedure:    true,
 	adminv1connect.AuthServiceUpdateSecuritySettingsProcedure: true, // the login captcha (turnstile.go)
+	adminv1connect.UserServiceDeleteUsersProcedure:            true,
+	adminv1connect.AssistantServiceSetProviderKeyProcedure:    true,
+	adminv1connect.AssistantServiceRemoveProviderKeyProcedure: true,
+}
+
+// userChangePlanProcedures identifies direct-write procedures whose owner-approved plan may exceed the unattended
+// hourly user-change budget. These procedures remain outside TokenAccessApproved.
+var userChangePlanProcedures = map[string][]string{
+	"user_update":        {adminv1connect.UserServiceUpdateUserProcedure},
+	"user_disable":       {adminv1connect.UserServiceSetUsersEnabledProcedure},
+	"user_reset_traffic": {adminv1connect.UserServiceResetUserTrafficProcedure},
+	"device_revoke":      {adminv1connect.UserServiceRevokeDeviceProcedure},
 }
 
 // grantProcedures says which procedures the approved plan of an MCP tool may open with its grant: the grant of
@@ -168,24 +256,48 @@ var stepUpProcedures = map[string]bool{
 var grantProcedures = map[string][]string{
 	"warp_reregister":             {adminv1connect.WarpServiceRegisterWarpProcedure},
 	"node_decoy":                  {adminv1connect.NodeServiceSetNodeDecoyModeProcedure},
+	"node_ipv6":                   {adminv1connect.NodeServiceUpdateIpv6EntryProcedure},
+	"node_awg_backend":            {adminv1connect.NodeServiceUpdateNodeProcedure},
+	"path_speed":                  {PathSpeedProcedure},
+	"channel_measure":             {ChannelMeasureStartProcedure},
 	"node_fix":                    {adminv1connect.HealthServiceApplyFixProcedure},
 	"rollout_start":               {adminv1connect.UpdateServiceStartRolloutProcedure},
 	"rollout_pause":               {adminv1connect.UpdateServicePauseRolloutProcedure},
 	"rollout_resume":              {adminv1connect.UpdateServiceResumeRolloutProcedure},
 	"rollout_cancel":              {adminv1connect.UpdateServiceCancelRolloutProcedure},
+	"os_rollout_start":            {adminv1connect.UpdateServiceStartOsRolloutProcedure},
+	"os_rollout_pause":            {adminv1connect.UpdateServicePauseOsRolloutProcedure},
+	"os_rollout_resume":           {adminv1connect.UpdateServiceResumeOsRolloutProcedure},
+	"os_rollout_cancel":           {adminv1connect.UpdateServiceCancelOsRolloutProcedure},
 	"node_rollback":               {adminv1connect.UpdateServiceRollbackNodeProcedure},
 	"node_update_schedule":        {adminv1connect.UpdateServiceScheduleNodeUpdateProcedure},
 	"node_update_schedule_cancel": {adminv1connect.UpdateServiceCancelNodeUpdateScheduleProcedure},
 	"update_timezone":             {adminv1connect.UpdateServiceSetUpdateTimezoneProcedure},
+	"update_download_timeout":     {adminv1connect.UpdateServiceSetUpdateDownloadTimeoutProcedure},
 	NodeInstallTool:               {adminv1connect.ProvisioningServiceStartNodeProvisionProcedure},
 	"node_server_password_rotate": {adminv1connect.ProvisioningServiceRotateNodeServerPasswordProcedure},
+	"node_server_key_add":         {adminv1connect.ProvisioningServiceAddNodeServerKeyProcedure},
+	"node_server_keys_add":        {adminv1connect.ProvisioningServiceAddNodeServerKeyProcedure},
+	"node_server_key_remove":      {adminv1connect.ProvisioningServiceRemoveNodeServerKeyProcedure},
 	"relay": {
 		adminv1connect.RelayServiceCreateRelayProcedure,
 		adminv1connect.RelayServiceUpdateRelayProcedure,
 		adminv1connect.RelayServiceDeleteRelayProcedure,
 	},
-	"subscription_app_upsert": {adminv1connect.SubscriptionServiceUpdateSubscriptionSettingsProcedure},
-	"subscription_app_remove": {adminv1connect.SubscriptionServiceUpdateSubscriptionSettingsProcedure},
+	"subscription_app_upsert":      {adminv1connect.SubscriptionServiceUpdateSubscriptionSettingsProcedure},
+	"subscription_app_remove":      {adminv1connect.SubscriptionServiceUpdateSubscriptionSettingsProcedure},
+	"subscription_rules_set":       {adminv1connect.SubscriptionServiceUpdateSubscriptionSettingsProcedure},
+	"subscription_texts_set":       {adminv1connect.SubscriptionServiceUpdateSubscriptionSettingsProcedure},
+	"subscription_link_limits_set": {adminv1connect.SubscriptionServiceUpdateSubscriptionSettingsProcedure},
+	"subscription_page_set":        {adminv1connect.SubscriptionServiceUpdateSubscriptionSettingsProcedure},
+	"subscription_routing_set":     {adminv1connect.SubscriptionServiceUpdateSubscriptionSettingsProcedure},
+	"dns_settings_set":             {adminv1connect.SubscriptionServiceUpdateSubscriptionSettingsProcedure},
+	"group_update":                 {adminv1connect.GroupServiceUpdateGroupProcedure},
+	"node_sharing_set":             {adminv1connect.GroupServiceSetNodeSharingProcedure},
+	"dns_preset_create":            {adminv1connect.DnsServiceCreateDnsPresetProcedure},
+	"dns_preset_update":            {adminv1connect.DnsServiceUpdateDnsPresetProcedure},
+	"dns_preset_delete":            {adminv1connect.DnsServiceDeleteDnsPresetProcedure},
+	"node_update":                  {adminv1connect.NodeServiceUpdateNodeProcedure, adminv1connect.ProfileServiceUpdateInboundProcedure},
 	"profile_create": {
 		adminv1connect.ProfileServiceCreateProfileProcedure,
 		adminv1connect.ProfileServiceCreateInboundProcedure,
@@ -199,6 +311,7 @@ var grantProcedures = map[string][]string{
 		adminv1connect.ProfileServiceDeleteInboundProcedure,
 		adminv1connect.GroupServiceUpdateGroupProcedure,
 	},
+	MihomoTemplateTool: {adminv1connect.SubscriptionServiceUpdateSubscriptionSettingsProcedure},
 }
 
 // tokenProcedureRoles is narrower than the signed-in admin policy: the MCP projection for GetWarp omits its node
@@ -232,8 +345,10 @@ func ProcedureRole(path string) string {
 	return store.RoleOwner
 }
 
-// NeedsStepUp reports whether the procedure's handler asks for a step-up.
-func NeedsStepUp(path string) bool { return stepUpProcedures[path] }
+// NeedsStepUp reports whether the procedure or a plain HTTP backup transfer asks for a step-up.
+func NeedsStepUp(path string) bool {
+	return path == BackupDownloadProcedure || path == BackupUploadProcedure || stepUpProcedures[path]
+}
 
 // TokenAccess says how a token may reach a procedure: TokenAccessDirect, TokenAccessApproved or TokenAccessPlanning; ok
 // is false when the procedure is closed to tokens.
@@ -252,3 +367,6 @@ func profileRole(profile string) string {
 	}
 	return store.RoleReadonly
 }
+
+// TokenProfileRole returns the role represented by a token profile.
+func TokenProfileRole(profile string) string { return profileRole(profile) }

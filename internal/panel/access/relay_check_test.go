@@ -12,7 +12,6 @@ import (
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
 	"github.com/mistgate/mistgate/internal/panel/store"
-	"github.com/mistgate/mistgate/internal/plugin"
 )
 
 // The gate of a relay and what follows the switch (relay_check.go), against a fake of the fleet's CheckRelay: the probes are
@@ -21,12 +20,14 @@ import (
 // fakeChecker answers CheckRelay as the fleet does: stages that run take the configured answer, the others keep the last
 // check of the same target; the result is stored in the relay.
 type fakeChecker struct {
-	f     *relayFix
-	mu    sync.Mutex
-	leg   store.RelayStage
-	path  store.RelayStage
-	err   error
-	calls [][]string
+	f    *relayFix
+	mu   sync.Mutex
+	leg  store.RelayStage
+	path store.RelayStage
+	// reverse and speed are what the reverse stages answer when they are asked for.
+	reverse, speed, direct store.RelayStage
+	err                    error
+	calls                  [][]string
 	// provenAtPath is what the relay's Proven said when the path was asked for, in the order of the asks.
 	provenAtPath []bool
 }
@@ -43,13 +44,17 @@ func (c *fakeChecker) check(ctx context.Context, id string, stages ...string) (s
 		return store.RelayCheck{}, err
 	}
 	runLeg, runPath := len(stages) == 0 || slices.Contains(stages, store.RelayStageLeg), len(stages) == 0 || slices.Contains(stages, store.RelayStagePath)
+	runReverseSpeed := slices.Contains(stages, store.RelayStageReverseSpeed)
 	now := c.f.clock.Unix()
 	if slices.Contains(stages, store.RelayStagePath) {
 		c.provenAtPath = append(c.provenAtPath, link.Proven())
 	}
 	out := store.RelayCheck{At: now, Network: link.Network, Port: link.Port, To: c.f.s.relayTo(ctx, link)}
-	if prev, ok := link.Check(); ok && prev.To == out.To && !runLeg {
-		out.Leg = prev.Leg
+	if prev, ok := link.Check(); ok {
+		if prev.To == out.To && !runLeg {
+			out.Leg = prev.Leg
+		}
+		out.ReverseReach, out.ReverseSpeed, out.DirectSpeed = prev.ReverseReach, prev.ReverseSpeed, prev.DirectSpeed
 	}
 	if runLeg {
 		out.Leg = c.leg
@@ -58,6 +63,21 @@ func (c *fakeChecker) check(ctx context.Context, id string, stages ...string) (s
 	if runPath {
 		out.Path = c.path
 		out.Path.At = now
+	}
+	if slices.Contains(stages, store.RelayStageReverseReach) || runLeg && out.Leg.Status == "fail" || runReverseSpeed {
+		out.ReverseReach = c.reverse
+		out.ReverseReach.At = now
+		if entry, err := c.f.st.Node(ctx, link.ViaNodeID); err == nil {
+			out.ReverseReach.Port = entry.BridgeEndpointPort() // the probe says which endpoint it was made for
+		}
+	}
+	if slices.Contains(stages, store.RelayStageDirectSpeed) {
+		out.DirectSpeed = c.direct
+		out.DirectSpeed.At = now
+	}
+	if slices.Contains(stages, store.RelayStageReverseSpeed) {
+		out.ReverseSpeed = c.speed
+		out.ReverseSpeed.At = now
 	}
 	out.Settle()
 	return out, c.f.st.SetRelayCheck(ctx, id, out)
@@ -73,6 +93,165 @@ func newCheckedFix(t *testing.T) (*relayFix, *fakeChecker, *adminv1.Relay) {
 	f.s.SetRelayWaitForTest(3*time.Second, 5*time.Millisecond)
 	r := must(f.create(f.server.Id, "nod_fi1", 0))
 	return f, c, r
+}
+
+// entryServesItsBridgeSite plays the entry's agent: for every relay through it that may use the bridge, it reports the pin of the
+// bridge site it runs, the way the stats of a real agent do.
+func entryServesItsBridgeSite(f *relayFix) {
+	f.t.Helper()
+	done := make(chan struct{})
+	f.t.Cleanup(func() { close(done) })
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case <-time.After(5 * time.Millisecond):
+			}
+			links, err := f.st.RelayLinks(context.Background(), store.RelayFilter{})
+			if err != nil {
+				continue
+			}
+			for _, l := range links {
+				entry, err := f.st.Node(context.Background(), l.ViaNodeID)
+				if err != nil || !l.BridgeServed() || entry.BridgePort == 0 {
+					continue
+				}
+				_ = f.st.SetRelayBridgeSide(context.Background(), l.ID, "entry", &store.RelayBridgeSideCheck{Connected: true, Conns: 1,
+					SinceUnix: f.clock.Unix() - 60, AtUnix: f.clock.Unix(), SitePin: strings.Repeat("ab", 32), SitePort: entry.BridgePort})
+			}
+		}
+	}()
+}
+
+func addTCPRelayServer(f *relayFix) *adminv1.Inbound {
+	f.t.Helper()
+	profile := must(f.s.CreateProfile(f.ctx, req(&adminv1.CreateProfileRequest{Protocol: "vless", Name: "TCP relay server",
+		SettingsJson: `{"port":443,"transport":"tcp","security":"reality","reality":{"target_kind":"site","target":"site.example.net:443","server_names":["site.example.net"],"short_ids":["aabbccdd"],"fingerprint":"chrome"},"xhttp":{"mode":"auto","x_padding_bytes":"100-1000"},"egress":"direct"}`}))).Msg.Profile
+	return f.inbound(profile.Id, "nod_de1")
+}
+
+func TestCreateRelayReverseModeRunsTheReverseReachGate(t *testing.T) {
+	f := newRelayFix(t)
+	inbound := addTCPRelayServer(f)
+	f.sql(`UPDATE node SET agent_caps = 'relay-forward/1 relay-reverse/1' WHERE id = 'nod_fi1'`)
+	f.sql(`UPDATE node SET agent_caps = 'relay-reverse/1 tcpcheck/1' WHERE id = 'nod_de1'`)
+	checker := &fakeChecker{f: f, reverse: store.RelayStage{Status: "ok", Sender: "nod_de1"}}
+	f.s.cfg.CheckRelay = checker.check
+	entryServesItsBridgeSite(f)
+	f.s.SetRelayWaitForTest(2*time.Second, 5*time.Millisecond)
+
+	created := must(f.s.CreateRelay(f.ctx, req(&adminv1.CreateRelayRequest{InboundId: inbound.Id, ViaNodeId: "nod_fi1", Mode: "reverse"}))).Msg.Relay
+	if created.Mode != store.RelayModeReverse || created.ActiveMode != store.RelayModeDNAT || created.Check == nil ||
+		created.Check.ReverseReach == nil || created.Check.ReverseReach.Status != "ok" {
+		t.Fatalf("created reverse relay = %+v", created)
+	}
+	if len(checker.calls) != 1 || len(checker.calls[0]) != 1 || checker.calls[0][0] != store.RelayStageReverseReach {
+		t.Fatalf("reverse reach calls = %v", checker.calls)
+	}
+}
+
+func TestCreateRelayReverseModeRefusesUnsupportedOrUnverifiedPairs(t *testing.T) {
+	f := newRelayFix(t)
+	inbound := addTCPRelayServer(f)
+	f.sql(`UPDATE node SET agent_caps = 'relay-forward/1 relay-reverse/1' WHERE id = 'nod_fi1'`)
+	_, err := f.s.CreateRelay(f.ctx, req(&adminv1.CreateRelayRequest{InboundId: inbound.Id, ViaNodeId: "nod_fi1", Mode: "reverse"}))
+	wantMsg(t, err, "failed_precondition: reverse_unavailable: reason=exit_agent_old")
+	if got := must(f.s.ListRelays(f.ctx, req(&adminv1.ListRelaysRequest{}))).Msg.Relays; len(got) != 0 {
+		t.Fatalf("a refused reverse relay was stored: %+v", got)
+	}
+
+	f.sql(`UPDATE node SET agent_caps = 'relay-reverse/1 tcpcheck/1' WHERE id = 'nod_de1'`)
+	f.s.cfg.CheckRelay = nil
+	_, err = f.s.CreateRelay(f.ctx, req(&adminv1.CreateRelayRequest{InboundId: inbound.Id, ViaNodeId: "nod_fi1", Mode: "reverse"}))
+	wantMsg(t, err, "failed_precondition: reverse_unavailable: reason=reverse_reach_unknown")
+	if got := must(f.s.ListRelays(f.ctx, req(&adminv1.ListRelaysRequest{}))).Msg.Relays; len(got) != 0 {
+		t.Fatalf("a relay with no reverse reach check was stored: %+v", got)
+	}
+}
+
+func TestAutoRelayEnablesThroughTheBridgeWhenItsLegFails(t *testing.T) {
+	f := newRelayFix(t)
+	inbound := addTCPRelayServer(f)
+	f.sql(`UPDATE node SET agent_caps = 'relay-forward/1 relay-reverse/1' WHERE id = 'nod_fi1'`)
+	f.sql(`UPDATE node SET agent_caps = 'relay-reverse/1 tcpcheck/1' WHERE id = 'nod_de1'`)
+	checker := &fakeChecker{f: f, leg: store.RelayStage{Status: "fail", Code: "timeout"},
+		path: store.RelayStage{Status: "ok", Sender: "nod_nl1"}, reverse: store.RelayStage{Status: "ok", Sender: "nod_de1"}}
+	f.s.cfg.CheckRelay = checker.check
+	entryServesItsBridgeSite(f)
+	f.s.SetRelayWaitForTest(2*time.Second, 5*time.Millisecond)
+	f.s.SetRelayWaitForTest(2*time.Second, 5*time.Millisecond)
+	r := must(f.s.CreateRelay(f.ctx, req(&adminv1.CreateRelayRequest{InboundId: inbound.Id, ViaNodeId: "nod_fi1", Mode: "auto"}))).Msg.Relay
+	on, mode := true, store.RelayModeAuto
+	result := make(chan error, 1)
+	go func() {
+		_, err := f.s.UpdateRelay(f.ctx, req(&adminv1.UpdateRelayRequest{Id: r.Id, Enabled: &on, Mode: &mode}))
+		result <- err
+	}()
+	go func() {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			link, err := f.st.RelayLink(f.ctx, r.Id)
+			if err == nil && link.Enabled {
+				at := f.clock.Unix()
+				_ = f.st.SetRelayBridgeSide(f.ctx, r.Id, "exit", &store.RelayBridgeSideCheck{Connected: true, Conns: 1,
+					SinceUnix: at - 10, AtUnix: at})
+				_ = f.st.RelaysApplied(f.ctx, "nod_fi1", []store.RelayApplied{{ID: r.Id, OK: true, ToIP: "192.0.2.10"}}, f.clock)
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	link := must(f.st.RelayLink(f.ctx, r.Id))
+	if !link.Enabled || link.ActiveMode != store.RelayModeReverse || link.ModeReason != "leg_failed" {
+		t.Fatalf("auto relay after the bridge and third-node path: enabled=%v active=%q reason=%q", link.Enabled, link.ActiveMode, link.ModeReason)
+	}
+	if len(checker.calls) < 2 || len(checker.calls[0]) != 0 || len(checker.calls[1]) != 1 || checker.calls[1][0] != store.RelayStagePath {
+		t.Fatalf("checks during enable = %v", checker.calls)
+	}
+}
+
+func TestRelayModeChangeNotifiesDesiredStateOnce(t *testing.T) {
+	f := newRelayFix(t)
+	f.s.cfg.AfterResponse = func(func()) {}
+	inbound := addTCPRelayServer(f)
+	f.sql(`UPDATE node SET agent_caps = 'relay-forward/1 relay-reverse/1' WHERE id = 'nod_fi1'`)
+	f.sql(`UPDATE node SET agent_caps = 'relay-reverse/1 tcpcheck/1' WHERE id = 'nod_de1'`)
+	created := must(f.s.CreateRelay(f.ctx, req(&adminv1.CreateRelayRequest{InboundId: inbound.Id, ViaNodeId: "nod_fi1", Mode: "auto"}))).Msg.Relay
+	on := true
+	if err := f.st.UpdateRelay(f.ctx, created.Id, store.RelayPatch{Enabled: &on}, f.clock); err != nil {
+		t.Fatal(err)
+	}
+	now := f.clock.Unix()
+	link := must(f.st.RelayLink(f.ctx, created.Id))
+	entry := must(f.st.Node(f.ctx, "nod_fi1"))
+	check := store.RelayCheck{At: now, Network: "tcp", Port: link.Port, To: f.s.relayTo(f.ctx, link),
+		Leg:          store.RelayStage{Status: "fail", Code: "timeout", At: now},
+		ReverseReach: store.RelayStage{Status: "ok", Sender: "nod_de1", At: now, Port: entry.BridgeEndpointPort()}}
+	if err := f.st.SetRelayCheck(f.ctx, created.Id, check); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.st.SetRelayMonitorCheck(f.ctx, created.Id, store.RelayMonitorCheck{AtUnix: now, FailStreak: 2, TargetKey: "same-target"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.st.SetRelayBridgeSide(f.ctx, created.Id, "exit", &store.RelayBridgeSideCheck{Connected: true, Conns: 1, SinceUnix: now - 10, AtUnix: now}); err != nil {
+		t.Fatal(err)
+	}
+	f.resetNotify()
+	f.s.ControlRelay(f.ctx, created.Id)
+	if got := f.notify.n.Load(); got != 1 {
+		t.Fatalf("mode change notifications = %d, want one", got)
+	}
+	if changed := must(f.st.RelayLink(f.ctx, created.Id)); changed.ActiveMode != store.RelayModeReverse || changed.ModeReason != "leg_failed" {
+		t.Fatalf("relay after controller: active=%q reason=%q", changed.ActiveMode, changed.ModeReason)
+	}
+	f.s.ControlRelay(f.ctx, created.Id)
+	if got := f.notify.n.Load(); got != 1 {
+		t.Fatalf("unchanged mode notifications = %d total, want one", got)
+	}
 }
 
 // reportsForward plays the entry's agent: once the relay is switched on, it reports the forward (ok, or the error).
@@ -165,6 +344,62 @@ func TestCheckRelayRPCStoresAndAuditsAndSwitchesNothing(t *testing.T) {
 	chk = must(f.s.CheckRelay(f.ctx, req(&adminv1.CheckRelayRequest{Id: r.Id}))).Msg.Relay.Check
 	if chk.Ok || chk.Stage != "leg" || chk.Leg.Code != "timeout" {
 		t.Fatalf("failed check = %+v", chk)
+	}
+}
+
+func TestCheckRelayRPCAsksForTheReverseStagesOnlyWhenToldTo(t *testing.T) {
+	f, c, r := newCheckedFix(t)
+	c.reverse = store.RelayStage{Status: "ok", Sender: "nod_de1", Verdict: "ours"}
+	c.speed = store.RelayStage{Status: "ok", Sender: "nod_de1", MB: 8, MbitS: 91.5, Bytes: 8 << 20, ConnectMS: 12, FirstByteMS: 30, DurationMS: 700}
+
+	chk := must(f.s.CheckRelay(f.ctx, req(&adminv1.CheckRelayRequest{Id: r.Id}))).Msg.Relay.Check
+	if chk.ReverseReach != nil || chk.ReverseSpeed != nil || len(c.calls[0]) != 0 {
+		t.Fatalf("a plain check ran or showed a reverse stage: %+v, asked for %v", chk, c.calls[0])
+	}
+	chk = must(f.s.CheckRelay(f.ctx, req(&adminv1.CheckRelayRequest{Id: r.Id, ReverseReach: true}))).Msg.Relay.Check
+	if !slices.Equal(c.calls[1], []string{"leg", "path", "reverse_reach"}) || chk.ReverseReach.GetStatus() != "ok" || chk.ReverseReach.SenderName != "de1" ||
+		chk.ReverseReach.Verdict != "ours" || chk.ReverseSpeed != nil {
+		t.Fatalf("reverse reach asked for: %v, %+v", c.calls[1], chk)
+	}
+	chk = must(f.s.CheckRelay(f.ctx, req(&adminv1.CheckRelayRequest{Id: r.Id, ReverseSpeed: true}))).Msg.Relay.Check
+	sp := chk.ReverseSpeed
+	if !slices.Equal(c.calls[2], []string{"leg", "path", "reverse_reach", "reverse_speed"}) || chk.ReverseReach.GetStatus() != "ok" ||
+		sp.GetStatus() != "ok" || sp.Mb != 8 || sp.MbitS != 91.5 || sp.Bytes != 8<<20 || sp.ConnectMs != 12 || sp.FirstByteMs != 30 || sp.DurationMs != 700 {
+		t.Fatalf("speed proof asked for: %v, %+v", c.calls[2], chk)
+	}
+	rows := f.audited("relay.check")
+	if len(rows) != 3 || !strings.Contains(rows[0].Params, `"reverse_speed":"ok"`) || strings.Contains(rows[2].Params, `"reverse_reach":"ok"`) {
+		t.Fatalf("audit: %+v", rows)
+	}
+}
+
+func TestListRelayCandidatesShowsWhatTheExitsProbeFound(t *testing.T) {
+	f, c, r := newCheckedFix(t)
+	other := f.inbound(f.vlessProfile("reality").Id, "nod_de1") // a second server of the same exit, no relay
+	list := func() map[string]*adminv1.RelayCandidate {
+		out := map[string]*adminv1.RelayCandidate{}
+		for _, cand := range must(f.s.ListRelayCandidates(f.ctx, req(&adminv1.ListRelayCandidatesRequest{ViaNodeId: "nod_fi1"}))).Msg.Candidates {
+			out[cand.InboundId] = cand
+		}
+		return out
+	}
+	if h := list()[other.Id].ExitReachesEntry; h == nil || h.Verdict != "no_data" || h.Source != "" || h.AtUnix != 0 {
+		t.Fatalf("before any check: %+v", h)
+	}
+	c.leg = store.RelayStage{Status: "fail", Code: "timeout", Sender: "nod_fi1", Verdict: "timeout"}
+	c.reverse = store.RelayStage{Status: "ok", Sender: "nod_de1", Verdict: "ours"}
+	must(f.s.CheckRelay(f.ctx, req(&adminv1.CheckRelayRequest{Id: r.Id, ReverseReach: true})))
+	// the finding is about the pair (this entry, this exit), so every server of the exit shows it
+	for _, id := range []string{f.server.Id, other.Id} {
+		h := list()[id].ExitReachesEntry
+		if h == nil || h.Verdict != "reach" || h.Source != "exit_probe" || h.AtUnix != f.clock.Unix() {
+			t.Errorf("%s: exit_reaches_entry = %+v", id, h)
+		}
+	}
+	c.reverse = store.RelayStage{Status: "fail", Code: "timeout", Sender: "nod_de1", Verdict: "timeout"}
+	must(f.s.CheckRelay(f.ctx, req(&adminv1.CheckRelayRequest{Id: r.Id, ReverseReach: true})))
+	if h := list()[other.Id].ExitReachesEntry; h.Verdict != "blocked" {
+		t.Errorf("after a timeout: %+v", h)
 	}
 }
 
@@ -330,29 +565,19 @@ func TestSwitchingOnWithoutAFreshCheckIsRefusedWithTheRealGate(t *testing.T) {
 	}
 }
 
-func TestCreateRelayRefusesAServerARelayCannotPassOn(t *testing.T) {
-	f := newRelayFix(t)
-	awg := f.awgProfile("awg-files", "")
-	srv := f.inbound(awg.Id, "nod_de1")
-	wantMsg(t, errOf2(f.create(srv.Id, "nod_fi1", 0)), "failed_precondition: relay_unsupported: reason=awg")
-}
-
-func TestRelayUnsupportedReasons(t *testing.T) {
-	for _, tc := range []struct {
-		name, protocol, settings, want string
-		tls                            plugin.TLSMode
-	}{
-		{"plain hysteria2", "hysteria2", `{}`, "", plugin.TLSSelfSigned},
-		{"vless reality", "vless", `{"reality":{"target":"www.example.org:443"}}`, "", 0},
-		{"vless behind a CDN", "vless", `{"cdn":{"host":"cdn.example.org","port":443}}`, "cdn", plugin.TLSAcmeDomain},
-		{"vless with an empty CDN host", "vless", `{"cdn":{"host":""}}`, "", plugin.TLSAcmeDomain},
-		{"certificate on an IP", "hysteria2", `{}`, "acme_ip", plugin.TLSAcmeIP},
-		{"awg", "awg", `{}`, "awg", 0},
-	} {
-		spec := plugin.InboundSpec{Settings: []byte(tc.settings), TLS: plugin.TLS{Mode: tc.tls}}
-		if got := relayUnsupported(tc.protocol, spec); got != tc.want {
-			t.Errorf("%s: %q, want %q", tc.name, got, tc.want)
-		}
+func TestCreateRelayAcceptsAWG(t *testing.T) {
+	e := newEnv(t)
+	e.node("nod_de1", "de1", "192.0.2.10", "active")
+	e.node("nod_msk1", "msk1", "198.51.100.20", "active")
+	e.sql(`UPDATE node SET agent_caps = 'relay-forward/1' WHERE id = 'nod_msk1'`)
+	profile := e.awgProfile("awg-files", `{"port":1194,"obfuscation":{"preset":"quic"}}`)
+	srv := e.inbound(profile.Id, "nod_de1")
+	r, err := e.s.CreateRelay(e.ctx, req(&adminv1.CreateRelayRequest{InboundId: srv.Id, ViaNodeId: "nod_msk1"}))
+	if err != nil {
+		t.Fatalf("CreateRelay for AWG: %v", err)
+	}
+	if r.Msg.Relay.Protocol != "awg" || r.Msg.Relay.Port != 443 || r.Msg.Relay.ExitPort != 1194 {
+		t.Fatalf("AWG relay did not prefer the free QUIC disguise port: %+v", r.Msg.Relay)
 	}
 }
 
@@ -397,7 +622,7 @@ func TestListRelayCandidates(t *testing.T) {
 	if got[f.server.Id].RelayId != r.Id || got[f.server.Id].Network != "udp" || got[f.server.Id].Port != 443 || got[f.server.Id].NodeName != "de1" || got[f.server.Id].Unsupported != "" {
 		t.Errorf("the server that has a relay: %+v", got[f.server.Id])
 	}
-	for id, want := range map[string]string{awg.Id: "awg", cdn.Id: "cdn", vless.Id: "", hy.Id: ""} {
+	for id, want := range map[string]string{awg.Id: "", cdn.Id: "cdn", vless.Id: "", hy.Id: ""} {
 		if got[id] == nil || got[id].Unsupported != want {
 			t.Errorf("%s: %+v, want unsupported %q", id, got[id], want)
 		}
@@ -436,10 +661,66 @@ func TestListRelayCandidates(t *testing.T) {
 	if resp.EntryCountry.Verdict != "ok" || resp.EntryCountry.AtUnix != 95 {
 		t.Errorf("entry: %+v", resp.EntryCountry)
 	}
-	if first := resp.Candidates[0]; first.InboundId != hy.Id {
+	if first := resp.Candidates[0]; first.NodeId != "nod_fr1" {
 		t.Errorf("the exit that is dark for some networks goes first: %+v", first)
 	}
 
 	_, err := f.s.ListRelayCandidates(f.ctx, req(&adminv1.ListRelayCandidatesRequest{ViaNodeId: "nod_nope"}))
 	wantCode(t, err, connect.CodeNotFound)
+}
+
+func TestListRelayCandidateAudience(t *testing.T) {
+	e := newEnv(t)
+	e.node("nod_de1", "de1", "de1.example.invalid", "active")
+	e.node("nod_nl1", "nl1", "nl1.example.invalid", "active")
+	e.node("nod_msk1", "msk1", "msk1.example.invalid", "active")
+	e.sql(`UPDATE node SET agent_caps = 'relay-forward/1' WHERE id = 'nod_msk1'`)
+	de1 := e.awgProfile("de1", "")
+	nl1 := e.awgProfile("nl1", "")
+	de1Inbound := e.inbound(de1.Id, "nod_de1")
+	e.inbound(nl1.Id, "nod_nl1")
+	group := e.group("de1", de1.Id, nl1.Id)
+	allNodes := func(m *adminv1.CreateUserRequest) { m.Nodes = &adminv1.NodeSelection{All: true} }
+	alice := e.userBare("alice", group, amnOnly(allNodes)).User
+	bob := e.userBare("bob", group, amnOnly(allNodes)).User
+	aliceKey := must(e.s.CreateAwgDevice(e.ctx, req(&adminv1.CreateAwgDeviceRequest{UserId: alice.Id, ProfileId: de1.Id, Platform: "ios"}))).Msg.Device
+	must(e.s.CreateAwgDevice(e.ctx, req(&adminv1.CreateAwgDeviceRequest{UserId: alice.Id, ProfileId: nl1.Id, Platform: "ios"})))
+	must(e.s.CreateAwgDevice(e.ctx, req(&adminv1.CreateAwgDeviceRequest{UserId: bob.Id, ProfileId: de1.Id, Platform: "ios"})))
+	revokedKey := must(e.s.CreateAwgDevice(e.ctx, req(&adminv1.CreateAwgDeviceRequest{UserId: alice.Id, ProfileId: de1.Id, Platform: "ios"}))).Msg.Device
+	e.sql(`UPDATE device_credential SET revoked_at = ? WHERE device_id = ? AND profile_id = ? AND path = ''`, e.clock.Unix(), revokedKey.Id, de1.Id)
+	e.sql(`INSERT INTO device_credential (id, device_id, user_id, protocol, profile_id, path, secret_enc, data_json, created_at)
+		VALUES ('crd_alice_path', ?, ?, 'awg', ?, 'relay:nod_msk1', x'01', '{}', ?)`, aliceKey.Id, alice.Id, de1.Id, e.clock.Unix())
+	e.sql(`INSERT INTO device (id, user_id, kind, first_seen_at, last_seen_at, created_at, platform, model)
+		VALUES ('dev_alice_link', ?, 'link', ?, ?, ?, 'ios', 'ios')`, alice.Id, e.clock.Unix(), e.clock.Unix(), e.clock.Unix())
+	e.sql(`INSERT INTO device_credential (id, device_id, user_id, protocol, profile_id, path, secret_enc, data_json, created_at)
+		VALUES ('crd_alice_link', 'dev_alice_link', ?, 'awg', ?, '', x'01', '{}', ?)`, alice.Id, de1.Id, e.clock.Unix())
+	e.sql(`UPDATE user SET disabled = 1, status = 'disabled' WHERE id = ?`, bob.Id)
+
+	list := func() *adminv1.RelayCandidate {
+		t.Helper()
+		resp := must(e.s.ListRelayCandidates(e.ctx, req(&adminv1.ListRelayCandidatesRequest{ViaNodeId: "nod_msk1"}))).Msg
+		for _, c := range resp.Candidates {
+			if c.InboundId == de1Inbound.Id {
+				return c
+			}
+		}
+		t.Fatalf("candidate %s is absent", de1Inbound.Id)
+		return nil
+	}
+	got := list()
+	if got.Audience == nil || got.Audience.People != 1 || got.Audience.StaticAwgDevices != 1 {
+		t.Fatalf("disabled bob and non-static keys changed audience: %+v", got.Audience)
+	}
+	e.sql(`UPDATE user SET disabled = 0, status = 'active' WHERE id = ?`, bob.Id)
+	got = list()
+	if got.Audience.People != 2 || got.Audience.StaticAwgDevices != 2 {
+		t.Fatalf("live static keys of this profile were not counted: %+v", got.Audience)
+	}
+	e.sql(`UPDATE user SET disabled = 1, status = 'disabled' WHERE id = ?`, bob.Id)
+	e.sql(`UPDATE user SET all_nodes = 0 WHERE id = ?`, alice.Id)
+	e.sql(`INSERT INTO user_node (user_id, node_id) VALUES (?, 'nod_de1'), (?, 'nod_nl1')`, alice.Id, alice.Id)
+	got = list()
+	if got.Audience.People != 0 || got.Audience.StaticAwgDevices != 0 {
+		t.Fatalf("person without the entry node was counted: %+v", got.Audience)
+	}
 }

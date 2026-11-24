@@ -8,15 +8,20 @@ import { useT, type T } from "@/i18n";
 import { profiles as profilesApi } from "@/lib/api";
 import { errorCode, errorVars } from "@/lib/errors";
 import { plain, type Plain } from "@/lib/plain";
-import { decoyNote } from "@/lib/port-check";
+import { decoyNote, takenNote } from "@/lib/port-check";
+import { shareCodes } from "@/lib/tcpshare";
 
 // The check before the click (CreateInbound / UpdateInbound with validate_only): asked again 300 ms after the last change
 // of the profile, the port or the domain, never written. The answer is either a coded refusal the dialog words next to the
 // field it is about, or the inbound as it would be (its real port and domain, for the placeholders), warnings and a port
 // that is free on the node.
 
-/** The refusals that stop the button: the real call would refuse the same way (port_lossy: from the stored UDP checks, never a run). */
-export const refusals = ["acme_needs_domain", "reality_needs_domain", "port_taken", "hop_taken", "port_in_hop", "sni_needs_domain", "sni_invalid", "already_on_node", "node_retired", "port_lossy"] as const;
+/**
+ * The refusals that stop the button: the real call would refuse the same way (port_lossy: from the stored UDP checks, never a run).
+ * Every one of them shows its reason and its way out in the dialog (a block that stops the button and says nothing is a bug): the share
+ * codes in screens/node/share-fix.tsx, the rest as a sentence under the field they are about or the notice at the foot of the dialog.
+ */
+export const refusals = ["acme_needs_domain", "reality_needs_domain", "mtproto_needs_domain", "port_taken", "hop_taken", "port_in_hop", "sni_needs_domain", "sni_invalid", "already_on_node", "node_retired", "port_lossy", ...shareCodes] as const;
 export type Refusal = (typeof refusals)[number];
 
 export type InboundCheck =
@@ -129,19 +134,36 @@ export function WarpWarnings({ check, nodeId, nodeName, onLeave }: { check: Inbo
   );
 }
 
-/** "hy2_decoy_paused" of the check: a VLESS profile takes the TCP port of the Hysteria2 site on this node. Says so, does not stop. */
+/**
+ * "hy2_decoy_paused" of the check: a VLESS profile takes the TCP port of the Hysteria2 site on this node; "hy2_site_taken": a
+ * TrustTunnel profile does, and serves the node's own site there ("hy2_site_taken_mtproto": an MTProto profile does, and shows its
+ * fallback). Says so, does not stop.
+ */
 export function DecoyNotice({ check }: { check: InboundCheck }) {
   const t = useT();
   if (check.state !== "ok") return null;
+  const taken = check.warnings.find((x) => x.code === "hy2_site_taken" || x.code === "hy2_site_taken_mtproto");
   const w = check.warnings.find((x) => x.code === "hy2_decoy_paused");
-  if (!w) return null;
+  // "bridge_site_lost": the node's own site on 443 that the bridge of reverse relays rides is replaced by another site
+  const bridge = check.warnings.find((x) => x.code === "bridge_site_lost");
   return (
-    <Notice className="items-start">
-      <span className="flex flex-col items-start gap-1.5">
-        {decoyNote(t, w.params)}
-        <VlessHy2Docs />
-      </span>
-    </Notice>
+    <>
+      {taken ? (
+        <Notice className="items-start">
+          <span className="flex flex-col items-start gap-1.5">{takenNote(t, taken.params)}</span>
+        </Notice>
+      ) : (
+        w && (
+          <Notice className="items-start">
+            <span className="flex flex-col items-start gap-1.5">
+              {decoyNote(t, w.params)}
+              <VlessHy2Docs />
+            </span>
+          </Notice>
+        )
+      )}
+      {bridge && <Notice className="items-start">{t("node.check.bridgeLost", { node: bridge.params.node ?? "", port: bridge.params.port ?? "" })}</Notice>}
+    </>
   );
 }
 

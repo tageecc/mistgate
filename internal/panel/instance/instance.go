@@ -33,18 +33,18 @@ func SettingKeys() []string {
 }
 
 // Defaults of a fresh installation: brand "Mistgate" (wordmark "mist" + "gate"), no
-// custom logo, lavender accent, English.
+// custom logo, mint accent, English.
 const (
 	DefaultBrandHead = "Mist"
 	DefaultBrandTail = "gate"
-	DefaultAccent    = "#b8acf2"
+	DefaultAccent    = "#7dd3a0"
 	DefaultLanguage  = "en"
 
 	maxBrandPart = 24 // runes per wordmark part
 )
 
-// Languages are the supported UI languages.
-var Languages = []string{"en", "ru", "zh"}
+// Languages are the supported UI languages, of the admin (web/src/i18n) and the user page (web/src/sub/i18n.ts) alike.
+var Languages = []string{"en", "ru", "zh", "fa", "tr"}
 
 // ErrInvalid wraps every validation failure, so callers can map it to INVALID_ARGUMENT.
 var ErrInvalid = errors.New("invalid instance setting")

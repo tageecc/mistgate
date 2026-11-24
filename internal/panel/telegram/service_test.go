@@ -3,6 +3,7 @@ package telegram
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -48,6 +49,32 @@ func TestAlertOpenIsOneMessageAndDuplicatesAreSuppressed(t *testing.T) {
 	}
 	if strings.Contains(got, "<a ") {
 		t.Errorf("no admin URL is known, yet the message links: %q", got)
+	}
+}
+
+// A scheduled task's alert goes to Telegram only when the owner asked for it on the task.
+func TestScheduledTaskAlertsGoOnlyWhenAskedFor(t *testing.T) {
+	e := newEnv(t)
+	owner := e.addAdmin("adm_o", "Owner", store.RoleOwner)
+	e.setBot()
+	e.link(owner, 777)
+	e.run()
+
+	quiet := alert("scheduled_check", "", 2)
+	quiet.Subject = "tsk_quiet"
+	quiet.Params = map[string]string{"task": "Quiet", "summary": "x", "telegram": "0"}
+	e.svc.AlertTransition(quiet, false)
+	loud := alert("scheduled_check", "", 2)
+	loud.Subject = "tsk_loud"
+	loud.Params = map[string]string{"task": "Morning check", "summary": "fleet_digest: totals.nodes_problem_now = 2", "telegram": "1"}
+	e.svc.AlertTransition(loud, false)
+	waitFor(t, "the task alert", func() bool { return len(e.tg.sentTo(777)) == 1 })
+	e.quiet(1, 150*time.Millisecond)
+	got := e.tg.sentTo(777)[0]
+	for _, want := range []string{"Scheduled check found a problem", "Morning check", "nodes_problem_now = 2"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("message %q lacks %q", got, want)
+		}
 	}
 }
 
@@ -129,10 +156,22 @@ func TestSeverityFloorAndSilentResolutions(t *testing.T) {
 		t.Fatalf("info USER_CONNECTION was sent: total messages %d, before %d", got, before)
 	}
 	e.svc.mu.Lock()
-	queued := e.svc.open["user_connection//"]
+	_, queued := e.svc.open["user_connection//"]
 	e.svc.mu.Unlock()
 	if queued {
 		t.Fatal("info USER_CONNECTION was recorded as announced")
+	}
+	countryAlert := alert("country_blocked", "nod_1", 1)
+	countryAlert.Params = map[string]string{"why": "reached_through_relays"}
+	e.svc.AlertTransition(countryAlert, false)
+	if got := e.tg.total(); got != before {
+		t.Fatalf("info COUNTRY_BLOCKED was sent: total messages %d, before %d", got, before)
+	}
+	e.svc.mu.Lock()
+	_, queued = e.svc.open["country_blocked/nod_1/"]
+	e.svc.mu.Unlock()
+	if queued {
+		t.Fatal("info COUNTRY_BLOCKED was recorded as announced")
 	}
 
 	e.svc.AlertTransition(alert("doctor_warn", "nod_1", 1), false)
@@ -145,6 +184,73 @@ func TestSeverityFloorAndSilentResolutions(t *testing.T) {
 		a.Resolution, a.ResolvedAt = res, e.clk.now()
 		e.svc.AlertTransition(a, true)
 		e.quiet(before, 120*time.Millisecond)
+	}
+}
+
+// An alert that was announced and then lowered to info (a country block the relays make up for) says it ended and is forgotten,
+// so that a block that comes later is announced again; one that never was announced ends in silence.
+func TestAnnouncedAlertLoweredToInfoIsToldEndedAndForgotten(t *testing.T) {
+	e := newEnv(t)
+	owner := e.addAdmin("adm_o", "Owner", store.RoleOwner)
+	e.addNode("nod_1", "n1")
+	e.setBot()
+	e.link(owner, 777)
+	e.run()
+
+	quiet := alert("country_blocked", "nod_1", 1)
+	quiet.Params = map[string]string{"why": "reached_through_relays"}
+	quiet.Resolution, quiet.ResolvedAt = "cleared", e.clk.now()
+	e.svc.AlertTransition(quiet, true) // never announced
+	e.quiet(e.tg.total(), 120*time.Millisecond)
+
+	e.svc.AlertTransition(alert("country_blocked", "nod_1", 2), false)
+	waitFor(t, "the open message", func() bool { return e.tg.total() >= 1 })
+	e.svc.AlertTransition(alert("country_blocked", "nod_1", 2), false) // the same alert risen again in place: told once
+	e.quiet(1, 120*time.Millisecond)
+
+	e.svc.AlertTransition(quiet, true) // ended while lowered
+	waitFor(t, "the end message", func() bool { return e.tg.total() >= 2 })
+	e.svc.mu.Lock()
+	_, kept := e.svc.open["country_blocked/nod_1/"]
+	e.svc.mu.Unlock()
+	if kept {
+		t.Fatal("the lowered alert stayed recorded as announced")
+	}
+	e.svc.AlertTransition(alert("country_blocked", "nod_1", 2), false)
+	waitFor(t, "a new block is announced", func() bool { return e.tg.total() >= 3 })
+}
+
+func TestAwgPrepareFailureIsToldOncePerTransitionAndOpenStateIsBounded(t *testing.T) {
+	e := newEnv(t)
+	e.addNode("de1", "de1")
+	e.svc.AwgPrepareFailed("de1", "apt_lock", 10)
+	e.svc.AwgPrepareFailed("de1", "apt_lock", 10) // the same transition again
+	e.svc.AwgPrepareFailed("de1", "apt_lock", 20) // a later build failed the same way
+	e.svc.AwgPrepareFailed("de1", "step_failed", 20)
+	e.svc.mu.Lock()
+	queued := len(e.svc.pending)
+	e.svc.mu.Unlock()
+	if queued != 3 {
+		t.Fatalf("queued %d prepare alerts, want one per transition (3)", queued)
+	}
+
+	e.clk.advance(openAlertTTL + time.Second)
+	e.svc.AwgPrepareFailed("de1", "apt_lock", 10)
+	e.svc.mu.Lock()
+	queued = len(e.svc.pending)
+	e.svc.mu.Unlock()
+	if queued != 4 {
+		t.Fatalf("after the TTL queued %d prepare alerts, want 4", queued)
+	}
+
+	for i := 0; i < maxOpenAlerts+1; i++ {
+		e.svc.openOnce("alert/" + strconv.Itoa(i))
+	}
+	e.svc.mu.Lock()
+	open := len(e.svc.open)
+	e.svc.mu.Unlock()
+	if open > maxOpenAlerts {
+		t.Fatalf("open alert map has %d entries, cap %d", open, maxOpenAlerts)
 	}
 }
 
@@ -520,13 +626,16 @@ func TestSecurityEvents(t *testing.T) {
 	e.link(owner, 1)
 	e.link(helper, 2)
 	e.link(reader, 3)
-	e.run()
 
+	// Queue the whole burst before the send loop starts: the first item opens the burst window, and a slow store read
+	// (the first Admin lookup costs ~50 ms under -race) would otherwise let the window close between two events and split
+	// the owner's one message in two.
 	e.svc.Security(auth.Event{Kind: auth.EventSignInFailed, IP: "198.51.100.9"})
 	e.svc.Security(auth.Event{Kind: auth.EventLockout, Login: "root", IP: "198.51.100.9", Until: e.clk.now().Add(15 * time.Minute)})
 	e.svc.Security(auth.Event{Kind: auth.EventSignIn, AdminID: helper.ID, Method: "passkey", IP: "203.0.113.5"})
 	e.svc.Security(auth.Event{Kind: auth.EventSignIn, AdminID: helper.ID, Method: "passkey", IP: "203.0.113.5"}) // same place: nothing new
 	e.svc.Security(auth.Event{Kind: auth.EventPasskeyAdded, AdminID: reader.ID, IP: "203.0.113.7"})
+	e.run()
 	waitFor(t, "the owner's and the helper's messages", func() bool { return len(e.tg.sentTo(1)) == 1 && len(e.tg.sentTo(2)) == 1 && len(e.tg.sentTo(3)) == 1 })
 	e.quiet(3, 150*time.Millisecond)
 	ownerMsg := e.tg.sentTo(1)[0]
@@ -758,4 +867,71 @@ func TestMutedAlertThatReopensIsNotAnnounced(t *testing.T) {
 	a.ResolvedAt, a.Resolution = time.Time{}, ""
 	e.svc.AlertTransition(a, false)
 	waitFor(t, "an open after the mute ended", func() bool { return len(e.tg.sentTo(777)) >= 2 })
+}
+
+// The logs of a person's app: the owner (and only the owner) hears that they came, on request or on the person's own, or that the
+// person refused; the text has the names and the count, and nothing a person's log could hold, in the panel's language, with a link
+// to the person's page only when the address is known.
+func TestClientLogsNewsIsTheOwnersAndCarriesOnlyMetadata(t *testing.T) {
+	e := newEnv(t, func(c *Config) { c.AdminURL = "https://panel.example/zz/" })
+	owner := e.addAdmin("adm_o", "Owner", store.RoleOwner)
+	helper := e.addAdmin("adm_h", "Helper", store.RoleHelper)
+	e.setBot()
+	e.link(owner, 1)
+	e.link(helper, 2)
+	e.run()
+
+	e.svc.ClientLogs(ClientLogsNews{Kind: "received", UserID: "usr_alice", Person: "alice-liddell", Device: "Office PC", Lines: 40})
+	waitFor(t, "the owner's message", func() bool { return len(e.tg.sentTo(1)) == 1 })
+	got := e.tg.sentTo(1)[0]
+	for _, want := range []string{"The logs of the Mistgate app came", "<b>alice-liddell</b>", "Device: Office PC", "Lines: 40", `href="https://panel.example/zz/users/usr_alice#client-logs"`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("message lacks %q: %q", want, got)
+		}
+	}
+	e.quiet(1, 150*time.Millisecond)
+	if n := len(e.tg.sentTo(2)); n != 0 {
+		t.Errorf("a helper got %d messages about a person's logs", n)
+	}
+
+	e.svc.ClientLogs(ClientLogsNews{Kind: "bogus", Person: "x"}) // an unknown kind says nothing
+	e.quiet(1, 150*time.Millisecond)
+}
+
+func TestClientLogsNewsTexts(t *testing.T) {
+	n := func(kind string) ClientLogsNews {
+		return ClientLogsNews{Kind: kind, UserID: "usr_bob", Person: "bob <the>-builder", Device: "iPhone 15", Lines: 22}
+	}
+	for _, tc := range []struct {
+		lang L
+		kind string
+		want []string
+		not  []string
+	}{
+		{"ru", "received", []string{"Пришли журналы приложения Mistgate", "Человек: <b>bob &lt;the&gt;-builder</b>", "Устройство: iPhone 15", "Строк: 22", "Открыть страницу человека"}, nil},
+		{"ru", "unasked", []string{"Человек сам прислал журналы приложения Mistgate", "Строк: 22"}, nil},
+		{"ru", "declined", []string{"Человек отказался присылать журналы приложения Mistgate", "Человек: <b>bob", "Устройство: iPhone 15"}, []string{"Строк"}},
+		{"en", "unasked", []string{"A person sent the logs of the Mistgate app on their own", "Lines: 22"}, nil},
+		{"en", "declined", []string{"A person declined to send the logs of the Mistgate app"}, []string{"Lines"}},
+		{"zh", "received", []string{"收到了 Mistgate 应用的日志", "用户：<b>bob", "设备：iPhone 15", "行数：22", "打开用户页面"}, nil},
+		{"zh", "declined", []string{"拒绝发送"}, []string{"行数"}},
+	} {
+		got := clientLogsText(tc.lang, n(tc.kind), "https://panel.example/zz/")
+		for _, w := range tc.want {
+			if !strings.Contains(got, w) {
+				t.Errorf("%s %s lacks %q: %q", tc.lang, tc.kind, w, got)
+			}
+		}
+		for _, w := range tc.not {
+			if strings.Contains(got, w) {
+				t.Errorf("%s %s has %q: %q", tc.lang, tc.kind, w, got)
+			}
+		}
+		if strings.Contains(got, "<the>") {
+			t.Errorf("a name was not escaped: %q", got)
+		}
+	}
+	if got := clientLogsText("ru", n("received"), ""); strings.Contains(got, "<a ") {
+		t.Errorf("a link without a known address: %q", got)
+	}
 }

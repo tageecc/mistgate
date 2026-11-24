@@ -2,9 +2,8 @@ import { describe, expect, it } from "vitest";
 import { UserStatus } from "@/gen/mistgate/admin/v1/user_pb";
 import { en as profilesEn, ru as profilesRu } from "@/i18n/profiles";
 import { en as usersEn, ru as usersRu } from "@/i18n/users";
-import { avatarIndex, daysLeft, shownStatus, termText, usage } from "./format";
+import { avatarIndex, daysLeft, shownStatus, usage } from "./format";
 import type { UserN } from "./model";
-import { useTx } from "./t";
 
 describe("dictionaries of the people screens", () => {
   const ph = (s: string) => [...new Set([...s.matchAll(/\{(\w+)\}/g)].map((m) => m[1]))].sort().join();
@@ -27,9 +26,6 @@ describe("dictionaries of the people screens", () => {
     const keys = [...Object.keys(usersEn), ...Object.keys(profilesEn)];
     expect(new Set(keys).size).toBe(keys.length);
   });
-  it("useTx is a function", () => {
-    expect(typeof useTx).toBe("function");
-  });
 });
 
 const user = (over: Partial<UserN>): UserN =>
@@ -50,9 +46,10 @@ describe("user display helpers", () => {
     expect(daysLeft(1000 - 10, 1000)).toBeLessThanOrEqual(0);
   });
 
-  it("gives a stable avatar slot per id", () => {
-    expect(avatarIndex("usr_a")).toBe(avatarIndex("usr_a"));
-    expect(avatarIndex("usr_a")).toBeLessThan(9);
+  it("gives an avatar slot from the name, as the board does: the first letter's code plus the length, around the 8 colours", () => {
+    expect(avatarIndex("carol")).toBe(0);
+    expect(avatarIndex("bob")).toBe(5);
+    expect(avatarIndex("")).toBeLessThan(8);
   });
 
   it("formats usage against a quota: whole numbers from 10 up, the quota apart, red once it is used up", () => {
@@ -65,12 +62,5 @@ describe("user display helpers", () => {
     expect(usage(100e9, 100e9, fmt).tone).toBe("over"); // the quota is used up: the server limits the person
     expect(usage(101e9, 100e9, fmt).tone).toBe("over");
     expect(usage(5e9, 0, fmt)).toMatchObject({ used: "5 GB", of: "", text: "5 GB", pct: 0 });
-  });
-
-  it("shows the term as days, expired or unlimited", () => {
-    const t = ((k: string, v?: Record<string, number>) => (k === "users.days" ? `${v!.n} d` : k)) as never;
-    expect(termText(user({ expiresUnix: 0 }), t, 100).text).toBe("∞");
-    expect(termText(user({ expiresUnix: 50 }), t, 100)).toMatchObject({ text: "0 d", tone: "bad" });
-    expect(termText(user({ expiresUnix: 100 + 86400 * 3 }), t, 100)).toMatchObject({ text: "3 d", tone: "fg" });
   });
 });

@@ -3,7 +3,9 @@ title: Subscriptions
 description: "One link per person for every app: which format each app gets and how the panel decides, how servers are named, what the apps show, and the settings of the subscription."
 ---
 
-Every person has one subscription link. The same link gives a subscription app its list of servers, gives an app on the mihomo core a ready config, gives an app on the Xray or sing-box core a JSON config of its own, and gives a browser the person's own page. The **Subscriptions** section decides what each app gets and what people see. It has five tabs: **Apps & formats**, **Who gets what**, **Names & texts**, **User page** and **DNS**.
+Every person has one subscription link. The same link gives a subscription app its list of servers, gives an app on the mihomo core a ready config, gives an app on the Xray or sing-box core a JSON config of its own, and gives a browser the person's own page. The **Subscriptions** section decides what each app gets and what people see. It has eight tabs: **Apps & formats**, **Who gets what**, **App versions**, **Names & texts**, **Response headers**, **Mihomo templates**, **User page** and **DNS**.
+
+![One link per person: a new user, their subscription link and their own page on a phone](../../images/video/link-poster-en.webp)
 
 ## The link
 
@@ -14,7 +16,7 @@ https://sub.example.com/<secret prefix>/<token>
 ```
 
 - The base, up to and including the secret prefix, is set by `mistgate setup` on the panel server; **Settings** → **Domains** shows it (to the owner) as **Base of the subscription links**. Without it, no links are handed out. See [Install the panel](../getting-started/install-panel.md).
-- The token is the person's own secret. **Subscription link** on the user card shows the link and its QR code; **New link** replaces it, and the old link stops working at once (the page password changes with it).
+- The token is the person's own secret. **Subscription link** on the user card shows the link and its QR code; **New link** replaces it, and the old link stops working at once (the page password changes with it; to change the password alone, use **Change** in the password block, see [The page password](user-page.md#the-page-password)).
 - A link nobody owns answers like any other unknown path of the site, so a link cannot be found by guessing.
 
 ## Formats
@@ -50,10 +52,16 @@ The **Apps & formats** tab lists the apps the protocols work with and what each 
 
 Both are built from the same profiles and the same access as the link list. They differ in what a format can carry ([What works where](#what-works-where)) and in how the app is wired.
 
-- **Xray JSON** is an array of configs, one per server; the server's name is the `remarks` of its config. Each config opens a local SOCKS proxy on `127.0.0.1:10808`, which the app's own VPN mode feeds. Other apps on the device can see that port, and some VPN checks look for it. There is no HTTP proxy, no API and no statistics port. The DNS preset is written into every config.
-- **sing-box JSON** is one profile: a switch with every server (the first is the default), a TUN interface, and the DNS preset. It opens no local proxy. It needs sing-box 1.12 or newer.
+- **Xray JSON** is an array of configs, one per server; the server's name is the `remarks` of its config. When automatic selection is on, an `Auto` config with every server comes first. Each config opens a local SOCKS proxy on `127.0.0.1:10808`, which the app's own VPN mode feeds. Other apps on the device can see that port, and some VPN checks look for it. There is no HTTP proxy, no API and no statistics port. The DNS preset is written into every config.
+- **sing-box JSON** is one profile: a selector with every server, a TUN interface, and the DNS preset. When automatic selection is on, its `Auto` option tests the servers; otherwise the first server is the default. It opens no local proxy. It needs sing-box 1.12 or newer.
 
 The names follow the template of [Names & texts](#names-texts). Xray JSON keeps the link list's 30-character limit and, for Happ, the load; sing-box JSON keeps the full names and never adds the load.
+
+### Automatic server choice
+
+When **Automatic server choice**, a card under the rules of **Who gets what**, is on (the default), Mihomo/Clash YAML and sing-box JSON include an `Auto` group, and Xray JSON an `Auto` config first, that tests each server at `https://www.gstatic.com/generate_204` every five minutes. The check goes through the server being tested, so a site blocked on the user's home connection does not affect it. A new install starts on `Auto`; a person's manual pick in the app remains in effect. With one server, there is no `Auto`. This setting does not affect AmneziaVPN, nor Happ on the link list, which has no groups.
+
+The Xray `Auto` config holds every server and sends traffic through a `leastPing` balancer fed by Xray's observatory: each new connection takes the server that answered fastest at the last check, the first server until the first check is in. Unlike Mihomo's `url-test`, it has no tolerance, so when two servers answer about as fast, new connections may move between them after a check.
 
 **Planned:** subscription mirrors.
 
@@ -75,7 +83,9 @@ A server that a format cannot carry is left out of that format without a word, a
 | The WARP copy of any of these | as its original | as its original | as its original | as its original |
 
 - sing-box has no XHTTP transport and cannot check a self-signed certificate by its fingerprint. Gecko is carried by Mihomo only.
-- AmneziaWG reaches an app only through Mihomo YAML or an AmneziaVPN key.
+- AmneziaWG reaches an app only through Mihomo YAML or an AmneziaVPN key. The first can be turned off: [AmneziaWG in apps on the link](#amneziawg-in-apps-on-the-link).
+- TrustTunnel is in no format: the official apps take a `tt://` link from the person's page ([TrustTunnel](trusttunnel.md)).
+- MTProto is in no format. A `tg://proxy` line would be a broken server in every VPN app, so the Telegram links come only from the person's page and the admin ([MTProto](mtproto.md)).
 - A WARP copy is the node's exit; nothing changes on the client, so it follows the profile it copies.
 - A person for whom a format has no server at all gets a placeholder entry: see [When no server fits the app](#when-no-server-fits-the-app).
 
@@ -98,6 +108,21 @@ What counts as a browser: a User-Agent that starts with `Mozilla/`, has a browse
 
 **Trying a format on one request.** `?format=xray-json` or `?format=sing-box` at the end of a subscription link picks the format for that request, whatever the rules say. It is meant for trying an app that no rule names yet. It grants nothing more than a rule does: a link nobody owns still gets the fake 404, a link whose rule is **Fake 404** stays the fake 404, and any other value is ignored. The user page never shows a link with the parameter.
 
+## AmneziaWG in apps on the link
+
+kl!ck and the other Mihomo apps get the AmneziaWG servers in their profile along with the rest. Happ and the other apps that read the link list never get them: their formats cannot carry AmneziaWG. The switch **AmneziaWG in apps on the link**, a card under the rules of **Who gets what**, takes AmneziaWG out of the apps on the link. It is on by default, and a panel that is updated keeps it on.
+
+Turn it off when people use AmneziaWG in AmneziaVPN anyway: in a Mihomo app it often works worse. Then:
+
+- each Mihomo app gets the subscription without the AmneziaWG servers at its next refresh;
+- at that refresh the AmneziaWG keys of that app are removed, and their addresses in the AmneziaWG network are freed. The confirmation **Take AmneziaWG out of the apps on the link?** says how many keys the apps hold now; when they hold none, the switch turns off at once;
+- AmneziaVPN keys, the person's page and the other formats do not change. The Mistgate app (not released publicly yet) is not one of the apps on the link here: it gets AmneziaWG on its own and keeps it whatever this switch says (its own switch is the row **Mistgate app** on the person's card), and its keys are not counted in the confirmation;
+- a person whose only servers are AmneziaWG gets the placeholder entry in a Mihomo app: see [When no server fits the app](#when-no-server-fits-the-app).
+
+Through a [relay](relays.md#amneziawg-through-a-relay), a Mihomo app gets a twin of the AmneziaWG server (` · via RU`) with its own key, and the Mistgate app gets it at its next sync. The link lists still carry no AmneziaWG.
+
+Turned back on, the apps get new keys at their next refresh. While it is off, **Apps & formats** strikes AmneziaWG out on the Mihomo card and links to the switch.
+
 ## Device limit for apps on the link
 
 An app that fetches the link sends, besides its User-Agent, a device ID in the `X-HWID` header (the standard of Happ, Remnawave and 3x-ui) and often its model and system. The panel counts devices by that ID: one app on one device is one device with its own place in the person's limit and its own keys. Apps that send no ID share one place. How devices appear and are managed: [Users and groups](users-and-groups.md#devices-and-the-device-limit). Which apps send an ID: [Client apps](client-apps.md#which-apps-send-a-device-id).
@@ -107,8 +132,10 @@ The mode is set in the card **Device limit for apps on the link**, under the rul
 | Mode | What it does |
 |:--|:--|
 | **Only count** | Nobody is refused. Devices get their places and keys, the limit is counted, and the users list shows who is over it. A person can have up to twice the limit; beyond that, a new app takes the shared place instead of one of its own, so an app that sends a different ID with every request cannot fill the panel. The event "the device limit is reached" is history only. |
-| **Limit** | A new device over the limit is refused. The devices a person already has stay. A link device silent for 30 days gives its place to a new one. Apps without a device ID share one place, and when the limit is full and there is no shared place yet, such an app is refused too. |
+| **Limit** | A new device over the limit is refused. Idle devices stay with their keys and credentials, but do not fill a place. Apps without a device ID share one place, and when the limit is full and there is no shared place yet, such an app is refused too. |
 | **Strict** | As **Limit**, and an app without a device ID is refused. Switching to it removes every shared place at once. |
+
+By default, a device becomes idle after 30 days without a connection seen by a node or a subscription fetch from that device. Set **Device idle after** to 7–365 days, or 0 to turn idling off. A device that has never connected counts from its creation. Idle devices keep their keys and credentials; when one returns, it counts again and is refused only if the limit is full in **Limit** or **Strict** mode. This applies to link and Mistgate app devices and AmneziaWG key devices.
 
 The default depends on the panel. A panel that already has users gets **Only count** when it is updated, so no one is cut off the day of the update. A new panel with no users gets **Limit**. The owner and helpers change the mode; the change applies at the next fetch.
 
@@ -123,6 +150,51 @@ The default depends on the panel. A panel that already has users gets **Only cou
 
 After the switch, the alert "An app was turned away at the device limit" tells you when someone was actually refused (see [Health](../operations/health.md)).
 
+## App versions
+
+A REALITY handshake can carry a post-quantum key share (X25519MLKEM768). Newer Xray servers can insist on it: an app that does not send the share is taken for a stranger and sent to the cover site. The tab **App versions** shows, for every device that receives a VLESS REALITY server, whether its app is known to send the share. It is knowledge for you as the owner, and today it changes nothing: no device is refused, no person is told anything, and the servers each app gets stay the same. Use it before you ever limit a profile to post-quantum handshakes.
+
+A device is on the list when it is a subscription-link device with a VLESS key, its person is active, and their group holds a VLESS REALITY profile with a live inbound on an active node. Each device gets one state, judged against the fingerprints of the REALITY profiles that person can use (the worst one counts):
+
+| State | Meaning |
+|:--|:--|
+| **OK** | The app and version are known to send the share. |
+| **Below the minimum** | The app is known, the version is lower than the lowest one known to work; the row says which version is needed. |
+| **Not supported** | No version of the app can do it (sing-box and the apps built on it), or the profile's fingerprint (`ios`, `edge` or `random`) builds a classical handshake in any app. Updating the app does not help; the row says which of the two. |
+| **Unknown** | The table cannot tell: an app it does not know, no known good version for that platform, or an app that reported no version. Unknown is never reported as outdated. |
+
+The cards on top count devices and people in each state and are the filter; **Need attention** (the default) is everything but OK. The table shows the person (a link to their card), the device, the app and version as it reported them, the state, what the nodes saw (see below), what is missing, and the last activity under the person. Add `?tab=clients&user=<user id>` to the address to see one person's devices.
+
+### What the nodes saw
+
+The **State** column is what the panel *knows* about the app, from the table of minimum versions. The column **In fact** is what the nodes *saw*: over the last 7 days every node with an up-to-date agent counts, per device, the handshakes that came in over VLESS REALITY, and the panel adds them up. A device is **New-style** when every handshake it sent carried the post-quantum key exchange, **Old-style** when none did (a strict profile would turn it away), **Mixed** when some did and some did not (an app that switches fingerprints, or two apps on one key), and **No data** when nothing readable was counted. The small numbers under the pill are the counts (new, old, and the ones that could not be read); the tooltip of the pill says the same in words.
+
+The two columns together are the useful part. A **≠** mark sits next to the pill where they disagree: the table says OK but the nodes saw old-style handshakes (the table is wrong for that app, fix the row in the table of minimum versions), or the table says there is a problem but the nodes saw only new-style handshakes (nothing to worry about). Under the cards, the chips **New-style**, **Old-style**, **Mixed** and **No data** count the devices by what the nodes saw and filter the list; a class chosen there takes in devices of every state, so the OK device that sends old-style handshakes is on the **Old-style** list. That list is who a strict mode would turn away entirely; the mixed ones it would turn away only in part.
+
+A device has data only when its node's agent is new enough (it lists `vless-hello-kex/1`). While some node with a REALITY server is older, a line says how many nodes do not count yet; update their agents, and until then the devices that connect through them show **No data**.
+
+### The table of minimum versions
+
+Below the list, **Minimum versions** holds the table behind the states: per app and platform, the lowest version that sends the share with a Chrome-like fingerprint and with a Firefox or Safari one, or "does not work". A blank version is "unknown". The built-in values come with the panel and move with its releases; they follow the release notes of the apps and of the Xray and Mihomo cores inside them:
+
+| App | Chrome fingerprint | Firefox / Safari fingerprint |
+|:--|:--|:--|
+| Happ, Android | 3.1.1 | 3.20.0 |
+| Happ, Windows, macOS, Linux | 0.3.6 | 2.10.0 |
+| Happ, iOS | unknown | 4.8.0 |
+| v2rayNG | 1.10.3 | 2.0.16 |
+| v2rayN | 7.12.6 | 7.20.0 |
+| Mihomo core (the version comes from the User-Agent) | 1.19.9 | never (Firefox_120 / Safari_16_0 carry no share) |
+| kl!ck (its own version; it is Mihomo inside) | 0.4.0 | never (Firefox_120 / Safari_16_0 carry no share) |
+| sing-box (SFA, SFI, SFM), Karing, NekoBox | does not work | does not work |
+| Hiddify, Streisand, FoXray, v2RayTun, INCY, OneXray, Shadowrocket, FlClash, Clash Verge, Mihomo Party, Clash Meta for Android | unknown | unknown |
+
+The Mihomo core sends the share only with the chrome fingerprint: the `support-x25519mlkem768` flag acts on it alone, and Mihomo builds firefox and safari from fingerprints without the share, in every version. So with a firefox or safari profile Mihomo and kl!ck are shown as unsupported by the fingerprint. Mihomo and kl!ck send the share only when the config asks for it (`support-x25519mlkem768`), and the panel's Mihomo profile does not ask today; for them the table says what the core can do, not what it does now. A device is judged by the app string it reported last, so a shared place reports whichever app fetched last.
+
+The owner can correct any value, add an app (its name is what it writes in the User-Agent before the `/`, in lower case) and return a row to the built-in value. Saving needs a step-up and is written to the audit log as `client_compat.update`. Only the differences from the built-in table are stored, so a row you never touched follows the panel's releases. Helpers and read-only admins see the table without the fields.
+
+Through MCP the list is the read tool [`outdated_devices`](../reference/mcp.md); the table itself is changed only in the panel, by the owner.
+
 ## What the apps receive
 
 Every answer to an app carries, besides the servers, the headers subscription apps read:
@@ -136,10 +208,23 @@ Every answer to an app carries, besides the servers, the headers subscription ap
 | `Announce` | The announcement, or the reason the subscription does not work. |
 | `Support-Url` | The support link. |
 | `Probe-Report` | `1` while the panel takes the reports of the kl!ck server check (**Reachability → Sources**, see [kl!ck reports](../operations/reachability.md#klck-reports)). Without it kl!ck sends nothing. |
-| `Routing` | The link list for Happ only: the person's DNS preset as a Happ routing profile. See [DNS](dns.md). The other formats carry their DNS inside, so they send no `Routing`. |
+| `Routing` | The link list for Happ and INCY only: your own [routing profile](#routing-for-happ-and-incy) for the person's group, with the DNS of the person's preset put in; without one, the person's DNS preset as a routing profile (Happ: `happ://`, INCY: `incy://`). A profile whose link is over 3000 bytes goes as a line of the body after the servers instead. See [DNS](dns.md). The other formats carry their DNS inside, so they send no `Routing`. |
 | `Ping-Type`, `Ping-Result`, `Subscription-Ping-Onopen-Enabled` | Happ only, and only when **Ping in Happ** is not **App default**: how Happ pings the servers, the delay in ms, and whether it pings when it opens. See [Names & texts](#names-texts). |
 
-The Mihomo YAML, Xray JSON and sing-box JSON carry the same headers except `Routing`. The Mihomo YAML has one proxy group with every server and a `dns:` section; Xray JSON has one config per server; sing-box JSON has one switch with every server. Each takes the person's DNS preset in its own form.
+Headers of your own go after these: see [Response headers](#response-headers); the **What an app gets** preview on that tab shows the `routing` header too. The Mihomo YAML, Xray JSON and sing-box JSON carry the same headers except `Routing`. The Mihomo YAML has a `select` group and, when enabled, an `Auto` group over the servers, plus a `dns:` section; Xray JSON has one config per server; sing-box JSON has one selector and, when enabled, an `Auto` URL test. Each takes the person's DNS preset in its own form.
+
+## Extra servers: over IPv6 and through a relay
+
+Next to a server of a node, an app can list up to two more, marked by a label after the name. They are the same server, with the same keys, names and certificates; only the address the app connects to differs, and an app picks one by its name like any other.
+
+| Label | What it is | Added by |
+|:--|:--|:--|
+| ` · IPv6` (the same in every language) | The server at one of the node's IPv6 addresses, for people whose network blocks the node's IPv4 address. Apps without IPv6 skip it. In URIs the address is in brackets (`@[2001:db8::5]:443`); in the Mihomo, Xray JSON and sing-box formats it is bare, as those formats want it. | The node's [IPv6 entry](nodes.md#ipv6-entry) |
+| ` · via RU` (ru ` · через RU`, zh ` · 经 RU`) | The server through a relay of an entry node, with the entry's country. | A [relay](relays.md) |
+
+The order is the node's server, its IPv6 server, then the servers through its relays; a relay's server is never doubled for IPv6. Both appear for every person who may use the node (and the entry node, for a relay), at the next refresh of the app. A server behind a CDN, one with a certificate for the node's IPv4 address, and the static AmneziaWG keys get no IPv6 server. The load of an IPv6 server in Happ is the node's. Names are kept within Happ's 30 characters: the label stays, the profile name is shortened first. The links of an [MTProto](mtproto.md#relays-and-ipv6-twins) profile get the same twins, in the person's Telegram block instead of the subscription.
+
+A server the owner keeps out of subscriptions on the node's **Ways in** tab (see [Nodes](nodes.md#direct)) is left out itself, while its IPv6 server and the servers through its relays stay.
 
 ## Names & texts
 
@@ -174,6 +259,182 @@ In Happ, a node also ends its name with its current load: "🇩🇪 DE · Hyster
 | **How to ping** | **App default** (the default) sends nothing, so Happ uses its own setting. **TCP** sends `Ping-Type: tcp` and `Ping-Result: time`: Happ opens a TCP connection to each server's port and shows the delay in ms. |
 | **Ping when the app opens** | With **TCP** only: Happ checks every server each time it starts (`Subscription-Ping-Onopen-Enabled: 1`; off sends `0`). |
 
+## Response headers
+
+The **Response headers** tab adds headers of your own to the subscription answer: the `flclashx-*` headers FlClashX reads for its service name, logo, view, widgets and settings, for example. The headers the panel sets itself are listed in [What the apps receive](#what-the-apps-receive).
+
+Each header is one row, with:
+
+| Field | What it does |
+|:--|:--|
+| **Name** | An HTTP header name: Latin letters, digits and the symbols `- _ . ! # $ % & ' * + ^ ~` (the characters RFC 9110 allows in a token), up to 64 characters. It goes out in the spelling you typed. |
+| **Value** | Up to 1000 bytes, with no line break or other control character. Only plain ASCII goes as it is. |
+| **Send as base64** | The panel sends `base64:` and the base64 of the value, the way it sends the title. Needed for any other text, such as «Мой VPN». |
+| **Formats** | **All formats**, or a choice of **Link list (base64)**, **Mihomo YAML**, **Xray JSON** and **sing-box JSON**: the format of the answer the app gets. |
+| **Groups** | **Every group**, or **Chosen groups**. A group that is deleted drops out of the row at the next save; a row with no group left goes to nobody. |
+
+The rows are in order: when two rows of one name apply to an answer, the first is sent. Up to 20 rows and 4096 bytes in all as sent (a proxy in front of the panel buffers the headers of an answer in 4 or 8 KiB).
+
+A header goes with an answer that serves the person, and only with that. A refusal ([device limit, a blocked device, an app with no device ID](#what-the-app-shows-when-a-device-is-refused)), the note a person without access gets, and the user page carry none of them: they stay as they are.
+
+**Names the panel keeps** are refused when you save, in any case: every header listed in [What the apps receive](#what-the-apps-receive) and in the refusal table, the families `X-Hwid-*`, `Profile-*`, `Subscription-*`, `Ping-*` and `Mistgate-*`, and the headers of the web server and the platform (`Content-*`, `Cache-Control`, `Set-Cookie`, `Location`, `Vary`, `ETag`, `Connection`, `Transfer-Encoding` and the other hop-by-hop headers, `Strict-Transport-Security`, `Access-Control-*`, `Sec-*` and so on). The tab shows the whole list. The panel's part of it comes from the code that sets the headers, and a test of that code fails when it sets a header that is not on the list, so a header the panel starts to send is kept from the same release.
+
+**What an app gets** shows what one person's answer to one User-Agent carries of the rows on the screen, saved or not: pick a person, type a User-Agent or take a sample. The headers are shown as they go out (a base64 row with its `base64:` text). For a browser, a rule that answers as an unknown link, and a person without access it says why there is nothing. The panel's own headers are not part of it.
+
+Changes wait for **Save**; **Discard** drops them. They apply at the next fetch, within a minute, without a restart. The Cloudflare edition serves them the same way.
+
+## Mihomo templates
+
+By default the Mihomo YAML is the panel's own profile: your servers, one group to pick from, an `Auto` group and the DNS of the person's preset. The **Mihomo templates** tab lets you write your own profile for chosen groups: your proxy groups, rules and rule lists, with the person's servers put in. One template can go to several groups (the router and the PC of the same family get different ones), and a group named by no template gets the panel's own profile. A person is in one group, so they get one template.
+
+Only the owner changes templates. A template is the whole config its people get, with the `proxy-providers` and rules it names, which is more than the other settings of this section. A helper reads the templates and uses the preview, but a save of theirs that adds, deletes or changes a template (its name, text or groups) is refused with `mihomo_templates_owner_only`; the rest of the settings stay open to them. The same holds for a token: an agent changes a template only through the owner's approval of its plan.
+
+The tab lists the templates (name, groups, size, a mark for errors and warnings). **Add template**, **Duplicate** (for a second device, start from a copy of the first) and **Delete** work on the list; a template has a **Name**, its **Groups** (a group already in another template is shown as taken) and the YAML text, which you type, paste or load with **Load .yaml**. Nothing is saved before **Save**. A change reaches people with their next fetch (in the Cloudflare edition, within a minute).
+
+### What the panel changes
+
+The panel touches three keys of the root and leaves the rest as you wrote it, with comments, anchors, `<<` and the order of the keys:
+
+| Key | What the panel does |
+|:--|:--|
+| `proxies` | Puts the person's servers **first**, before the proxies you wrote. A missing key (or `null`) is created. |
+| `proxy-groups` | Adds the group `Auto` at the end while **Automatic server choice** is on and the template has no group of that name, even for a person with one server, so that your groups can refer to it. It is a `url-test` over the person's servers (not over your own `proxies`). |
+| `dns` | Only when the template has none: the resolvers of the person's DNS preset, with `respect-rules: true`. Nothing else of the preset is added (see below). |
+
+Everything else is yours: `rules`, `rule-providers`, `proxy-providers`, `tun`, the ports. The rules of the person's DNS preset (blocked ads, the split, countries) are **not** added to a template, because the order of the rules and the `MATCH` are yours; write them in the template if you need them. When the template has its own `dns`, the person's DNS preset and their pick on the page do not apply to the Mihomo apps (the other apps keep them).
+
+The panel names the person's servers by the [server name template](#names-texts). If one of those names is one that a proxy or group of the template already has, or a name of the Mihomo core (`DIRECT`, `REJECT`, `REJECT-DROP`, `PASS`, `COMPATIBLE`, `GLOBAL`), the server gets ` ·` added to its name. The names in your template are never changed, and none of them may be a core name.
+
+### Getting the servers into your groups
+
+Do not write a server's name in a group: the servers differ from person to person, and a name a person does not have makes Mihomo refuse the whole file. The save refuses it too. Ask Mihomo for the servers instead:
+
+- `include-all-proxies: true` takes the person's servers and the proxies of your template;
+- `filter` and `exclude-filter` (regular expressions) narrow them by name, for example `filter: "Germany"`;
+- `include-all: true` also takes the groups of your `proxy-providers`;
+- the group `Auto` is the person's servers by speed.
+
+A template for the group `ROUTER`, written with made-up names:
+
+```yaml
+# ROUTER: a transparent proxy for the home network
+mixed-port: 7890
+redir-port: 7892
+allow-lan: true
+mode: rule
+
+proxy-groups:
+  - name: Proxy
+    type: select
+    include-all-proxies: true
+    proxies: [Auto, DIRECT]   # Auto is the group the panel adds
+  - name: Germany
+    type: url-test
+    include-all-proxies: true
+    filter: "Germany"
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+
+rule-providers:
+  ads:
+    type: http
+    behavior: domain
+    format: mrs
+    url: https://rules.example.com/ads.mrs
+    interval: 86400
+
+rules:
+  - RULE-SET,ads,REJECT
+  - DOMAIN-SUFFIX,example.com,DIRECT
+  - GEOIP,LAN,DIRECT,no-resolve
+  - DOMAIN-SUFFIX,example.org,Germany
+  - MATCH,Proxy
+```
+
+A person in `ROUTER` gets this text with their servers at the top of `proxies`, `Auto` at the end of `proxy-groups` and a `dns` section, and nothing else changed.
+
+### What a save checks
+
+The limits: 20 templates, 64 KiB each and 256 KiB in all; a name of 1 to 60 characters (the same name in another letter case counts as the same); at most 100 groups in one template; a group in one template only. A group you delete drops out of its template at the next save.
+
+The save refuses a template, with the line in the message, when:
+
+- the text is not valid UTF-8 or YAML, holds a second document (`---`), a key given twice, or aliases that expand far beyond the text;
+- the root is not a mapping or has `<<`, or `proxies` or `proxy-groups` is not a plain list (an alias there would let the panel change the anchor too);
+- a proxy has no `name`, a group has no `name` or `type`, names repeat, or one is a core name;
+- a group refers in its `proxies` to a name that is no proxy or group of the template, no core name and not `Auto` (while the panel adds that group), or in `use` to a provider you did not define;
+- the panel cannot build a profile from it with two sample servers.
+
+Other findings do not stop a save and show in the preview as **Worth a look**: no group takes the person's servers (add `include-all-proxies` or refer to `Auto`); the template has its own `dns`; the person's DNS preset has ad, split or country rules that the template does not get; the template has its own `Auto`, so the panel adds none; a rule sends to a name that is nothing in the template; no group is chosen. The panel does not check the rest of Mihomo's keys: run the file in Mihomo for that.
+
+### Preview
+
+**Preview** builds the profile of one person from the text on the screen, saved or not: pick a person (any person, not only one of the chosen groups) and read the YAML their link would give. The servers show only name, type, address and port, never a key or a password; nothing is saved and no device is created. It also says which template that person gets today and why, for example that they are in a group no template names, so they get the panel's own profile.
+
+### Who gets the template
+
+The template goes only into the **Mihomo YAML** answer of a link, to people whose subscription is on. A person whose subscription is off, expired or over the quota gets the panel's own profile with the note that says so, and so does a person none of whose servers can be put in a Mihomo profile (for example, only AmneziaWG servers while **AmneziaWG in apps on the link** is off): an empty `url-test` would break the file. The other formats (link list, Xray JSON, sing-box JSON) do not use templates. kl!ck reads only the `proxies` of the profile and keeps its own groups, rules and DNS: the proxies of your template show up in its list, its `proxy-providers` do not.
+
+### Addresses in a template
+
+The panel never opens an address from a template, and a save does not check that a list or a provider answers. The apps of your people do: each app downloads the `rule-providers` and `proxy-providers` itself. The host sees the person's IP address and the time of the request, and a `proxy-providers` source can add servers you do not control. Use hosts you trust.
+
+Everything in a template is seen by every person of its groups, and by every admin, read-only ones too: the comments, and any token in the URL of a list. Keep secrets out of it. An agent that reads a template over [MCP](../reference/mcp.md) gets it with query strings and long path segments cut, and cannot write such a text back; the owner's approval card for a change lists the hosts the template's addresses name.
+
+### Keep it compact
+
+The panel reads and writes the template again for every fetch. A template of 14 KB costs about 6 ms of processor time in the Cloudflare edition, one of 64 KiB about 27 ms. Put the rules in `rule-providers` instead of thousands of lines of `rules`.
+
+### If you had one file with a block per device
+
+The panel has no markers that cut one file by group. Make a template for each group: copy the file, delete the blocks of the other devices in each copy and give each copy to its group (**Duplicate** makes the copy). One group, one template: renaming a group breaks nothing.
+
+A panel rolled back to a version without templates drops them from the settings at its next save of these settings: keep the texts elsewhere before you roll back.
+
+## Routing for Happ and INCY
+
+Happ and INCY have their own routing: what goes out directly, what goes through the VPN and what is blocked. The **Routing** tab gives them a profile of yours, for the groups you choose. Without one they get what they got before: the DNS of the person's preset as a profile (Happ since the DNS presets came, INCY too, with its own `incy://` scheme: the two apps read the same fields).
+
+Only the owner changes the profiles, as with the [Mihomo templates](#mihomo-templates). A profile decides what goes outside the VPN for everybody in its groups. A helper reads the tab and sees what each profile holds, but a save of theirs that adds, deletes or changes a profile (its text, mode or groups) is refused with `routing_profiles_owner_only`; the rest of the settings stay open to them. The same holds for a token: an agent changes a profile only through the owner's approval of its plan.
+
+### Getting the profile in
+
+Make the profile where you already have it: in 3x-ui (the routing rules of a subscription), in Happ or in INCY. They give you a link like `happ://routing/onadd/eyJ…` or `incy://routing/onadd/eyJ…`. Paste it into **Link, base64 or JSON** of a new profile. These work as well:
+
+- the link of any scheme (`sbx://routing/add/…`) or none (`://routing/onadd/…`), the way INCY's header has it;
+- the bare base64 of the JSON, with or without the padding;
+- the JSON itself: an object with `Name`, `GlobalProxy`, `DirectSites`, `DirectIp`, `ProxySites`, `ProxyIp`, `BlockSites`, `BlockIp`, `DnsHosts`, `Geoipurl`, `Geositeurl`, `DomainStrategy`, `FakeDNS`, `LastUpdated`, the DNS fields `RemoteDNSType`, `RemoteDNSDomain`, `RemoteDNSIP`, `DomesticDNSType`, `DomesticDNSDomain`, `DomesticDNSIP` (and the older `RemoteDns`, `DomesticDns`) and `useChunkFiles`.
+
+A link `…/routing/off` (it only turns routing off) and an auto-updating `…/autorouting/…` (it holds the address of a profile, not a profile) are refused with the reason.
+
+The panel reads the text at once and shows what it found in words, beside the list: the name the app will show, how many sites and addresses go direct, through the VPN and to the block list, what the rest does (`GlobalProxy`), the geo files and where they come from, how the profile reaches the app, and the fields it left out. A text it cannot read is refused with the reason (not a JSON object, a field of the wrong type, no routing field at all, a geo file or DoH address that is not `https`, a profile over 32 KiB) and cannot be saved.
+
+### What the panel keeps
+
+The panel does not pass your text on. A save reads it into the fields the two apps document, checks their types and stores the JSON it writes out of them; the answer to the app carries only that. A field of the pasted text that is not among them (an app may add one tomorrow) is **left out**, and the tab names it. The header is a fixed prefix and base64, whatever the text says. Addresses of geo files and of DoH are taken only as `https://`, without a login. The panel never opens them: the apps of your people do, so use hosts you trust.
+
+The name of the profile is its `Name` (a profile without one is called `Routing`). Names are unique without regard to case: an app that gets a profile of a name it has already updates it, it does not add another. Put a new `LastUpdated` (Unix time) into the profile when you change it: both apps take an update only when it is higher than the one they have.
+
+### Who gets it
+
+Each profile is for **All groups** or for chosen **Groups**, and has a mode: **Adds it and turns it on** (`onadd`) or **Only adds it** (`add`: the app turns it on once the geo files are downloaded, or the person does). A pasted link sets the mode it says. A person gets the profile of their **main group**; the extra groups they are in do not count. A person whose main group no profile names gets the profile for all groups, and without one, the DNS profile as before. A group is in one profile only, and one profile is for all groups: the tab and the save refuse anything else.
+
+### Where it goes
+
+Only the link list of a person whose subscription is on, and only to **Happ** and **INCY** (INCY is told by `INCY/<version>/<platform>` in the User-Agent). Each gets the link in its own scheme. A device that the [device limit](#device-limit-for-apps-on-the-link) turns away gets none of your rules (it keeps what it got before). The other formats and apps (Mihomo YAML, Xray JSON, sing-box JSON, any other app) are not changed.
+
+A link of at most 3000 bytes goes in the `routing` header. A proxy in front of the panel buffers the headers of an answer in 4 or 8 KiB; the panel's own take about 1 KiB and your own response headers up to 4096 bytes, so 3 KiB is what is left. A longer profile goes as one line of the subscription after the servers, where both apps read a routing link (their documentation shows it there); the tab says which of the two a profile takes.
+
+### The DNS of the person
+
+The DNS of a profile is not yours to fix: the DNS fields of the profile (`RemoteDNS*`, `DomesticDNS*`, the older aliases) are replaced by those of the person's DNS preset, and its host pins are added to `DnsHosts`. Your rules (`DirectSites`, `ProxySites`, `BlockSites` and the address lists), the geo files and the rest stay as you wrote them. The preset's own split and ad list are **not** added to a profile of yours: with your profile the rules are yours alone. A preset with no server the apps can take (DoT only, say) leaves the DNS written in your profile as it is.
+
+### Limits
+
+Up to 20 profiles, 32 KiB each once read (128 KiB of pasted text). Changes wait for **Save**; **Discard** drops them. They reach people with their next fetch, within a minute.
+
+The format follows the documentation of the two apps (Happ: dev-docs/routing; INCY: docs.incy.cc, Routing and Subscription format). The panel has not been run against the apps themselves: whether INCY takes a `happ://` link, and exactly how each reads a routing line in a base64 body, was not checked on a device.
+
 ## When a subscription does not work
 
 When a person is disabled, past their term or over their quota, the apps do not get an empty list. They get one entry, named after the reason, that never connects, and the announcement is replaced by the same reason, in the panel's default language:
@@ -195,7 +456,7 @@ For such a person the refresh interval drops to 1 hour, so a fix (term extended,
 
 ### When no server fits the app
 
-Xray JSON and sing-box JSON never answer an active person with an empty document. When none of the person's servers can be carried in the format (all of them use XHTTP and the app reads sing-box, or the person has only AmneziaWG, or there is no server at all), the app gets one entry that never connects, named "Your servers do not work in this app. The subscription page shows which app does". The announcement carries the same text.
+Xray JSON and sing-box JSON never answer an active person with an empty document. When none of the person's servers can be carried in the format (all of them use XHTTP and the app reads sing-box, or the person has only AmneziaWG, or there is no server at all), the app gets one entry that never connects, named "Your servers do not work in this app. The subscription page shows which app does". The announcement carries the same text. A Mihomo app gets the same entry when AmneziaWG is taken out of the apps on the link and the person's only servers are AmneziaWG.
 
 In Russian: «Ваши серверы не работают в этом приложении. Какое подойдёт — на странице подписки».
 
@@ -262,14 +523,14 @@ A fresh panel recommends kl!ck on Windows and macOS (Happ second) and Happ on iO
 | **Devices on the page** | on | People add, re-key and remove their own AmneziaWG devices on their page, within their device limit. |
 | **DNS choice on the page** | off | People pick on their page one DNS for the apps on the link, from the presets listed under the switch (**DNS for the apps on the link**), and the DNS of the AmneziaWG keys of each server, from the presets the owner offers on each node. See [DNS](dns.md) and [User page](user-page.md). |
 
-Rules are saved as soon as you add, move or remove one. On **Names & texts** and **User page**, changes wait for **Save** in the bar at the bottom (**Discard** drops them). Either way they apply at the next fetch, without a restart.
+Rules are saved as soon as you add, move or remove one. On **Names & texts**, **Response headers** and **User page**, changes wait for **Save** in the bar at the bottom (**Discard** drops them). Either way they apply at the next fetch, without a restart.
 
 ## Protection of the links
 
-- **Fetches.** One link answers at most 60 times an hour; more get "too many requests". Fetches within 10 seconds of each other get the same answer.
-- **Guessing.** A network (a /24 for IPv4, a /48 for IPv6) that tries 20 unknown links within a minute gets only the fake 404 for 15 minutes, even for valid links.
+- **Fetches.** One client network (an IPv4 address or an IPv6 /64) can fetch a link at most 60 times an hour; the link's total ceiling is 600 fetches an hour across all networks. More get "too many requests". Fetches within 10 seconds of each other get the same answer.
+- **Guessing.** A client network (an IPv4 address or an IPv6 /64) that tries 20 unknown links within a minute is blocked for 15 minutes. Unknown links still get the fake 404, and the panel spends at most one lookup on them per two seconds (30 at once). Real links keep working for the people behind that network, however many unknown links the others send: the panel keeps the list of existing links in memory, so it recognises a real link without a lookup, including the first request after a restart and a link you have just issued. A link created outside this panel process (another replica, a direct change in the database) is found by the next refresh of that list, at most every 5 minutes, or by the few lookups above.
 - **Sharing.** When one link is used from more than 8 networks in a day, the panel writes the event "a subscription link is used from 9 networks a day" and opens the alert "A subscription looks shared". It counts networks, it never stores the addresses. Issue a new link if the old one leaked.
 
 ## Who can do what
 
-Every admin can read these settings and try a User-Agent. The owner and helpers change them. The DNS tab is described in [DNS](dns.md).
+Every admin can read these settings, including the Mihomo templates, and try a User-Agent or a template preview. The owner and helpers change them, except the Mihomo templates and the routing profiles, which only the owner changes. The DNS tab is described in [DNS](dns.md).

@@ -222,6 +222,22 @@ async function securityLimit(input, now = Date.now()) {
   if (request.operation === "peek") {
     return limitMath.peekWindow(saved.window, now, request.limit, request.spanMs);
   }
+  if (request.operation === "recordN") {
+    const result = limitMath.recordWindowN(saved.window, now, request.limit, request.spanMs, request.units);
+    if (result.state) saved.window = result.state;
+    else delete saved.window;
+    if (Object.keys(saved).length) securityLimits.set(id, saved);
+    else securityLimits.delete(id);
+    return result.reply;
+  }
+  if (request.operation === "undoN") {
+    const window = limitMath.undoWindowN(saved.window, now, request.spanMs, request.units, request.windowStartMs);
+    if (window) saved.window = window;
+    else delete saved.window;
+    if (Object.keys(saved).length) securityLimits.set(id, saved);
+    else securityLimits.delete(id);
+    return { ok: true, retryAfterMs: 0, remaining: 0, first: false };
+  }
   const result = limitMath.recordWindow(saved.window, now, request.limit, request.spanMs, request.lockoutMs);
   saved.window = result.state;
   securityLimits.set(id, saved);
@@ -245,6 +261,8 @@ async function assertSharedLimitVectors() {
         input.spanMs = operation.window.span_ms;
         input.lockoutMs = operation.window.lockout_ms;
       }
+      if (operation.units !== undefined) input.units = operation.units;
+      if (operation.window_start_ms !== undefined) input.windowStartMs = operation.window_start_ms;
       const got = await securityLimit(input, operation.at_ms);
       const want = {
         ok: operation.want.allowed,
@@ -252,6 +270,7 @@ async function assertSharedLimitVectors() {
         remaining: operation.want.remaining,
         first: operation.want.first,
       };
+      if (operation.want.window_start_ms !== undefined) want.windowStartMs = operation.want.window_start_ms;
       assert.deepEqual(got, want, `${scenario.name}, operation ${index} (${operation.op})`);
     }
   }
@@ -320,7 +339,7 @@ function advanceClock(ms) {
 // agent played by node:crypto. agentlink signs the SHA-256 digest of "domain NUL node NUL audience NUL nonce(s)", which is
 // plain ECDSA-SHA256 over that preimage, in IEEE P1363 r||s form.
 async function assertLinkHandshake(panel) {
-  const nodeID = "nod_bridge";
+  const nodeID = "nod_aaaaaaaaaaaaaaaaaaaaaaaaaa";
   const audience = "link.example.com";
   const link = (op, args) => Promise.race([panel.link(op, args), wasmFailure]);
   const nodeKey = crypto.generateKeyPairSync("ec", { namedCurve: "P-256" });
@@ -401,7 +420,7 @@ async function assertLinkHandshake(panel) {
   await opened.waitUntil;
 
   // A Hello on a bare node (no inbounds) costs 5 D1 calls. Its update cost is the per-isolate "updating" cache (10 s): a
-  // stale cache adds one read of the active rollout, and a second one for its steps when there is a rollout. nod_bridge has
+  // stale cache adds one read of the active rollout, and a second one for its steps when there is a rollout. The bridge node has
   // inbounds, so its own Hello is dominated by their reads. The clock is moved forward instead of sleeping, and each node
   // and rollout is removed afterwards, so later counts and the connected-node lists are unchanged.
   const helloCost = async (id, { advanceMs = 0, rollout = false } = {}) => {
@@ -545,13 +564,13 @@ async function assertProvisioner(bytes, forwardPanel, adminCookie, initOptions, 
   };
   await insertJob("prv_done", "failed");
   // 6 for the sweeps and settings, one read of the active rollout for the updates job, one Telegram pending-code check, one
-  // cheburcheck and one bsbord settings read while off and 11 for a warm evaluator pass (see "cron tick" below); nothing in an install wakes more.
-  assert.equal((await tick(3)).queries.sequentialQueries, 21);
+  // cheburcheck and one bsbord settings read while off and 12 for a warm evaluator pass (see "cron tick" below); nothing in an install wakes more.
+  assert.equal((await tick(3)).queries.sequentialQueries, 22);
   assert.equal(provisionKicks, 0, "a finished install wakes nothing");
   for (const [i, state] of ["queued", "running", "cancel_requested"].entries()) {
     await globalThis.__d1.prepare("DELETE FROM node_provision_job WHERE id = 'prv_open'").run();
     await insertJob("prv_open", state);
-    assert.equal((await tick(3)).queries.sequentialQueries, 21, "waking costs no query beyond the look");
+    assert.equal((await tick(3)).queries.sequentialQueries, 22, "waking costs no query beyond the look");
     assert.equal(provisionKicks, i + 1, `a ${state} install wakes the Provisioner`);
   }
   await globalThis.__d1.prepare("DELETE FROM node_provision_job").run();
@@ -691,18 +710,21 @@ async function run() {
         },
       },
     };
+    // The owner's setup token is one the deployer chose; the panel gets only its hash (SETUP_TOKEN_SHA256).
+    const ownerToken = randomBytes(32).toString("hex");
+    const ownerHash = crypto.createHash("sha256").update(ownerToken).digest("hex");
     try {
       await assert.rejects(Promise.race([
         firstPanel.init({ ...initOptions, publicURL: "https://192.0.2.10" }), // WebAuthn refuses an IP-address RP ID
         wasmFailure,
       ]), "invalid WebAuthn RP settings must fail before first-run settings are stored");
       // The VPS oracle shares this database; its own start writes the subscription-rules markers (subsettings.MigrateM3, MigrateSingbox)
-      // and the link device limit mode (subsettings.MigrateLinkDeviceLimit).
-      const settingsAfterFailure = await globalThis.__d1.prepare("SELECT count(*) AS n FROM setting WHERE k NOT IN ('sub_rules_m3', 'sub_rules_singbox', 'link_device_limit')").first("n");
+      // and the link device limit mode (subsettings.MigrateLinkDeviceLimit); a migration writes the idle-device default itself.
+      const settingsAfterFailure = await globalThis.__d1.prepare("SELECT count(*) AS n FROM setting WHERE k NOT IN ('sub_rules_m3', 'sub_rules_singbox', 'link_device_limit', 'device_idle_after_days')").first("n");
       assert.equal(Number(settingsAfterFailure), 0, "failed first init leaves no settings behind");
 
       // A setup token hash from the deployer (SETUP_TOKEN_SHA256): the panel offers it, logs only its expiry, and never
-      // revives an expired one. The database is emptied again afterwards, so the random-token flow below starts clean.
+      // revives an expired one. The database is emptied again afterwards, so the owner's flow below starts clean.
       const scenarioStart = logs.length;
       const deployerToken = randomBytes(32).toString("hex");
       const deployerHash = crypto.createHash("sha256").update(deployerToken).digest("hex");
@@ -715,7 +737,7 @@ async function run() {
         hashPanel.init({ ...initOptions, setupTokenSHA256: deployerHash.toUpperCase() }),
         wasmFailure,
       ]), /setupTokenSHA256/, "an uppercase or malformed hash is refused");
-      assert.equal(Number(await globalThis.__d1.prepare("SELECT count(*) AS n FROM setting WHERE k NOT IN ('sub_rules_m3', 'sub_rules_singbox', 'link_device_limit')").first("n")), 0,
+      assert.equal(Number(await globalThis.__d1.prepare("SELECT count(*) AS n FROM setting WHERE k NOT IN ('sub_rules_m3', 'sub_rules_singbox', 'link_device_limit', 'device_idle_after_days')").first("n")), 0,
         "a refused hash leaves no settings behind");
       let mark = logs.length;
       await Promise.race([hashPanel.init({ ...initOptions, setupTokenSHA256: deployerHash }), wasmFailure]);
@@ -748,25 +770,35 @@ async function run() {
       }
       logs.length = 0;
       for (const table of ["setup_token", "auth_ceremony"]) await globalThis.__d1.prepare(`DELETE FROM ${table}`).run();
-      await globalThis.__d1.prepare("DELETE FROM setting WHERE k NOT IN ('sub_rules_m3', 'sub_rules_singbox', 'link_device_limit')").run();
+      await globalThis.__d1.prepare("DELETE FROM setting WHERE k NOT IN ('sub_rules_m3', 'sub_rules_singbox', 'link_device_limit', 'device_idle_after_days')").run();
 
-      firstInstance = await Promise.race([firstPanel.init(initOptions), wasmFailure]);
-      secondPanel = await startIsolate(bytes, expiredPanel);
-      secondInstance = await Promise.race([secondPanel.init(initOptions), wasmFailure]);
+      // Without SETUP_TOKEN_SHA256 the panel mints no token and prints no link (a link in the Worker's log would let anyone who
+      // can read that log create the owner); it says how to set the secret.
+      const plainPanel = await startIsolate(bytes, expiredPanel);
+      await Promise.race([plainPanel.init(initOptions), wasmFailure]);
+      const plainLogs = logs.map((args) => args.map(String).join(" "));
+      assert.ok(plainLogs.some((line) => line.startsWith("No admin yet.") && line.includes("SETUP_TOKEN_SHA256")), "without the secret the log says to set it");
+      assert.ok(!plainLogs.some((line) => line.includes("/setup#") || line.includes("test-admin")), "without the secret no setup link and no address is printed");
+      assert.equal(Number(await globalThis.__d1.prepare("SELECT count(*) AS n FROM setup_token").first("n")), 0, "without the secret no setup token is minted");
+      logs.length = 0;
+
+      firstInstance = await Promise.race([firstPanel.init({ ...initOptions, setupTokenSHA256: ownerHash }), wasmFailure]);
+      secondPanel = await startIsolate(bytes, plainPanel);
+      secondInstance = await Promise.race([secondPanel.init({ ...initOptions, setupTokenSHA256: ownerHash }), wasmFailure]);
     } finally {
       console.log = consoleLog;
     }
     assert.equal(firstInstance, firstPanel, "first isolate init returns the panel API");
     assert.equal(secondInstance, secondPanel, "fresh isolate init returns the panel API");
     // Two wasm instances in this Node process model separate Worker isolates with shared D1 and limiter callbacks.
-    const setupMessages = logs.map((args) => String(args[0])).filter((message) => message.startsWith("No admin yet."));
-    const newLinks = setupMessages.filter((message) => message.includes("Create one") && message.includes("/setup#"));
-    const existingLinks = setupMessages.filter((message) => message.includes("already issued"));
-    if (newLinks.length !== 1 || existingLinks.length !== 1 || !existingLinks[0].includes("expires at")) {
-      throw new Error("a second isolate must log the existing setup link expiry without issuing another link");
+    const setupMessages = logs.map((args) => args.map(String).join(" ")).filter((message) => message.startsWith("No admin yet."));
+    if (setupMessages.length !== 2 || !setupMessages.every((message) => message.includes("accepted until"))) {
+      throw new Error("both isolates must log only the expiry of the deployer's token: " + JSON.stringify(setupMessages));
     }
-    const setupMatch = newLinks[0].match(/\/setup#([A-Za-z0-9_-]+)/);
-    if (!setupMatch || existingLinks[0].includes(setupMatch[1])) throw new Error("setup logs did not keep the token private to its first link");
+    if (logs.some((args) => args.map(String).join(" ").includes(ownerToken) || args.map(String).join(" ").includes("/setup#"))) {
+      throw new Error("no log line may show the owner's token or a setup link");
+    }
+    const setupMatch = [null, ownerToken];
 
     const setupPage = await bridgeRequestFor(firstPanel, "https://example.com/test-admin/setup", {
       headers: { "CF-Connecting-IP": "127.0.0.1" },
@@ -910,7 +942,6 @@ async function run() {
     const me = await connectRPC(secondPanel, "AuthService/Me", {}, adminCookie);
     assert.equal(me.message.edition, "edge", "Me names the edge edition");
     assert.ok(me.message.unavailable.includes("backups") && me.message.unavailable.includes("mcp"), "Me lists the features the edge lacks");
-    assert.ok(!me.message.unavailable.includes("agent_updates"), "agent updates are available on the edge");
     assert.ok(!me.message.unavailable.includes("provision"), "SSH installs run on the edge: Me does not list them as unavailable");
 
     const tokens = await connectRPC(secondPanel, "ApiTokenService/ListApiTokens", {}, adminCookie);
@@ -939,13 +970,13 @@ async function run() {
 
     // Seed the node fixture like the Go subscription fixtures, then create the profiles and access rows through the admin API.
     await globalThis.__d1.prepare("INSERT INTO node (id, name, address, state, created_at) VALUES (?, ?, ?, ?, ?)")
-      .bind("nod_bridge", "node de", "de.example.com", "active", 1).run();
+      .bind("nod_aaaaaaaaaaaaaaaaaaaaaaaaaa", "node de", "de.example.com", "active", 1).run();
     const hysteriaProfile = await connectRPC(secondPanel, "ProfileService/CreateProfile", {
       protocol: "hysteria2", name: "bridge-hysteria2",
     }, adminCookie);
     assert.equal(hysteriaProfile.response.status, 200, "the admin API creates a Hysteria2 profile");
     const hysteriaInbound = await connectRPC(secondPanel, "ProfileService/CreateInbound", {
-      profileId: hysteriaProfile.message.profile.id, nodeId: "nod_bridge",
+      profileId: hysteriaProfile.message.profile.id, nodeId: "nod_aaaaaaaaaaaaaaaaaaaaaaaaaa",
     }, adminCookie);
     assert.equal(hysteriaInbound.response.status, 200, "the admin API deploys the Hysteria2 profile");
     const awgProfile = await connectRPC(secondPanel, "ProfileService/CreateProfile", {
@@ -953,7 +984,7 @@ async function run() {
     }, adminCookie);
     assert.equal(awgProfile.response.status, 200, "the admin API creates an AmneziaWG profile");
     const awgInbound = await connectRPC(secondPanel, "ProfileService/CreateInbound", {
-      profileId: awgProfile.message.profile.id, nodeId: "nod_bridge",
+      profileId: awgProfile.message.profile.id, nodeId: "nod_aaaaaaaaaaaaaaaaaaaaaaaaaa",
     }, adminCookie);
     assert.equal(awgInbound.response.status, 200, "the admin API deploys the AmneziaWG profile");
     const group = await connectRPC(secondPanel, "GroupService/CreateGroup", {
@@ -1107,9 +1138,10 @@ async function run() {
     });
     assert.equal(configPair.edge.status, 200, "the AWG device config endpoint succeeds");
 
-    // The subscription miss lockout lives in the shared limiter, not in an isolate: misses on one isolate lock the client
-    // network for a fresh one. Edge only: the VPS oracle sees every request from its loopback peer, so it cannot tell
-    // client networks apart. It runs after the cold fetches above so they still measure the first fetch of the user.
+    // The shared limiter carries subscription miss lockouts across isolates, while a fresh isolate can make a bounded
+    // token check for a cold valid link. This check runs only at the edge because the VPS oracle sees every request from
+    // its loopback peer and cannot tell client networks apart. It runs after the cold fetches above so they still measure
+    // the first fetch of the user.
     async function edgeOnly(label, panel, url, init) {
       const { response, queries } = await countedRequest(label, () => bridgeRequestFor(panel, url, init));
       assertQueryBudget(queries);
@@ -1130,8 +1162,8 @@ async function run() {
     const lockedValid = await edgeOnly("valid subscription from a locked miss network", await freshPanel(), userSubURL, {
       headers: { "CF-Connecting-IP": missClientIP, "User-Agent": missUA },
     });
-    assert.equal(lockedValid.status, 404, "the locked network receives the decoy for a valid token");
-    assert.deepEqual(Buffer.from(lockedValid.body), Buffer.from(missResponse), "the locked valid token matches the decoy response");
+    assert.equal(lockedValid.status, 200, "a cold valid token remains usable from the locked network");
+    assert.notDeepEqual(Buffer.from(lockedValid.body), Buffer.from(missResponse), "the locked valid token receives its subscription");
 
     const otherClient = await edgeOnly("valid subscription from an unaffected client network", await freshPanel(), userSubURL, {
       headers: { "CF-Connecting-IP": "198.51.100.82", "User-Agent": missUA },
@@ -1167,7 +1199,7 @@ async function run() {
     const baseCronDate = new Date();
     // This node is deliberately disconnected for the fleet fan-out assertion but still inside the blip window, so the
     // evaluator pass has no alert transition to add a variable Telegram node-name lookup.
-    await globalThis.__d1.prepare("UPDATE node SET last_seen_at = ?, last_connected_at = ? WHERE id = 'nod_bridge'")
+    await globalThis.__d1.prepare("UPDATE node SET last_seen_at = ?, last_connected_at = ? WHERE id = 'nod_aaaaaaaaaaaaaaaaaaaaaaaaaa'")
       .bind(nowS, nowS).run();
     const normalCronDate = new Date(baseCronDate);
     normalCronDate.setUTCMinutes(3, 0, 0);
@@ -1177,8 +1209,8 @@ async function run() {
     console.log(`D1 query count ${JSON.stringify(normalCronQueries)}`);
     assert.equal(
       normalCronQueries.sequentialQueries,
-      24,
-      "a normal cron tick costs 24 D1 calls: 6 for the sweeps and the country settings, one read of the active rollout for the updates job, one Telegram pending-code check, one cheburcheck and one bsbord settings read while off, and 14 for the isolate's first evaluator pass: its lease, nodes, inbounds, live nodes, doctor results and acceptances, the signal batch, port checks, active alerts, the interval setting, the update rollout, the country settings, the node-summary write and one batched external-source settings read",
+      25,
+      "a normal cron tick costs 25 D1 calls: 6 for the sweeps and the country settings, one read of the active rollout for the updates job, one Telegram pending-code check, one cheburcheck and one bsbord settings read while off, and 15 for the isolate's first evaluator pass: its lease, nodes, inbounds, live nodes, doctor results and acceptances, the signal batch, port checks, UDP path losses, active alerts, the interval setting, the update rollout, the country settings, the node-summary write and one batched external-source settings read",
     );
 
     liveProjectionQueries = 0;
@@ -1193,8 +1225,8 @@ async function run() {
     console.log(`D1 query count ${JSON.stringify(cronQueries)}`);
     assert.equal(
       cronQueries.sequentialQueries,
-      23,
-      "one minute 10 cron tick costs 23 D1 calls: the 7 of the sweeps, the country settings and the fan-out live read, one read of the active rollout for the updates job, one Telegram pending-code check, one Telegram bot check for the watcher, one cheburcheck and one bsbord settings read while off, plus 11 for a warm evaluator pass (no nodes or inbounds read again, no summary write, and one batched external-source settings read)",
+      24,
+      "one minute 10 cron tick costs 24 D1 calls: the 7 of the sweeps, the country settings and the fan-out live read, one read of the active rollout for the updates job, one Telegram pending-code check, one Telegram bot check for the watcher, one cheburcheck and one bsbord settings read while off, plus 12 for a warm evaluator pass (no nodes or inbounds read again, no summary write, the UDP path losses, and one batched external-source settings read)",
     );
     assert.equal(liveProjectionQueries, 3, "the node-down sweep, the evaluator and the ten-minute safety net each read live nodes once");
     assert.equal(nodePokeCalls, 1, "the ten-minute safety net performs one remote fan-out");
@@ -1209,8 +1241,8 @@ async function run() {
     console.log(`D1 query count ${JSON.stringify(retentionQueries)}`);
     assert.equal(
       retentionQueries.sequentialQueries,
-      36,
-      "a minute 17 cron tick costs 36 D1 calls: 6 for the sweeps and settings, one Telegram pending-code check, one cheburcheck and one bsbord settings read while off, 14 for retention (eight of them prune statements), 11 for a warm evaluator pass (including one batched external-source settings read), and 2 for the updates job (the active rollout read and its history prune)",
+      43,
+      "a minute 17 cron tick costs 43 D1 calls: 6 for the sweeps and settings, one Telegram pending-code check, one cheburcheck and one bsbord settings read while off, 20 for retention (the batched retention settings read and twelve prune statements, the one count read of orphan AWG path keys, the audit log, the hourly host load and the two hourly traffic tables among them), 12 for a warm evaluator pass (including the UDP path losses and one batched external-source settings read), and 2 for the updates job (the active rollout read and its history prune)",
     );
 
     // The Overview is polled every 10 seconds. The health summary of every node is one settings row, read once: more connected

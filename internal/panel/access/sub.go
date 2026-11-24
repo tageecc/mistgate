@@ -1,6 +1,7 @@
 package access
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -22,6 +23,7 @@ var ErrUnknownToken = errors.New("access: unknown subscription token")
 // SubView is what the public subscription endpoint needs about one token.
 type SubView struct {
 	UserID           string
+	GroupID          string // the person's group; the owner's own response headers can be limited to groups
 	UserName         string
 	SubscriptionName string
 	Status           string // active | disabled | expired | limited
@@ -36,22 +38,32 @@ type SubView struct {
 	// What the public user page and the server names need; all optional (a fake Source may leave them zero).
 	// Servers parallels Lines (same order) with the facts behind each line: the subscription handler renders the
 	// remark (#fragment) from them. Devices, QuotaReset and the rest describe the user, not the protocols.
-	Servers     []SubServer
+	Servers []SubServer
+	// Telegram are the person's tg://proxy links, one per MTProto inbound they may use and the node's IPv6 and relay twins of it.
+	// They belong to no subscription: they are never in Lines, Servers or a node's Conns, because an app of the link would
+	// list a tg:// line as a server. Only the user page and GetTelegramLinks read them.
+	Telegram []SubServer
+	// TrustTunnel are the key-owned links for the official app. They never enter Lines, Servers or a node's Conns.
+	TrustTunnel []SubServer
 	QuotaReset  string // none | day | week | month | rolling_month
 	NextReset   time.Time
 	DeviceLimit int
-	// DevicesUsed counts the devices that count against DeviceLimit (live credentials); Devices lists them.
+	// DevicesUsed counts live devices against DeviceLimit (including AmneziaVPN and TrustTunnel keys, excluding the Telegram key);
+	// Devices lists all of them.
 	DevicesUsed int
+	DevicesIdle int
 	Devices     []SubDevice
 	// AWGProfiles are the AmneziaWG profiles the user could add a device on right now (in the group, with a usable
 	// inbound; empty unless the Amnezia toggle is on).
 	AWGProfiles []SubAWGProfile
 	// AccessHapp / AccessAmnezia: the user's app toggle AND a usable deployed inbound whose protocol that app
 	// can consume (the user page shows only what works).
-	AccessHapp, AccessAmnezia bool
+	AccessHapp, AccessAmnezia, AccessTelegram, AccessTrustTunnel bool
 	// AppAmnezia is the user's AmneziaVPN toggle alone (AccessAmnezia also needs a live inbound and an active user): a person
 	// whose subscription ended still sees the keys they hold and can remove them.
-	AppAmnezia bool
+	AppAmnezia, AppTelegram, AppTrustTunnel bool
+	// AppMistgateOff is the person's Mistgate app switch, off: a client API sync of one of their devices carries no servers.
+	AppMistgateOff bool
 	// Nodes are the servers of the person, one per node, in subscription order: the ones a link carries and the ones a key
 	// can be made for. Empty unless Status is active.
 	Nodes []SubNode
@@ -66,27 +78,37 @@ type SubView struct {
 	// LinkMode is the mode of the device limit for the apps on the link (store.LinkModeTrack, LinkModeEnforce or LinkModeStrict):
 	// the page words the shared place and the full limit by it.
 	LinkMode string
-	// Refusal says why an app that is entitled to servers gets none: RefusalDeviceLimit, RefusalDeviceBlocked or
-	// RefusalNoDeviceID. "" for everyone served, for a person without access (Status says why) and for the page, which never
+	// Refusal says why an app that is entitled to servers gets none: RefusalDeviceLimit, RefusalDeviceBlocked,
+	// RefusalNoDeviceID or RefusalClientAPIEnrolled. "" for everyone served, for a person without access (Status says why) and for the page, which never
 	// registers a device. Lines and Servers are empty with it; the subscription handler answers with one entry that says why.
 	Refusal string
+	// Page is the state of the person's page password (the generation it is computed with, whether it was removed): the public
+	// handler decides the lock of the page and the cookie by it. It comes with the user's row, so it costs no read of its own.
+	Page PageState
 }
+
+// PageState is the state of a person's page password in the database (generation and "removed"); the password itself is computed
+// from it and the subscription token (package pagepass).
+type PageState = store.PageState
 
 // The reasons of SubView.Refusal. They are stable words: the subscription handler words them for the apps (subs.stateNote).
 const (
-	// RefusalDeviceLimit: the person has no room for one more device (ENFORCE and STRICT) and none of theirs is silent enough to
-	// give its place away.
+	// RefusalDeviceLimit: the person has no room for a new device or a returning idle device (ENFORCE and STRICT).
 	RefusalDeviceLimit = "device_limit"
 	// RefusalDeviceBlocked: the owner blocked the device of the app.
 	RefusalDeviceBlocked = "device_blocked"
 	// RefusalNoDeviceID: STRICT, and the app reports no device ID (X-HWID).
 	RefusalNoDeviceID = "no_device_id"
+	// RefusalClientAPIEnrolled: the device of the app was enrolled in the client API, so its credentials go to the holder of its key
+	// only, not to whoever sends its HWID with the link.
+	RefusalClientAPIEnrolled = "client_api_enrolled"
 )
 
 // SubNode is one node as the page's server list shows it.
 type SubNode struct {
 	ID          string
 	Name        string // the panel's node name: never emitted as user-facing text
+	Address     string // the node's own address, as its direct link and keys give it (store.AccessNode.Address; not a relay's entry)
 	CountryCode string
 	Location    string
 	// Online: the node's agent is connected (a live session, or a network sample not older than 90 seconds).
@@ -109,19 +131,28 @@ type SubConn struct {
 	Via string
 	// Relay: this link is a twin (a relay's server), whatever the entry's country.
 	Relay bool
+	// IPv6: this link is the "· IPv6" twin of the node's server (the node's IPv6 entry).
+	IPv6 bool
 }
 
 // SubServer is one Lines entry with the facts the remark (server name) is built from.
 type SubServer struct {
 	URI         string // the same string as the matching Lines entry (a proxy for the Mihomo format)
+	Note        string // stable reason a TrustTunnel server was skipped, empty for a rendered link
 	Protocol    string // plugin id
 	ProfileID   string
 	NodeID      string // internal grouping key; never emitted as user-facing text
+	InboundID   string // internal stable path input; never emitted as user-facing text
+	PathKey     string // direct, ipv6 or relay:<node id>; internal path identity only
 	Node        string // node name
 	CountryCode string // node country, ISO 3166-1 alpha-2 or ""
 	Location    string
-	Profile     string // profile name
-	Exit        string // "direct" | "warp"
+	// PublicLabel is the node's public label, the owner's short text for people ("" = none). The client API shows it; the node name never.
+	PublicLabel string
+	// IPv6Egress says the client gets IPv6 out of this server's exit node: see ipv6Egress. A relay's twin carries its exit's value.
+	IPv6Egress bool
+	Profile    string // profile name
+	Exit       string // "direct" | "warp"
 	// Made is the inbound's rank in creation order. Servers are listed by country and protocol, but a repeated name is
 	// numbered in creation order, so a server added later never takes the name of an older one (a Mihomo select group
 	// remembers the chosen server by name).
@@ -130,10 +161,13 @@ type SubServer struct {
 	// It is nil when capacity is unknown or the node has no fresh sample. The rates themselves stay out of the view:
 	// whatever reaches a user must not tell when the other person on a node streams.
 	LoadPercent *int
-	// Mark labels a server that is not the exit's own: a twin through a relay (ViaMark). The name builder writes it after the
-	// server's name in the language of the subscription; "" for an ordinary server.
+	// Mark labels a server that is not the node's plain one: a twin through a relay (ViaMark) or the node's IPv6 entry (MarkIPv6).
+	// The name builder writes it after the server's name in the language of the subscription; "" for an ordinary server.
 	Mark string
 }
+
+// MarkIPv6 is SubServer.Mark of the twin that connects to the node's IPv6 entry.
+const MarkIPv6 = "ipv6"
 
 // MarkVia is the prefix of SubServer.Mark of a relay's twin; the rest is the country code of the entry node.
 const MarkVia = "via:"
@@ -146,8 +180,8 @@ func ViaMark(entryCountry string) string {
 // SubDevice is one device of the user as the public page lists it.
 type SubDevice struct {
 	ID, Platform, Model string
-	// Kind is "link" (an app that reports a device ID), "shared" (the common place of the apps that report none) or "key" (an
-	// AmneziaVPN key). The person can remove and rename the first and the last.
+	// Kind is "link" (an app that reports a device ID), "shared" (the common place of the apps that report none), "key" (an
+	// AmneziaVPN or TrustTunnel key) or "telegram" (the Telegram proxy key). The person can remove and rename link/key devices.
 	Kind string
 	// OSVersion and Client are what the app last said about itself (X-Ver-OS, the first token of its User-Agent); "" if nothing.
 	OSVersion, Client string
@@ -181,8 +215,11 @@ type SubAWGProfile struct {
 // SubOptions says how a subscription view is rendered.
 type SubOptions struct {
 	// Format of the lines; "" = FormatURIList. FormatMihomo also gives the request's device its AWG credentials (one per
-	// usable AWG profile, made on the first fetch).
+	// usable AWG profile, made on the first fetch), unless NoLinkAWG is set.
 	Format plugin.ClientFormat
+	// NoLinkAWG omits AmneziaWG from Mihomo profiles. A touching Mihomo fetch revokes the request's link-device AWG
+	// credentials and quarantines their peer indexes; explicit AmneziaVPN devices are unaffected.
+	NoLinkAWG bool
 	// Device is what the request says about its device (its HWID above all). With a HWID the app gets a device of its own, with
 	// credentials of its own; without one, or when the user has no room for another device, the shared device of the user.
 	Device DeviceHint
@@ -194,8 +231,15 @@ type SubOptions struct {
 	// NoPageData: the view is for an app, so it leaves out what only the user page shows (the DNS of each node, the
 	// presets they name, the keys that hold an older DNS) and does not read it.
 	NoPageData bool
+	// IncludeTrustTunnel renders the person's key links for the public user page and admin key RPC only.
+	IncludeTrustTunnel bool
 	// IncludeEffectiveDNS lets the writer of a profile (Mihomo, Xray JSON, sing-box) reuse the effective preset read with node DNS.
 	IncludeEffectiveDNS bool
+	// EnrolledDevice selects the device already authenticated by its client API key. It may receive missing credentials through
+	// the separate enrolled-device store path; basic link requests keep their key_hash IS NULL guards.
+	EnrolledDevice *store.AccessDevice
+	// Capabilities are the parsed X-Mistgate-Caps values used only by the Mistgate settings renderer.
+	Capabilities []string
 }
 
 // Subscription resolves a token. The lookup is by sha256(token), so the comparison never sees the token
@@ -205,26 +249,34 @@ func (s *Service) Subscription(ctx context.Context, token string) (SubView, erro
 	return s.SubscriptionWith(ctx, token, SubOptions{})
 }
 
-// CheckSubscriptionToken checks whether a cached subscription token still exists, without building its view.
-func (s *Service) CheckSubscriptionToken(ctx context.Context, token string) error {
-	found, err := s.st.Access().HasUserWithTokenHash(ctx, hashToken(token))
+// CheckSubscriptionToken checks whether a cached subscription token still exists, without building its view. It also returns
+// the state of the person's page password, which the same one-row read holds: a handler that serves the page from a cached view
+// decides its lock by the fresh state, with no read added.
+func (s *Service) CheckSubscriptionToken(ctx context.Context, token string) (PageState, error) {
+	k := tokenKey(token)
+	st, found, err := s.st.Access().PageStateByTokenHash(ctx, k[:])
 	if err != nil {
-		return err
+		return PageState{}, err
 	}
 	if !found {
-		return ErrUnknownToken
+		s.tokens.remove(k)
+		return PageState{}, ErrUnknownToken
 	}
-	return nil
+	s.tokens.add(k)
+	return st, nil
 }
 
 // SubscriptionWith is Subscription with a client format (see SubOptions).
 func (s *Service) SubscriptionWith(ctx context.Context, token string, opt SubOptions) (SubView, error) {
-	u, err := s.st.Access().UserByTokenHash(ctx, hashToken(token))
+	k := tokenKey(token)
+	u, err := s.st.Access().UserByTokenHash(ctx, k[:])
 	if errors.Is(err, store.ErrNotFound) {
+		s.tokens.remove(k)
 		return SubView{}, ErrUnknownToken
 	} else if err != nil {
 		return SubView{}, err
 	}
+	s.tokens.add(k)
 	return s.subView(ctx, u, !opt.NoTouch, opt)
 }
 
@@ -238,7 +290,7 @@ func (s *Service) PreviewSubscription(ctx context.Context, userID string) (SubVi
 	} else if err != nil {
 		return SubView{}, "", err
 	}
-	v, err := s.subView(ctx, u, false, SubOptions{})
+	v, err := s.subView(ctx, u, false, SubOptions{IncludeTrustTunnel: true})
 	if err != nil {
 		return SubView{}, "", err
 	}
@@ -250,12 +302,26 @@ func (s *Service) PreviewSubscription(ctx context.Context, userID string) (SubVi
 	return v, link, nil
 }
 
-// credKey names a credential in the secrets map: a per-device protocol holds one credential per profile.
-func credKey(protocol, profileID string) string {
+// PreviewSubscriptionWith is the view of a user for the admin's preview of a profile (opt.Format says which): looked up by id
+// (ErrUnknownToken when there is none), and it writes nothing, whatever opt says: no device, no credential, no mark that the
+// subscription was fetched. A server the person has no credentials for yet is shown with a throwaway secret.
+func (s *Service) PreviewSubscriptionWith(ctx context.Context, userID string, opt SubOptions) (SubView, error) {
+	u, err := s.st.Access().User(ctx, userID)
+	if errors.Is(err, store.ErrNotFound) {
+		return SubView{}, ErrUnknownToken
+	} else if err != nil {
+		return SubView{}, err
+	}
+	opt.NoTouch, opt.NoPageData = true, true
+	return s.subView(ctx, u, false, opt)
+}
+
+// credKey names a credential in the secrets map: AWG credentials are distinct for each profile and connection path.
+func credKey(protocol, profileID, path string) string {
 	if profileID == "" {
 		return protocol
 	}
-	return protocol + "/" + profileID
+	return protocol + "/" + profileID + "/" + path
 }
 
 func subscriptionProtocolRank(protocol string) int {
@@ -314,23 +380,26 @@ func compareSubscriptionInbounds(a, b store.AccessInboundFull) int {
 func (s *Service) subView(ctx context.Context, u store.AccessUser, touch bool, opt SubOptions) (SubView, error) {
 	a := s.st.Access()
 	now := s.now()
-	// Not the stored status: expiry and quota are exact at this instant even before the sweep ran.
-	ps, reset := AdvancePeriod(u.QuotaReset, u.PeriodStart, now)
-	if reset {
-		u.UsedBytes, u.PeriodStart = 0, ps
-	}
+	u, status := currentSubscriptionUser(u, now)
 	v := SubView{
-		UserID: u.ID, UserName: u.Name, SubscriptionName: u.SubscriptionName, Status: ComputeStatus(u.Disabled, u.ExpiresAt, u.QuotaBytes, u.UsedBytes, now),
+		UserID: u.ID, GroupID: u.GroupID, UserName: u.Name, SubscriptionName: u.SubscriptionName, Status: status,
 		Total: u.QuotaBytes, Expires: u.ExpiresAt, QuotaReset: u.QuotaReset, NextReset: NextReset(u.QuotaReset, u.PeriodStart),
-		DeviceLimit: u.DeviceLimit, AppAmnezia: u.AppAmnezia,
+		DeviceLimit: u.DeviceLimit, AppAmnezia: u.AppAmnezia, AppTelegram: u.AppTelegram, AppTrustTunnel: u.AppTrustTunnel,
+		Page: PageState{Gen: u.PagePassGen, Open: u.PageOpen},
 	}
 	var hash []byte // the request's device: its HWID, hashed with the user; nil = the shared device
 	if opt.Device.HWID != "" {
 		hash = store.HWIDHash(u.ID, opt.Device.HWID)
 	}
-	data, err := a.SubscriptionData(ctx, u.ID, u.GroupID, u.PeriodStart, v.Status == StatusActive, now, hash)
+	if opt.EnrolledDevice != nil {
+		hash = slices.Clone(opt.EnrolledDevice.HWIDHash)
+	}
+	data, err := a.SubscriptionData(ctx, u.ID, u.PeriodStart, v.Status == StatusActive, now, hash)
 	if err != nil {
 		return SubView{}, err
+	}
+	if hook := s.snapshotHookForTest; hook != nil {
+		hook()
 	}
 	made := make(map[string]int, len(data.Inbounds)) // the store returns creation order: SubServer.Made
 	for i, f := range data.Inbounds {
@@ -349,14 +418,19 @@ func (s *Service) subView(ctx context.Context, u store.AccessUser, touch bool, o
 		awgByID[d.ID] = d
 	}
 	for _, d := range devs {
-		sd := SubDevice{ID: d.ID, Platform: d.Platform, Model: d.Model, Kind: subDeviceKind(d), OSVersion: d.OSVersion, Client: d.Client,
-			LastSeen: d.LastSeenAt, Online: d.Kind == store.DeviceKindLink && len(data.OnlineDevices[d.ID]) > 0}
+		kind := subDeviceKind(d)
+		sd := SubDevice{ID: d.ID, Platform: d.Platform, Model: d.Model, Kind: kind, OSVersion: d.OSVersion, Client: d.Client,
+			LastSeen: d.LastSeenAt, Online: (d.Kind == store.DeviceKindLink || kind == "telegram" || kind == "trusttunnel") && len(data.OnlineDevices[d.ID]) > 0}
 		for _, pid := range d.Protocols {
 			if p, ok := s.reg.Get(pid); ok {
-				if happ, amnezia, _ := clientApps(p); happ {
+				if happ, amnezia, telegram, trustTunnel, _ := clientApps(p); happ {
 					sd.App = "happ"
 				} else if amnezia {
 					sd.App = "amnezia"
+				} else if telegram {
+					sd.App = "telegram"
+				} else if trustTunnel {
+					sd.App = "trusttunnel"
 				}
 				break
 			}
@@ -371,10 +445,24 @@ func (s *Service) subView(ctx context.Context, u store.AccessUser, touch bool, o
 		}
 		v.Devices = append(v.Devices, sd)
 	}
-	v.DevicesUsed, v.LinkMode = len(devs), data.LinkMode
+	v.DevicesUsed, v.DevicesIdle, v.LinkMode = data.LimitCount(), data.IdleCount(), data.LinkMode // TrustTunnel keys count; the Telegram key does not
 	if v.Status != StatusActive {
 		// The app keeps fetching after access ended: the touch is what lets health notice that the person is trying.
-		if touch {
+		if touch && opt.EnrolledDevice != nil {
+			// The client API's device, known by its key: it is touched as itself, never as the shared place.
+			if now.Sub(opt.EnrolledDevice.LastSeenAt) >= clientTouchEvery {
+				s.touchDevice(opt.EnrolledDevice.ID, now, opt.Device.meta(), clientTouchEvery)
+			}
+		} else if touch && !(len(data.Device.KeyHash) > 0 && hash != nil) { // an enrolled device is the client API's: a basic fetch writes nothing on it
+			if opt.Format == plugin.FormatMihomo && opt.NoLinkAWG {
+				dropped, err := a.RevokeLinkAWGCreds(ctx, data.Device, now)
+				if err != nil {
+					return SubView{}, err
+				}
+				if dropped > 0 {
+					s.notify.StateChanged()
+				}
+			}
 			dev, m := data.Device, opt.Device.meta()
 			if dev.ID == "" && hash != nil {
 				// An app that reports a HWID no device is known by (and none is made for a person without access): the shared
@@ -382,28 +470,76 @@ func (s *Service) subView(ctx context.Context, u store.AccessUser, touch bool, o
 				dev, m = sharedDevice(data.Devices), deviceMeta{}
 			}
 			if dev.ID != "" && now.Sub(dev.LastSeenAt) >= deviceTouchEvery {
-				s.touchDevice(dev.ID, now, m)
+				s.touchDevice(dev.ID, now, m, deviceTouchEvery)
 			}
 		}
 		return v, nil
 	}
 
 	rd := requestDevice{dev: data.Device, creds: data.DeviceCreds, hash: hash}
-	g, full := data.Group, data.Inbounds
-	if touch {
+	gs, full := data.Groups, data.Inbounds
+	format := opt.Format
+	if format == "" {
+		format = plugin.FormatURIList
+	}
+	relaysOf := s.subRelays(data.Relays, full, gs, u, format)
+	if touch && opt.EnrolledDevice != nil {
+		// The client API's device, known by its key: the one place where the credentials of an enrolled device are issued.
+		// The basic path below refuses such a device by design, so it is never reached from here.
+		if refusal := s.admit(u, rd, data); refusal != "" {
+			v.Refusal = refusal
+			return v, nil
+		}
+		wasIdle := rd.dev.Idle && len(rd.dev.Protocols) > 0
+		rd, err = s.ensureClientAPICreds(ctx, u, gs, full, relaysOf, opt, rd)
+		if err != nil {
+			if refusal, _ := s.refusalOf(u, err); refusal != "" {
+				v.Refusal = refusal
+				return v, nil
+			}
+			return SubView{}, err
+		}
+		if wasIdle {
+			v.DevicesUsed++
+			v.DevicesIdle--
+		}
+		// The owner's switch "AmneziaWG in apps on the link" (NoLinkAWG) is for the other apps of the link: the Mistgate app gets
+		// AmneziaWG on its own terms (its switch, its caps, the profiles it may use), and its peers are never taken by that switch.
+		if rd.dev.ID != "" && now.Sub(rd.dev.LastSeenAt) >= clientTouchEvery {
+			s.touchDevice(rd.dev.ID, now, opt.Device.meta(), clientTouchEvery)
+		}
+	} else if touch {
+		if len(data.Device.KeyHash) > 0 && hash != nil {
+			// The HWID is no secret and the link is shared: the credentials of an enrolled device leave only through its key.
+			v.Refusal = RefusalClientAPIEnrolled
+			return v, nil
+		}
+		wasIdle := rd.dev.Idle && len(rd.dev.Protocols) > 0
 		if rd, v.Refusal, err = s.ensureLinkCreds(ctx, u, opt.Device, rd, data); err != nil {
 			return SubView{}, err
 		}
-		if v.Refusal == "" && opt.Format == plugin.FormatMihomo {
-			rd, v.Refusal = s.ensureMihomoAWG(ctx, u, g, full, opt.Device, rd, data)
+		if v.Refusal == "" && wasIdle {
+			v.DevicesUsed++
+			v.DevicesIdle--
+		}
+		changed := rd.added
+		if opt.Format == plugin.FormatMihomo && opt.NoLinkAWG {
+			dropped, err := a.RevokeLinkAWGCreds(ctx, rd.dev, now)
+			if err != nil {
+				return SubView{}, err
+			}
+			changed = changed || dropped > 0
+		} else if v.Refusal == "" && opt.Format == plugin.FormatMihomo {
+			rd, v.Refusal = s.ensureMihomoAWG(ctx, u, gs, full, relaysOf, opt.Device, rd, data)
+			changed = rd.added
 		}
 		if v.Refusal != "" {
-			if rd.added {
+			if changed {
 				s.notify.StateChanged()
 			}
 			return v, nil // a refused app gets no server, and the request wrote nothing for it
 		}
-		if rd.added {
+		if changed {
 			s.notify.StateChanged()
 		}
 		if rd.dev.ID != "" && now.Sub(rd.dev.LastSeenAt) >= deviceTouchEvery {
@@ -411,8 +547,11 @@ func (s *Service) subView(ctx context.Context, u store.AccessUser, touch bool, o
 			if rd.hash == nil && opt.Device.HWID != "" {
 				m.OSVersion = "" // the app took the shared place: its OS is not the place's
 			}
-			s.touchDevice(rd.dev.ID, now, m)
+			s.touchDevice(rd.dev.ID, now, m, deviceTouchEvery)
 		}
+	}
+	if opt.Format == plugin.FormatMihomo && opt.NoLinkAWG && opt.EnrolledDevice == nil {
+		rd.creds = slices.DeleteFunc(rd.creds, func(c store.AccessCred) bool { return c.Protocol == awg.ID })
 	}
 	secrets := map[string]string{}
 	for _, c := range rd.creds {
@@ -420,7 +559,15 @@ func (s *Service) subView(ctx context.Context, u store.AccessUser, touch bool, o
 		if err != nil {
 			return SubView{}, err
 		}
-		secrets[credKey(c.Protocol, c.ProfileID)] = string(pt)
+		secrets[credKey(c.Protocol, c.ProfileID, c.Path)] = string(pt)
+	}
+	var telegramSecret string // the secret of the person's Telegram key; "" without one
+	if u.AppTelegram && data.TelegramCred.ID != "" {
+		pt, err := s.vault.Open(data.TelegramCred.SecretEnc, data.TelegramCred.ID)
+		if err != nil {
+			return SubView{}, err
+		}
+		telegramSecret = string(pt)
 	}
 	if !touch {
 		// The page lists the person's servers, which it renders from a secret: a person with no device yet gets throwaway ones,
@@ -430,15 +577,11 @@ func (s *Service) subView(ctx context.Context, u store.AccessUser, touch bool, o
 		}
 	}
 
-	format := opt.Format
-	if format == "" {
-		format = plugin.FormatURIList
-	}
 	v.Format = format
 	var networkNodeIDs []string
 	capacityMbps := map[string]int{}
 	for _, f := range full {
-		if !s.usable(f, g, u) {
+		if !s.usableForFormat(f, gs, u, format) {
 			continue
 		}
 		if _, exists := s.reg.Get(f.Profile.Protocol); exists {
@@ -446,7 +589,14 @@ func (s *Service) subView(ctx context.Context, u store.AccessUser, touch bool, o
 			capacityMbps[f.Node.ID] = f.Node.BandwidthMbps
 		}
 	}
-	relaysOf := s.subRelays(data.Relays, full, g, u)
+	if u.AppTrustTunnel {
+		for _, f := range full {
+			if s.usableForFormat(f, gs, u, plugin.FormatTTLink) {
+				v.AccessTrustTunnel = true
+				break
+			}
+		}
+	}
 	for _, rs := range relaysOf { // a twin's load is the larger of its entry's and its exit's
 		for _, l := range rs {
 			networkNodeIDs = append(networkNodeIDs, l.ViaNodeID)
@@ -468,7 +618,7 @@ func (s *Service) subView(ctx context.Context, u store.AccessUser, touch bool, o
 		if !ok {
 			i = len(v.Nodes)
 			nodeAt[f.Node.ID] = i
-			n := SubNode{ID: f.Node.ID, Name: f.Node.Name, CountryCode: f.Node.CountryCode, Location: f.Node.Location}
+			n := SubNode{ID: f.Node.ID, Name: f.Node.Name, Address: f.Node.Address, CountryCode: f.Node.CountryCode, Location: f.Node.Location}
 			if usage, ok := networkUsage[f.Node.ID]; ok {
 				n.LoadPercent = usage.LoadPercent
 			}
@@ -477,13 +627,14 @@ func (s *Service) subView(ctx context.Context, u store.AccessUser, touch bool, o
 		return &v.Nodes[i]
 	}
 	for _, f := range full {
-		if !s.usable(f, g, u) {
+		if !s.usableForFormat(f, gs, u, format) {
 			continue
 		}
 		proto, _ := s.reg.Get(f.Profile.Protocol)
-		happ, amnezia, _ := clientApps(proto)
+		happ, amnezia, telegram, _, _ := clientApps(proto)
 		v.AccessHapp = v.AccessHapp || happ && u.AppHapp
 		v.AccessAmnezia = v.AccessAmnezia || amnezia && u.AppAmnezia
+		v.AccessTelegram = v.AccessTelegram || telegram && u.AppTelegram
 		merged, err := s.mergedSettings(f.Profile)
 		if err != nil {
 			return SubView{}, err
@@ -503,34 +654,42 @@ func (s *Service) subView(ctx context.Context, u store.AccessUser, touch bool, o
 		}
 		key := f.Profile.Protocol
 		if protocols.IsPerDevice(proto) {
-			key = credKey(key, f.Profile.ID)
+			key = credKey(key, f.Profile.ID, "")
 		}
 		secret := secrets[key]
+		if telegram {
+			secret = telegramSecret // the person's key, not a link device's: without it there is no link
+		}
 		if secret == "" {
 			continue
 		}
 		spec, err := s.buildSpec(f, merged)
 		if err != nil {
-			s.log.Error("access: cannot build inbound for subscription", "inbound", f.Inbound.ID, "err", err)
+			var noName *protocols.NeedsDomainError
+			if !errors.As(err, &noName) || !noName.MTProto { // a node that lost its host name is known (the node page says so): no link, no log line per request
+				s.log.Error("access: cannot build inbound for subscription", "code", "subscription_inbound_render_failed", "inbound", f.Inbound.ID, "err", err)
+			}
 			continue
 		}
 		if _, pinOK := protocols.NormalizePin(f.Inbound.CertPinSHA256); spec.TLS.Mode == plugin.TLSSelfSigned && !pinOK {
 			continue // the node has not reported its certificate yet: a client could not verify it
 		}
-		srv := SubServer{NodeID: f.Node.ID, Node: f.Node.Name, CountryCode: f.Node.CountryCode, Location: f.Node.Location,
+		srv := SubServer{NodeID: f.Node.ID, InboundID: f.Inbound.ID, PathKey: store.PathDirect, Node: f.Node.Name, CountryCode: f.Node.CountryCode, Location: f.Node.Location, PublicLabel: f.Node.PublicLabel,
 			Profile: f.Profile.Name, Protocol: f.Profile.Protocol, ProfileID: f.Profile.ID, Exit: egressOf(merged), Made: made[f.Inbound.ID]}
+		srv.IPv6Egress = ipv6Egress(f.Node, srv.Exit)
 		if usage, ok := networkUsage[f.Node.ID]; ok {
 			srv.LoadPercent = usage.LoadPercent
 		}
 		in := protocols.RenderInput{
-			Format: format, Settings: merged, Inbound: inboundView(nodeView(f.Node), spec, f.Inbound.CertPinSHA256),
+			Format: format, Capabilities: opt.Capabilities, Settings: merged, Inbound: inboundView(nodeView(f.Node), spec, f.Inbound.CertPinSHA256),
 			UserID: u.ID, UserName: u.Name, DeviceID: rd.dev.ID, Secret: secret,
 			InboundPublic: json.RawMessage(f.Inbound.PluginPublicJSON),
 		}
+		in.NoIPv6Egress = !srv.IPv6Egress
 		if protocols.IsPerDevice(proto) {
 			// An AmneziaWG proxy carries a resolver of its own: the DNS of its node. (Hysteria2 has none; the URI list has no AWG.)
 			var dnsServers []string
-			if format == plugin.FormatMihomo {
+			if format == plugin.FormatMihomo || format == plugin.FormatMistgate {
 				dnsServers, _ = dnsOf().awg(f.Node.ID)
 			}
 			in.Peer, in.DNS, in.NodeAddr = json.RawMessage(secret), dnsServers, f.Node.Address
@@ -538,47 +697,91 @@ func (s *Service) subView(ctx context.Context, u store.AccessUser, touch bool, o
 		if opt.Name != nil {
 			in.DisplayName = opt.Name(srv)
 		}
-		frag, ok := proto.Render(in)
-		if ok {
-			srv.URI = string(frag.Data)
+		// emit puts a rendered server where it belongs: the list of the subscription (and the node's way to use it), or, for
+		// Telegram, the person's own links and nowhere else.
+		emit := func(srv SubServer, conn *SubConn) {
+			if telegram {
+				v.Telegram = append(v.Telegram, srv)
+				return
+			}
 			v.Lines = append(v.Lines, srv.URI)
 			v.Servers = append(v.Servers, srv)
-			if !protocols.IsPerDevice(proto) { // the page lists a link by its Hysteria2 servers; the keys are counted above
+			if conn != nil {
+				conn.Server = len(v.Servers) - 1
 				n := nodeOf(f)
-				n.Conns = append(n.Conns, SubConn{Way: "link", Exit: srv.Exit, Server: len(v.Servers) - 1})
+				n.Conns = append(n.Conns, *conn)
 			}
-			// The twins of the server, right after it: the same server through each relay of it that is usable for the person.
-			for _, l := range relaysOf[f.Inbound.ID] {
-				if relayUnsupported(f.Profile.Protocol, spec) != "" {
-					break
+		}
+		if telegram {
+			in.Format = plugin.FormatTelegramLink
+		}
+		frag, ok := proto.Render(in)
+		paths := serverPaths(f.Node, spec, relaysOf[f.Inbound.ID])
+		if ok {
+			// The server, then its IPv6 twin, then the twins through its relays (copies of the server itself, never of the IPv6 twin).
+			for _, p := range paths {
+				if p.Kind == pathDirect {
+					if f.Inbound.DirectInSubscriptions {
+						srv.URI = string(frag.Data)
+						var conn *SubConn
+						if !protocols.IsPerDevice(proto) { // the page lists a link by its Hysteria2 servers; the keys are counted above
+							c := p.conn(srv.Exit)
+							conn = &c
+						}
+						emit(srv, conn)
+					}
+					continue
 				}
-				twin := srv
-				twin.Mark = ViaMark(l.ViaNodeCountry)
-				twin.LoadPercent = maxPercent(srv.LoadPercent, networkUsage[l.ViaNodeID].LoadPercent)
-				tin := twinInput(in, f, spec, l)
+				twin := p.server(srv)
+				if p.Kind == pathRelay {
+					twin.LoadPercent = maxPercent(srv.LoadPercent, networkUsage[p.Relay.ViaNodeID].LoadPercent)
+				}
+				tin := p.input(in, f, spec)
+				if f.Profile.Protocol == awg.ID {
+					// The same server at two endpoints with one key would have its peer endpoint jump between them, so a twin has a
+					// key of its own; without one (no free address) there is no twin and the direct server is untouched.
+					pathSecret := secrets[credKey(awg.ID, f.Profile.ID, p.Key)]
+					if pathSecret == "" {
+						continue
+					}
+					tin.Secret, tin.Peer = pathSecret, json.RawMessage(pathSecret)
+					if p.Kind == pathRelay {
+						tin.NodeAddr = p.Relay.ViaNodeAddress
+					}
+				}
 				if opt.Name != nil {
 					tin.DisplayName = opt.Name(twin)
 				}
 				if tf, ok := proto.Render(tin); ok {
 					twin.URI = string(tf.Data)
-					v.Lines = append(v.Lines, twin.URI)
-					v.Servers = append(v.Servers, twin)
-					n := nodeOf(f)
-					n.Conns = append(n.Conns, SubConn{Way: "link", Exit: srv.Exit, Server: len(v.Servers) - 1, Via: strings.ToUpper(strings.TrimSpace(l.ViaNodeCountry)), Relay: true})
+					c := p.conn(srv.Exit)
+					emit(twin, &c)
 				}
 			}
-		} else if format == plugin.FormatURIList && !protocols.IsPerDevice(proto) {
-			// The URI list leaves out what only the Mihomo apps can use (Gecko), but it is still the person's server: the page lists it.
+		} else if format == plugin.FormatURIList && !protocols.IsPerDevice(proto) && !telegram {
+			// The URI list leaves out what only the Mihomo apps can use (Gecko), but it is still the person's server, and so are its
+			// twins: the page lists them.
 			in.Format = plugin.FormatMihomo
 			if _, ok := proto.Render(in); ok {
 				n := nodeOf(f)
-				n.Conns = append(n.Conns, SubConn{Way: "link", Exit: srv.Exit, MihomoOnly: true})
-				for _, l := range relaysOf[f.Inbound.ID] { // its twins are Mihomo-only as well
-					if relayUnsupported(f.Profile.Protocol, spec) == "" {
-						n.Conns = append(n.Conns, SubConn{Way: "link", Exit: srv.Exit, MihomoOnly: true, Via: strings.ToUpper(strings.TrimSpace(l.ViaNodeCountry)), Relay: true})
+				for _, p := range paths {
+					if p.Kind != pathDirect || f.Inbound.DirectInSubscriptions {
+						c := p.conn(srv.Exit)
+						c.MihomoOnly = true
+						n.Conns = append(n.Conns, c)
 					}
 				}
 			}
+		}
+	}
+	if opt.IncludeTrustTunnel && u.AppTrustTunnel && data.TrustTunnelCred.ID != "" {
+		pt, err := s.vault.Open(data.TrustTunnelCred.SecretEnc, data.TrustTunnelCred.ID)
+		if err != nil {
+			return SubView{}, err
+		}
+		v.TrustTunnel, err = s.trustTunnelServers(ctx, u, gs, full, data.Relays, string(pt), opt)
+		if err != nil {
+			return SubView{}, err
 		}
 	}
 	for i := range v.Nodes {
@@ -593,7 +796,7 @@ func (s *Service) subView(ctx context.Context, u store.AccessUser, touch bool, o
 		return v, nil
 	}
 	n := dnsOf()
-	s.markDNSStale(u, g, full, n, awgDevs)
+	s.markDNSStale(u, gs, full, n, awgDevs)
 	for _, ad := range awgDevs {
 		if i := slices.IndexFunc(v.Devices, func(d SubDevice) bool { return d.ID == ad.ID }); i >= 0 && v.Devices[i].AWG != nil {
 			v.Devices[i].AWG.DNSStale = ad.DNSStale
@@ -603,13 +806,43 @@ func (s *Service) subView(ctx context.Context, u store.AccessUser, touch bool, o
 	return v, nil
 }
 
+// SubscriptionStatus is the status a subscription fetch would derive for the person now (a due quota reset applied first).
+func SubscriptionStatus(u store.AccessUser, now time.Time) string {
+	_, status := currentSubscriptionUser(u, now)
+	return status
+}
+
+// currentSubscriptionUser applies a due quota reset before deriving status, as a subscription fetch does even before the sweep.
+func currentSubscriptionUser(u store.AccessUser, now time.Time) (store.AccessUser, string) {
+	periodStart, reset := AdvancePeriod(u.QuotaReset, u.PeriodStart, now)
+	if reset {
+		u.UsedBytes, u.PeriodStart = 0, periodStart
+	}
+	return u, ComputeStatus(u.Disabled, u.ExpiresAt, u.QuotaBytes, u.UsedBytes, now)
+}
+
+// ipv6Egress says whether a client of this exit node gets IPv6 out of it. Only what the panel knows for sure counts, and what it does
+// not know is "no": a client that is told there is IPv6 where there is none hangs on it, one that is told there is none uses IPv4.
+//   - through WARP, the node's own uplink is not what the client leaves by: the node routes IPv6 into WARP when the WARP account has an
+//     IPv6 address (the node's own "IPv6 for clients" switch does not apply to WARP), so that is the whole rule;
+//   - direct, the exit's "IPv6 for clients" switch has to be on and the doctor has to have reported that outbound IPv6 works: not "no
+//     IPv6", not "broken" (the node page's no_ipv6 and ipv6_broken), and not "not reported yet".
+//
+// A relay is not asked: the client leaves by the exit.
+func ipv6Egress(n store.AccessNode, exit string) bool {
+	if exit == "warp" {
+		return n.WarpIPv6
+	}
+	return n.ClientIPv6 && n.IPv6.Works()
+}
+
 // subRelays are the relays that give the person a twin server, by the exit's inbound: the ones relayUsable accepts, in the
-// order of the relays. The caller drops the ones the protocol cannot carry (relayUnsupported).
-func (s *Service) subRelays(relays []store.RelayLink, full []store.AccessInboundFull, g store.AccessGroup, u store.AccessUser) map[string][]store.RelayLink {
+// order of the relays. serverPaths drops them for a server that cannot go through another address.
+func (s *Service) subRelays(relays []store.RelayLink, full []store.AccessInboundFull, gs store.AccessGroups, u store.AccessUser, format plugin.ClientFormat) map[string][]store.RelayLink {
 	var out map[string][]store.RelayLink
 	for _, l := range relays {
 		i := slices.IndexFunc(full, func(f store.AccessInboundFull) bool { return f.Inbound.ID == l.InboundID })
-		if i < 0 || l.ViaNodeAddress == "" || !s.relayUsable(l, full[i], g, u) {
+		if i < 0 || l.ViaNodeAddress == "" || !s.relayUsableFor(l, full[i], gs, u, format) {
 			continue
 		}
 		if out == nil {
@@ -620,12 +853,36 @@ func (s *Service) subRelays(relays []store.RelayLink, full []store.AccessInbound
 	return out
 }
 
+// ipv6EntryAddr is the address of the node's IPv6 entry when the node has one that can be used, else "": the entry has to be a global
+// IPv6 address, and a node whose own address is IPv6 already has nothing to add.
+func ipv6EntryAddr(n store.AccessNode) string {
+	addr, ok := store.UsableIPv6(n.IPv6Entry)
+	if !ok {
+		return ""
+	}
+	if _, main := store.UsableIPv6(n.Address); main {
+		return ""
+	}
+	return addr
+}
+
+// ipv6Input is the render input of the server at the node's IPv6 entry: the same settings, SNI, keys and pin, only the address
+// the client connects to changes (an AmneziaWG proxy carries it as its endpoint).
+func ipv6Input(in protocols.RenderInput, addr string) protocols.RenderInput {
+	in.Inbound.Node.Address = addr
+	if in.NodeAddr != "" {
+		in.NodeAddr = addr
+	}
+	return in
+}
+
 // twinInput is the render input of the exit's server through the relay l: the exit's own protocol settings, SNI, keys, pin and
 // credential, with the entry node's address and the port it forwards. The forward is one port, so the twin has no hop range.
 func twinInput(in protocols.RenderInput, f store.AccessInboundFull, spec plugin.InboundSpec, l store.RelayLink) protocols.RenderInput {
 	spec.Listen.Port, spec.Listen.HopFrom, spec.Listen.HopTo = l.Port, 0, 0
 	in.ClientPort = l.Port
 	in.Inbound = inboundView(protocols.NodeView{ID: f.Node.ID, Name: f.Node.Name, Address: l.ViaNodeAddress, CountryCode: f.Node.CountryCode}, spec, f.Inbound.CertPinSHA256)
+	in.Inbound.TCPOnly = true
 	return in
 }
 
@@ -649,6 +906,10 @@ type requestDevice struct {
 // subDeviceKind is SubDevice.Kind of a device.
 func subDeviceKind(d store.AccessDevice) string {
 	switch {
+	case d.Kind == store.DeviceKindKey && slices.Contains(d.Protocols, store.TelegramProtocol):
+		return "telegram"
+	case d.Kind == store.DeviceKindKey && slices.Contains(d.Protocols, store.TrustTunnelProtocol):
+		return "trusttunnel"
 	case d.Kind == store.DeviceKindKey:
 		return "key"
 	case d.Implicit:
@@ -674,21 +935,21 @@ func sharedDevice(devs []store.AccessDevice) store.AccessDevice {
 // In TRACK a user with twice the limit in live devices gets no device for one more HWID: that app takes the shared place, as
 // an app without a HWID does. refusal is a Refusal* reason, "" when the request is served.
 func (s *Service) ensureLinkCreds(ctx context.Context, u store.AccessUser, hint DeviceHint, rd requestDevice, data store.SubscriptionData) (requestDevice, string, error) {
+	if refusal := s.admit(u, rd, data); refusal != "" {
+		return rd, refusal, nil
+	}
 	have := make(map[string]bool, len(rd.dev.Protocols))
 	for _, protocol := range rd.dev.Protocols {
 		have[protocol] = true
 	}
-	if len(s.missingProtocols(u.AppHapp, u.AppAmnezia, have)) == 0 {
+	if len(s.missingProtocols(u.AppHapp, u.AppAmnezia, u.AppTelegram, have)) == 0 {
 		return rd, "", nil // a user of the Amnezia app alone has none to give, and no device is made for nothing
-	}
-	if refusal := s.admit(u, rd, data); refusal != "" {
-		return rd, refusal, nil
 	}
 	m := hint.meta()
 	template := store.AccessDevice{ID: store.NewID("dev_"), UserID: u.ID, HWIDHash: rd.hash, Implicit: rd.hash == nil,
 		Platform: m.Platform, Model: m.Model, OSVersion: m.OSVersion, Client: m.Client}
 	res, err := s.st.Access().EnsureLinkDevice(ctx, template, u.DeviceLimit, s.now(), func(deviceID string, have map[string]bool) ([]store.AccessCred, error) {
-		return s.newCreds(u.ID, deviceID, u.AppHapp, u.AppAmnezia, have)
+		return s.newCreds(u.ID, deviceID, u.AppHapp, u.AppAmnezia, u.AppTelegram, have)
 	})
 	if err != nil {
 		if refusal, fallback := s.refusalOf(u, err); refusal != "" {
@@ -706,9 +967,8 @@ func (s *Service) ensureLinkCreds(ctx context.Context, u store.AccessUser, hint 
 	return requestDevice{dev: res.Device, creds: res.Creds, hash: rd.hash, added: len(res.Added) > 0}, "", nil
 }
 
-// admit is the refusal the snapshot of a fetch already holds for a request whose device does not exist yet. The store makes
-// the same decision again, with guards, when it is called; this one only spares the call (and its reads) to an app that is
-// refused on every refresh.
+// admit is the refusal the snapshot already holds for a new request device or a returning idle device. The store makes the same
+// decision again, with guards, when it is called; this one only spares the call (and its reads) to a refused request.
 func (s *Service) admit(u store.AccessUser, rd requestDevice, data store.SubscriptionData) string {
 	err := data.LinkRefusal(u.DeviceLimit, rd.hash != nil, s.now())
 	if err == nil {
@@ -725,12 +985,14 @@ func (s *Service) refusalOf(u store.AccessUser, err error) (refusal string, fall
 	switch {
 	case errors.Is(err, store.ErrAccessBlocked):
 		return RefusalDeviceBlocked, false
+	case errors.Is(err, store.ErrDeviceEnrolled):
+		return RefusalClientAPIEnrolled, false // enrolled since the snapshot of this fetch was read
 	case errors.Is(err, store.ErrNoSharedDevice):
 		return RefusalNoDeviceID, false
 	case errors.As(err, &limit):
 		// TRACK refuses nobody: the app takes the shared place, and the event is a sighting. ENFORCE and STRICT turn it away.
 		refused := limit.Mode != store.LinkModeTrack
-		s.limitReached(u.ID, limit.Used, u.DeviceLimit, limit.Mode, refused)
+		s.limitReached(u.ID, limit.Used, u.DeviceLimit, limit.Mode, refused, limit.WasIdle)
 		if !refused {
 			return "", true
 		}
@@ -739,20 +1001,25 @@ func (s *Service) refusalOf(u store.AccessUser, err error) (refusal string, fall
 	return "", false
 }
 
-// placed records what a device that was made in this request means for the limit: in TRACK, a person who now has more
-// devices than the limit is an event for the owner to see. A place that a silent device gave away is no such case.
+// placed records a new device in TRACK when it takes the person over their configured limit.
 func (s *Service) placed(u store.AccessUser, data store.SubscriptionData, res store.LinkDeviceResult) {
-	if res.Born && u.DeviceLimit > 0 && res.Replaced == "" && len(data.Devices) >= u.DeviceLimit {
-		s.limitReached(u.ID, len(data.Devices)+1, u.DeviceLimit, data.LinkMode, false)
+	s.placedAt(u, data.LimitCount(), data.LinkMode, res)
+}
+
+// placedAt is placed for a caller that knows the count and the mode it decided on (the snapshot of the fetch, or the store's
+// result for an enrolment): used is the person's active devices that count before the new one.
+func (s *Service) placedAt(u store.AccessUser, used int, mode string, res store.LinkDeviceResult) {
+	if res.Born && u.DeviceLimit > 0 && used >= u.DeviceLimit {
+		s.limitReached(u.ID, used+1, u.DeviceLimit, mode, false, false)
 	}
 }
 
 // limitReached writes the device_limit_reached event off the request (the store keeps one an hour per user; the same hour is
 // remembered here too, so that a refused app that keeps asking does not even queue the read). On Cloudflare the work runs
 // after the response (AfterResponse).
-func (s *Service) limitReached(userID string, used, limit int, mode string, refused bool) {
+func (s *Service) limitReached(userID string, used, limit int, mode string, refused, wasIdle bool) {
 	now := s.now()
-	key := "lim:" + userID + ":" + strconv.FormatBool(refused)
+	key := "lim:" + userID + ":" + strconv.FormatBool(refused) + ":" + strconv.FormatBool(wasIdle)
 	if at, seen := s.limited.LoadOrStore(key, now); seen {
 		if now.Sub(at.(time.Time)) < time.Hour {
 			return
@@ -762,8 +1029,8 @@ func (s *Service) limitReached(userID string, used, limit int, mode string, refu
 	s.afterResponse(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		if err := s.st.RecordDeviceLimitReached(ctx, userID, used, limit, mode, refused, now); err != nil {
-			s.log.Warn("access: device limit event", "user", userID, "err", err)
+		if err := s.st.RecordDeviceLimitReached(ctx, userID, used, limit, mode, refused, wasIdle, now); err != nil {
+			s.log.Warn("access: device limit event", "code", "device_limit_event_write_failed", "user", userID, "err", err)
 		}
 	})
 }
@@ -775,7 +1042,7 @@ func (s *Service) placeholderSecrets(u store.AccessUser, protocolsHeld []string,
 	for _, protocol := range protocolsHeld {
 		have[protocol] = true
 	}
-	for _, p := range s.missingProtocols(u.AppHapp, u.AppAmnezia, have) {
+	for _, p := range s.missingProtocols(u.AppHapp, u.AppAmnezia, u.AppTelegram, have) {
 		iss, err := p.IssueCredential(protocols.IssueInput{UserID: u.ID})
 		if err != nil {
 			return err
@@ -783,6 +1050,139 @@ func (s *Service) placeholderSecrets(u store.AccessUser, protocolsHeld []string,
 		secrets[p.ID()] = iss.Secret
 	}
 	return nil
+}
+
+// ensureClientAPICreds makes the enrolled device hold the credentials of the link protocols and of the AWG profiles its client
+// announced, in one guarded store batch that re-checks the device's key and the link it was enrolled under; unlike basic link
+// fetches this path is tied to the key that authorised the request. When the snapshot of the request shows nothing missing the
+// store is not called at all (nothing would be written, and the snapshot is as fresh as any basic fetch's).
+func (s *Service) ensureClientAPICreds(ctx context.Context, u store.AccessUser, gs store.AccessGroups, full []store.AccessInboundFull, relays map[string][]store.RelayLink, opt SubOptions, rd requestDevice) (requestDevice, error) {
+	dev := *opt.EnrolledDevice
+	dev.UserID, dev.HWIDHash = u.ID, slices.Clone(rd.hash)
+	if dev.ID == "" || len(dev.KeyHash) == 0 {
+		return rd, store.ErrNotFound
+	}
+	// AmneziaWG does not follow the owner's link switch (opt.NoLinkAWG): the app asks for it with its caps and gets it while it may.
+	want := s.awgWants(u, gs, full, relays, dev.ID, func(version string) bool { return protocols.HasCapability(opt.Capabilities, "awg", version) })
+	if s.enrolledDeviceComplete(u, dev, rd, want, opt.Capabilities, !u.AppMistgateOff) {
+		return rd, nil
+	}
+	result, err := s.st.Access().EnsureEnrolledLinkDevice(ctx, dev, s.now(), func(deviceID string, have map[string]bool) ([]store.AccessCred, error) {
+		return s.newEnrolledClientCreds(u.ID, deviceID, u.AppHapp, u.AppAmnezia, u.AppTelegram, have,
+			opt.Capabilities, !u.AppMistgateOff)
+	}, want, u.DeviceLimit)
+	if err != nil {
+		return rd, err
+	}
+	for _, profileID := range result.FullProfiles {
+		s.log.Warn("access: AWG profile network is full for a client API device", "code", "client_api_awg_network_full", "profile", profileID, "err", store.ErrAccessSubnetFull)
+	}
+	for _, full := range result.FullPaths {
+		s.log.Warn("access: AWG path key network is full for a client API device", "code", "awg_path_network_full", "profile", full.ProfileID, "path", full.Path, "err", store.ErrAccessSubnetFull)
+	}
+	for _, failed := range result.FailedPaths {
+		s.log.Warn("access: cannot issue an AWG path key for a client API device", "code", "awg_path_credential_issue_failed", "profile", failed.ProfileID, "path", failed.Path, "err", failed.Err)
+	}
+	if len(result.Added) > 0 {
+		s.notify.StateChanged()
+	}
+	if result.Device.ID == "" {
+		return rd, store.ErrNotFound
+	}
+	return requestDevice{dev: result.Device, creds: result.Creds, hash: rd.hash, added: len(result.Added) > 0}, nil
+}
+
+// enrolledDeviceComplete reports whether the snapshot of the request already shows the enrolled device as the live holder of the
+// key and of the link it was enrolled under, with a credential of every link protocol its apps allow and of every wanted AWG
+// profile: then there is nothing to issue.
+func (s *Service) enrolledDeviceComplete(u store.AccessUser, dev store.AccessDevice, rd requestDevice, want []store.AWGImplicitWant,
+	caps []string, mistgateEnabled bool) bool {
+	if rd.dev.ID != dev.ID || !bytes.Equal(rd.dev.KeyHash, dev.KeyHash) || len(rd.dev.EnrolTokenHash) == 0 || !bytes.Equal(rd.dev.EnrolTokenHash, u.SubTokenHash) {
+		return false
+	}
+	have := map[string]bool{}
+	profiles := map[string]bool{}
+	for _, c := range rd.creds {
+		if c.Path == "" {
+			have[c.Protocol] = true
+		}
+		if c.ProfileID != "" {
+			profiles[c.ProfileID+"\x00"+c.Path] = true
+		}
+	}
+	if len(s.missingProtocols(u.AppHapp, u.AppAmnezia, u.AppTelegram, have)) != 0 {
+		return false
+	}
+	if s.mistgateTrustTunnelWanted(caps, mistgateEnabled) && !have["trusttunnel"] {
+		return false
+	}
+	for _, w := range want {
+		if !profiles[w.ProfileID+"\x00"+w.Path] {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Service) mistgateTrustTunnelWanted(caps []string, enabled bool) bool {
+	if !enabled || !protocols.HasCapability(caps, "trusttunnel", "1") {
+		return false
+	}
+	return s.mistgateConsumes("trusttunnel")
+}
+
+// awgWants lists the AmneziaWG profiles the user can use, each with the way to issue its credential to deviceID. keep, when set,
+// decides by the version of a profile whether the device is to get it. A profile whose secrets cannot be opened or whose network
+// is invalid is logged and left out; the subscription itself must not fail for it.
+func (s *Service) awgWants(u store.AccessUser, gs store.AccessGroups, full []store.AccessInboundFull, relays map[string][]store.RelayLink, deviceID string, keep func(version string) bool) []store.AWGImplicitWant {
+	proto, ok := s.reg.Get(awg.ID)
+	if !ok {
+		return nil
+	}
+	var want []store.AWGImplicitWant
+	seen := map[string]bool{}
+	skipped := map[string]bool{} // profiles that are left out: logged once, not once for each of their inbounds
+	for _, f := range full {
+		if f.Profile.Protocol != awg.ID || skipped[f.Profile.ID] || !s.usable(f, gs, u) {
+			continue
+		}
+		merged, err := s.mergedSettings(f.Profile)
+		if err != nil {
+			s.log.Error("access: cannot open profile secrets", "code", "awg_profile_settings_open_failed", "profile", f.Profile.ID, "err", err)
+			skipped[f.Profile.ID] = true
+			continue
+		}
+		if keep != nil && !keep(awgVersion(merged)) {
+			skipped[f.Profile.ID] = true
+			continue
+		}
+		maxIdx, err := awg.MaxPeerIndex(merged)
+		if err != nil {
+			s.log.Error("access: bad AWG network", "code", "awg_profile_network_invalid", "profile", f.Profile.ID, "err", err)
+			skipped[f.Profile.ID] = true
+			continue
+		}
+		issue := s.awgIssuer(proto, u.ID, deviceID, f.Profile.ID, merged)
+		if key := f.Profile.ID + "\x00"; !seen[key] {
+			want = append(want, store.AWGImplicitWant{ProfileID: f.Profile.ID, MaxIdx: maxIdx, Issue: issue})
+			seen[key] = true
+		}
+		spec, err := s.buildSpec(f, merged)
+		if err != nil {
+			continue
+		}
+		for _, p := range serverPaths(f.Node, spec, relays[f.Inbound.ID]) {
+			if p.Kind == pathDirect {
+				continue
+			}
+			key := f.Profile.ID + "\x00" + p.Key
+			if !seen[key] {
+				want = append(want, store.AWGImplicitWant{ProfileID: f.Profile.ID, Path: p.Key, MaxIdx: maxIdx, Issue: issue})
+				seen[key] = true
+			}
+		}
+	}
+	return want
 }
 
 // awgMinClients are the minimum client versions of an AWG profile, from its settings without secrets (the
@@ -800,9 +1200,8 @@ func (s *Service) awgMinClients(settings string) []protocols.ClientReq {
 // proxy is skipped; the subscription itself must not fail for it, nor for the ceiling of devices in TRACK (the shared device
 // then). The device may be born here (a person with only the AmneziaVPN access has no link credential to be born with): it
 // is refused like in ensureLinkCreds, and refusal says so.
-func (s *Service) ensureMihomoAWG(ctx context.Context, u store.AccessUser, g store.AccessGroup, full []store.AccessInboundFull, hint DeviceHint, rd requestDevice, data store.SubscriptionData) (requestDevice, string) {
-	proto, ok := s.reg.Get(awg.ID)
-	if !ok {
+func (s *Service) ensureMihomoAWG(ctx context.Context, u store.AccessUser, gs store.AccessGroups, full []store.AccessInboundFull, relays map[string][]store.RelayLink, hint DeviceHint, rd requestDevice, data store.SubscriptionData) (requestDevice, string) {
+	if _, ok := s.reg.Get(awg.ID); !ok {
 		return rd, ""
 	}
 	m := hint.meta()
@@ -811,29 +1210,7 @@ func (s *Service) ensureMihomoAWG(ctx context.Context, u store.AccessUser, g sto
 	if template.ID == "" {
 		template.ID = store.NewID("dev_")
 	}
-	var want []store.AWGImplicitWant
-	seen := map[string]bool{}
-	for _, f := range full {
-		if f.Profile.Protocol != awg.ID || seen[f.Profile.ID] || !s.usable(f, g, u) {
-			continue
-		}
-		seen[f.Profile.ID] = true
-		merged, err := s.mergedSettings(f.Profile)
-		if err != nil {
-			s.log.Error("access: cannot open profile secrets", "profile", f.Profile.ID, "err", err)
-			continue
-		}
-		maxIdx, err := awg.MaxPeerIndex(merged)
-		if err != nil {
-			s.log.Error("access: bad AWG network", "profile", f.Profile.ID, "err", err)
-			continue
-		}
-		want = append(want, store.AWGImplicitWant{
-			ProfileID: f.Profile.ID,
-			MaxIdx:    maxIdx,
-			Issue:     s.awgIssuer(proto, u.ID, template.ID, f.Profile.ID, merged),
-		})
-	}
+	want := s.awgWants(u, gs, full, relays, template.ID, nil)
 	if len(want) == 0 {
 		return rd, ""
 	}
@@ -849,13 +1226,19 @@ func (s *Service) ensureMihomoAWG(ctx context.Context, u store.AccessUser, g sto
 		} else if fallback {
 			// No device of its own for this HWID: the shared device holds the proxies, as for an app without a HWID.
 			hint.HWID = ""
-			return s.ensureMihomoAWG(ctx, u, g, full, hint, requestDevice{added: rd.added}, data)
+			return s.ensureMihomoAWG(ctx, u, gs, full, relays, hint, requestDevice{added: rd.added}, data)
 		}
-		s.log.Warn("access: cannot issue AWG credentials for a Mihomo subscription", "user", u.ID, "err", err)
+		s.log.Warn("access: cannot issue AWG credentials for a Mihomo subscription", "code", "mihomo_awg_credential_issue_failed", "user", u.ID, "err", err)
 		return rd, ""
 	}
 	for _, profileID := range result.FullProfiles {
-		s.log.Warn("access: AWG profile network is full for a Mihomo subscription", "user", u.ID, "profile", profileID, "err", store.ErrAccessSubnetFull)
+		s.log.Warn("access: AWG profile network is full for a Mihomo subscription", "code", "mihomo_awg_network_full", "user", u.ID, "profile", profileID, "err", store.ErrAccessSubnetFull)
+	}
+	for _, full := range result.FullPaths {
+		s.log.Warn("access: AWG path key network is full for a Mihomo subscription", "code", "awg_path_network_full", "user", u.ID, "profile", full.ProfileID, "path", full.Path, "err", store.ErrAccessSubnetFull)
+	}
+	for _, failed := range result.FailedPaths {
+		s.log.Warn("access: cannot issue an AWG path key for a Mihomo subscription", "code", "awg_path_credential_issue_failed", "user", u.ID, "profile", failed.ProfileID, "path", failed.Path, "err", failed.Err)
 	}
 	if result.Device.ID == "" {
 		return rd, ""
@@ -867,12 +1250,16 @@ func (s *Service) ensureMihomoAWG(ctx context.Context, u store.AccessUser, g sto
 // deviceTouchEvery is how stale a device's last_seen_at must be before a subscription fetch refreshes it.
 const deviceTouchEvery = time.Hour
 
+// clientTouchEvery is the same for a device of the client API, which syncs by itself about hourly: a write at most this often per
+// device keeps last_seen_at current without a write per request.
+const clientTouchEvery = 10 * time.Minute
+
 // touchDevice records a fetch on the device, off the request path and at most once per device at a time. The
 // fetch is read-only by design: it is open to anyone holding a link, and a write per request would queue on the
 // single writer connection that stats ingestion and the admin share. Only a stale last_seen_at (decided from the
 // row the fetch already read) gets here, so a device is written about once an hour; a busy writer delays only
 // this goroutine, never the response.
-func (s *Service) touchDevice(id string, now time.Time, m deviceMeta) {
+func (s *Service) touchDevice(id string, now time.Time, m deviceMeta, every time.Duration) {
 	if _, busy := s.touching.LoadOrStore(id, struct{}{}); busy {
 		return
 	}
@@ -889,22 +1276,38 @@ func (s *Service) touchDevice(id string, now time.Time, m deviceMeta) {
 		}()
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		if err := s.st.Access().TouchDevice(ctx, id, now, now.Add(-deviceTouchEvery), m.OSVersion, m.Client); err != nil {
-			s.log.Warn("access: cannot record subscription fetch", "err", err)
+		if err := s.st.Access().TouchDevice(ctx, id, now, now.Add(-every), m.OSVersion, m.Client); err != nil {
+			s.log.Warn("access: cannot record subscription fetch", "code", "subscription_device_touch_failed", "err", err)
 		}
 	})
 }
 
+// SetSnapshotHookForTest runs hook between a subscription view's read of the person's state and the writes that follow it: the
+// window in which another request can enrol a device.
+func (s *Service) SetSnapshotHookForTest(hook func()) { s.snapshotHookForTest = hook }
+
 // SetTouchHookForTest observes when an asynchronous subscription touch starts and finishes.
 func (s *Service) SetTouchHookForTest(hook func(started bool)) { s.touchHookForTest = hook }
 
-// usable is the subscription half of the effective-access rule: the user's group holds the profile, the
+// usable is the subscription half of the effective-access rule: one of the user's groups holds the profile and gets the node, the
 // node is selected and live, the inbound is on and not failed, and an enabled app consumes the protocol.
-func (s *Service) usable(f store.AccessInboundFull, g store.AccessGroup, u store.AccessUser) bool {
-	return liveInbound(f) &&
-		slices.Contains(g.ProfileIDs, f.Profile.ID) &&
-		(u.AllNodes || slices.Contains(u.NodeIDs, f.Node.ID)) &&
-		s.allowed(f.Profile.Protocol, u.AppHapp, u.AppAmnezia)
+func (s *Service) usable(f store.AccessInboundFull, gs store.AccessGroups, u store.AccessUser) bool {
+	return s.usableForFormat(f, gs, u, plugin.FormatURIList)
+}
+
+// usableForFormat is usable for a subscription of the given format: the Mistgate app's format also carries the protocols that
+// only that app consumes (while the person's Mistgate switch is on); every other format leaves them out.
+func (s *Service) usableForFormat(f store.AccessInboundFull, gs store.AccessGroups, u store.AccessUser, format plugin.ClientFormat) bool {
+	if !liveInbound(f) || !gs.Gives(f.Profile.ID, f.Node.ID) || !(u.AllNodes || slices.Contains(u.NodeIDs, f.Node.ID)) {
+		return false
+	}
+	if format == plugin.FormatTTLink {
+		return u.AppTrustTunnel && s.allowed(f.Profile.Protocol, false, false, false, true)
+	}
+	if s.allowed(f.Profile.Protocol, u.AppHapp, u.AppAmnezia, u.AppTelegram, false) {
+		return true
+	}
+	return format == plugin.FormatMistgate && !u.AppMistgateOff && s.mistgateConsumes(f.Profile.Protocol)
 }
 
 // liveInbound: the inbound is on and not failed, on an enrolled node (the part of usable that is not about the user).
@@ -914,16 +1317,22 @@ func liveInbound(f store.AccessInboundFull) bool {
 
 // accessOf is what the user's page offers by app (User.access_happ / access_amnezia): SubView's AccessHapp and
 // AccessAmnezia, without the status.
-func (s *Service) accessOf(u store.AccessUser, g store.AccessGroup, full []store.AccessInboundFull) (happ, amnezia bool) {
+func (s *Service) accessOf(u store.AccessUser, gs store.AccessGroups, full []store.AccessInboundFull) (happ, amnezia, telegram, trustTunnel bool) {
 	for _, f := range full {
-		if !s.usable(f, g, u) {
+		linkUsable := s.usable(f, gs, u)
+		ttUsable := s.usableForFormat(f, gs, u, plugin.FormatTTLink)
+		if !linkUsable && !ttUsable {
 			continue
 		}
 		if p, ok := s.reg.Get(f.Profile.Protocol); ok {
-			h, a, _ := clientApps(p)
-			happ = happ || h && u.AppHapp
-			amnezia = amnezia || a && u.AppAmnezia
+			h, a, t, tt, _ := clientApps(p)
+			if linkUsable {
+				happ = happ || h && u.AppHapp
+				amnezia = amnezia || a && u.AppAmnezia
+				telegram = telegram || t && u.AppTelegram
+			}
+			trustTunnel = trustTunnel || ttUsable && tt && u.AppTrustTunnel
 		}
 	}
-	return happ, amnezia
+	return happ, amnezia, telegram, trustTunnel
 }

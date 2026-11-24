@@ -46,10 +46,53 @@ type unknownPeerSource interface {
 	TakeUnknownPeers(name string) uint32
 }
 
+// unknownPeerWatcher subscribes to kernel notifications for the lifetime of a debug capture.
+type unknownPeerWatcher interface {
+	WatchUnknownPeers(fn func(ifname string)) func()
+}
+
 const unknownInitiationLogFormat = "Received invalid initiation message from %s"
 
 func isUnknownInitiationLog(format string) bool {
 	return format == unknownInitiationLogFormat
+}
+
+// handshakeSource reports, per peer, the handshake initiations that reached the interface and the responses it sent since
+// the last call (agent.proto LinkCounters, links/3). Only the userspace backend has one: the kernel module's netlink
+// statistics carry the last handshake time and the byte counters of a peer, and its "auth" multicast group reports unknown
+// keys only, so nothing there tells an initiation from a response (the engine then leaves the counters zero and the panel
+// reads the backend from AwgHealth to say "not known").
+type handshakeSource interface {
+	TakeHandshakes(name string, keys [][32]byte) map[[32]byte]handshakeCounts
+}
+
+type handshakeCounts struct {
+	initiations, responses uint32
+}
+
+// The pinned amneziawg-go templates (device/receive.go, device/noise-protocol.go and device/send.go), whose first argument
+// is the *device.Peer: a valid initiation of a known key (and its replays and floods, refused before an answer), the
+// response the device starts to send, and the two ways that response fails to leave.
+const (
+	initiationLogFormat       = "%v - Received handshake initiation"
+	initiationReplayLogFormat = "%v - ConsumeMessageInitiation: handshake replay @ %v"
+	initiationFloodLogFormat  = "%v - ConsumeMessageInitiation: handshake flood"
+	responseLogFormat         = "%v - Sending handshake response"
+	responseCreateFailFormat  = "%v - Failed to create response message: %v"
+	responseSendFailFormat    = "%v - Failed to send handshake response: %v"
+)
+
+// handshakeLogKind is +1 for an initiation, +2 for a response sent and -2 for a response that did not leave, 0 otherwise.
+func handshakeLogKind(format string) int {
+	switch format {
+	case initiationLogFormat, initiationReplayLogFormat, initiationFloodLogFormat:
+		return 1
+	case responseLogFormat:
+		return 2
+	case responseCreateFailFormat, responseSendFailFormat:
+		return -2
+	}
+	return 0
 }
 
 // userspaceErrorLogMessage keeps the live log's formatted text and returns the template for the private journal.
@@ -67,5 +110,8 @@ type BackendStatus struct {
 	Name      string // "kernel" | "userspace"; "" when unavailable
 	Version   string
 	Available bool
-	Reason    string // when unavailable: a short English fact, e.g. "no /dev/net/tun"
+	// Fallback: the setting is "kernel", the module does not load and userspace serves instead. Reason then says why the
+	// module is not used. The engine stays on userspace until it is built again (never by itself, choose.go).
+	Fallback bool
+	Reason   string // when unavailable (or Fallback): a short English fact, e.g. "no /dev/net/tun"
 }

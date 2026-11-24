@@ -1,5 +1,6 @@
 ---
 title: 常见问题
+seoTitle: "Mistgate 常见问题：Docker、内存、迁移、许可证"
 description: 关于 Mistgate 常见问题的简短回答：Docker、内存、应用、规模、IPv6、Cloudflare、迁移、许可证以及问题反馈渠道。
 ---
 
@@ -18,8 +19,22 @@ Mistgate 由两个静态 Go 二进制文件组成：内嵌 SQLite 数据库和�
 
 - **Hysteria2 和 VLESS**：使用 Happ 等订阅类应用（获取 URI 列表），或使用基于 mihomo 内核的应用，例如 kl!ck、Clash Verge 或 FlClash（获取 Mihomo YAML 配置）。在浏览器中打开链接会进入该用户的页面，其中包含使用说明。
 - **AmneziaWG**：使用 AmneziaVPN 应用，每台设备单独使用密钥；kl!ck 和其他基于 mihomo 内核的应用通过订阅获取配置。
+- **MTProto**（实验性）：Telegram 应用，使用用户页面中的 `tg://proxy` 链接；没有任何订阅包含它。
+- **TrustTunnel**（实验性）：官方 TrustTunnel 应用（所有平台和路由器），使用用户页面中的 `tt://` 链接或二维码；没有任何订阅包含它。Mistgate 应用直接获取它。
 
 带有自签名证书的 Hysteria2 协议配置已使用官方 Hysteria2 客户端和 Mihomo 验证；尚未使用 Happ 验证。Xray JSON 和 sing-box JSON 格式也已提供；sing-box 不支持自签名的 Hysteria2 证书和 XHTTP（参见[各格式支持哪些协议配置](../guide/subscriptions.md#各格式支持哪些协议配置)）。参见[订阅](../guide/subscriptions.md)和[客户端应用](../guide/client-apps.md)：Mistgate 推荐在 Windows 和 macOS 上使用 kl!ck。
+
+## Mistgate 可以作为 Telegram 的代理吗？
+
+可以，作为实验性的协议配置提供：[MTProto](../guide/mtproto.md)。节点会成为使用 Fake TLS 的 Telegram 代理，开启了 **Telegram 代理**开关的每位用户都会在自己的页面上获得一个密钥和 `tg://proxy` 链接。它只服务于 Telegram 应用，不服务于其他应用，链接也绝不会写入订阅。Telegram 须与 Happ 或 AmneziaVPN 一起使用：用户不能只有代理。
+
+## TrustTunnel 是什么，它能更好地通过封锁吗？
+
+[TrustTunnel](../guide/trusttunnel.md) 是运行在普通 HTTPS 之上、使用真实证书的实验性 VPN，各平台和路由器都有官方应用。它并不是绕过 VLESS 或 Hysteria2 通不过的封锁的办法：在 HTTP/2 上，数据流在最初几 KB 之后会在“16 KB 后冻结”规则下冻结，与任何 TCP 数据流一样（HTTP/3 走 UDP，可以通过），而且 TLS 套 TLS 能被流量分析看出来。选择它是为了官方应用和路由器，并请在重要的网络上验证。
+
+## Telegram 代理在俄罗斯能用吗？
+
+可能不能。自 2026 年春季起，MTProto 代理在俄罗斯一直被成批地检测并封锁，所以一个代理可能用一阵子就失效。面板的检测从境外发起：绿色检测结果只能说明节点在工作，不能说明俄罗斯的网络会放行该代理。请让处于相关网络的用户实际测试，并保留一个 VPN 协议配置作为主要手段。
 
 ## 可以管理多少用户和节点？
 
@@ -31,6 +46,7 @@ Mistgate 由两个静态 Go 二进制文件组成：内嵌 SQLite 数据库和�
 - WARP 使用 IPv4 端点，因此没有 IPv6 的节点也可以使用 WARP。
 - 面板会监听 `--listen` 指定的地址；`:443` 同时覆盖 IPv4 和 IPv6。
 - 速率限制和登录锁定会将一个 IPv6 /64 视为一个客户端。
+- IPv6 可用的节点还可以提供 [IPv6 入口](../guide/nodes.md#ipv6-入口)：在它的 IPv6 地址上多一个服务器，供所在网络封锁了该节点 IPv4 地址的用户使用。
 
 ## 面板可以运行在 Cloudflare 代理之后吗？
 
@@ -44,7 +60,7 @@ Mistgate 由两个静态 Go 二进制文件组成：内嵌 SQLite 数据库和�
 
 ## 面板可以不使用服务器，直接运行在 Cloudflare Workers 上吗？
 
-可以作为预览版使用：`mistgate edge deploy` 会将面板部署到 Cloudflare 账户中的六个 Worker 和一个 D1 数据库。它需要 Workers Paid 计划和 Cloudflare DNS 中的域名。告警、Telegram 和节点更新均可使用；备份、MCP、隧道检测、节点实时日志（已保存的运行记录可用）以及从管理后台更新面板本身暂不支持。参见[安装 Cloudflare 版](../getting-started/install-edge.md)。
+可以作为预览版使用：`mistgate edge deploy` 会将面板部署到 Cloudflare 账户中的六个 Worker 和一个 D1 数据库。它需要 Workers Paid 计划和 Cloudflare DNS 中的域名。告警、Telegram 和节点更新均可使用；备份、MCP、助手、隧道检测、节点实时日志（已保存的运行记录可用）以及从管理后台更新面板本身暂不支持。参见[安装 Cloudflare 版](../getting-started/install-edge.md)。
 
 ## 可以从其他面板迁移吗？
 

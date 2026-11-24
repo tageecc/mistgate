@@ -6,6 +6,8 @@
 //
 //	go build -o bin/mistgate ./cmd/mistgate && go run ./scripts/e2e/mcpe2e -bin bin/mistgate        # both admin modes
 //	scripts/e2e-mcp.sh                                                                                   # the same, builds first
+//	scripts/dev-fleet.sh --mcp-e2e                                                                     # every read tool on the dev fleet
+//	scripts/e2e/censor.sh                                                                               # diagnosis assertions on the censor lab
 //
 // -mode listener|prefix|both: the admin on its own listener (`setup --admin-listen`, the dev layout), or on the public
 // listener under a secret path prefix (the production layout, where /mcp outside the prefix must be the decoy).
@@ -32,6 +34,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -42,9 +45,25 @@ import (
 )
 
 var (
-	binPath = flag.String("bin", "", "path to the mistgate binary (required)")
-	mode    = flag.String("mode", "both", "listener, prefix or both")
-	keep    = flag.Bool("keep", false, "keep the temp dir (logs, database)")
+	binPath          = flag.String("bin", "", "path to the mistgate binary (required)")
+	mode             = flag.String("mode", "both", "listener, prefix or both")
+	keep             = flag.Bool("keep", false, "keep the temp dir (logs, database)")
+	externalURL      = flag.String("url", "", "an already running panel's admin URL (external MCP mode)")
+	tokenFile        = flag.String("token-file", "", "file containing an MCP bearer token or mcptoken output line")
+	secretFile       = flag.String("secret-file", "", "optional owner.env or newline-delimited secrets file to scan")
+	addresses        = flag.String("addresses", "", "comma-separated node addresses that must not appear in tool output")
+	sweep            = flag.Bool("sweep", false, "call every non-plan/apply tool on an already running panel")
+	diagnose         = flag.String("diagnose", "", "call block_diagnosis for this node on an already running panel")
+	callTool         = flag.String("call-tool", "", "call one named MCP tool on an already running panel")
+	callArgs         = flag.String("call-args", "{}", "JSON object of arguments for -call-tool")
+	callResultFile   = flag.String("call-result-file", "", "write the raw MCP tool result to this file")
+	country          = flag.String("country", "", "country for -diagnose")
+	wantClass        = flag.String("expect-class", "", "expected block class for -diagnose")
+	wantScope        = flag.String("expect-scope", "", "expected scope for -diagnose")
+	minConfidence    = flag.String("min-confidence", "", "minimum confidence: low, medium, high")
+	withAccessReport = flag.Bool("access-report", false, "also call access_report and assert the diagnosis is present")
+	caseLabel        = flag.String("case", "", "scenario label for external diagnosis output")
+	resultFile       = flag.String("result-file", "", "write external diagnosis assertion JSON to this file")
 
 	results []result
 	cleanup func() // stops the panel and removes its data; fatal runs it before it exits
@@ -59,6 +78,17 @@ type result struct {
 
 func main() {
 	flag.Parse()
+	if *externalURL != "" {
+		if err := runExternal(); err != nil {
+			fmt.Fprintln(os.Stderr, "mcpe2e:", err)
+			failed = true
+		}
+		printResults()
+		if failed {
+			os.Exit(1)
+		}
+		return
+	}
 	if *binPath == "" {
 		fmt.Fprintln(os.Stderr, "usage: mcpe2e -bin <mistgate binary> [-mode listener|prefix|both] [-keep]")
 		os.Exit(2)
@@ -83,13 +113,21 @@ func main() {
 			failed = true
 		}
 	}
-	fmt.Printf("\n%-9s %-4s %s\n", "mode", "", "check")
+	printResults()
+	if failed {
+		fmt.Println("\nFAILED")
+		os.Exit(1)
+	}
+}
+
+func printResults() {
+	fmt.Printf("\n%-12s %-4s %s\n", "scenario", "", "check")
 	for _, r := range results {
 		st := "PASS"
 		if !r.ok {
 			st = "FAIL"
 		}
-		fmt.Printf("%-9s %-4s %s", r.mode, st, r.name)
+		fmt.Printf("%-12s %-4s %s", r.mode, st, r.name)
 		if r.detail != "" {
 			fmt.Printf("  [%s]", r.detail)
 		}
@@ -97,9 +135,327 @@ func main() {
 	}
 	if failed {
 		fmt.Println("\nFAILED")
-		os.Exit(1)
+	} else {
+		fmt.Printf("\nall %d checks passed\n", len(results))
 	}
-	fmt.Printf("\nall %d checks passed\n", len(results))
+}
+
+// runExternal is the same MCP client and tool layer as the self-hosted harness, aimed at a panel that is already running.
+// It is used by the censorship lab and by the release dev-fleet sweep.
+func runExternal() error {
+	modes := 0
+	if *sweep {
+		modes++
+	}
+	if *diagnose != "" {
+		modes++
+	}
+	if *callTool != "" {
+		modes++
+	}
+	if *tokenFile == "" || modes != 1 {
+		return errors.New("external mode needs -token-file and exactly one of -sweep, -diagnose or -call-tool")
+	}
+	admin := *externalURL
+	if !strings.HasSuffix(admin, "/") {
+		admin += "/"
+	}
+	raw, err := os.ReadFile(*tokenFile)
+	if err != nil {
+		return fmt.Errorf("read token file: %w", err)
+	}
+	token := strings.TrimSpace(string(raw))
+	if m := regexp.MustCompile(`Authorization: Bearer (tk1_[A-Za-z0-9_-]{43})`).FindStringSubmatch(token); m != nil {
+		token = m[1]
+	}
+	if !regexp.MustCompile(`^tk1_[A-Za-z0-9_-]{43}$`).MatchString(token) {
+		return errors.New("token file must contain an MCP token or mcptoken output")
+	}
+	e := &env{mode: "fleet", admin: admin, secrets: map[string]string{}, fixtureAddress: ""}
+	e.secrets["MCP token"] = token
+	if *secretFile != "" {
+		b, err := os.ReadFile(*secretFile)
+		if err != nil {
+			return fmt.Errorf("read secret file: %w", err)
+		}
+		for _, line := range strings.Split(string(b), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			if i := strings.IndexByte(line, '='); i >= 0 {
+				line = strings.Trim(strings.TrimSpace(line[i+1:]), "\"'")
+			}
+			if len(line) >= 8 {
+				e.secrets[fmt.Sprintf("owner secret %d", len(e.secrets))] = line
+			}
+		}
+	}
+	for _, addr := range strings.Split(*addresses, ",") {
+		if addr = strings.TrimSpace(addr); addr != "" {
+			e.secrets["node address "+addr] = addr
+		}
+	}
+	s, err := e.connect(token)
+	if err != nil {
+		e.check("connect to running panel", false, "%v", err)
+		return nil
+	}
+	defer s.Close()
+	e.check("connect to running panel", true, "%s", admin)
+	if *sweep {
+		runExternalSweep(e, s)
+	} else if *diagnose != "" {
+		runExternalDiagnosis(e, s)
+	} else {
+		runExternalCall(e, s)
+	}
+	text := e.leakScan.String()
+	var hits []string
+	for name, secret := range e.secrets {
+		if strings.HasPrefix(name, "node address ") {
+			if strings.Contains(text, secret) {
+				hits = append(hits, name)
+			}
+			continue
+		}
+		if len(secret) >= 8 && strings.Contains(text, secret) {
+			hits = append(hits, name)
+		}
+	}
+	e.check("no managed secret or node address in MCP results", len(hits) == 0, "%v", hits)
+	return nil
+}
+
+func runExternalCall(e *env, s *sdk.ClientSession) {
+	args := map[string]any{}
+	if err := json.Unmarshal([]byte(*callArgs), &args); err != nil {
+		e.check(*callTool, false, "invalid -call-args JSON: %v", err)
+		return
+	}
+	got, isErr, err := e.call(s, *callTool, args)
+	if *callResultFile != "" {
+		if writeErr := os.WriteFile(*callResultFile, []byte(got+"\n"), 0o600); writeErr != nil {
+			e.check(*callTool, false, "write MCP result: %v", writeErr)
+			return
+		}
+	}
+	e.check(*callTool, err == nil && !isErr, "tool error=%v protocol error=%v result=%s", isErr, err != nil, got)
+}
+
+func runExternalDiagnosis(e *env, s *sdk.ClientSession) {
+	r := diagnosisResult{Scenario: *caseLabel, Expected: *wantClass, Scope: *wantScope, Confidence: "unknown"}
+	if r.Scenario == "" {
+		r.Scenario = *diagnose
+	}
+	args := map[string]any{"node": *diagnose}
+	if *country != "" {
+		args["country"] = *country
+	}
+	args["hours"] = 24
+	got, isErr, err := e.call(s, "block_diagnosis", args)
+	if err != nil || isErr {
+		e.check("block_diagnosis", false, "%s", got)
+		writeDiagnosisResult(r)
+		return
+	}
+	class, scope, confidence, found := diagnosis(got, *diagnose, *wantClass)
+	r.Got, r.GotScope, r.Confidence = class, scope, confidence
+	ok := found
+	if *wantScope != "" {
+		ok = ok && scope == *wantScope
+	}
+	if *minConfidence != "" {
+		ok = ok && confidenceRank(confidence) >= confidenceRank(*minConfidence)
+	}
+	e.check("block_diagnosis", ok, "expected %s/%s min %s; got %s/%s %s", *wantClass, *wantScope, *minConfidence, class, scope, confidence)
+	r.Pass = ok
+	if *withAccessReport {
+		got, isErr, err = e.call(s, "access_report", args)
+		if err != nil || isErr {
+			e.check("access_report", false, "%s", got)
+			r.Pass = false
+			writeDiagnosisResult(r)
+			return
+		}
+		ac, as, found := diagnosisInAccessReport(got, *diagnose, *wantClass)
+		if *wantScope != "" {
+			found = found && as == *wantScope
+		}
+		e.check("access_report", found, "expected %s/%s; got %s/%s", *wantClass, *wantScope, ac, as)
+		r.Pass = r.Pass && found
+	}
+	writeDiagnosisResult(r)
+}
+
+type diagnosisResult struct {
+	Scenario   string `json:"scenario"`
+	Expected   string `json:"expected"`
+	Scope      string `json:"scope"`
+	Got        string `json:"got"`
+	GotScope   string `json:"got_scope"`
+	Confidence string `json:"confidence"`
+	Pass       bool   `json:"pass"`
+}
+
+func writeDiagnosisResult(r diagnosisResult) {
+	if *resultFile == "" {
+		return
+	}
+	b, err := json.Marshal(r)
+	if err == nil {
+		err = os.WriteFile(*resultFile, append(b, '\n'), 0o600)
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "mcpe2e: write diagnosis result:", err)
+		failed = true
+	}
+}
+
+func diagnosis(raw, node, class string) (gotClass, scope, confidence string, found bool) {
+	var v struct {
+		Nodes []struct {
+			Node    string `json:"node"`
+			Classes []struct {
+				Class      string `json:"class"`
+				Scope      string `json:"scope"`
+				Confidence string `json:"confidence"`
+			} `json:"classes"`
+		} `json:"nodes"`
+	}
+	if json.Unmarshal([]byte(raw), &v) != nil {
+		return "", "", "", false
+	}
+	for _, n := range v.Nodes {
+		if n.Node != node {
+			continue
+		}
+		for _, c := range n.Classes {
+			if class == "" || c.Class == class {
+				return c.Class, c.Scope, c.Confidence, true
+			}
+		}
+	}
+	return "", "", "", false
+}
+
+func diagnosisInAccessReport(raw, node, class string) (gotClass, scope string, found bool) {
+	var v struct {
+		BlockDiagnosis []struct {
+			Node    string `json:"node"`
+			Classes []struct {
+				Class string `json:"class"`
+				Scope string `json:"scope"`
+			} `json:"classes"`
+		} `json:"block_diagnosis"`
+	}
+	if json.Unmarshal([]byte(raw), &v) != nil {
+		return "", "", false
+	}
+	for _, n := range v.BlockDiagnosis {
+		if n.Node != node {
+			continue
+		}
+		for _, c := range n.Classes {
+			if class == "" || c.Class == class {
+				return c.Class, c.Scope, true
+			}
+		}
+	}
+	return "", "", false
+}
+
+func confidenceRank(c string) int {
+	switch c {
+	case "low":
+		return 1
+	case "medium":
+		return 2
+	case "high":
+		return 3
+	default:
+		return 0
+	}
+}
+
+func runExternalSweep(e *env, s *sdk.ClientSession) {
+	args := externalReadArgs()
+	needsFixture := externalFixtureTools()
+	names, _, err := toolNames(s)
+	if err != nil {
+		e.check("list tools", false, "%v", err)
+		return
+	}
+	slices.Sort(names)
+	var uncovered []string
+	var readTools []string
+	for _, name := range names {
+		if isWrite(name) {
+			continue
+		}
+		readTools = append(readTools, name)
+		if _, ok := args[name]; !ok && !needsFixture[name] {
+			uncovered = append(uncovered, name)
+		}
+	}
+	// Run the bounded live check last: its production gate refuses a node probed in the previous 30 seconds.
+	if i := slices.Index(readTools, "checks_run_now"); i >= 0 && i < len(readTools)-1 {
+		readTools = append(readTools[:i], readTools[i+1:]...)
+		readTools = append(readTools, "checks_run_now")
+	}
+	e.check("every read tool has sweep arguments", len(uncovered) == 0, "%v", uncovered)
+	for _, name := range readTools {
+		a := args[name]
+		if a == nil {
+			a = map[string]any{}
+		}
+		text, isErr, err := e.call(s, name, a)
+		// the live check's gate refuses a node whose checks ran in the last 30 s, the panel's own rounds included: wait it out once
+		if isErr && (strings.Contains(text, "checks_recent") || strings.Contains(text, "less than 30 seconds ago")) {
+			time.Sleep(31 * time.Second)
+			text, isErr, err = e.call(s, name, a)
+		}
+		ok := err == nil && (!isErr || needsFixture[name])
+		detail := ""
+		if isErr && !ok {
+			detail = ": " + text[:min(len(text), 200)]
+		}
+		e.check(name, ok, "tool error=%v protocol error=%v%s", isErr, err != nil, detail)
+		time.Sleep(500 * time.Millisecond) // the token allows 120 MCP requests per minute
+	}
+}
+
+func externalReadArgs() map[string]map[string]any {
+	return map[string]map[string]any{
+		"fleet_status": {}, "node_get": {"node": "de1"}, "nodes_get": {}, "node_metrics": {"node": "de1"}, "node_doctor": {"node": "de1"}, "node_ports": {"node": "de1"}, "warp_status": {},
+		"users_search": {}, "groups_list": {}, "group_get": {"group_id": "grp_missing"}, "user_get": {"user_id": "usr_missing"}, "user_traffic": {"user_id": "usr_missing"},
+		"user_devices": {"user_id": "usr_missing"}, "user_connection": {"user_id": "usr_missing"}, "subscription_preview": {"user_id": "usr_missing"},
+		"subscription_settings_get": {}, "alerts_list": {"include_history": true}, "events_search": {}, "checks_results": {"daily_days": 7},
+		"checks_run_now": {"node": "de1"}, "health_summary": {}, "klick_reports": {}, "reachability_history": {}, "node_connections": {"node": "de1"},
+		"fleet_connections": {}, "node_journal": {"node": "de1"}, "audit_search": {"hours": 24}, "updates_status": {}, "backup_status": {}, "dns_presets_list": {},
+		"profiles_list": {}, "protocols_list": {}, "relays_list": {}, "node_server_access_list": {}, "node_server_keys_list": {"node": "de1"},
+		"node_ipv6_check": {"node": "de1"}, "relay_candidates": {"node": "de1"}, "dns_preset_get": {"id": "dns_missing"}, "profile_get": {"profile_id": "prf_missing"}, "relay_check": {"relay_id": "rly_missing"},
+		"timeline": {"hours": 24}, "fleet_digest": {}, "user_diagnose": {"user_id": "usr_missing"}, "node_runtime": {}, "path_loss_matrix": {"hours": 24},
+		"path_probe": {"from": "de1", "to": "nl1", "kind": "udp"}, "node_trace": {"from": "de1", "to": "nl1"}, "node_dns_check": {"node": "de1"}, "node_neighbor_sites": {"node": "de1", "stored_only": true},
+		"panel_logs": {"min_level": "debug"}, "retention_status": {}, "access_report": {}, "block_diagnosis": {}, "node_debug_logs": {"node": "de1"}, "capacity_report": {"hours": 24}, "panel_resources": {},
+		"tasks_list": {}, "task_get": {"task_id": "tsk_missing"}, "task_runs": {"task_id": "tsk_missing"}, "task_run_now": {"task_id": "tsk_missing"},
+		"os_updates_status": {}, "client_api_settings": {}, "outdated_devices": {},
+		"decoy_sites_list": {}, "decoy_site_get": {"site_id": "dsi_missing"}, "decoy_site_file": {"site_id": "dsi_missing", "path": "index.html"},
+		"path_speed_results": {}, "subscription_mihomo_template_get": {"name": "missing"},
+	}
+}
+
+func externalFixtureTools() map[string]bool {
+	return map[string]bool{
+		"node_metrics": true, "node_doctor": true, "checks_results": true, "node_ipv6_check": true, "relay_candidates": true,
+		"node_connections": true, "node_server_keys_list": true, "dns_preset_get": true, "profile_get": true, "relay_check": true, "node_ports": true,
+		"warp_status": true, "nodes_get": true, "user_get": true, "user_traffic": true, "user_devices": true, "user_connection": true,
+		"subscription_preview": true, "group_get": true, "user_diagnose": true,
+		"task_get": true, "task_runs": true, "task_run_now": true,
+		"node_debug_logs":     true, // a capture is created only by the mutating node_debug_capture tool
+		"node_neighbor_sites": true, // the sweep reads the stored result only; a node that was never scanned is a clean answer
+		"decoy_site_get":      true, "decoy_site_file": true, "subscription_mihomo_template_get": true,
+	}
 }
 
 func fatal(err error) {
@@ -428,6 +784,11 @@ func toolNames(s *sdk.ClientSession) (names []string, descs map[string]string, e
 // call returns the text of a tool result; err is a protocol error (unknown tool), isErr the tool's own error.
 func (e *env) call(s *sdk.ClientSession, name string, args map[string]any) (text string, isErr bool, err error) {
 	r, err := s.CallTool(context.Background(), &sdk.CallToolParams{Name: name, Arguments: args})
+	// a token's burst is 30 requests: the harness walks every read tool, so it waits out a refusal instead of failing on it
+	for try := 0; err != nil && strings.Contains(err.Error(), "Too Many Requests") && try < 10; try++ {
+		time.Sleep(2 * time.Second)
+		r, err = s.CallTool(context.Background(), &sdk.CallToolParams{Name: name, Arguments: args})
+	}
 	if err != nil {
 		return err.Error(), true, err
 	}
@@ -449,7 +810,34 @@ func (e *env) mustCall(s *sdk.ClientSession, name string, args map[string]any) s
 	return t
 }
 
-func isWrite(n string) bool { return strings.HasSuffix(n, "_plan") || strings.HasSuffix(n, "_apply") }
+// sameNames compares two tool lists as sets.
+func sameNames(a, b []string) bool { return len(diffNames(a, b)) == 0 && len(diffNames(b, a)) == 0 }
+
+// diffNames is the names of a that b lacks.
+func diffNames(a, b []string) []string {
+	var out []string
+	for _, n := range a {
+		if !contains(b, n) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+func contains(s []string, x string) bool {
+	for _, v := range s {
+		if v == x {
+			return true
+		}
+	}
+	return false
+}
+
+// isWrite: a plan, an apply, or a write that needs no plan (the operator's free tools): none of them is a read.
+func isWrite(n string) bool {
+	k := mcp.KindOf(n)
+	return k == mcp.KindPlan || k == mcp.KindApply || n == "decoy_site_draft_save"
+}
 
 // ------------------------------------------------------------------------------------------------ the scenario
 
@@ -557,7 +945,15 @@ func (e *env) scenario() {
 	roN, roD, _ := toolNames(ro)
 	opN, _, _ := toolNames(op)
 	adN, _, _ := toolNames(ad)
-	e.check("tool counts per profile 15 / 33 / 57", len(roN) == 15 && len(opN) == 33 && len(adN) == 57, "%d / %d / %d", len(roN), len(opN), len(adN))
+	// The counts are not written down here: each profile must serve exactly the tools of the registry.
+	wantRO, wantOP, wantAD := mcp.ToolNames(mcp.ProfileReadonly), mcp.ToolNames(mcp.ProfileOperator), mcp.ToolNames(mcp.ProfileAdmin)
+	e.check(fmt.Sprintf("tools per profile match the registry (%d / %d / %d)", len(wantRO), len(wantOP), len(wantAD)),
+		sameNames(roN, wantRO) && sameNames(opN, wantOP) && sameNames(adN, wantAD),
+		"served %d / %d / %d; registry-only %v; served-only %v", len(roN), len(opN), len(adN),
+		diffNames(wantAD, adN), diffNames(adN, wantAD))
+	for _, name := range []string{"rollout_start_plan", "node_server_keys_add_plan", "node_server_keys_add_apply", "os_rollout_start_plan", "os_rollout_start_apply", "os_rollout_pause_plan", "os_rollout_pause_apply", "os_rollout_resume_plan", "os_rollout_resume_apply", "os_rollout_cancel_plan", "os_rollout_cancel_apply"} {
+		e.check("admin tool list includes "+name, slices.Contains(adN, name), "")
+	}
 	writes := 0
 	for _, n := range roN {
 		if isWrite(n) {
@@ -587,7 +983,7 @@ func (e *env) scenario() {
 	} else {
 		n, _, _ := toolNames(ps)
 		fs, isErr, _ := e.call(ps, "fleet_status", map[string]any{})
-		e.check("`mistgate mcp` stdio proxy: 15 tools, fleet_status answers", len(n) == 15 && !isErr && strings.Contains(fs, "nodes_total"), "%d tools", len(n))
+		e.check(fmt.Sprintf("`mistgate mcp` stdio proxy: %d tools, fleet_status answers", len(wantRO)), sameNames(n, wantRO) && !isErr && strings.Contains(fs, "nodes_total"), "%d tools", len(n))
 		ps.Close()
 		e.check("the proxy never prints the token", !strings.Contains(perrBuf.String(), roSecret), "")
 	}
@@ -596,33 +992,115 @@ func (e *env) scenario() {
 		ps2, err := e.stdio(adSecret, &b2)
 		if err == nil {
 			n, _, _ := toolNames(ps2)
-			e.check("stdio proxy with an admin token: 46 tools", len(n) == 46, "%d", len(n))
+			e.check(fmt.Sprintf("stdio proxy with an admin token: %d tools", len(wantAD)), sameNames(n, wantAD), "%d", len(n))
 			ps2.Close()
 		} else {
 			e.check("stdio proxy with an admin token", false, "%v", err)
 		}
 	}
 
-	// -- every read tool, as admin (the scan for secrets reads these)
-	allReads := map[string]map[string]any{
-		"fleet_status": {}, "node_get": {"node": "de1"}, "node_metrics": {"node": "de1"}, "node_doctor": {"node": "de1"},
-		"users_search": {}, "groups_list": {}, "user_get": {"user_id": userIDs[0]}, "user_traffic": {"user_id": userIDs[0]},
-		"user_devices": {"user_id": userIDs[0]}, "subscription_preview": {"user_id": userIDs[0]}, "alerts_list": {"include_history": true},
-		"events_search": {}, "checks_results": {}, "audit_search": {}, "updates_status": {},
+	// -- scripts/e2e/mcp-token.sh's helper: a coding agent's way to a token on a test panel (the owner's session and a step-up)
+	{
+		cmd := exec.Command("go", "run", "./scripts/e2e/mcptoken", "-profile", "readonly", "-name", "e2e-agent")
+		cmd.Env = append(os.Environ(), "MG_ADMIN_URL="+e.admin, "MG_OWNER_COOKIE="+e.cookie, "MG_TOTP_SECRET="+e.totp)
+		var so, se bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &so, &se
+		err := cmd.Run()
+		m := regexp.MustCompile(`^claude mcp add --transport http mistgate (\S+)mcp --header "Authorization: Bearer (tk1_[A-Za-z0-9_-]{43})"\s*$`).FindStringSubmatch(so.String())
+		e.check("mcptoken prints a `claude mcp add` line with a working token", err == nil && m != nil && m[1] == e.admin, "%v %.80s %.80s", err, so.String(), se.String())
+		if m != nil {
+			e.secrets["token secret mcptoken"] = m[2]
+			if s, err := e.connect(m[2]); err != nil {
+				e.check("the token mcptoken made connects", false, "%v", err)
+			} else {
+				n, _, _ := toolNames(s)
+				e.check("the token mcptoken made is a readonly one", sameNames(n, wantRO), "%d tools", len(n))
+				s.Close()
+			}
+		}
 	}
+
+	// -- every read tool, as admin (the scan for secrets reads these)
+	// Every read tool the admin profile sees (all tools that are not a plan or an apply) is called here, so the scan for
+	// secrets and addresses reads every one of them. A read tool without an entry in readArgs fails the check: add its
+	// arguments when you add the tool.
+	// a decoy site for decoy_site_get and decoy_site_file to read: a draft, which the library keeps without the owner
+	draft := decode[mcp.DecoyDraftV](e.mustCall(ad, "decoy_site_draft_save", map[string]any{
+		"name": "Birch Lane Pottery", "note": "e2e: a small pottery shop",
+		"files": []map[string]any{
+			{"path": "index.html", "content": "<!doctype html><html><head><title>Birch Lane Pottery</title></head><body><h1>Birch Lane Pottery</h1></body></html>"},
+			{"path": "404.html", "content": "<!doctype html><html><head><title>Not found</title></head><body><p>Not found</p></body></html>"},
+		}}))
+	e.check("decoy_site_draft_save keeps a draft in the library", strings.HasPrefix(draft.SiteID, "dsi_"), "site_id %q", draft.SiteID)
+	readArgs := map[string]map[string]any{
+		"subscription_mihomo_template_get": {"name": "e2e-template"}, "decoy_sites_list": {}, "decoy_site_get": {"site_id": draft.SiteID}, "decoy_site_file": {"site_id": draft.SiteID, "path": "index.html"}, "path_speed_results": {},
+		"fleet_status": {}, "node_get": {"node": "de1"}, "nodes_get": {}, "node_metrics": {}, "node_doctor": {}, "node_ports": {}, "warp_status": {},
+		"users_search": {}, "groups_list": {}, "group_get": {"group_id": groupID}, "user_get": {"user_id": userIDs[0]}, "user_traffic": {"user_id": userIDs[0]},
+		"user_devices": {"user_id": userIDs[0]}, "user_connection": {"user_id": userIDs[0]}, "subscription_preview": {"user_id": userIDs[0]},
+		"subscription_settings_get": {}, "alerts_list": {"include_history": true}, "events_search": {}, "checks_results": {"daily_days": 7},
+		"checks_run_now": {"node": "de1"}, "health_summary": {}, "klick_reports": {}, "reachability_history": {}, "node_connections": {"node": "de1"},
+		"fleet_connections": {}, "node_journal": {}, "audit_search": {"hours": 24}, "updates_status": {}, "backup_status": {}, "dns_presets_list": {},
+		"profiles_list": {}, "protocols_list": {}, "relays_list": {}, "node_server_access_list": {}, "node_server_keys_list": {"node": "de1"},
+		"node_ipv6_check": {"node": "de1"}, "relay_candidates": {"node": "de1"},
+		"timeline": {"hours": 24}, "fleet_digest": {}, "user_diagnose": {"user_id": userIDs[0]}, "node_runtime": {}, "path_loss_matrix": {"hours": 24},
+		// they send test traffic between nodes, so they are not read-only; the throwaway panel has no connected nodes (needsFixture)
+		"path_probe": {"from": "de1", "to": "nl1", "kind": "udp"}, "node_trace": {"from": "de1", "to": "nl1"}, "node_dns_check": {"node": "de1"}, "node_neighbor_sites": {"node": "de1", "stored_only": true},
+		"panel_logs": {"min_level": "debug"}, "retention_status": {}, "access_report": {}, "block_diagnosis": {}, "node_debug_logs": {}, "capacity_report": {"hours": 24}, "panel_resources": {},
+		"tasks_list": {}, "os_updates_status": {}, "client_api_settings": {}, "outdated_devices": {},
+	}
+	// These need a fixture the throwaway panel does not have (a connected node, a profile, a relay): a clean tool error is
+	// an answer; a protocol error never is.
+	needsFixture := map[string]bool{
+		"node_metrics": true, "node_doctor": true, "checks_results": true, "checks_run_now": true, "node_ipv6_check": true, "relay_candidates": true,
+		"node_connections": true, "node_server_keys_list": true, "dns_preset_get": true, "profile_get": true, "relay_check": true, "node_ports": true,
+		"warp_status": true, "nodes_get": true, "path_probe": true, "node_trace": true, "node_dns_check": true, "node_neighbor_sites": true,
+		// the throwaway panel has no scheduled task: task_not_found is a clean answer
+		"task_get": true, "task_runs": true, "task_run_now": true,
+		// the throwaway panel has no Mihomo template of its own: the owner makes one through an approved plan, so the name is
+		// answered with a clean "no such template" (the text of a real one is read in internal/panel/mcp's tests)
+		"subscription_mihomo_template_get": true,
+	}
+	var readTools, uncovered []string
+	for _, n := range adN {
+		if isWrite(n) {
+			continue
+		}
+		readTools = append(readTools, n)
+		if _, ok := readArgs[n]; !ok && !needsFixture[n] {
+			uncovered = append(uncovered, n)
+		}
+	}
+	for _, n := range uncovered {
+		e.check("arguments for "+n, false, "add arguments for %s to readArgs in scripts/e2e/mcpe2e/main.go (a tool called with none cannot be checked)", n)
+	}
+	e.check("every read tool has arguments in the e2e harness", len(uncovered) == 0, "%v", uncovered)
 	bad := []string{}
-	for n, a := range allReads {
+	for _, n := range readTools {
+		a, ok := readArgs[n]
+		if !ok && !needsFixture[n] {
+			continue // reported above: no arguments, no call
+		}
+		if !ok {
+			a = map[string]any{} // a fixture-dependent tool nobody gave arguments: an empty call must still answer cleanly
+		}
 		t, isErr, err := e.call(ad, n, a)
-		if err != nil || (isErr && n != "node_metrics" && n != "node_doctor" && n != "checks_results") {
+		if err != nil || (isErr && !needsFixture[n]) {
 			bad = append(bad, n+": "+t)
 		}
 	}
-	e.check("all 15 read tools answer for an admin token", len(bad) == 0, "%v", bad)
-	for n, a := range allReads {
-		if n == "audit_search" {
+	e.check(fmt.Sprintf("all %d read tools answer for an admin token", len(readTools)), len(bad) == 0, "%v", bad)
+	for _, n := range readTools {
+		if n == "audit_search" || !contains(roN, n) {
 			continue
 		}
-		if t, isErr, _ := e.call(ro, n, a); isErr && n != "node_metrics" && n != "node_doctor" && n != "checks_results" {
+		a, ok := readArgs[n]
+		if !ok && !needsFixture[n] {
+			continue // reported above
+		}
+		if !ok {
+			a = map[string]any{}
+		}
+		if t, isErr, _ := e.call(ro, n, a); isErr && !needsFixture[n] {
 			e.check("readonly can call "+n, false, "%s", t)
 		}
 	}
@@ -674,7 +1152,7 @@ func (e *env) scenario() {
 	e.check("apply after a rejection is refused", isErr && strings.Contains(tx, "rejected"), "%.80s", tx)
 
 	// -- the fleet: rollouts need a signed bundle and a node
-	rpText, rpErr, _ := e.call(ad, "rollout_start_plan", map[string]any{})
+	rpText, rpErr, _ := e.call(ad, "rollout_start_plan", map[string]any{"node_ids": []string{"nod_e2e"}})
 	// a fresh panel has no signed bundle (needs a release key and a node: scripts/e2e-wsl.sh): the plan is a clean refusal
 	e.check("rollout_start_plan on a panel without a bundle: a clean refusal, no plan", rpErr && strings.Contains(rpText, "not trusted"), "%.80s", rpText)
 	st, _ = e.rpc("", adSecret, "UpdateService", "StartRollout", nil)

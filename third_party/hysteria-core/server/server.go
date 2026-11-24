@@ -65,8 +65,9 @@ func NewServer(config *Config) (Server, error) {
 		DisablePathManager:             true,
 	}
 	tr := &quic.Transport{
-		Conn:       config.Conn,
-		DisableGSO: config.QUICConfig.DisableGSO,
+		Conn:        config.Conn,
+		DisableGSO:  config.QUICConfig.DisableGSO,
+		ConnContext: config.QUICConfig.ConnContext, // Mistgate patch, see MISTGATE.md
 	}
 	// A nil key means quic-go never sends stateless resets. Clients then have to
 	// wait for the idle timeout to notice the server is gone, so keep them on
@@ -338,11 +339,18 @@ func (h *h3sHandler) handleTCPRequest(stream *utils.QStream) {
 	if len(putback) > 0 {
 		n, _ := tConn.Write(putback)
 		streamStats.Tx.Add(uint64(n))
+		// Mistgate patch (see MISTGATE.md): the put back bytes are the client's upload, so count them like the rest. The sniffer of
+		// v2.13.0 puts back what it read, up to a few KB per stream, no longer the 3 bytes of v2.12.3.
+		if trafficLogger != nil && !trafficLogger.LogTraffic(h.authID, uint64(n), 0) {
+			err = errDisconnect
+		}
 	}
 	// Start proxying
-	if trafficLogger != nil {
+	switch {
+	case err != nil: // the traffic logger asked to disconnect the client
+	case trafficLogger != nil:
 		err = copyTwoWayEx(h.authID, stream, tConn, trafficLogger, streamStats)
-	} else {
+	default:
 		// Use the fast path if no traffic logger is set
 		err = copyTwoWay(stream, tConn)
 	}
@@ -417,11 +425,11 @@ func (io *udpIOImpl) SendMessage(buf []byte, msg *protocol.UDPMessage) error {
 	return io.Conn.SendDatagram(buf[:msgN])
 }
 
-func (io *udpIOImpl) Hook(data []byte, reqAddr *string) error {
+func (io *udpIOImpl) Hook(packets [][]byte, reqAddr *string) (bool, error) {
 	if io.RequestHook != nil && io.RequestHook.Check(true, *reqAddr) {
-		return io.RequestHook.UDP(data, reqAddr)
+		return io.RequestHook.UDP(packets, reqAddr)
 	} else {
-		return nil
+		return true, nil
 	}
 }
 

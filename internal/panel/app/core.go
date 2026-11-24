@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/netip"
+	"os"
 	"runtime"
 	"slices"
 	"strings"
@@ -14,6 +15,7 @@ import (
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
 	"github.com/mistgate/mistgate/internal/buildinfo"
+	"github.com/mistgate/mistgate/internal/node/osupdate"
 	"github.com/mistgate/mistgate/internal/panel/access"
 	"github.com/mistgate/mistgate/internal/panel/auth"
 	"github.com/mistgate/mistgate/internal/panel/blocklist"
@@ -40,8 +42,16 @@ import (
 	"github.com/mistgate/mistgate/internal/panel/update"
 	"github.com/mistgate/mistgate/internal/panel/vault"
 	"github.com/mistgate/mistgate/internal/panel/warp"
+	"github.com/mistgate/mistgate/internal/release"
 	"github.com/mistgate/mistgate/internal/statehash"
 )
+
+func globalpingIPv6Error(err error) error {
+	if errors.Is(err, globalping.ErrDisabled) {
+		return fleet.ErrGlobalpingOff
+	}
+	return err
+}
 
 func nodeUpdateReleaseKey(dataDir string, onEdge bool) (ed25519.PublicKey, error) {
 	key, err := buildinfo.ReleasePublicKey()
@@ -62,7 +72,18 @@ func nodeUpdateConfig(dataDir string, edge, onEdge bool, key ed25519.PublicKey, 
 		gateHealth = gate
 	}
 	return update.Config{DataDir: dataDir, Key: key, PanelVersion: buildinfo.Version, PanelBuilt: buildinfo.BuiltUnix(),
-		Edge: edge, StepUp: stepUp, PanelUpdater: panelUpdater, NodeBundleSource: source, Log: log}, gateHealth
+		InitialChannel: os.Getenv("MISTGATE_UPDATE_CHANNEL"),
+		Edge:           edge, StepUp: stepUp, PanelUpdater: panelUpdater, NodeBundleSource: source, Log: log}, gateHealth
+}
+
+func configuredUpdateChannel(st *store.Store) release.Channel {
+	value, err := st.Setting(context.Background(), update.UpdateChannelSetting)
+	if err == nil {
+		if channel, ok := release.ParseChannel(value); ok {
+			return channel
+		}
+	}
+	return release.ChannelStable
 }
 
 // base is what every role needs from its Config: the defaults filled in, and the few values derived from it.
@@ -100,10 +121,9 @@ func newBase(c Config) (base, error) {
 
 // fleetConfig is the part of the fleet's configuration that every role that builds a fleet shares.
 func (b base) fleetConfig(desired func(ctx context.Context, nodeID string) ([]statehash.Inbound, error), onUsage func(ctx context.Context, userIDs []string)) fleet.Config {
-	agentSNIPrefix, _, _ := strings.Cut(b.in.AgentSNI, ".")
 	return fleet.Config{
 		AgentSNI:             b.in.AgentSNI,
-		JournalSecrets:       []string{b.in.AgentSNI, agentSNIPrefix, b.in.AdminPrefix, b.in.SubPrefix, b.in.LinkPrefix},
+		JournalSecrets:       b.in.logSecrets(),
 		LinkServed:           b.in.LinkPrefix != "",
 		LinkURL:              linkURL(b.in),
 		Remote:               b.c.Remote,
@@ -112,6 +132,7 @@ func (b base) fleetConfig(desired func(ctx context.Context, nodeID string) ([]st
 		PanelAddr:            b.c.PanelAddr,
 		ExpectedAgentVersion: buildinfo.Version,
 		DecoyDir:             b.c.DecoyDir,
+		PublicURL:            b.in.PublicURL,
 		Desired:              desired,
 		OnUsage:              onUsage,
 		Log:                  b.log,
@@ -119,8 +140,10 @@ func (b base) fleetConfig(desired func(ctx context.Context, nodeID string) ([]st
 }
 
 // accessConfig is the access service's configuration, the same in every role.
-func (b base) accessConfig(fl *fleet.Fleet) access.Config {
-	return access.Config{SubscriptionBaseURL: b.subBase, Log: b.log, AfterResponse: b.c.AfterResponse, CheckPorts: fl.CheckPorts, CheckRelay: fl.CheckRelay}
+func (b base) accessConfig(fl *fleet.Fleet, stepUp func(context.Context) error) access.Config {
+	return access.Config{SubscriptionBaseURL: b.subBase, StepUp: stepUp, Log: b.log, AfterResponse: b.c.AfterResponse, CheckPorts: fl.CheckPorts,
+		CheckRelay: fl.CheckRelay, Limiter: b.limiter,
+		OwnHosts: []string{b.in.PublicURL, b.in.AdminHost, b.in.AgentSNI, b.c.PanelAddr, linkURL(b.in)}}
 }
 
 // usageRecompute is fleet.Config.OnUsage: a quota overrun takes effect right after the stats batch that crossed it.
@@ -167,7 +190,7 @@ func (b base) newSubParts(migrate bool) subParts {
 func (p subParts) mux(b base, acc *access.Service) http.Handler {
 	sub := http.NewServeMux()
 	sub.Handle("GET /brand/logo.svg", httpserver.NewLogoHandler(b.st, b.log))
-	sub.Handle("/", subs.Handler(acc, httpserver.NewDecoy(b.c.DecoyDir), p.cfg))
+	sub.Handle("/", subs.Handler(acc, httpserver.NewDecoyFor(b.c.DecoyDir, b.st), p.cfg))
 	return sub
 }
 
@@ -176,20 +199,24 @@ func (p subParts) mux(b base, acc *access.Service) http.Handler {
 type core struct {
 	cloud *cloudusage.Service
 	base
-	authSvc *auth.Service
-	tg      *telegram.Service
-	fl      *fleet.Fleet
-	acc     *access.Service
-	cr      *countryreach.Service
-	gp      *globalping.Service
-	cc      *cheburcheck.Service
-	bs      *bsbord.Service
-	bl      *blocklist.Service
-	cp      *countryprobe.Service
-	hl      *health.Service
-	upd     *update.Service
-	wsv     *warp.Service
-	desired func(ctx context.Context, nodeID string) ([]statehash.Inbound, error)
+	authSvc            *auth.Service
+	tg                 *telegram.Service
+	fl                 *fleet.Fleet
+	acc                *access.Service
+	cr                 *countryreach.Service
+	gp                 *globalping.Service
+	cc                 *cheburcheck.Service
+	bs                 *bsbord.Service
+	bl                 *blocklist.Service
+	cp                 *countryprobe.Service
+	own                ownProbeService // nil on the Cloudflare edition (ownprobe_wiring_js.go)
+	hl                 *health.Service
+	upd                *update.Service
+	wsv                *warp.Service
+	asst               assistantRPC
+	assistantRetention assistantRetention
+	sched              scheduledTasks // the scheduled tasks (VPS only; nil on the edge)
+	desired            func(ctx context.Context, nodeID string) ([]statehash.Inbound, error)
 }
 
 // wireCore builds the telegram alerts, the fleet, access, Globalping and the health module, the node-agent updates and WARP,
@@ -240,23 +267,31 @@ func wireCore(c Config) (*core, error) {
 	}
 	fcfg := b.fleetConfig(k.desired, b.usageRecompute(func() *access.Service { return acc }))
 	fcfg.OnAwgPrepareFailed = tg.AwgPrepareFailed
+	// the last resort of the IPv6 check of a node; Globalping is built after the fleet, hence the late binding
+	fcfg.GlobalpingTCP6 = func(ctx context.Context, addr string, port uint16) (int, int, error) {
+		answered, connected, err := k.gp.ProbeTCP6(ctx, addr, port)
+		return answered, connected, globalpingIPv6Error(err)
+	}
 	k.fl, err = fleet.New(st, vlt, b.reg, fcfg)
 	if err != nil {
 		return nil, err
 	}
 	fl := k.fl
-	acc, err = access.New(st, vlt, b.reg, fl, fl, b.accessConfig(fl))
+	acc, err = access.New(st, vlt, b.reg, fl, fl, b.accessConfig(fl, authSvc.RequireStepUp))
 	if err != nil {
 		return nil, err
 	}
 	k.acc = acc
+	fl.SetRelayControl(acc.ControlRelay)
 	// Globalping, an integration of its own: off until the owner switches it on. The country check of the health module
 	// measures through it and does nothing while it is off. The country it looks from is the shared one of countryreach.
 	// Its history is read by the health module, which knows which sources are on: late binding to hl.
 	k.cr = countryreach.New(st, log, c.Clock, func(ctx context.Context, since time.Time, family int) ([]string, []*adminv1.NodeReachabilityHistory, error) {
 		return hl.CountryHistory(ctx, since, family)
 	})
+	gpBase, gpPoll := censorSimGlobalping()
 	k.gp, err = globalping.New(globalping.Config{Store: st, Vault: vlt, StepUp: authSvc.RequireStepUp, Log: log, Now: c.Clock, Country: k.cr.Country,
+		BaseURL: gpBase, PollDelay: gpPoll,
 		OnChange: func(ctx context.Context) { hl.ReconcileCountry(ctx) }})
 	if err != nil {
 		return nil, err
@@ -275,6 +310,7 @@ func wireCore(c Config) (*core, error) {
 	// Bsbord, the paid mobile-operator source: the online nodes' addresses and TLS ports are read the way the health module reads
 	// them, hence the late binding to hl.
 	k.bs, err = bsbord.New(bsbord.Config{Store: st, Vault: vlt, StepUp: authSvc.RequireStepUp, Log: log, Now: c.Clock, Country: k.cr.Country,
+		BaseURL:  censorSimBsbord(),
 		Targets:  func(ctx context.Context) ([]health.CountryTarget, error) { return hl.CountryTargets(ctx) },
 		OnChange: func(ctx context.Context) { hl.ReconcileCountry(ctx) }, Edge: edge, RoundLease: callLease})
 	if err != nil {
@@ -307,8 +343,10 @@ func wireCore(c Config) (*core, error) {
 	// Health: the synthetic checker, alerts, the node doctor and retention. The fleet hands it doctor reports and
 	// returning nodes; it gives the fleet the node status and the alert badge.
 	hcfg := health.Config{Edge: edge, Log: log, BlipWindow: c.HealthBlipWindow, CheckPorts: fl.CheckPortsAsSystem, CheckPortsUDP: fl.CheckPortsAsSystemUDP,
-		Country: k.gp.Country,
-		Lists:   k.bl.Active,
+		ControlRelay: acc.ControlRelay,
+		Country:      k.gp.Country,
+		Lists:        k.bl.Active,
+		CountryNow:   countryNowSources(k),
 		// One read for both external sources: the evaluator asks on every pass, also while both are off.
 		External: func(ctx context.Context) []health.ExternalState {
 			kv, err := st.SettingValues(ctx, append(cheburcheck.StateKeys(), bsbord.StateKeys()...))
@@ -320,7 +358,8 @@ func wireCore(c Config) (*core, error) {
 			for _, s := range cheburcheck.StateFrom(kv).Sources() {
 				out = append(out, health.ExternalState(s))
 			}
-			return append(out, bsbord.StateFrom(kv))
+			out = append(out, bsbord.StateFrom(kv))
+			return append(out, ownProbeStates(ctx, k.own, log)...)
 		},
 		TSPU: func(ctx context.Context) health.TSPUState {
 			st := k.cp.State(ctx)
@@ -356,7 +395,8 @@ func wireCore(c Config) (*core, error) {
 	// the panel's service user. Without one the Updates page says the panel cannot verify releases.
 	compiledKey, _ := buildinfo.ReleasePublicKey()
 	panelUpdater := update.NewGitHubPanelUpdater(update.PanelUpdateConfig{
-		CurrentBuilt: buildinfo.BuiltUnix(), Key: compiledKey, DataDir: c.DataDir, NotesURL: update.GitHubReleaseNotesURL,
+		CurrentBuilt: buildinfo.BuiltUnix(), Key: compiledKey, DataDir: c.DataDir,
+		Channel:     func() release.Channel { return configuredUpdateChannel(st) },
 		ServiceUnit: c.UpdateService, Enabled: update.PanelUpdateHostSupported(),
 		UseRootHelperService: update.PanelUpdateUsesRootHelperService(), Log: log,
 	})
@@ -371,15 +411,20 @@ func wireCore(c Config) (*core, error) {
 	if len(relKey) > 0 && c.DataDir != "" && !onEdge {
 		nodeBundleSource = update.NewGitHubNodeBundleSource(update.GitHubNodeBundleConfig{
 			DataDir: c.DataDir, Key: relKey, Log: log,
+			Channel: func() release.Channel { return configuredUpdateChannel(st) },
 		})
 	}
 	updateConfig, gateHealth := nodeUpdateConfig(c.DataDir, edge, onEdge, relKey, authSvc.RequireStepUp, panelUpdater, nodeBundleSource, hl, log)
+	if !onEdge {
+		updateConfig.OSStatusReader = osupdate.NewReader()
+	}
 	k.upd, err = update.New(st, fl, gateHealth, updateConfig)
 	if err != nil {
 		return nil, err
 	}
 	upd := k.upd
 	fl.SetUpdates(upd)
+	wireNetworkBundleChanged(fl, upd)
 	hl.AddConditionSource(upd.Conditions)
 	tg.SetSources(telegram.Sources{
 		PanelRelease: func() (string, bool) {
@@ -397,13 +442,15 @@ func wireCore(c Config) (*core, error) {
 		return nil, err
 	}
 	fl.SetWarp(warpForFleet{k.wsv})
+	k.addWarpReachConditions(hl) // WARP_REACH: a site that shows a block page through a node's WARP
+	k.own = newOwnProbes(k)
 	return k, nil
 }
 
 // panel is the Panel of the services the core holds; a role adds what it serves.
 func (k *core) panel() *Panel {
 	return &Panel{
-		Fleet: k.fl, Access: k.acc, Health: k.hl, Blocklist: k.bl, CountryProbe: k.cp, Cheburcheck: k.cc, Bsbord: k.bs, Update: k.upd, Warp: k.wsv, Telegram: k.tg, Store: k.st, Desired: k.desired,
+		Fleet: k.fl, Access: k.acc, Health: k.hl, Blocklist: k.bl, CountryProbe: k.cp, OwnProbes: k.own, Cheburcheck: k.cc, Bsbord: k.bs, Update: k.upd, Warp: k.wsv, Telegram: k.tg, Store: k.st, Desired: k.desired,
 		provisionKick: k.c.ProvisionKick,
 	}
 }

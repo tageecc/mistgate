@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { changedCount, guessPlatform, leaves, minClients, parseAwgConf, randomKey32, randomPort } from "./awg";
+import { changedCount, configKey, guessPlatform, leaves, minClientLabel, minClients, parseAwgConf, randomKey32, randomPort } from "./awg";
 import { codedError } from "./coded-error";
 import { errorCode } from "./errors";
 import { Code, ConnectError } from "@connectrpc/connect";
@@ -117,6 +117,12 @@ describe("tables", () => {
   it("3.1 asks for the newer clients", () => {
     expect(minClients["3.1"].find((c) => c.app === "AmneziaVPN")?.min).toBe("5.0.1.5");
     expect(minClients["2.0"].find((c) => c.app === "AmneziaVPN")?.min).toBe("4.8.12.9");
+    expect(minClients["3.1"].map(({ app, min }) => [app, min])).toEqual(expect.arrayContaining([
+      ["WG Tunnel", "5.6.0"], ["FlClash", "0.8.97"], ["Throne", "1.4.0"], ["ZedSecure", "3.1.8"],
+      ["Keenetic", "5.2 alpha 11"], ["GL.iNet", "2.0 only"], ["Hiddify", "2.0 only"],
+    ]));
+    expect(minClientLabel("GL.iNet", "2.0 only")).toBe("GL.iNet · 2.0 only");
+    expect(minClientLabel("WG Tunnel", "5.6.0")).toBe("WG Tunnel 5.6.0+");
   });
   it("guesses the platform of the browser", () => {
     expect(guessPlatform("Mozilla/5.0 (iPhone; CPU iPhone OS 17_4)")).toBe("ios");
@@ -137,5 +143,15 @@ describe("coded errors", () => {
     expect(codedError(new ConnectError("device_limit: 5/5", Code.FailedPrecondition), t, "awg.err")).toBe("limit 5/5");
     expect(codedError(new ConnectError("brand_new_code", Code.FailedPrecondition), t, "awg.err")).toBe("brand_new_code");
     expect(codedError(new ConnectError("x", Code.Internal), t, "awg.err")).toBe("err.generic");
+  });
+});
+
+describe("configKey", () => {
+  it("tells the config through an entry from the direct one of the same node", () => {
+    expect(configKey({ nodeId: "nod_de1", viaNodeId: "" })).toBe("nod_de1");
+    expect(configKey({ nodeId: "nod_de1", viaNodeId: "nod_msk1" })).toBe("nod_de1|nod_msk1");
+    expect(configKey({ nodeId: "nod_de1", viaNodeId: "nod_msk1" })).not.toBe(configKey({ nodeId: "nod_de1", viaNodeId: "" }));
+    expect(configKey({ nodeId: "nod_de1", viaNodeId: "", ipv6: true })).toBe("nod_de1|ipv6");
+    expect(configKey({ nodeId: "nod_de1", viaNodeId: "", ipv6: true })).not.toBe(configKey({ nodeId: "nod_de1", viaNodeId: "" }));
   });
 });

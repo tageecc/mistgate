@@ -174,13 +174,13 @@ describe("AwgPanel score and remarks", () => {
   it("draws the server's remarks by code, with numbers; the port remark names the port and is not an alarm", async () => {
     const { el } = await mount(start, { warnings: [fe("mtu_headroom", { s4: "30", suggested_mtu: "1390" }), fe("preset_port", { preset: "quic", ports: "443" }), fe("h_lt5")], score: undefined });
     expect(el.textContent).toContain("S4 = 30 does not fit under 1500 at this MTU: data packets fragment. MTU 1390 fits.");
-    expect(el.textContent).toContain("QUIC traffic is normally on port 443.");
+    expect(el.textContent).toContain("QUIC traffic usually goes over port 443. On another port this look is more noticeable");
     expect(el.textContent).toContain(en["awg.warn.h_lt5"]);
     // two amber notices, the port line is plain text
     expect(el.querySelectorAll('[role="status"]')).toHaveLength(2);
   });
   it("every code of the server has a text in both languages", async () => {
-    const warn = ["jc_high", "jmax_ge_mtu", "no_flood_protection", "trailers_unequal_s", "mtu_above_1280", "mtu_headroom", "h_default_v20", "h_small_range", "h_lt5", "preset_port", "keepalive_over_nat"];
+    const warn = ["jc_high", "jmax_ge_mtu", "no_flood_protection", "trailers_unequal_s", "mtu_above_1280", "mtu_headroom", "mtu_ipv6_min", "h_default_v20", "h_small_range", "h_lt5", "preset_port", "keepalive_over_nat"];
     const items = ["h_default_v20", "h_lt5", "h_small_range", "jc_zero", "junk_narrow", "s_zero", "jc_high", "jmax_ge_mtu", "no_random_trailers", "trailers_unequal_s", "no_data_padding", "timers_default", "no_cps", "cps_frozen", "preset_port", "port_default", "keepalive_over_nat", "mtu_headroom", "per_device_signature"];
     const tiers = ["header_protection", "ranges", "cps", "headers", "wireguard"];
     const keys = [...warn.map((c) => `awg.warn.${c}`), ...items.map((c) => `awg.score.${c}`), ...tiers.map((c) => `awg.score.tier.${c}`)];

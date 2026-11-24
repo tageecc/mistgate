@@ -14,9 +14,11 @@ import (
 	"log/slog"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"google.golang.org/protobuf/encoding/protojson"
@@ -106,6 +108,7 @@ func Defaults() *adminv1.SubscriptionSettings {
 		Rules:               rules,
 		UpdateIntervalHours: DefaultUpdateHours,
 		ServerNameTemplate:  DefaultNameTemplate,
+		DeviceIdleAfterDays: proto.Uint32(store.DefaultDeviceIdleAfterDays),
 		Apps: []*adminv1.PlatformApp{
 			happ(adminv1.Platform_PLATFORM_IOS, "https://apps.apple.com/us/app/happ-proxy-utility/id6504287215", true),
 			happ(adminv1.Platform_PLATFORM_ANDROID, "https://play.google.com/store/apps/details?id=com.happproxy", true),
@@ -132,6 +135,18 @@ func SelfService(s *adminv1.SubscriptionSettings) bool {
 func PagePassword(s *adminv1.SubscriptionSettings) bool {
 	o := s.GetUserPage()
 	return o == nil || o.RequirePagePassword == nil || *o.RequirePagePassword
+}
+
+// LinkAWG reports whether Mihomo profiles carry AmneziaWG servers. Settings stored before the switch existed have no key:
+// absent means on, so an upgrade keeps today's behaviour.
+func LinkAWG(s *adminv1.SubscriptionSettings) bool {
+	return s == nil || s.LinkAwg == nil || *s.LinkAwg
+}
+
+// LinkAutoSelect reports whether Mihomo and sing-box profiles include an automatic server group. Settings stored before
+// the switch existed have no key: absent means on, so an upgrade keeps the current server list usable by default.
+func LinkAutoSelect(s *adminv1.SubscriptionSettings) bool {
+	return s == nil || s.LinkAutoSelect == nil || *s.LinkAutoSelect
 }
 
 // DNSChoice reports whether people may pick the DNS of each server on the public page (DnsService.SetNodeDnsOptions says what
@@ -317,7 +332,7 @@ func checkPlaceholders(what, s string, known map[string]bool) error {
 }
 
 func noControl(s string) bool {
-	return !strings.ContainsFunc(s, func(r rune) bool { return r < 0x20 || r == 0x7f })
+	return !strings.ContainsFunc(s, unicode.IsControl)
 }
 
 // httpsURL checks an optional link: empty, or an absolute https URL without spaces or control characters (the user
@@ -363,6 +378,10 @@ func Validate(s *adminv1.SubscriptionSettings) error {
 	}
 	if _, ok := adminv1.LinkDeviceLimit_name[int32(s.GetLinkDeviceLimit())]; !ok {
 		return invalid("link_device_limit: unknown mode")
+	}
+	if s.DeviceIdleAfterDays != nil && s.GetDeviceIdleAfterDays() != 0 &&
+		(s.GetDeviceIdleAfterDays() < 7 || s.GetDeviceIdleAfterDays() > 365) {
+		return invalid("device_idle_after_days: must be 0 or between 7 and 365")
 	}
 	if _, ok := adminv1.HappPing_name[int32(s.HappPing)]; !ok {
 		return invalid("happ_ping: unknown value")
@@ -411,7 +430,7 @@ func Validate(s *adminv1.SubscriptionSettings) error {
 			return invalid("%s.description: control characters are not allowed", w)
 		}
 		if t := a.AddLinkTemplate; t != "" {
-			if len(t) > maxTemplate || !noControl(t) || strings.ContainsAny(t, " \t") {
+			if len(t) > maxTemplate || !noControl(t) || strings.ContainsFunc(t, unicode.IsSpace) {
 				return invalid("%s.add_link_template: not a valid link template", w)
 			}
 			if err := checkPlaceholders(w+".add_link_template", t, addKnown); err != nil {
@@ -427,6 +446,15 @@ func Validate(s *adminv1.SubscriptionSettings) error {
 				return invalid("%s.add_link_template: this scheme is not allowed", w)
 			}
 		}
+	}
+	if err := validateResponseHeaders(s.ResponseHeaders); err != nil {
+		return err
+	}
+	if err := validateMihomoTemplates(s); err != nil {
+		return err
+	}
+	if err := validateRoutingProfiles(s); err != nil {
+		return err
 	}
 	if o := s.UserPage; o == nil {
 		return invalid("user_page missing")
@@ -465,6 +493,9 @@ func Normalize(s *adminv1.SubscriptionSettings) {
 			r.UaContains = strings.TrimSpace(r.UaContains)
 		}
 	}
+	normalizeResponseHeaders(s.ResponseHeaders)
+	normalizeMihomoTemplates(s.MihomoTemplates)
+	normalizeRoutingProfiles(s.RoutingProfiles)
 }
 
 var (
@@ -475,25 +506,45 @@ var (
 // Load reads the stored settings; an install that never saved any gets Defaults(). The mode of the device limit, which has a
 // setting of its own (see linkModeKey), is merged in: a panel that was never given one reads as TRACK.
 func Load(ctx context.Context, st *store.Store) (*adminv1.SubscriptionSettings, error) {
-	set, _, err := load(ctx, st)
+	set, _, _, err := load(ctx, st)
 	return set, err
 }
 
-// load is Load that also reads the switch of the kl!ck reports (store.SettingClientProbe) in the same query: every
-// subscription answer needs it for the Probe-Report header, and a read of its own would cost each cold answer one more.
-func load(ctx context.Context, st *store.Store) (*adminv1.SubscriptionSettings, bool, error) {
-	kv, err := st.SettingValues(ctx, []string{Key, store.SettingLinkDeviceLimit, store.SettingClientProbe})
+// load is Load that also reads the kl!ck reports and client API discovery switches in the same query: every subscription
+// answer needs them for response headers, and separate reads would cost each cold answer one more query.
+func load(ctx context.Context, st *store.Store) (*adminv1.SubscriptionSettings, bool, bool, error) {
+	kv, err := st.SettingValues(ctx, []string{Key, store.SettingLinkDeviceLimit, store.SettingDeviceIdleAfterDays, store.SettingClientProbe, store.SettingClientAPI})
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 	set := Defaults()
 	if v, ok := kv[Key]; ok {
 		if set, err = Parse(v); err != nil {
-			return nil, false, err
+			return nil, false, false, err
 		}
 	}
+	days, err := parseDeviceIdleAfterDays(kv[store.SettingDeviceIdleAfterDays])
+	if err != nil {
+		return nil, false, false, err
+	}
+	set.DeviceIdleAfterDays = proto.Uint32(days)
 	set.LinkDeviceLimit = linkModeProto(kv[store.SettingLinkDeviceLimit]).Enum()
-	return set, kv[store.SettingClientProbe] == "1", nil
+	return set, kv[store.SettingClientProbe] == "1", kv[store.SettingClientAPI] == "1", nil
+}
+
+func parseDeviceIdleAfterDays(value string) (uint32, error) {
+	if value == "" {
+		return store.DefaultDeviceIdleAfterDays, nil
+	}
+	n, err := strconv.ParseUint(value, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("stored %s: %w", store.SettingDeviceIdleAfterDays, err)
+	}
+	days := uint32(n)
+	if days != 0 && (days < 7 || days > 365) {
+		return 0, fmt.Errorf("stored %s: out of range", store.SettingDeviceIdleAfterDays)
+	}
+	return days, nil
 }
 
 // Parse reads a stored subscription-settings document. Missing documents should use Defaults instead.
@@ -506,6 +557,8 @@ func Parse(value string) (*adminv1.SubscriptionSettings, error) {
 		s.UserPage = &adminv1.UserPageOptions{}
 	}
 	s.DefaultDnsPresetId, s.LinkDns = "", nil
+	s.ResponseHeaders = keepValidHeaders(s.ResponseHeaders)
+	keepValidRoutingProfiles(s)
 	return s, nil
 }
 
@@ -516,10 +569,11 @@ type Cache struct {
 	now func() time.Time
 	ttl time.Duration
 
-	mu    sync.Mutex
-	cur   *adminv1.SubscriptionSettings
-	probe bool // the kl!ck reports are on, read with cur
-	at    time.Time
+	mu        sync.Mutex
+	cur       *adminv1.SubscriptionSettings
+	probe     bool // the kl!ck reports are on, read with cur
+	clientAPI bool // client API discovery is on, read with cur
+	at        time.Time
 }
 
 // NewCache makes the cache. log may be nil. It also runs MigrateM3, MigrateSingbox and MigrateLinkDeviceLimit (the panel builds the cache
@@ -531,13 +585,13 @@ func NewCache(st *store.Store, log *slog.Logger) *Cache {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := MigrateM3(ctx, st); err != nil {
-		log.Warn("subscription settings: the Mihomo format rules were not added", "err", err)
+		log.Warn("subscription settings: the Mihomo format rules were not added", "code", "m3_rules_migration_failed", "err", err)
 	}
 	if err := MigrateSingbox(ctx, st); err != nil {
-		log.Warn("subscription settings: the sing-box format rule was not added", "err", err)
+		log.Warn("subscription settings: the sing-box format rule was not added", "code", "singbox_rule_migration_failed", "err", err)
 	}
 	if err := MigrateLinkDeviceLimit(ctx, st); err != nil {
-		log.Warn("subscription settings: the device limit mode was not set", "err", err)
+		log.Warn("subscription settings: the device limit mode was not set", "code", "link_device_limit_migration_failed", "err", err)
 	}
 	return NewCacheWithoutMigrations(st, log)
 }
@@ -556,35 +610,41 @@ func NewCacheWithoutMigrations(st *store.Store, log *slog.Logger) *Cache {
 // are returned without being cached. The read does not end with the caller's context: one app that gave up on a slow
 // panel must not decide what everyone else is served for the next minute.
 func (c *Cache) Get(ctx context.Context) *adminv1.SubscriptionSettings {
-	s, _ := c.get(ctx)
+	s, _, _ := c.get(ctx)
 	return s
 }
 
 // ProbeReports says whether the panel takes the reports of the kl!ck probe (store.SettingClientProbe), as cached with the
 // settings: a switch reaches the subscription answers within the TTL. Off while nothing could be read yet.
 func (c *Cache) ProbeReports(ctx context.Context) bool {
-	_, on := c.get(ctx)
+	_, on, _ := c.get(ctx)
 	return on
 }
 
-func (c *Cache) get(ctx context.Context) (*adminv1.SubscriptionSettings, bool) {
+// ClientAPIEnabled reports whether the owner enabled client API discovery; it shares the subscription settings cache.
+func (c *Cache) ClientAPIEnabled(ctx context.Context) bool {
+	_, _, on := c.get(ctx)
+	return on
+}
+
+func (c *Cache) get(ctx context.Context) (*adminv1.SubscriptionSettings, bool, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.cur != nil && c.now().Sub(c.at) < c.ttl {
-		return c.cur, c.probe
+		return c.cur, c.probe, c.clientAPI
 	}
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), loadTimeout)
 	defer cancel()
-	s, probe, err := load(rctx, c.st)
+	s, probe, clientAPI, err := load(rctx, c.st)
 	if err != nil {
-		c.log.Warn("subscription settings unreadable, keeping the last good copy", "err", err)
+		c.log.Warn("subscription settings unreadable, keeping the last good copy", "code", "subscription_settings_read_failed", "err", err)
 		if c.cur != nil {
-			return c.cur, c.probe
+			return c.cur, c.probe, c.clientAPI
 		}
-		return Defaults(), false
+		return Defaults(), false, false
 	}
-	c.cur, c.probe, c.at = s, probe, c.now()
-	return s, probe
+	c.cur, c.probe, c.clientAPI, c.at = s, probe, clientAPI, c.now()
+	return s, probe, clientAPI
 }
 
 // loadTimeout bounds one read of the document, which runs under the cache lock.
@@ -609,17 +669,32 @@ func (c *Cache) Update(ctx context.Context, s *adminv1.SubscriptionSettings) (*a
 func (c *Cache) UpdateRevoking(ctx context.Context, s *adminv1.SubscriptionSettings) (*adminv1.SubscriptionSettings, int, error) {
 	s = proto.Clone(s).(*adminv1.SubscriptionSettings)
 	s.DefaultDnsPresetId, s.LinkDns = "", nil // live in the DNS module
+	if s.DeviceIdleAfterDays == nil {
+		stored, err := c.st.Setting(ctx, store.SettingDeviceIdleAfterDays)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return nil, 0, err
+		}
+		days, err := parseDeviceIdleAfterDays(stored)
+		if err != nil {
+			return nil, 0, err
+		}
+		s.DeviceIdleAfterDays = proto.Uint32(days)
+	}
 	Normalize(s)
 	if err := Validate(s); err != nil {
 		return nil, 0, err
 	}
 	mode := linkModeStored(s.GetLinkDeviceLimit())
 	s.LinkDeviceLimit = nil // not part of the document
+	idleAfterDays := s.GetDeviceIdleAfterDays()
+	s.DeviceIdleAfterDays = nil // stored separately so access limits can read it in their transaction
 	b, err := marshal.Marshal(s)
 	if err != nil {
 		return nil, 0, err
 	}
-	revoked, err := c.st.SaveSubscriptionSettings(ctx, map[string]string{Key: string(b)}, mode, c.now())
+	revoked, err := c.st.SaveSubscriptionSettings(ctx, map[string]string{
+		Key: string(b), store.SettingDeviceIdleAfterDays: strconv.FormatUint(uint64(idleAfterDays), 10),
+	}, mode, c.now())
 	if err != nil {
 		return nil, 0, err
 	}
@@ -631,6 +706,7 @@ func (c *Cache) UpdateRevoking(ctx context.Context, s *adminv1.SubscriptionSetti
 		mode = stored
 	}
 	s.LinkDeviceLimit = linkModeProto(mode).Enum()
+	s.DeviceIdleAfterDays = proto.Uint32(idleAfterDays)
 	c.mu.Lock()
 	if c.cur != nil { // else the switch of the kl!ck reports was never read: the next Get reads both
 		c.cur, c.at = s, c.now()

@@ -28,6 +28,7 @@ import (
 	"connectrpc.com/connect"
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
+	"github.com/mistgate/mistgate/internal/agentcap"
 	"github.com/mistgate/mistgate/internal/node/engine"
 	panelvless "github.com/mistgate/mistgate/internal/panel/protocols/vless"
 	"github.com/mistgate/mistgate/internal/plugin"
@@ -71,7 +72,7 @@ func newVLESSProbeRig(t *testing.T, security, transport string) *vlessProbeRig {
 		c.ProbeTimeout = 10 * time.Second
 	})
 	e.node("de1", "provider", true)
-	e.fl.set("de1", liveState{up: true, caps: []string{capDoctor, "vless/1", "vless-self/1", "vless-tls/1"}, lastSeen: e.clock.Now()})
+	e.fl.set("de1", liveState{up: true, caps: []string{agentcap.Doctor, "vless/1", "vless-self/1", "vless-tls/1"}, lastSeen: e.clock.Now()})
 
 	settingsRaw, err := panelvless.New().DefaultSettings()
 	if err != nil {
@@ -212,8 +213,26 @@ func (r *vlessProbeRig) openClientWithSecret(t *testing.T, secret string, testPi
 func (r *vlessProbeRig) runProbe(t *testing.T, testPin []byte) Result {
 	t.Helper()
 	client := r.openClient(t, testPin)
-	defer client.Close()
-	return r.e.s.probe(r.e.ctx, client, r.target.node, time.Now())
+	result := r.e.s.probe(r.e.ctx, client, r.target.node, time.Now())
+	closeErr := client.Close()
+	logVLESSHelperFailure(t, client, result, closeErr)
+	return result
+}
+
+func logVLESSHelperFailure(t *testing.T, client Tunnel, result Result, closeErr error) {
+	t.Helper()
+	if result.Status == cOK && closeErr == nil {
+		return
+	}
+	tunnel, ok := client.(*vlessTunnel)
+	if !ok {
+		return
+	}
+	state := "still running"
+	if tunnel.cmd.ProcessState != nil {
+		state = fmt.Sprintf("%s (exit %d)", tunnel.cmd.ProcessState, tunnel.cmd.ProcessState.ExitCode())
+	}
+	t.Logf("VLESS client helper exit status %s; stderr: %s; close error: %v", state, tunnel.stderr.String(), closeErr)
 }
 
 func (r *vlessProbeRig) runProbeWithSecret(t *testing.T, secret string, testPin []byte) (Result, *vlessTunnel) {
@@ -223,8 +242,10 @@ func (r *vlessProbeRig) runProbeWithSecret(t *testing.T, secret string, testPin 
 		t.Fatal("dialVLESS returned an unexpected tunnel type")
 	}
 	result := r.e.s.probe(r.e.ctx, client, r.target.node, time.Now())
-	if err := client.Close(); err != nil {
-		t.Fatalf("close VLESS helper: %v", err)
+	closeErr := client.Close()
+	logVLESSHelperFailure(t, client, result, closeErr)
+	if closeErr != nil {
+		t.Fatalf("close VLESS helper: %v", closeErr)
 	}
 	return result, client
 }
@@ -235,8 +256,13 @@ func (r *vlessProbeRig) runProbeWithTarget(t *testing.T, target Target, testPin 
 	if err != nil {
 		t.Fatalf("dialVLESS: %v", err)
 	}
-	defer client.Close()
-	return r.e.s.probe(r.e.ctx, client, r.target.node, time.Now())
+	result := r.e.s.probe(r.e.ctx, client, r.target.node, time.Now())
+	closeErr := client.Close()
+	logVLESSHelperFailure(t, client, result, closeErr)
+	if closeErr != nil {
+		t.Fatalf("close VLESS helper: %v", closeErr)
+	}
+	return result
 }
 
 func (r *vlessProbeRig) warmTunnel(t *testing.T, testPin []byte) {
@@ -329,11 +355,13 @@ func TestVLESSXHTTPHelperProcessesDoNotLeak(t *testing.T) {
 		default:
 			t.Fatalf("helper %d remained running after its round", i)
 		}
-		// Under -race the helper is race-instrumented and Xray's XHTTP client has known races: the helper reports them on its own
-		// stderr and exits 66, which is the point of keeping that code out of the panel process. A kill is never acceptable.
 		state := helper.cmd.ProcessState
-		if state == nil || !(state.Success() || (raceBuild && state.ExitCode() == 66)) {
-			t.Fatalf("helper %d was not reaped successfully: %+v", i, helper.cmd.ProcessState)
+		if state == nil || !state.Success() {
+			exit := -1
+			if state != nil {
+				exit = state.ExitCode()
+			}
+			t.Fatalf("helper %d was not reaped successfully: exit status %d (%v); stderr: %s", i, exit, state, helper.stderr.String())
 		}
 	}
 	if len(helpers) != 30 {

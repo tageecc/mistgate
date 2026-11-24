@@ -20,11 +20,15 @@ import (
 
 // ---------------------------------------------------------------------------------------------------
 // resolver: the resolver does not resolve the control domains; a RU node must ask Yandex DNS or
-// gosuslugi.ru dies. Fix: set_resolver, only when the recommended resolvers answered in this very run.
+// gosuslugi.ru dies, and AliDNS and DNSPod resolve www.baidu.com for a CN node. Fix: set_resolver,
+// only when the recommended resolvers answered in this very run.
 
 var controlDomains = []string{"www.cloudflare.com", "www.gstatic.com", "www.google.com"}
 
-const ruDomain = "gosuslugi.ru"
+var countryDomains = map[string]string{
+	"RU": "gosuslugi.ru",
+	"CN": "www.baidu.com",
+}
 
 // ResolverTargets is what set_resolver configures: the usable (IP, optionally host:port) entries of
 // NodeSettings.dns_resolvers, else the default for the country.
@@ -45,9 +49,15 @@ func ResolverTargets(s Settings) []string {
 func dialAddr(s string) (string, bool) {
 	s = strings.TrimSpace(s)
 	if ap, err := netip.ParseAddrPort(s); err == nil {
+		if ap.Addr().Zone() != "" {
+			return "", false
+		}
 		return ap.String(), true
 	}
 	if a, err := netip.ParseAddr(s); err == nil {
+		if a.Zone() != "" {
+			return "", false
+		}
 		return net.JoinHostPort(a.String(), "53"), true
 	}
 	return "", false
@@ -55,10 +65,10 @@ func dialAddr(s string) (string, bool) {
 
 func checkResolver(ctx context.Context, e *Env) Result {
 	st := e.Settings()
-	ru := strings.EqualFold(st.Country, "RU")
+	domesticDomain := countryDomains[strings.ToUpper(st.Country)]
 	domains := append([]string(nil), controlDomains...)
-	if ru {
-		domains = append(domains, ruDomain)
+	if domesticDomain != "" {
+		domains = append(domains, domesticDomain)
 	}
 	type probe struct {
 		err error
@@ -102,12 +112,12 @@ func checkResolver(ctx context.Context, e *Env) Result {
 
 	var failed []string
 	var lat []time.Duration
-	ruFailed := false
+	domesticFailed := false
 	for i, r := range res {
 		if r.err != nil {
 			failed = append(failed, domains[i])
-			if domains[i] == ruDomain {
-				ruFailed = true
+			if domains[i] == domesticDomain {
+				domesticFailed = true
 			}
 		} else {
 			lat = append(lat, r.d)
@@ -119,9 +129,10 @@ func checkResolver(ctx context.Context, e *Env) Result {
 		median = lat[len(lat)/2]
 	}
 	r := Result{Status: OK, Code: CodeResolverOK, Params: p("failed", csv(failed), "median_ms", strconv.Itoa(int(median.Milliseconds())), "resolver", recommended,
-		"domains", strconv.Itoa(len(domains)), "failed_count", strconv.Itoa(len(failed)))}
+		"domains", strconv.Itoa(len(domains)), "failed_count", strconv.Itoa(len(failed)),
+		"p50_ms", strconv.Itoa(int(median.Milliseconds())), "p95_ms", strconv.Itoa(int(percentile(lat, 95).Milliseconds())))}
 	switch {
-	case ruFailed || len(failed) >= 2:
+	case domesticFailed || len(failed) >= 2:
 		r.Status = Fail
 	case len(failed) == 1 || median > resolverSlow:
 		r.Status = Warn
@@ -136,6 +147,15 @@ func checkResolver(ctx context.Context, e *Env) Result {
 		r.FixID = FixSetResolver
 	}
 	return r
+}
+
+// percentile is the nearest-rank percentile of lat, which is sorted; 0 for no samples.
+func percentile(lat []time.Duration, pct int) time.Duration {
+	if len(lat) == 0 {
+		return 0
+	}
+	rank := (len(lat)*pct + 99) / 100
+	return lat[max(rank, 1)-1]
 }
 
 // timedLookup resolves one name through the host resolver: 3 s, one retry. The duration is that of the
@@ -162,7 +182,44 @@ func timedLookup(ctx context.Context, e *Env, host string) (time.Duration, error
 
 var ipv6Probes = []string{"[2606:4700:4700::1111]:443", "[2001:4860:4860::8888]:443"}
 
-func checkIPv6(ctx context.Context, e *Env) Result {
+func checkIPv6(ctx context.Context, e *Env) Result { return withOwnedIPv6(e, checkIPv6Uplink(ctx, e)) }
+
+// withOwnedIPv6 adds the addresses the agent holds for the panel (hostctl.OwnedIPv6Host) to the result: the param owned
+// ("addr=state", comma-separated, sorted by address). A DAD failure or an address that is not on the interface turns a
+// result that was fine into a warning; a result that already warns keeps its own code.
+func withOwnedIPv6(e *Env, r Result) Result {
+	if e.OwnedIPv6 == nil {
+		return r
+	}
+	owned := e.OwnedIPv6()
+	if len(owned) == 0 {
+		return r
+	}
+	sort.Slice(owned, func(i, j int) bool { return owned[i].Addr < owned[j].Addr })
+	var parts []string
+	var dad, missing bool
+	for _, o := range owned {
+		parts = append(parts, o.Addr+"="+o.State)
+		dad = dad || o.State == hostctl.IPv6AddrDADFailed
+		missing = missing || o.State == hostctl.IPv6AddrMissing || o.State == hostctl.IPv6AddrDenied
+	}
+	if r.Params == nil {
+		r.Params = map[string]string{}
+	}
+	r.Params["owned"] = csv(parts)
+	if r.Status != OK {
+		return r
+	}
+	switch {
+	case dad:
+		r.Status, r.Code, r.Detail = Warn, CodeIPv6OwnedDADFailed, "an IPv6 address of this node failed duplicate address detection and was removed"
+	case missing:
+		r.Status, r.Code, r.Detail = Warn, CodeIPv6OwnedMissing, "an IPv6 address of this node is not on the interface"
+	}
+	return r
+}
+
+func checkIPv6Uplink(ctx context.Context, e *Env) Result {
 	has := false
 	if s, err := e.read("/proc/net/if_inet6"); err == nil {
 		has = hasGlobalInet6(s)
@@ -248,10 +305,6 @@ func ipv6Uplink(ctx context.Context, e *Env) uplink6 {
 	return u
 }
 
-// tunnelIfacePrefixes name interfaces that never carry the uplink: the agent's own links (mgwarp, mgawg*), other
-// VPN, bridge and container devices.
-var tunnelIfacePrefixes = []string{"lo", "mg", "wg", "awg", "tun", "tap", "ppp", "sit", "ip6tnl", "ip6gre", "gre", "tailscale", "zt", "docker", "br-", "veth", "virbr"}
-
 // ipv6DefaultIface returns the interface of the IPv6 default route (::/0) from /proc/net/ipv6_route: the lowest
 // metric among the routes that are up and not rejecting, on an interface that is not a tunnel. "" = none.
 // Columns: dest dest_len src src_len next_hop metric refcnt use flags iface (hex).
@@ -259,7 +312,7 @@ func ipv6DefaultIface(s string) string {
 	best, bestMetric := "", uint64(0)
 	for _, line := range strings.Split(s, "\n") {
 		f := strings.Fields(line)
-		if len(f) < 10 || f[0] != "00000000000000000000000000000000" || f[1] != "00" || isTunnelIface(f[9]) {
+		if len(f) < 10 || f[0] != "00000000000000000000000000000000" || f[1] != "00" || hostctl.NotUplink(f[9]) {
 			continue
 		}
 		flags, err := strconv.ParseUint(f[8], 16, 32)
@@ -272,15 +325,6 @@ func ipv6DefaultIface(s string) string {
 		}
 	}
 	return best
-}
-
-func isTunnelIface(name string) bool {
-	for _, pre := range tunnelIfacePrefixes {
-		if strings.HasPrefix(name, pre) {
-			return true
-		}
-	}
-	return false
 }
 
 // stableInet6 lists the global addresses of one interface as "addr/plen", sorted: not ULA, link-local, temporary
@@ -476,10 +520,23 @@ func inboundPorts(ibs []Inbound) map[portKey]bool {
 	m := map[portKey]bool{}
 	for _, in := range ibs {
 		if in.Enabled {
-			m[portKey{in.Network, in.Port}] = true
+			for _, listen := range inboundListens(in) {
+				m[portKey{listen.Network, listen.Port}] = true
+			}
 		}
 	}
 	return m
+}
+
+func inboundListens(in Inbound) []InboundListen {
+	out := []InboundListen{{Network: in.Network, Port: in.Port}}
+	for _, side := range in.SideListens {
+		if side.Network == "" || side.Port <= 0 || (side.Network == in.Network && side.Port == in.Port) {
+			continue
+		}
+		out = append(out, side)
+	}
+	return out
 }
 
 // tcpPortIsOurs: a TCP listener of this agent holds the port. When the socket table cannot be read the answer
@@ -591,7 +648,9 @@ func portSpecs(ibs []Inbound) []portSpec {
 		if !in.Enabled {
 			continue
 		}
-		out = append(out, portSpec{in.Network, in.Port, in.Port})
+		for _, listen := range inboundListens(in) {
+			out = append(out, portSpec{listen.Network, listen.Port, listen.Port})
+		}
 		if in.HopFrom != 0 {
 			out = append(out, portSpec{in.Network, in.HopFrom, in.HopTo})
 		}
@@ -692,36 +751,42 @@ func checkPortConflicts(_ context.Context, e *Env) Result {
 	ls := listeners(e)
 
 	type hit struct {
-		in    Inbound
-		procs []string
+		in      Inbound
+		network string
+		port    int
+		procs   []string
 	}
 	var own, hop, tcp []hit
 	var recoverable []Inbound
 	for _, in := range enabled {
-		var holders, inRange []string
+		var inRange []string
 		free := true
-		for _, l := range ls {
-			if l.network != in.Network {
-				continue
-			}
-			// A running awg inbound on the kernel backend holds its UDP port with a kernel socket (inode 0, no owner process).
-			foreign := l.pid != e.SelfPID && !(l.pid == 0 && in.Protocol == "awg" && in.State == "running")
-			name := l.comm
-			if name == "" {
-				name = "unknown"
-			}
-			switch {
-			case l.port == in.Port:
-				free = false
-				if foreign {
-					holders = append(holders, fmt.Sprintf("%s(%d)", name, l.pid))
+		for _, listen := range inboundListens(in) {
+			var holders []string
+			mainListen := listen.Network == in.Network && listen.Port == in.Port
+			for _, l := range ls {
+				if l.network != listen.Network {
+					continue
 				}
-			case in.HopFrom != 0 && l.port >= in.HopFrom && l.port <= in.HopTo && foreign:
-				inRange = append(inRange, fmt.Sprintf("%s:%d", name, l.port))
+				// A running awg inbound on the kernel backend holds its UDP port with a kernel socket (inode 0, no owner process).
+				foreign := l.pid != e.SelfPID && !(l.pid == 0 && in.Protocol == "awg" && in.State == "running")
+				name := l.comm
+				if name == "" {
+					name = "unknown"
+				}
+				switch {
+				case l.port == listen.Port:
+					free = false
+					if foreign {
+						holders = append(holders, fmt.Sprintf("%s(%d)", name, l.pid))
+					}
+				case mainListen && in.HopFrom != 0 && l.port >= in.HopFrom && l.port <= in.HopTo && foreign:
+					inRange = append(inRange, fmt.Sprintf("%s:%d", name, l.port))
+				}
 			}
-		}
-		if len(holders) > 0 {
-			own = append(own, hit{in, uniq(sorted(holders))})
+			if len(holders) > 0 {
+				own = append(own, hit{in: in, network: listen.Network, port: listen.Port, procs: uniq(sorted(holders))})
+			}
 		}
 		if in.TLSPort > 0 { // the HTTPS listener (decoy and ACME) sits on a TCP port of its own
 			var th []string
@@ -731,11 +796,11 @@ func checkPortConflicts(_ context.Context, e *Env) Result {
 				}
 			}
 			if len(th) > 0 {
-				tcp = append(tcp, hit{in, uniq(sorted(th))})
+				tcp = append(tcp, hit{in: in, network: "tcp", port: in.TLSPort, procs: uniq(sorted(th))})
 			}
 		}
 		if len(inRange) > 0 {
-			hop = append(hop, hit{in, firstN(uniq(sorted(inRange)), maxNames)})
+			hop = append(hop, hit{in: in, procs: firstN(uniq(sorted(inRange)), maxNames)})
 		}
 		if in.State == "failed" && bindErrRe.MatchString(in.Error) && free {
 			recoverable = append(recoverable, in)
@@ -765,8 +830,8 @@ func checkPortConflicts(_ context.Context, e *Env) Result {
 	if len(own) > 0 {
 		h := own[0]
 		r.Status, r.Code = Fail, CodePortsHeld
-		r.Params = p("inbound_id", h.in.ID, "port", strconv.Itoa(h.in.Port), "network", h.in.Network, "process", strings.Join(h.procs, ","))
-		r.Detail = fmt.Sprintf("%s/%d of inbound %s is held by %s", h.in.Network, h.in.Port, h.in.ID, strings.Join(h.procs, ", "))
+		r.Params = p("inbound_id", h.in.ID, "port", strconv.Itoa(h.port), "network", h.network, "process", strings.Join(h.procs, ","))
+		r.Detail = fmt.Sprintf("%s/%d of inbound %s is held by %s", h.network, h.port, h.in.ID, strings.Join(h.procs, ", "))
 		r.FixID = "" // restarting cannot free a port a foreign process holds
 	}
 	return r
@@ -1021,14 +1086,6 @@ func parseConntrackDrops(content string) (uint64, bool) {
 	return 0, false
 }
 
-func conntrackAtCapacity(count, max uint64) bool {
-	if max == 0 {
-		return false
-	}
-	threshold := max/5*4 + (max%5*4+4)/5 // ceil(80% of max), without overflowing uint64.
-	return count >= threshold
-}
-
 // addConntrackParams reports the table's fill whenever it was read. The drops come from /proc/net/stat/nf_conntrack,
 // which kernels built without CONFIG_NF_CONNTRACK_PROCFS (Ubuntu's) do not have: then there is no drops param.
 func addConntrackParams(params map[string]string, snapshot conntrackSnapshot, dropsOK bool) map[string]string {
@@ -1051,11 +1108,12 @@ func containsField(s, want string) bool {
 	return false
 }
 
+// checkNetBaseline compares the settings with the baseline. The connection-tracking table's fill is reported in its params
+// (the table's size is part of the baseline), but a full table is conntrack_fill's verdict, not a baseline difference.
 func checkNetBaseline(_ context.Context, e *Env) Result {
 	diff, fixable, notes := baselineDiff(e)
 	conntrack, hasConntrack := readConntrackSnapshot(e)
-	underPressure := conntrack.hasCountAndMax && conntrackAtCapacity(conntrack.count, conntrack.max)
-	if len(diff) == 0 && !underPressure {
+	if len(diff) == 0 {
 		if len(notes) > 0 {
 			params := addConntrackParams(addUDPBufferErrorParams(p("notes", strings.Join(notes, ",")), e), conntrack, hasConntrack)
 			return Result{Status: OK, Code: CodeBaselineNotes, Params: params, Detail: noteText(notes)}
@@ -1063,21 +1121,8 @@ func checkNetBaseline(_ context.Context, e *Env) Result {
 		params := addConntrackParams(addUDPBufferErrorParams(p(), e), conntrack, hasConntrack)
 		return Result{Status: OK, Code: CodeBaselineOK, Params: params, Detail: "fq, bbr, conntrack, UDP buffers and the journald cap are in place"}
 	}
-	reportedDiff := append([]string(nil), diff...)
-	if underPressure {
-		reportedDiff = append(reportedDiff, "conntrack_pressure")
-	}
-	params := addConntrackParams(addUDPBufferErrorParams(p("differs", strings.Join(reportedDiff, ","), "notes", strings.Join(notes, ",")), e), conntrack, hasConntrack)
-	r := Result{Status: Warn, Code: CodeBaselineDiff, Params: params}
-	if len(diff) > 0 {
-		r.Detail = "baseline differs: " + strings.Join(diff, ", ")
-	}
-	if underPressure {
-		if r.Detail != "" {
-			r.Detail += "; "
-		}
-		r.Detail += fmt.Sprintf("conntrack table is at least 80%% full (%d/%d entries)", conntrack.count, conntrack.max)
-	}
+	params := addConntrackParams(addUDPBufferErrorParams(p("differs", strings.Join(diff, ","), "notes", strings.Join(notes, ",")), e), conntrack, hasConntrack)
+	r := Result{Status: Warn, Code: CodeBaselineDiff, Params: params, Detail: "baseline differs: " + strings.Join(diff, ", ")}
 	if len(notes) > 0 {
 		if r.Detail != "" {
 			r.Detail += "; "

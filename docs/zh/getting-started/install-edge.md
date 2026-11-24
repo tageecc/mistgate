@@ -5,7 +5,7 @@ description: 使用 mistgate edge deploy 在 Cloudflare 上运行面板，无需
 
 Cloudflare 版是为 WebAssembly 构建的同一面板，由六个 Cloudflare Workers 和一个 D1 数据库运行，无需在自有 Linux 服务器上运行二进制文件。运行一条命令 `mistgate edge deploy` 即可在 Cloudflare 账户中创建所有内容。节点仍然是你自己的服务器，照常从管理后台添加。本页介绍如何从 Cloudflare 账户开始，在管理后台创建所有者账户。示例使用 `panel.example.com`。
 
-> **警告：** 此版本为预览版。`mistgate edge deploy` 和面板已在模拟的 Cloudflare 环境中测试，并自 2026 年 10 月起在一个真实账户上配合一个测试节点运行。从 v0.1.36 起，发布版本中已包含 Cloudflare 版发布包。不要将依赖面板的用户迁移到此版本。部分功能尚不可用，见下文「此版本中尚不可用的功能」。如果现在需要可靠的面板，使用[安装面板](install-panel.md)。
+> **警告：** 此版本为预览版。`mistgate edge deploy` 和面板已在模拟的 Cloudflare 环境中测试；2026 年 10 月曾在一个真实账户上配合一个测试节点完成首次部署，但尚未在真实账户上完整测试。从 v0.1.36 起，发布版本中已包含 Cloudflare 版发布包。不要将依赖面板的用户迁移到此版本。部分功能尚不可用，见下文「此版本中尚不可用的功能」。如果现在需要可靠的面板，使用[安装面板](install-panel.md)。
 
 ## 要求
 
@@ -141,6 +141,7 @@ Setup link (one-time; the token is valid for 30 minutes from the panel's first s
 |:--|:--|
 | 备份 | 不支持加密备份和恢复。Cloudflare 自带的 D1 恢复功能（Time Travel）可以恢复数据库，但尚未与面板一起测试。妥善保管密钥文件。 |
 | MCP 和 API 令牌 | 不提供 MCP 服务器。已有令牌会显示在列表中，也可以吊销；不能创建新令牌。 |
+| 助手 | 不提供；将与 MCP 一同推出。参见[助手](../guide/assistant.md#在-cloudflare-版中)。 |
 | 隧道检测 | 面板目前不会从客户端视角检测服务器的隧道。 |
 | 节点日志 | 不显示节点 Agent 的实时日志；其警告和错误见节点的[运行记录](../guide/nodes.md#运行记录)。 |
 | 更新面板 | 不支持自更新：需再次运行命令更新（见下文）。 |

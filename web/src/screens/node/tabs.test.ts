@@ -13,8 +13,21 @@ describe("validateNodeSearch", () => {
     expect(validateNodeSearch({ tab: "ways", way: "direct", add: "1" })).toEqual({ tab: "ways", way: "direct", add: "1" });
     expect(validateNodeSearch({ tab: "ways", add: 1 })).toEqual({ tab: "ways", add: "1" });
     expect(validateNodeSearch({ tab: "ways", add: "via:nod_msk1" })).toEqual({ tab: "ways", add: "via:nod_msk1" });
+    // one server of that entry, dragged on the graph
+    expect(validateNodeSearch({ tab: "ways", add: "via:nod_msk1/inb_h" })).toEqual({ tab: "ways", add: "via:nod_msk1/inb_h" });
+    expect(validateNodeSearch({ tab: "ways", add: "via:nod_msk1/inb_h/x" })).toEqual({ tab: "ways" });
+    // the IPv6 entry's dialog: Reachability and the alerts link here
+    expect(validateNodeSearch({ tab: "ways", way: "ipv6", add: "ipv6" })).toEqual({ tab: "ways", way: "ipv6", add: "ipv6" });
     expect(validateNodeSearch({ tab: "ways", way: "sideways", add: "prf_1" })).toEqual({ tab: "ways" });
     expect(validateNodeSearch({ tab: "exit", way: "direct" })).toEqual({ tab: "exit" });
+  });
+
+  it("keeps the open section of the Server tab, the first without one", () => {
+    expect(validateNodeSearch({ tab: "server", sv: "ssh" })).toEqual({ tab: "server", sv: "ssh" });
+    expect(validateNodeSearch({ tab: "server", sv: "del" })).toEqual({ tab: "server", sv: "del" });
+    expect(validateNodeSearch({ tab: "server", sv: "node" })).toEqual({ tab: "server" });
+    expect(validateNodeSearch({ tab: "server", sv: "nope" })).toEqual({ tab: "server" });
+    expect(validateNodeSearch({ tab: "exit", sv: "ssh" })).toEqual({ tab: "exit" });
   });
 
   it("keeps the profile to add only on the profiles tab", () => {
@@ -60,5 +73,14 @@ describe("upgradeNodeLink", () => {
     for (const s of [{}, { tab: "profiles", add: "prf_1" }, { tab: "profiles" }, { tab: "ways", way: "direct" }, { tab: "exit" }, { tab: "history", view: "journal" }, { tab: "server" }, { tab: "nope" }])
       expect(upgradeNodeLink(s, ""), JSON.stringify(s)).toBeUndefined();
     expect(upgradeNodeLink({ tab: "exit" }, "warp")).toBeUndefined();
+  });
+});
+
+describe("coming from the fleet map", () => {
+  it("keeps ?from=map on any tab, and on the overview, so the page can show its breadcrumb back", () => {
+    expect(validateNodeSearch({ tab: "ways", view: "graph", from: "map" })).toEqual({ tab: "ways", view: "graph", from: "map" });
+    expect(validateNodeSearch({ from: "map" })).toEqual({ from: "map" });
+    expect(validateNodeSearch({ tab: "doctor", from: "map" })).toEqual({ tab: "doctor", from: "map" });
+    expect(validateNodeSearch({ tab: "ways", from: "elsewhere" })).toEqual({ tab: "ways" });
   });
 });

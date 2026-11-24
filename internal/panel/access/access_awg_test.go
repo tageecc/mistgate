@@ -232,7 +232,7 @@ func TestAWGDeviceCreateRejections(t *testing.T) {
 	wantCode(t, err, connect.CodeNotFound)
 	_ = msgOf
 	// Nothing was stored by the rejected calls: one device (the "ok" one).
-	if n := must(e.st.Access().DeviceCounts(e.ctx, []string{f.user}))[f.user]; n != 1 {
+	if n := must(e.st.Access().DeviceCounts(e.ctx, []string{f.user}, e.s.now()))[f.user].Used; n != 1 {
 		t.Errorf("devices = %d", n)
 	}
 }
@@ -891,23 +891,23 @@ func TestEnsureMihomoAWGReadsBackLiveImplicitDevice(t *testing.T) {
 	e := f.e
 	a := e.st.Access()
 	u := must(a.User(e.ctx, f.user))
-	g := must(a.Group(e.ctx, f.group))
+	g := store.AccessGroups{must(a.Group(e.ctx, f.group))}
 	full, err := a.InboundsFull(e.ctx, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	seed := requestDevice{dev: store.AccessDevice{ID: "dev_mihomo_readback", UserID: u.ID, Implicit: true}}
-	if got, _ := e.s.ensureMihomoAWG(e.ctx, u, g, full, DeviceHint{}, seed, store.SubscriptionData{}); !got.added {
+	if got, _ := e.s.ensureMihomoAWG(e.ctx, u, g, full, nil, DeviceHint{}, seed, store.SubscriptionData{}); !got.added {
 		t.Fatal("initial Mihomo call did not add the AWG credential")
 	}
-	wantData, err := a.SubscriptionData(e.ctx, u.ID, g.ID, e.clock, true, e.clock, nil)
+	wantData, err := a.SubscriptionData(e.ctx, u.ID, e.clock, true, e.clock, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	wantDevice, wantCreds := wantData.Device, wantData.DeviceCreds
 
-	read, _ := e.s.ensureMihomoAWG(e.ctx, u, g, full, DeviceHint{}, seed, store.SubscriptionData{})
+	read, _ := e.s.ensureMihomoAWG(e.ctx, u, g, full, nil, DeviceHint{}, seed, store.SubscriptionData{})
 	gotDevice, gotCreds := read.dev, read.creds
 	if read.added {
 		t.Fatal("a read-back of an existing device reported a new credential")

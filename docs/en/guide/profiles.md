@@ -3,7 +3,7 @@ title: Profiles
 description: What a profile is, how the editor works, how a profile is put on nodes with its port and certificate, and which changes break existing users.
 ---
 
-A profile is a protocol setup with a name: "Hysteria2 · 443 with Salamander and Let's Encrypt", "AmneziaWG 3.1 that looks like DNS". You make it once and put it on as many nodes as you like; each placement is a server on a node. People get a profile through their group. This page covers the **Profiles** section, the profile editor and placing profiles on nodes; the settings of each protocol are on [Hysteria2](hysteria2.md), [VLESS REALITY](vless.md) and [AmneziaWG](amneziawg.md).
+A profile is a protocol setup with a name: "Hysteria2 · 443 with Salamander and Let's Encrypt", "AmneziaWG 3.1 that looks like DNS". You make it once and put it on as many nodes as you like; each placement is a server on a node. People get a profile through their group. This page covers the **Profiles** section, the profile editor and placing profiles on nodes; the settings of each protocol are on [Hysteria2](hysteria2.md), [VLESS REALITY](vless.md), [AmneziaWG](amneziawg.md) and [MTProto](mtproto.md).
 
 ## Profiles, nodes and groups
 
@@ -17,7 +17,7 @@ A person gets a server when all of these hold: the profile is in their group, it
 
 ## Protocols are plugins
 
-Each protocol is a plugin of the panel: today Hysteria2, VLESS and AmneziaWG. A plugin brings its settings as a schema, and the editor draws the form from it. That is why every protocol's form looks alike:
+Each protocol is a plugin of the panel: today Hysteria2, VLESS, AmneziaWG, MTProto and TrustTunnel; the last two are marked as experimental. A plugin brings its settings as a schema, and the editor draws the form from it. That is why every protocol's form looks alike:
 
 - fields are grouped into **Basics**, **Obfuscation** and **Advanced**; a group header counts what you changed ("2 changed") and what is wrong ("1 error");
 - numbers carry their unit (Mbit/s, s, bytes);
@@ -39,6 +39,8 @@ Not every subscription format can carry every profile: sing-box has no XHTTP, on
 - The line lists the formats that carry the profile: "Link list · Mihomo · Xray JSON · sing-box". A profile that works everywhere has only this line.
 - A yellow chip marks a real loss: "not in sing-box: XHTTP". Formats that lose the profile for the same reason share one chip: "not in Link list, Xray JSON, sing-box: Gecko". Hover or focus a chip for the full sentence.
 - AmneziaWG is not a loss, it is how it works: the line ends "Mihomo · AmneziaVPN keys", with no chip.
+- MTProto is in no subscription format and is not a loss either: its `tg://` links come from the person's page, and the preview under **What the client sees** shows the link ("Telegram · tg://proxy link"). See [MTProto](mtproto.md).
+- TrustTunnel is in no subscription format either: its `tt://` links come from the person's page, and the Mistgate app gets its path directly. See [TrustTunnel](trusttunnel.md).
 - A Hysteria2 port-hopping range is not a loss either. The link list and Xray JSON write it as one port, so their names carry a dotted underline and a tip: "The port range is written as one port."
 - In the editor the line follows your settings as you type, and it is hidden while the draft has errors. On the user card, next to a subscription profile that some format leaves out, only the yellow chip shows.
 
@@ -55,7 +57,7 @@ The reasons are stable codes. The panel's API and [MCP](../reference/mcp.md) ret
 
 ## Creating a profile
 
-1. **New profile**. If the panel has more than one protocol, pick it under **Protocol**. The form starts from the plugin's defaults, with every secret already generated.
+1. **New profile** has two steps. First choose the protocol: a card for each (**Hysteria2**, **VLESS**, **AmneziaWG**, **MTProto**, **TrustTunnel**; the experimental ones say so). Then the form opens, starting from the plugin's defaults, with every secret already generated. The settings of the protocol you chose are on its page, for example [MTProto](mtproto.md).
 2. **Name**. Until you type one, it follows the port: "Hysteria2 · 443". Up to 64 characters, shown in the panel's lists and, through `{profile}` of the name template, in the server names people see (see [Subscriptions](subscriptions.md)).
 3. Change the settings you need. The panel checks them as you type; a field with a problem is marked, and the preview waits until it is fixed.
 4. **Right after it is created** decides what happens on the click:
@@ -69,7 +71,7 @@ The panel on the right, **What the client sees**, shows what a client would get 
 
 An existing profile's page starts with **Where it runs**: one line that says whether the profile works ("Working: 2 nodes, 1 group, 14 users") or what is missing, with the button that fixes it, then three columns:
 
-- **Nodes**: each node with the port and the state of the profile there, and the agent's error when it failed. **Put on nodes** adds more.
+- **Nodes**: each node with the port and the state of the profile there, and the agent's error when it failed. **Put on nodes** adds more. The tick button in the card's header (**Choose nodes to take the profile off**) puts a box on every row: tick the nodes, press **Take off N nodes** and confirm. The nodes lose the profile in one step, and the people connected through it on them lose the connection.
 - **Groups**: the groups that carry it; **Edit** opens a group, **Add to a group** adds it to one more.
 - **Users**: how many people get it, per group. Only active users whose app switch allows the protocol are counted.
 
@@ -85,19 +87,19 @@ A profile can go on any node of the fleet, including one still waiting for insta
 On a node, a profile can have its own:
 
 - **Port**. Empty means the profile's port.
-- **Domain (SNI)** (Hysteria2). Empty means the profile's domain, and if the profile has none, the node address when it is a domain.
+- **Domain (SNI)** (Hysteria2; and MTProto, where it is the name in the handshake when the profile uses the node's own name). Empty means the profile's domain, and if the profile has none, the node address when it is a domain.
 
 The first AmneziaWG profile on a node also asks which AmneziaWG backend the node uses, see [AmneziaWG](amneziawg.md).
 
 ### Ports and the free-port suggestion
 
-Two profiles cannot listen on the same port of one node, and a port cannot sit inside another profile's port-hopping range. When the port is taken, the dialog puts in a free one at once and says so ("Port 443 is taken by "Main": the free port 8443 is filled in. You can type your own."), and **Take 8443** brings it back if you typed something else. For Hysteria2 the panel tries 8443, 4443, 2053, 2083, 2087 and 2096 first, then random ports between 10000 and 60000; for AmneziaWG only random ones. Hop ranges count as taken.
+Two profiles cannot listen on the same port of one node, except VLESS, TrustTunnel and MTProto on a TCP port, which can share it by name ([One 443 for everyone](shared-port.md)). A port cannot sit inside another profile's port-hopping range either. When the port is taken, the dialog puts in a free one at once and says so ("Port 443 is taken by "Main": the free port 8443 is filled in. You can type your own."), and **Take 8443** brings it back if you typed something else. For Hysteria2 the panel tries 8443, 4443, 2053, 2083, 2087 and 2096 first, then random ports between 10000 and 60000; for AmneziaWG only random ones. Hop ranges count as taken.
 
 A port can also be held by a program outside Mistgate. The panel cannot see that before the profile starts: the profile then fails with "Port 443 is taken by another program", the doctor names the process when it can, and **Change port** opens the dialog on a free port.
 
 ### Certificates
 
-AmneziaWG has no certificate, and neither has VLESS REALITY: it borrows the one of its target site. A Hysteria2 profile has one of two:
+AmneziaWG has no certificate, and neither has VLESS REALITY: it borrows the one of its target site. MTProto has none of its own either: with the node's own name, strangers on its port see the node's site with the node's certificate ([MTProto](mtproto.md#the-name-in-the-handshake)). A Hysteria2 profile has one of two:
 
 | Certificate | Needs | How the app checks it |
 |:--|:--|:--|
@@ -122,7 +124,8 @@ While you fill in the add-profile dialog (and the per-node edit dialog), the pan
 | Code | When | What the dialog says or does |
 |:--|:--|:--|
 | `acme_needs_domain` | Let's Encrypt and no domain on an IP node | The Let's Encrypt block with **Enter a domain** and the self-signed ways. |
-| `port_taken` | Another profile of the node listens there, or the port lies in its hop range | "Port 443 on de1 is already taken by the profile "Main"." A free port is filled in; **Take N**. |
+| `mtproto_needs_domain` | An MTProto profile with the node's own name, on a node that has only an IP address | The message asks for a domain for the profile on that node, or for the choice of **Another site**. |
+| `port_taken` | Another profile of the node listens there (not a TCP service that can share the port), or the port lies in its hop range | "Port 443 on de1 is already taken by the profile "Main"." A free port is filled in; **Take N**. |
 | `hop_taken` | This profile's own hop range overlaps another profile on the node | The overlap, and **Open the profile**: only changing the range helps. |
 | `port_in_hop` | The port lies inside the profile's own hop range | "The port must be outside the profile's hop range (20000–30000)." |
 | `sni_needs_domain` | An IP typed into **Domain (SNI)** of a Let's Encrypt profile | "Let's Encrypt needs a domain here, and "…" is not one." |
@@ -132,12 +135,20 @@ While you fill in the add-profile dialog (and the per-node edit dialog), the pan
 
 The UDP delivery check runs when you save a new or changed port and can take about 8 seconds; **validate only** stays cache-only. If the selected port loses packets, saving stops and offers a port that passed the same check. You can choose **Add anyway** to save it, and Mistgate records that choice in the audit log. The picker hides ports that lost packets in the last 30 days, so they are not offered; a fresh passing result is suggested first, then unchecked ports.
 
-A warning does not stop the button. Today there are two:
+A warning does not stop the button. These are the ones:
 
 - `warp_missing`, when the profile exits through WARP and the node has no WARP account, WARP is paused there, or the node's last report says the tunnel is down. The dialog says that the profile will not pass traffic there and links to the node's WARP card.
 - `hy2_decoy_paused`, when a VLESS profile on a TCP port is added next to a Hysteria2 profile whose site uses that port (TCP 443 by default), or the other way round. The dialog names both profiles and says that the Hysteria2 site is off while VLESS holds the port. See [VLESS and Hysteria2 on one node](vless-and-hysteria2.md).
+- `hy2_site_taken` and `hy2_site_taken_mtproto`, when TrustTunnel or MTProto on a TCP port is added next to a Hysteria2 profile whose site uses that port, or the other way round. The Hysteria2 site gives the port up to them.
+- `tcp_port_shared` and `share_two_faces`, when the profile stands on a TCP port that other services share by name, and when one of them shows another site. See [One 443 for everyone](shared-port.md).
 
 The same codes come back from the API and the MCP server, as "code: key=value&key=value", so scripts can read them too. See [API](../reference/api.md).
+
+## Two services on one TCP port
+
+A node can run several TCP services on the same port, TCP 443 for example: VLESS REALITY, VLESS over TLS, TrustTunnel and MTProto at once. The agent tells them apart by the **name** the client asks for in the first bytes of the connection (the SNI), so every service needs a name of its own, with a DNS record, and one of them must show the node's own site: it answers everyone who names nothing or a name nobody holds. A Hysteria2 site is not one of them: it still gives its TCP port up. UDP is not shared.
+
+When the port is taken, the dialog offers **Put beside on 443** with a name you can edit (a subdomain of the node's address), shows the DNS record to add and says who restarts; **Take 8443** is the old way out. The **TCP 443 is shared** card on the node's Profiles tab shows who shares the port, the names and the counters. Everything about it, from what a stranger sees to the limits, is on one page: [One 443 for everyone](shared-port.md).
 
 ## Errors the editor explains
 
@@ -186,7 +197,7 @@ Save your changes first: the copy is made from the saved profile. People of thos
 
 ## Deleting a profile
 
-**Danger zone** → **Delete profile** removes the profile for good, and groups lose it. A profile that is still on a node cannot be deleted: the window names the nodes. Remove it from those nodes first (node → **Profiles** → **Remove**).
+**Danger zone** → **Delete profile** removes the profile for good, and groups lose it. For a profile that is on nodes the window lists them with a box each, all ticked. With all of them ticked the red button reads **Take off all nodes and delete**: type the profile name and the panel takes the profile off every node and deletes it in one step. Untick some nodes and the button takes the profile off only the ticked ones and keeps the profile; the window stays with the nodes that are left. People connected through the profile on those nodes lose the connection, and relays through them go too; this cannot be undone. A node that is not connected does not hold anything up: it drops the profile as soon as it connects. If the profile got another node while the window was open, nothing is changed and the window names that node. Groups lose a deleted profile. Removing it from a single node is still on the node's **Profiles** tab (**Remove**).
 
 ## Who can do what
 

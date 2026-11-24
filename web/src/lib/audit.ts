@@ -29,7 +29,11 @@ const keys: Record<string, MessageKey> = {
   "node.awg_prepare": "audit.node.awg_prepare",
   "node.bandwidth_measure": "audit.node.bandwidth_measure",
   "node.bandwidth_auto": "audit.node.bandwidth_auto",
+  "node.debug_capture": "audit.node.debug_capture",
+  "node.debug_capture_stop": "audit.node.debug_capture_stop",
   "node.ports_check": "audit.node.ports_check",
+  "node.ipv6_check": "audit.node.ipv6_check",
+  "node.ipv6_entry": "audit.node.ipv6_entry",
   port_lossy_override: "audit.port_lossy_override",
   stepup: "audit.stepup",
   captcha: "audit.captcha",
@@ -37,9 +41,21 @@ const keys: Record<string, MessageKey> = {
   security_update: "audit.security_update",
   page_unlock_lockout: "audit.page_unlock_lockout",
   subscription_settings_update: "audit.subscription_settings_update",
+  client_api_update: "audit.client_api_update",
+  client_device_enrolled: "audit.client_device_enrolled",
+  client_device_reenrolled: "audit.client_device_reenrolled",
+  client_device_left: "audit.client_device_left",
+  client_debug_requested: "audit.client_debug_requested",
+  client_debug_cancelled: "audit.client_debug_cancelled",
+  client_debug_received: "audit.client_debug_received",
+  client_debug_declined: "audit.client_debug_declined",
+  client_debug_read: "audit.client_debug_read",
+  client_debug_downloaded: "audit.client_debug_downloaded",
+  client_debug_deleted: "audit.client_debug_deleted",
   user_create: "audit.user_create",
   user_update: "audit.user_update",
   user_delete: "audit.user_delete",
+  user_link_rotate: "audit.user_link_rotate",
   users_disable: "audit.users_disable",
   users_enable: "audit.users_enable",
   users_extend: "audit.users_extend",
@@ -52,6 +68,7 @@ const keys: Record<string, MessageKey> = {
   inbound_add: "audit.inbound_add",
   inbound_update: "audit.inbound_update",
   inbound_remove: "audit.inbound_remove",
+  inbounds_remove: "audit.inbounds_remove",
   "relay.create": "audit.relay.create",
   "relay.update": "audit.relay.update",
   "relay.delete": "audit.relay.delete",
@@ -69,6 +86,8 @@ const keys: Record<string, MessageKey> = {
   device_revoke: "audit.device_revoke",
   user_reset_traffic: "audit.user_reset_traffic",
   "health.mute_alert": "audit.health.mute_alert",
+  "health.dismiss_alert": "audit.health.dismiss_alert",
+  "health.reopen_alert": "audit.health.reopen_alert",
   "health.fix_plan": "audit.health.fix_plan",
   "health.apply_fix": "audit.health.apply_fix",
   update_rollout_start: "audit.update_rollout_start",
@@ -77,6 +96,10 @@ const keys: Record<string, MessageKey> = {
   update_rollout_cancel: "audit.update_rollout_cancel",
   update_rollback_node: "audit.update_rollback_node",
   update_rescan: "audit.update_rescan",
+  os_rollout_start: "audit.os_rollout_start",
+  os_rollout_cancel: "audit.os_rollout_cancel",
+  os_refresh: "audit.os_refresh",
+  update_download_sources: "audit.update_download_sources",
   warp_params: "audit.warp_params",
   warp_register: "audit.warp_register",
   warp_import: "audit.warp_import",
@@ -85,8 +108,16 @@ const keys: Record<string, MessageKey> = {
   warp_refresh: "audit.warp_refresh",
   warp_delete: "audit.warp_delete",
   warp_reregister: "audit.warp_reregister",
+  warp_license: "audit.warp_license",
+  warp_reach_settings: "audit.warp_reach_settings",
+  log_level_set: "audit.log_level_set",
+  retention_set: "audit.retention_set",
+  metrics_set: "audit.metrics_set",
+  export_data: "audit.export_data",
   token_create: "audit.token_create",
   token_revoke: "audit.token_revoke",
+  api_token_bulk: "audit.api_token_bulk",
+  user_change_limit: "audit.user_change_limit",
   approval_approve: "audit.approval_approve",
   approval_reject: "audit.approval_reject",
   mcp_plan: "audit.mcp_plan",
@@ -151,6 +182,7 @@ function sentenceKey(e: Pick<AuditEntry, "action" | "result">, p: Record<string,
     case "users_disable":
     case "users_enable":
     case "users_extend":
+    case "inbounds_remove":
       return p.count === "1" ? variant("one") : { key: base, worded: false };
     case "inbound_update":
       return p.enabled === "false" ? variant("off") : { key: base, worded: false };
@@ -163,6 +195,10 @@ function sentenceKey(e: Pick<AuditEntry, "action" | "result">, p: Record<string,
       return p.reason && p.reason !== "admin" ? variant("gone") : { key: base, worded: false };
     case "relay.check":
       return p.ok === "false" ? variant("fail") : p.verified === "true" ? variant("verified") : { key: base, worded: false };
+    case "node.ipv6_check":
+      return p.pass === "false" ? variant("fail") : { key: base, worded: false };
+    case "node.ipv6_entry":
+      return p.action === "off" ? variant("off") : { key: base, worded: false };
     case "preset_default":
       return p.name ? { key: base, worded: false } : variant("builtin");
     case "node_dns_options":
@@ -171,6 +207,17 @@ function sentenceKey(e: Pick<AuditEntry, "action" | "result">, p: Record<string,
       return p.preset ? { key: base, worded: false } : variant("default");
     case "reset_login":
       return p.created === "true" ? variant("added") : { key: base, worded: false };
+    case "os_rollout_start":
+      return p.mode === "reboot_only" ? variant("reboot") : { key: base, worded: false };
+    case "update_download_sources":
+      return p.sources ? { key: base, worded: false } : variant("off");
+    case "client_api_update":
+      return p.enabled === "true" || p.enabled === "false" ? variant(p.enabled === "true" ? "on" : "off") : { key: base, worded: false };
+    case "api_token_bulk":
+      return variant(p.allow === "true" ? "on" : "off");
+    case "user_change_limit":
+      // the limiter itself failed: there is no count to show
+      return p.reason === "limiter_unavailable" ? variant("unavailable", true) : { key: base, worded: true };
     case "mcp_plan":
       return p.needs_approval === "true" ? { key: "audit.mcp_plan_owner", worded: false } : { key: base, worded: false };
   }

@@ -54,6 +54,10 @@ type credState struct {
 	person     atomic.Pointer[ratelimit.Limiter] // the person limit: the bucket of the whole user on this node (ratelimit.Registry)
 	up, down   atomic.Uint64
 	removed    atomic.Bool
+	// links/3 events (links.go): connections whose first request carried this key, and how many of them stalled.
+	connects, tcpStalls, tcpStalls16K atomic.Uint32
+	// vless-hello-kex/1 (hellokex.go): the key exchange the ClientHellos of this key's REALITY connections offered. Event.
+	helloPQ, helloClassic, helloUnknown atomic.Uint32
 
 	now   func() time.Time
 	after afterFunc
@@ -64,32 +68,41 @@ type credState struct {
 	expiryTimer stoppable
 }
 
-// users hands out the person buckets of the inbound's credentials (nil: no person limits).
-func buildIndex(inboundID string, old *credentialIndex, creds []plugin.UserCred, now func() time.Time, after afterFunc, users *ratelimit.Registry) (*credentialIndex, error) {
+// users hands out the person buckets of the inbound's credentials (nil: no person limits). Malformed credentials and
+// later duplicate ids or UUIDs are skipped so a single entry cannot freeze updates to the rest of the inbound.
+func buildIndex(inboundID string, old *credentialIndex, creds []plugin.UserCred, now func() time.Time, after afterFunc, users *ratelimit.Registry) (*credentialIndex, []error) {
+	creds = append([]plugin.UserCred(nil), creds...)
+	sort.SliceStable(creds, func(i, j int) bool { return creds[i].CredID < creds[j].CredID })
 	parsed := make([]parsedCredential, 0, len(creds))
 	seenID := make(map[string]struct{}, len(creds))
 	seenUUID := make(map[xuuid.UUID]string, len(creds))
+	var skipped []error
 	for _, c := range creds {
 		if c.CredID == "" {
-			return nil, errors.New("credential without id")
+			skipped = append(skipped, errors.New("credential without id"))
+			continue
 		}
+		if _, dup := seenID[c.CredID]; dup {
+			skipped = append(skipped, fmt.Errorf("duplicate credential id %s", c.CredID))
+			continue
+		}
+		seenID[c.CredID] = struct{}{}
 		var data struct {
 			ID string `json:"id"`
 		}
 		if err := json.Unmarshal(c.Data, &data); err != nil {
-			return nil, fmt.Errorf("credential %s: data: %w", c.CredID, err)
+			skipped = append(skipped, fmt.Errorf("credential %s: data: %w", c.CredID, err))
+			continue
 		}
 		u, err := parseUUID(data.ID)
 		if err != nil {
-			return nil, fmt.Errorf("credential %s: data.id must be a UUID", c.CredID)
-		}
-		if _, dup := seenID[c.CredID]; dup {
-			return nil, fmt.Errorf("duplicate credential id %s", c.CredID)
+			skipped = append(skipped, fmt.Errorf("credential %s: data.id must be a UUID", c.CredID))
+			continue
 		}
 		if other, dup := seenUUID[u]; dup {
-			return nil, fmt.Errorf("credentials %s and %s share one UUID", other, c.CredID)
+			skipped = append(skipped, fmt.Errorf("credentials %s and %s share one UUID", other, c.CredID))
+			continue
 		}
-		seenID[c.CredID] = struct{}{}
 		seenUUID[u] = c.CredID
 		c.Data = append([]byte(nil), c.Data...)
 		parsed = append(parsed, parsedCredential{cred: c, uuid: u})
@@ -115,7 +128,7 @@ func buildIndex(inboundID string, old *credentialIndex, creds []plugin.UserCred,
 		cs.person.Store(shared[cs.id])
 		ix.byID[cs.id] = cs
 	}
-	return ix, nil
+	return ix, skipped
 }
 
 func parseUUID(text string) (xuuid.UUID, error) {
@@ -250,6 +263,21 @@ func (cs *credState) cancelLinks() int {
 		return 1
 	}
 	return 0
+}
+
+func (cs *credState) stall(stalled, first16K bool) {
+	if stalled {
+		cs.tcpStalls.Add(1)
+		if first16K {
+			cs.tcpStalls16K.Add(1)
+		}
+	}
+}
+
+func (cs *credState) takeLinkStats() plugin.LinkStat {
+	return plugin.LinkStat{CredID: cs.id, InboundID: cs.inboundID, Connects: cs.connects.Swap(0), TCPStalls: cs.tcpStalls.Swap(0),
+		TCPStalls16K: cs.tcpStalls16K.Swap(0), HelloPQ: cs.helloPQ.Swap(0), HelloClassic: cs.helloClassic.Swap(0),
+		HelloUnknown: cs.helloUnknown.Swap(0)}
 }
 
 func (cs *credState) session() (time.Time, bool) {
@@ -422,6 +450,14 @@ func (in *inbound) dispatch(ctx context.Context, link *transport.Link) error {
 	handle, ok := cs.addLink(ctx, link, inboundSession.Conn)
 	if !ok {
 		return errors.New("credential unavailable")
+	}
+	// The first request of a TCP connection makes it a connection of this key (a mux or XUDP connection carries more).
+	if tc := trackedConnOf(inboundSession.Conn); tc != nil {
+		if tc.markSession(cs) {
+			cs.connects.Add(1)
+		}
+	} else if t := in.connTracker; t != nil && t.byAddr != nil {
+		t.sessionKex(cs, inboundSession.Source) // XHTTP: the session is not one TCP connection; its first request names it
 	}
 	stopOnInbound := context.AfterFunc(in.ctx, handle.stop)
 	if in.ctx.Err() != nil {

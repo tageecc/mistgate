@@ -1,3 +1,5 @@
+//go:build !js
+
 package mcp
 
 import (
@@ -5,8 +7,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -31,14 +35,15 @@ const instructions = "Tools of a VPN panel. Reads return structured JSON. A chan
 // The minimum profile is derived from the procedures (a test compares it with the role policy), so a tool cannot claim to
 // be safer than what it calls.
 type toolDef struct {
-	name   string
-	min    Profile  // the lowest profile that sees the tool
-	procs  []string // the panel procedures it calls, "/mistgate.admin.v1.X/Y"
-	free   bool     // returns text from data: carries untrustedNotice
-	isPlan bool     // a <tool>_plan: carries planNotice
-	danger bool     // the change may need the owner's approval
-	desc   string
-	add    func(s *mcp.Server, e *env, desc string)
+	name     string
+	min      Profile  // the lowest profile that sees the tool
+	procs    []string // the panel procedures it calls, "/mistgate.admin.v1.X/Y"
+	free     bool     // returns text from data: carries untrustedNotice
+	readOnly bool     // Follow-up sessions may include this tool because it has no side effects.
+	isPlan   bool     // a <tool>_plan: carries planNotice
+	danger   bool     // the change may need the owner's approval
+	desc     string
+	add      func(s *mcp.Server, e *env, desc string)
 }
 
 func (t toolDef) description() string {
@@ -54,7 +59,11 @@ func (t toolDef) description() string {
 
 // registry is every tool; a name may appear twice with different minimum profiles (node_doctor has a refresh argument only
 // for operators): a server takes the highest entry its profile reaches.
-var registry = slices.Concat(readTools(), changeTools(), nodeProvisionTools(), subscriptionTools(), profileTools(), relayTools())
+var registry = slices.Concat(
+	readTools(), ownerReadTools(), changeTools(), nodeProvisionTools(), subscriptionTools(),
+	groupTools(), dnsTools(), nodeSettingsTools(), profileTools(), relayTools(), ipv6Tools(), batchTools(), insightTools(), dataTools(), probeTools(), observabilityTools(), accessTools(),
+	capacityTools(), taskTools(), decoySiteTools(),
+)
 
 // toolsFor lists the tools a profile sees, by name.
 func toolsFor(p Profile) []toolDef {
@@ -75,6 +84,105 @@ func toolsFor(p Profile) []toolDef {
 	return out
 }
 
+// ToolNames lists, sorted, the names of the tools a token profile sees: the registry that tests and the end-to-end harness
+// (scripts/e2e/mcpe2e) compare a running server against, so a tool count is never written down twice.
+func ToolNames(p Profile) []string {
+	var names []string
+	for _, t := range toolsFor(p) {
+		names = append(names, t.name)
+	}
+	return names
+}
+
+const (
+	planSuffix  = "_plan"
+	applySuffix = "_apply"
+)
+
+// PlanTool and ApplyTool are the names of the two tools of a change: the one place that spells the suffixes.
+func PlanTool(change string) string  { return change + planSuffix }
+func ApplyTool(change string) string { return change + applySuffix }
+
+// ChangeOf is the change a plan tool belongs to (the name the plan is stored and shown under).
+func ChangeOf(planTool string) string { return strings.TrimSuffix(planTool, planSuffix) }
+
+// ToolKind says what calling a tool does.
+type ToolKind string
+
+const (
+	KindRead  ToolKind = "read"  // changes nothing
+	KindRun   ToolKind = "run"   // does something without a plan: a probe, a run of a task, a draft saved
+	KindPlan  ToolKind = "plan"  // <change>_plan: describes a change
+	KindApply ToolKind = "apply" // <change>_apply: carries it out
+)
+
+func (t toolDef) kind() ToolKind {
+	switch {
+	case t.isPlan:
+		return KindPlan
+	case t.readOnly:
+		return KindRead
+	case strings.HasSuffix(t.name, applySuffix):
+		return KindApply
+	}
+	return KindRun
+}
+
+// ToolInfo is what the rest of the panel may know of a tool.
+type ToolInfo struct {
+	Name   string
+	Kind   ToolKind
+	Min    Profile // the lowest profile that sees the tool
+	Danger bool    // the change may need the owner's approval
+}
+
+// Tools lists every tool of the registry once, sorted by name: the one list that the assistant, the scheduled checks, the guards of
+// the prompt and of the documentation derive their own lists from.
+func Tools() []ToolInfo {
+	byName := map[string]ToolInfo{}
+	for _, t := range registry {
+		cur, ok := byName[t.name]
+		if !ok {
+			byName[t.name] = ToolInfo{Name: t.name, Kind: t.kind(), Min: t.min, Danger: t.danger}
+			continue
+		}
+		if t.min.rank() < cur.Min.rank() {
+			cur.Min = t.min
+		}
+		cur.Danger = cur.Danger || t.danger
+		byName[t.name] = cur
+	}
+	out := make([]ToolInfo, 0, len(byName))
+	for _, t := range byName {
+		out = append(out, t)
+	}
+	slices.SortFunc(out, func(a, b ToolInfo) int { return strings.Compare(a.Name, b.Name) })
+	return out
+}
+
+var kindByName = sync.OnceValue(func() map[string]ToolKind {
+	m := make(map[string]ToolKind, len(registry))
+	for _, t := range registry {
+		m[t.name] = t.kind()
+	}
+	return m
+})
+
+// KindOf is the kind of a tool of the registry. A name the registry does not have is judged by its suffix, so a plan or an apply a
+// model made up is still one; any other unknown name has no kind.
+func KindOf(name string) ToolKind {
+	if k, ok := kindByName()[name]; ok {
+		return k
+	}
+	switch {
+	case strings.HasSuffix(name, planSuffix):
+		return KindPlan
+	case strings.HasSuffix(name, applySuffix):
+		return KindApply
+	}
+	return ""
+}
+
 func (e *env) newServer(p Profile) *mcp.Server {
 	s := mcp.NewServer(&mcp.Implementation{Name: "mistgate", Version: buildinfo.Version}, &mcp.ServerOptions{
 		Instructions: instructions,
@@ -89,12 +197,13 @@ func (e *env) newServer(p Profile) *mcp.Server {
 
 // call is one tool call: who is calling, a context carrying the MCP channel and a deadline, and the in-process clients.
 type call struct {
-	e       *env
-	ctx     context.Context
-	tokenID string
-	profile Profile
-	cl      *clients
-	cancel  context.CancelFunc
+	e         *env
+	ctx       context.Context
+	tokenID   string
+	profile   Profile
+	assistant *AssistantIdentity
+	cl        *clients
+	cancel    context.CancelFunc
 }
 
 func (c *call) done() { c.cancel() }
@@ -102,14 +211,33 @@ func (c *call) done() { c.cancel() }
 // begin resolves the token of the request (the bearer layer put it in TokenInfo) and prepares the call.
 func (e *env) begin(ctx context.Context, req *mcp.CallToolRequest, timeout time.Duration) (*call, error) {
 	ex := req.GetExtra()
-	if ex == nil || ex.TokenInfo == nil || ex.TokenInfo.UserID == "" || len(ex.TokenInfo.Scopes) == 0 {
-		return nil, errors.New("not authenticated")
+	var tokenID string
+	var profile Profile
+	var header http.Header
+	var assistant *AssistantIdentity
+	if id, ok := assistantCallIdentity(ctx); ok {
+		_, hasAssistantAuth := e.cfg.Auth.(assistantAuth)
+		if !hasAssistantAuth || id.TokenID == "" || id.AdminID == "" {
+			return nil, errors.New("not authenticated")
+		}
+		identity := id
+		assistant = &identity
+		tokenID, profile = id.TokenID, Profile(id.Profile)
+		header = make(http.Header)
+	} else {
+		if ex == nil || ex.TokenInfo == nil || ex.TokenInfo.UserID == "" || len(ex.TokenInfo.Scopes) == 0 {
+			return nil, errors.New("not authenticated")
+		}
+		tokenID, profile, header = ex.TokenInfo.UserID, Profile(ex.TokenInfo.Scopes[0]), ex.Header
 	}
 	remote, _ := ctx.Value(remoteKey{}).(string)
 	ctx, cancel := context.WithTimeout(e.cfg.Auth.WithChannel(ctx), timeout)
+	if assistant != nil {
+		ctx = e.cfg.Auth.(assistantAuth).WithAssistant(ctx, *assistant)
+	}
 	return &call{
-		e: e, ctx: ctx, cancel: cancel, tokenID: ex.TokenInfo.UserID, profile: Profile(ex.TokenInfo.Scopes[0]),
-		cl: newClients(e.cfg.API, ex.Header, remote),
+		e: e, ctx: ctx, cancel: cancel, tokenID: tokenID, profile: profile, assistant: assistant,
+		cl: newClients(e.cfg.API, header, remote),
 	}, nil
 }
 
@@ -136,17 +264,24 @@ func result(v any) (*mcp.CallToolResult, any, error) {
 	}
 }
 
-// planResult is result for a plan: the confirm token is the one secret the agent is meant to get, so it travels around the
-// scrubber and is put back afterwards.
+// planResult is result for a plan: it inserts the confirm token into its named field after all other strings are scrubbed.
 func planResult(p *PlanOut) (*mcp.CallToolResult, any, error) {
-	const placeholder = "@@confirm@@"
 	token := p.ConfirmToken
-	p.ConfirmToken = placeholder
+	p.ConfirmToken = ""
 	res, _, err := result(p)
 	p.ConfirmToken = token
 	if err == nil {
 		tc := res.Content[0].(*mcp.TextContent)
-		tc.Text = strings.Replace(tc.Text, placeholder, token, 1)
+		var clean PlanOut
+		if err := json.Unmarshal([]byte(tc.Text), &clean); err != nil {
+			return nil, nil, errors.New("internal error")
+		}
+		clean.ConfirmToken = token
+		b, err := marshal(clean)
+		if err != nil {
+			return nil, nil, errors.New("internal error")
+		}
+		tc.Text = string(b)
 	}
 	return res, nil, err
 }
@@ -170,7 +305,7 @@ func readTool[In any](name string, min Profile, procs []string, desc string, h f
 // readToolWithin is readTool for a read that waits for the nodes longer than a stored read does (a check).
 func readToolWithin[In any](timeout time.Duration, name string, min Profile, procs []string, desc string, h func(c *call, in In) (any, error)) toolDef {
 	return toolDef{
-		name: name, min: min, procs: procs, free: true, desc: desc,
+		name: name, min: min, procs: procs, free: true, readOnly: true, desc: desc,
 		add: func(s *mcp.Server, e *env, desc string) {
 			mcp.AddTool(s, &mcp.Tool{
 				Name: name, Description: desc,

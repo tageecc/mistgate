@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/mistgate/mistgate/internal/buildinfo"
+	"github.com/mistgate/mistgate/internal/panel/store"
 	"github.com/mistgate/mistgate/internal/panel/update"
 )
 
@@ -25,8 +26,14 @@ type coreUpdateGate struct{}
 func (coreUpdateGate) RunChecksNow(context.Context, string) (int, int, time.Duration, error) {
 	return 0, 0, 0, nil
 }
-func (coreUpdateGate) NodeChecksSince(context.Context, string, time.Time) (int, int, int, error) {
-	return 0, 0, 0, nil
+func (coreUpdateGate) NodeChecksSince(context.Context, string, time.Time) (int, int, int, bool, time.Duration, error) {
+	return 0, 0, 0, false, 0, nil
+}
+func (coreUpdateGate) NodeChecksPending(context.Context, string, time.Time) ([]string, error) {
+	return nil, nil
+}
+func (coreUpdateGate) NodeLastRounds(context.Context, string) ([]store.CheckSample, error) {
+	return nil, nil
 }
 
 func TestEdgeNodeUpdateCoreWiring(t *testing.T) {

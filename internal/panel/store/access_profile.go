@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"time"
 )
@@ -114,12 +115,8 @@ func (a Access) UpdateProfile(ctx context.Context, p AccessProfile, expectedVers
 // behind as an empty shell.
 func (a Access) DeleteProfile(ctx context.Context, id string, now time.Time) error {
 	_, err := a.s.batch(ctx,
-		guard(`EXISTS (SELECT 1 FROM profile WHERE id = ?)
-			AND NOT EXISTS (SELECT 1 FROM inbound WHERE profile_id = ?)`, id, id),
-		Stmt{Query: `UPDATE device SET revoked_at = ? WHERE revoked_at IS NULL AND kind = 'key' AND id IN
-		   (SELECT device_id FROM device_credential WHERE profile_id = ?)`, Args: []any{unix(now), id}},
-		Stmt{Query: `DELETE FROM profile WHERE id = ?`, Args: []any{id}},
-	)
+		append([]Stmt{guard(`EXISTS (SELECT 1 FROM profile WHERE id = ?)
+			AND NOT EXISTS (SELECT 1 FROM inbound WHERE profile_id = ?)`, id, id)}, deleteProfileStmts(id, now)...)...)
 	if errors.Is(err, errGuard) {
 		var inbounds int
 		if readErr := a.s.R.QueryRowContext(ctx, `SELECT count(*) FROM inbound WHERE profile_id = ?`, id).Scan(&inbounds); readErr != nil {
@@ -133,16 +130,27 @@ func (a Access) DeleteProfile(ctx context.Context, id string, now time.Time) err
 	return err
 }
 
+// deleteProfileStmts are the writes that remove a profile whose inbounds are already gone (or go in the same batch).
+func deleteProfileStmts(id string, now time.Time) []Stmt {
+	return []Stmt{
+		{Query: `UPDATE device SET revoked_at = ? WHERE revoked_at IS NULL AND kind = 'key' AND id IN
+		   (SELECT device_id FROM device_credential WHERE profile_id = ?)`, Args: []any{unix(now), id}},
+		{Query: `DELETE FROM profile WHERE id = ?`, Args: []any{id}},
+	}
+}
+
 // AccessBrief is a user id and name.
 type AccessBrief struct{ ID, Name string }
 
-// ProfileUsers lists users whose group contains the profile and whose app toggles allow it: happ and
-// amnezia say which toggles count (derived from the protocol's Clients()). Ordered by name.
-func (a Access) ProfileUsers(ctx context.Context, profileID string, happ, amnezia bool) ([]AccessBrief, error) {
+// ProfileUsers lists users with a group (the main one or an extra one) that contains the profile and whose app toggles allow
+// it, each once. Ordered by name.
+func (a Access) ProfileUsers(ctx context.Context, profileID string, happ, amnezia, telegram, trustTunnel bool) ([]AccessBrief, error) {
 	rows, err := a.s.R.QueryContext(ctx,
-		`SELECT u.id, u.name FROM user u JOIN user_group_profile gp ON gp.group_id = u.group_id
-		 WHERE gp.profile_id = ? AND ((? = 1 AND u.app_happ = 1) OR (? = 1 AND u.app_amnezia = 1))
-		 ORDER BY u.name`, profileID, accBool(happ), accBool(amnezia))
+		`SELECT u.id, u.name FROM user u
+		 WHERE u.id IN (SELECT m.id FROM user_group_profile gp JOIN user m ON m.group_id = gp.group_id WHERE gp.profile_id = ?1
+		                UNION SELECT x.user_id FROM user_group_profile gp JOIN user_extra_group x ON x.group_id = gp.group_id WHERE gp.profile_id = ?1)
+		   AND ((?2 = 1 AND u.app_happ = 1) OR (?3 = 1 AND u.app_amnezia = 1) OR (?4 = 1 AND u.app_telegram = 1) OR (?5 = 1 AND u.app_trusttunnel = 1))
+		 ORDER BY u.name`, profileID, accBool(happ), accBool(amnezia), accBool(telegram), accBool(trustTunnel))
 	if err != nil {
 		return nil, err
 	}
@@ -164,7 +172,10 @@ type AccessInbound struct {
 	ID, ProfileID, NodeID string
 	PortOverride          uint16 // 0 = none
 	TLSServerNameOverride string
+	// RealityTargetOverride is "host:port" of the site this node shows instead of the profile's REALITY target; "" = the profile's.
+	RealityTargetOverride string
 	Enabled               bool
+	DirectInSubscriptions bool
 	SpecVersion           uint64
 	State                 string // pending | active | failed | disabled
 	LastError             string
@@ -181,7 +192,8 @@ type AccessInbound struct {
 }
 
 const accInboundCols = `i.id AS inbound_id, i.profile_id AS inbound_profile_id, i.node_id AS inbound_node_id,
-	i.port_override AS inbound_port_override, i.tls_server_name_override AS inbound_tls_server_name_override, i.enabled AS inbound_enabled,
+	i.port_override AS inbound_port_override, i.tls_server_name_override AS inbound_tls_server_name_override, i.reality_target_override AS inbound_reality_target_override, i.enabled AS inbound_enabled,
+	i.direct_in_subscriptions AS inbound_direct_in_subscriptions,
 	i.spec_version AS inbound_spec_version, i.state AS inbound_state, i.last_error AS inbound_last_error,
 	i.cert_pin_sha256 AS inbound_cert_pin_sha256, i.cert_not_after AS inbound_cert_not_after, i.created_at AS inbound_created_at,
 	i.updated_at AS inbound_updated_at, i.plugin_state_enc AS inbound_plugin_state_enc, i.plugin_public_json AS inbound_plugin_public_json,
@@ -189,14 +201,14 @@ const accInboundCols = `i.id AS inbound_id, i.profile_id AS inbound_profile_id, 
 
 func scanAccessInbound(r rowScanner) (AccessInbound, error) {
 	var i AccessInbound
-	var id, profileID, nodeID, tlsName, state, lastError, certPin, pluginPublic, healthJSON sql.NullString
-	var port, enabled, specVersion, notAfter, created, updated, healthAt sql.NullInt64
-	err := r.Scan(&id, &profileID, &nodeID, &port, &tlsName, &enabled, &specVersion,
+	var id, profileID, nodeID, tlsName, realityTarget, state, lastError, certPin, pluginPublic, healthJSON sql.NullString
+	var port, enabled, directInSubscriptions, specVersion, notAfter, created, updated, healthAt sql.NullInt64
+	err := r.Scan(&id, &profileID, &nodeID, &port, &tlsName, &realityTarget, &enabled, &directInSubscriptions, &specVersion,
 		&state, &lastError, &certPin, &notAfter, &created, &updated,
 		&i.PluginStateEnc, &pluginPublic, &healthJSON, &healthAt)
 	i.ID, i.ProfileID, i.NodeID = id.String, profileID.String, nodeID.String
-	i.PortOverride, i.TLSServerNameOverride = uint16(port.Int64), tlsName.String
-	i.Enabled, i.SpecVersion = enabled.Int64 == 1, uint64(specVersion.Int64)
+	i.PortOverride, i.TLSServerNameOverride, i.RealityTargetOverride = uint16(port.Int64), tlsName.String, realityTarget.String
+	i.Enabled, i.DirectInSubscriptions, i.SpecVersion = enabled.Int64 == 1, directInSubscriptions.Int64 == 1, uint64(specVersion.Int64)
 	i.State, i.LastError, i.CertPinSHA256 = state.String, lastError.String, certPin.String
 	i.PluginPublicJSON, i.AwgHealthJSON = pluginPublic.String, healthJSON.String
 	i.CreatedAt, i.UpdatedAt = accTimeFromUnix(created), accTimeFromUnix(updated)
@@ -223,10 +235,10 @@ func accNullPort(p uint16) any {
 // deleted in the same transaction, so the key is never on both sides.
 func (a Access) CreateInbound(ctx context.Context, i AccessInbound) error {
 	_, err := a.s.batch(ctx,
-		Stmt{Query: `INSERT INTO inbound (id, profile_id, node_id, port_override, tls_server_name_override, enabled, spec_version, state,
+		Stmt{Query: `INSERT INTO inbound (id, profile_id, node_id, port_override, tls_server_name_override, reality_target_override, enabled, spec_version, state,
 		   plugin_state_enc, plugin_public_json, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, 1, 'pending', ?, ?, ?, ?)`,
-			Args: []any{i.ID, i.ProfileID, i.NodeID, accNullPort(i.PortOverride), i.TLSServerNameOverride, int64(accBool(i.Enabled)),
+		 VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'pending', ?, ?, ?, ?)`,
+			Args: []any{i.ID, i.ProfileID, i.NodeID, accNullPort(i.PortOverride), i.TLSServerNameOverride, i.RealityTargetOverride, int64(accBool(i.Enabled)),
 				i.PluginStateEnc, accPublicJSON(i.PluginPublicJSON), unix(i.CreatedAt), unix(i.CreatedAt)}},
 		Stmt{Query: `DELETE FROM awg_retained_key WHERE profile_id = ? AND node_id = ?`, Args: []any{i.ProfileID, i.NodeID}},
 	)
@@ -275,25 +287,36 @@ func (a Access) InboundsOfNode(ctx context.Context, nodeID string) ([]AccessInbo
 	return a.inbounds(ctx, `WHERE i.node_id = ?`, nodeID)
 }
 
-// UpdateInbound writes the admin-editable fields and the spec version of i (matched by ID). When
-// resetState is set the state goes back to pending (enabled) or disabled, until the node reports again.
-func (a Access) UpdateInbound(ctx context.Context, i AccessInbound, resetState bool, now time.Time) error {
-	q := `UPDATE inbound SET port_override = ?, tls_server_name_override = ?, enabled = ?, spec_version = ?, updated_at = ?`
+// UpdateInbound writes the admin-editable fields and the spec version of i (matched by ID), provided the row still holds
+// the fields of was, the row i was made from: two edits that read the same row must not overwrite each other's field.
+// The fleet's own columns (state, certificate, health) are not compared, so a node's report never fails an edit.
+// ErrAccessVersion when the row changed since it was read, ErrNotFound when it is gone. When resetState is set the
+// state goes back to pending (enabled) or disabled, until the node reports again.
+func (a Access) UpdateInbound(ctx context.Context, i, was AccessInbound, resetState bool, now time.Time) error {
+	q := `UPDATE inbound SET port_override = ?, tls_server_name_override = ?, reality_target_override = ?, enabled = ?, direct_in_subscriptions = ?, spec_version = ?, updated_at = ?`
 	if resetState {
 		q += `, state = CASE WHEN ? = 1 THEN 'pending' ELSE 'disabled' END, last_error = ''`
 	}
-	q += ` WHERE id = ?`
-	args := []any{accNullPort(i.PortOverride), i.TLSServerNameOverride, accBool(i.Enabled), i.SpecVersion, unix(now)}
+	q += ` WHERE id = ? AND port_override IS ? AND tls_server_name_override = ? AND reality_target_override = ? AND enabled = ? AND direct_in_subscriptions = ? AND spec_version = ?`
+	args := []any{accNullPort(i.PortOverride), i.TLSServerNameOverride, i.RealityTargetOverride, accBool(i.Enabled), accBool(i.DirectInSubscriptions), i.SpecVersion, unix(now)}
 	if resetState {
 		args = append(args, accBool(i.Enabled))
 	}
-	args = append(args, i.ID)
+	args = append(args, i.ID, accNullPort(was.PortOverride), was.TLSServerNameOverride, was.RealityTargetOverride, accBool(was.Enabled), accBool(was.DirectInSubscriptions), was.SpecVersion)
 	res, err := a.s.W.ExecContext(ctx, q, args...)
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrNotFound
+		var one int
+		err := a.s.W.QueryRowContext(ctx, `SELECT 1 FROM inbound WHERE id = ?`, i.ID).Scan(&one) // the writer: the row just read there
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		return ErrAccessVersion
 	}
 	return nil
 }
@@ -377,6 +400,79 @@ func (a Access) DeleteInbound(ctx context.Context, id string, now time.Time, ret
 	return ErrConflict
 }
 
+// RemoveProfileInbounds removes the inbounds of a profile on the given nodes in one transaction and returns them; a node
+// that does not carry the profile is skipped. With deleteProfile the profile goes in the same transaction (its inbounds
+// must all be among the removed ones, else ErrAccessInUse and nothing changes). Without it retain parks the server key of
+// a per-device (AWG) inbound for the pair, as DeleteInbound does. ErrNotFound: no such profile; ErrConflict: the inbounds
+// of the profile kept changing while this ran.
+func (a Access) RemoveProfileInbounds(ctx context.Context, profileID string, nodeIDs []string, deleteProfile bool, now time.Time,
+	retain func(stateEnc []byte, profileID, nodeID string) ([]byte, error)) ([]AccessInbound, error) {
+	for range 8 { // the guards pin what was read; a change in between starts over
+		var protocol string
+		if err := a.s.W.QueryRowContext(ctx, `SELECT protocol FROM profile WHERE id = ?`, profileID).Scan(&protocol); errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		} else if err != nil {
+			return nil, err
+		}
+		all, err := a.InboundsOfProfile(ctx, profileID)
+		if err != nil {
+			return nil, err
+		}
+		var victims []AccessInbound
+		for _, in := range all {
+			if slices.Contains(nodeIDs, in.NodeID) {
+				victims = append(victims, in)
+			}
+		}
+		if deleteProfile && len(victims) != len(all) {
+			return nil, ErrAccessInUse
+		}
+		stmts := []Stmt{guard(`EXISTS (SELECT 1 FROM profile WHERE id = ? AND protocol = ?)
+			AND (SELECT count(*) FROM inbound WHERE profile_id = ?) = ?`, profileID, protocol, profileID, len(all))}
+		for _, in := range victims {
+			var enc []byte
+			var public string
+			if err := a.s.W.QueryRowContext(ctx, `SELECT plugin_state_enc, plugin_public_json FROM inbound WHERE id = ?`, in.ID).Scan(&enc, &public); errors.Is(err, sql.ErrNoRows) {
+				stmts = nil // gone since the list was read
+				break
+			} else if err != nil {
+				return nil, err
+			}
+			if retain != nil && !deleteProfile && len(enc) > 0 {
+				stmts = append(stmts, guard(`EXISTS (SELECT 1 FROM inbound WHERE id = ? AND plugin_state_enc IS ? AND plugin_public_json = ?)`, in.ID, enc, public))
+				kept, err := retain(enc, profileID, in.NodeID)
+				if err != nil {
+					return nil, err
+				}
+				if len(kept) > 0 {
+					stmts = append(stmts, Stmt{Query: `INSERT OR REPLACE INTO awg_retained_key (profile_id, node_id, state_enc, public_json, created_at)
+						 SELECT ?1, ?2, ?3, ?4, ?5 WHERE EXISTS (SELECT 1 FROM node WHERE id = ?2 AND state <> 'retired')`,
+						Args: []any{profileID, in.NodeID, kept, accPublicJSON(public), unix(now)}})
+				}
+			}
+			stmts = append(stmts,
+				Stmt{Query: `INSERT OR REPLACE INTO node_inbound_stats_tombstone (node_id, inbound_id, protocol) VALUES (?, ?, ?)`, Args: []any{in.NodeID, in.ID, protocol}},
+				Stmt{Query: `DELETE FROM inbound WHERE id = ?`, Args: []any{in.ID}})
+		}
+		if stmts == nil {
+			continue
+		}
+		if deleteProfile {
+			stmts = append(stmts, deleteProfileStmts(profileID, now)...)
+		}
+		if len(victims) == 0 && !deleteProfile {
+			return nil, nil // nothing to do: a repeated call
+		}
+		if _, err := a.s.batch(ctx, stmts...); errors.Is(err, errGuard) {
+			continue
+		} else if err != nil {
+			return nil, err
+		}
+		return victims, nil
+	}
+	return nil, ErrConflict
+}
+
 // AccessInboundFull is an inbound with its profile and node.
 type AccessInboundFull struct {
 	Inbound AccessInbound
@@ -410,34 +506,141 @@ func (a Access) InboundsFull(ctx context.Context, nodeID string) ([]AccessInboun
 }
 
 func scanAccessInboundFull(r rowScanner) (AccessInboundFull, error) {
-	values, err := scanRowValues(r, 35)
+	values, err := scanRowValues(r, 42)
 	if err != nil {
 		return AccessInboundFull{}, err
 	}
-	inbound, err := scanAccessInbound(batchRow(values[:17]))
+	inbound, err := scanAccessInbound(batchRow(values[:19]))
 	if err != nil {
 		return AccessInboundFull{}, err
 	}
-	profile, err := scanAccessProfile(batchRow(values[17:25]))
+	profile, err := scanAccessProfile(batchRow(values[19:27]))
 	if err != nil {
 		return AccessInboundFull{}, err
 	}
-	node, err := scanAccessNode(batchRow(values[25:]))
+	node, err := scanAccessNode(batchRow(values[27:]))
 	if err != nil {
 		return AccessInboundFull{}, err
 	}
 	return AccessInboundFull{Inbound: inbound, Profile: profile, Node: node}, nil
 }
 
-// AccessGroup is an access group: a named set of profiles.
+// AccessGroup is an access group: a named set of profiles with an optional disabled-node set.
 type AccessGroup struct {
-	ID, Name    string
-	ProfileIDs  []string
-	UserCount   int
-	CreatedAt   time.Time
-	DNSPresetID string // "" = the instance default
+	ID, Name        string
+	ProfileIDs      []string
+	DisabledNodeIDs []string
+	UserCount       int // people whose main group it is
+	// ExtraUserCount is the people who have it as an extra group (user_extra_group). Read by groups() only.
+	ExtraUserCount int
+	CreatedAt      time.Time
+	DNSPresetID    string // "" = the instance default
 	// Color is a tone of GroupTones, "" = none picked. CreateGroup fills in the least used tone when it is empty.
 	Color string
+}
+
+// GroupGetsNode is the one rule of which nodes a group hands out: every node except the ones on its disabled list. A node the
+// owner holds back (NodeShare) is on the list of every group that was not given it, groups made later included, so the rule has
+// no case for it. Every reader of a group's nodes asks here (or, in SQL, uses accGroupGetsNode).
+func GroupGetsNode(disabledNodeIDs []string, nodeID string) bool {
+	return !slices.Contains(disabledNodeIDs, nodeID)
+}
+
+// GetsNode is GroupGetsNode for the group.
+func (g AccessGroup) GetsNode(nodeID string) bool { return GroupGetsNode(g.DisabledNodeIDs, nodeID) }
+
+// AccessGroups are the groups of one person: the main one first. The person gets what each of them hands out, pair by pair:
+// profile P on node N comes from a group that holds P and gets N, the same group for both. The one rule of what a person is
+// given asks Gives (in SQL the same rule is the granted pairs of DesiredCreds). A person in one group gets exactly what the
+// group hands out.
+type AccessGroups []AccessGroup
+
+// Gives reports whether some group holds the profile and gets every one of the nodes: the node of the inbound and, for a twin
+// served through a relay, its entry node as well, all through the same group.
+func (gs AccessGroups) Gives(profileID string, nodeIDs ...string) bool {
+	return slices.ContainsFunc(gs, func(g AccessGroup) bool {
+		return slices.Contains(g.ProfileIDs, profileID) && !slices.ContainsFunc(nodeIDs, func(id string) bool { return !g.GetsNode(id) })
+	})
+}
+
+// Holds reports whether some group holds the profile, wherever it is deployed.
+func (gs AccessGroups) Holds(profileID string) bool {
+	return slices.ContainsFunc(gs, func(g AccessGroup) bool { return slices.Contains(g.ProfileIDs, profileID) })
+}
+
+// ProfileIDs are the profiles of all the groups, sorted, each once.
+func (gs AccessGroups) ProfileIDs() []string {
+	var out []string
+	for _, g := range gs {
+		out = append(out, g.ProfileIDs...)
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
+}
+
+// GroupsOf picks the person's groups out of all groups by id: the main one first, then the extra ones. A group that is not in
+// the map (it was deleted since the person was read) is skipped.
+func GroupsOf(u AccessUser, byID map[string]AccessGroup) AccessGroups {
+	out := make(AccessGroups, 0, 1+len(u.ExtraGroupIDs))
+	for _, id := range append([]string{u.GroupID}, u.ExtraGroupIDs...) {
+		if g, ok := byID[id]; ok {
+			out = append(out, g)
+		}
+	}
+	return out
+}
+
+// groupItem is one row of a group's profile list or disabled-node list: the group and the profile or node id.
+type groupItem struct{ group, id string }
+
+func scanGroupItem(r rowScanner) (groupItem, error) {
+	var group, id sql.NullString
+	if err := r.Scan(&group, &id); err != nil {
+		return groupItem{}, err
+	}
+	return groupItem{group.String, id.String}, nil
+}
+
+// groupsWithLists fills the groups (in the order given) with their profile and disabled-node rows, which keep their order.
+func groupsWithLists(groups []AccessGroup, profiles, disabled []groupItem) AccessGroups {
+	idx := make(map[string]int, len(groups))
+	for i := range groups {
+		groups[i].ProfileIDs, groups[i].DisabledNodeIDs = []string{}, []string{}
+		idx[groups[i].ID] = i
+	}
+	for _, p := range profiles {
+		if i, ok := idx[p.group]; ok {
+			groups[i].ProfileIDs = append(groups[i].ProfileIDs, p.id)
+		}
+	}
+	for _, d := range disabled {
+		if i, ok := idx[d.group]; ok {
+			groups[i].DisabledNodeIDs = append(groups[i].DisabledNodeIDs, d.id)
+		}
+	}
+	return groups
+}
+
+// accUserGroupIDs is the SQL list of the ids of one person's groups, the main one and the extra ones, where userExpr is the SQL
+// of the person's id (a numbered placeholder, or a subquery of one: it is written twice, so it must not be a bare "?").
+func accUserGroupIDs(userExpr string) string {
+	return `SELECT group_id FROM user WHERE id = ` + userExpr + ` UNION ALL SELECT group_id FROM user_extra_group WHERE user_id = ` + userExpr
+}
+
+// UserGroups reads the person's groups, the main one first; ErrNotFound when the main group is gone.
+func (a Access) UserGroups(ctx context.Context, u AccessUser) (AccessGroups, error) {
+	all, err := a.groups(ctx, append([]string{u.GroupID}, u.ExtraGroupIDs...))
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[string]AccessGroup, len(all))
+	for _, g := range all {
+		byID[g.ID] = g
+	}
+	if _, ok := byID[u.GroupID]; !ok {
+		return nil, ErrNotFound
+	}
+	return GroupsOf(u, byID), nil
 }
 
 // GroupTones is the palette of a group's colour, in the order the admin offers it and the order a new group takes the least
@@ -472,6 +675,10 @@ func (a Access) CreateGroup(ctx context.Context, g AccessGroup) error {
 	}
 	stmts := []Stmt{insert}
 	stmts = append(stmts, accSetGroupProfileStmts(g.ID, g.ProfileIDs)...)
+	stmts = append(stmts, accSetGroupDisabledNodeStmts(g.ID, g.DisabledNodeIDs)...)
+	// a node the owner holds back is not given to a group made later
+	stmts = append(stmts, Stmt{Query: `INSERT OR IGNORE INTO user_group_disabled_node (group_id, node_id)
+		SELECT ?, id FROM node WHERE hold_new_groups = 1 AND state <> 'retired'`, Args: []any{g.ID}})
 	_, err := a.s.batch(ctx, stmts...)
 	switch {
 	case accIsUnique(err):
@@ -490,14 +697,26 @@ func accSetGroupProfileStmts(groupID string, profileIDs []string) []Stmt {
 	return stmts
 }
 
+func accSetGroupDisabledNodeStmts(groupID string, nodeIDs []string) []Stmt {
+	stmts := []Stmt{{Query: `DELETE FROM user_group_disabled_node WHERE group_id = ?`, Args: []any{groupID}}}
+	for _, nodeID := range nodeIDs {
+		stmts = append(stmts, Stmt{Query: `INSERT OR IGNORE INTO user_group_disabled_node (group_id, node_id) VALUES (?, ?)`, Args: []any{groupID, nodeID}})
+	}
+	return stmts
+}
+
 // Groups returns all groups with their profile ids and user counts, ordered by name.
 func (a Access) Groups(ctx context.Context) ([]AccessGroup, error) {
-	return a.groups(ctx, "")
+	return a.groups(ctx, nil)
 }
 
 // Group returns one group, or ErrNotFound.
 func (a Access) Group(ctx context.Context, id string) (AccessGroup, error) {
-	gs, err := a.groups(ctx, id)
+	var ids []string
+	if id != "" {
+		ids = []string{id}
+	}
+	gs, err := a.groups(ctx, ids)
 	if err != nil {
 		return AccessGroup{}, err
 	}
@@ -507,10 +726,12 @@ func (a Access) Group(ctx context.Context, id string) (AccessGroup, error) {
 	return gs[0], nil
 }
 
-func (a Access) groups(ctx context.Context, id string) ([]AccessGroup, error) {
+// groups reads the groups with the given ids (every group when ids is empty), ordered by name.
+func (a Access) groups(ctx context.Context, ids []string) ([]AccessGroup, error) {
+	list := accJSON(ids)
 	rows, err := a.s.R.QueryContext(ctx,
 		`SELECT g.id, g.name, g.created_at, (SELECT count(*) FROM user u WHERE u.group_id = g.id), g.dns_preset_id, g.color
-		 FROM user_group g WHERE (? = '' OR g.id = ?) ORDER BY g.name`, id, id)
+		 FROM user_group g WHERE (json_array_length(?1) = 0 OR g.id IN (SELECT value FROM json_each(?1))) ORDER BY g.name`, list)
 	if err != nil {
 		return nil, err
 	}
@@ -523,6 +744,7 @@ func (a Access) groups(ctx context.Context, id string) ([]AccessGroup, error) {
 			return nil, err
 		}
 		g.ProfileIDs = []string{}
+		g.DisabledNodeIDs = []string{}
 		idx[g.ID] = len(out)
 		out = append(out, g)
 	}
@@ -530,8 +752,28 @@ func (a Access) groups(ctx context.Context, id string) ([]AccessGroup, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	xrows, err := a.s.R.QueryContext(ctx,
+		`SELECT group_id, count(*) FROM user_extra_group WHERE (json_array_length(?1) = 0 OR group_id IN (SELECT value FROM json_each(?1))) GROUP BY group_id`, list)
+	if err != nil {
+		return nil, err
+	}
+	for xrows.Next() {
+		var gid string
+		var n int
+		if err := xrows.Scan(&gid, &n); err != nil {
+			xrows.Close()
+			return nil, err
+		}
+		if i, ok := idx[gid]; ok {
+			out[i].ExtraUserCount = n
+		}
+	}
+	xrows.Close()
+	if err := xrows.Err(); err != nil {
+		return nil, err
+	}
 	prow, err := a.s.R.QueryContext(ctx,
-		`SELECT group_id, profile_id FROM user_group_profile WHERE (? = '' OR group_id = ?) ORDER BY profile_id`, id, id)
+		`SELECT group_id, profile_id FROM user_group_profile WHERE (json_array_length(?1) = 0 OR group_id IN (SELECT value FROM json_each(?1))) ORDER BY profile_id`, list)
 	if err != nil {
 		return nil, err
 	}
@@ -545,7 +787,27 @@ func (a Access) groups(ctx context.Context, id string) ([]AccessGroup, error) {
 			out[i].ProfileIDs = append(out[i].ProfileIDs, pid)
 		}
 	}
-	return out, prow.Err()
+	if err := prow.Err(); err != nil {
+		prow.Close()
+		return nil, err
+	}
+	prow.Close()
+	drows, err := a.s.R.QueryContext(ctx,
+		`SELECT group_id, node_id FROM user_group_disabled_node WHERE (json_array_length(?1) = 0 OR group_id IN (SELECT value FROM json_each(?1))) ORDER BY node_id`, list)
+	if err != nil {
+		return nil, err
+	}
+	defer drows.Close()
+	for drows.Next() {
+		var gid, nodeID string
+		if err := drows.Scan(&gid, &nodeID); err != nil {
+			return nil, err
+		}
+		if i, ok := idx[gid]; ok {
+			out[i].DisabledNodeIDs = append(out[i].DisabledNodeIDs, nodeID)
+		}
+	}
+	return out, drows.Err()
 }
 
 func scanAccessGroup(r rowScanner) (AccessGroup, error) {
@@ -566,6 +828,11 @@ func scanAccessGroup(r rowScanner) (AccessGroup, error) {
 
 // UpdateGroup renames a group, replaces its profile set and/or its DNS preset, sets its colour (nil = unchanged, "" = none).
 func (a Access) UpdateGroup(ctx context.Context, id string, name *string, profileIDs *[]string, dnsPresetID, color *string) error {
+	return a.UpdateGroupWithDisabledNodes(ctx, id, name, profileIDs, dnsPresetID, color, nil)
+}
+
+// UpdateGroupWithDisabledNodes updates a group and optionally replaces its disabled node set.
+func (a Access) UpdateGroupWithDisabledNodes(ctx context.Context, id string, name *string, profileIDs *[]string, dnsPresetID, color *string, disabledNodeIDs *[]string) error {
 	stmts := []Stmt{guard(`EXISTS (SELECT 1 FROM user_group WHERE id = ?)`, id)}
 	if name != nil {
 		stmts = append(stmts, Stmt{Query: `UPDATE user_group SET name = ? WHERE id = ?`, Args: []any{*name, id}})
@@ -578,6 +845,9 @@ func (a Access) UpdateGroup(ctx context.Context, id string, name *string, profil
 	}
 	if profileIDs != nil {
 		stmts = append(stmts, accSetGroupProfileStmts(id, *profileIDs)...)
+	}
+	if disabledNodeIDs != nil {
+		stmts = append(stmts, accSetGroupDisabledNodeStmts(id, *disabledNodeIDs)...)
 	}
 	_, err := a.s.batch(ctx, stmts...)
 	if errors.Is(err, errGuard) {
@@ -615,8 +885,12 @@ func (a Access) DeleteGroup(ctx context.Context, id, moveTo string) error {
 		}
 		return err
 	}
+	// The people of the group are the ones that have it as their main group; the ones that have it as an extra group just leave it
+	// (their rows go with the group). A person that is moved to a group they already have as an extra group keeps it as the
+	// main one only (user_extra_group never holds a person's main group): the extra row goes first.
 	_, err = a.s.batch(ctx,
 		guard(`EXISTS (SELECT 1 FROM user_group WHERE id = ?)`, id),
+		Stmt{Query: `DELETE FROM user_extra_group WHERE group_id = ?1 AND user_id IN (SELECT id FROM user WHERE group_id = ?2)`, Args: []any{moveTo, id}},
 		Stmt{Query: `UPDATE user SET group_id = ? WHERE group_id = ?`, Args: []any{moveTo, id}},
 		Stmt{Query: `DELETE FROM user_group WHERE id = ?`, Args: []any{id}},
 	)

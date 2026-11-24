@@ -44,8 +44,20 @@ func TestAPITokenLifecycle(t *testing.T) {
 	}
 	if got.ID != tok.ID || got.Name != "Claude-Ops" || got.Profile != ProfileOperator || got.CreatedByName != "Ada" ||
 		got.RatePerMin != 120 || !got.CreatedAt.Equal(t0) || !got.ExpiresAt.Equal(tok.ExpiresAt) ||
-		got.Revoked() || !got.LastUsedAt.IsZero() || got.Hint != "wxyz" {
+		got.Revoked() || !got.LastUsedAt.IsZero() || got.Hint != "wxyz" || got.AllowBulkUserChanges {
 		t.Fatalf("token read back: %+v", got)
+	}
+	got, err = s.SetAPITokenBulk(ctx, tok.ID, true, t0)
+	if err != nil || !got.AllowBulkUserChanges {
+		t.Fatalf("enable bulk user changes: %+v %v", got, err)
+	}
+	got, err = s.GetAPIToken(ctx, tok.ID)
+	if err != nil || !got.AllowBulkUserChanges {
+		t.Fatalf("read bulk user change setting: %+v %v", got, err)
+	}
+	got, err = s.SetAPITokenBulk(ctx, tok.ID, false, t0)
+	if err != nil || got.AllowBulkUserChanges {
+		t.Fatalf("disable bulk user changes: %+v %v", got, err)
 	}
 	if got.Expired(t0) || !got.Expired(tok.ExpiresAt) {
 		t.Fatal("Expired: the token lives up to, not including, expires_at")
@@ -96,6 +108,54 @@ func TestAPITokenLifecycle(t *testing.T) {
 	list, err := s.ListAPITokens(ctx)
 	if err != nil || len(list) != 2 || list[0].ID != dup.ID || list[1].ID != tok.ID {
 		t.Fatalf("list: %+v %v", list, err)
+	}
+}
+
+func TestSetAPITokenBulkRequiresLiveToken(t *testing.T) {
+	ctx := context.Background()
+	s := openTemp(t)
+	mkAdmin(t, s, "adm_a", "Ada")
+	expired := APIToken{ID: NewID("tok_"), Name: "expired", Profile: ProfileOperator, Hint: "wxyz", RatePerMin: 120,
+		CreatedBy: "adm_a", CreatedAt: t0.Add(-time.Hour), ExpiresAt: t0}
+	if err := s.CreateAPIToken(ctx, expired, hashOf("expired-secret")); err != nil {
+		t.Fatal(err)
+	}
+	revoked := newTok(t, s, "revoked", ProfileOperator)
+	if _, err := s.RevokeAPIToken(ctx, revoked.ID, "adm_a", t0); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{expired.ID, revoked.ID, "tok_missing"} {
+		if _, err := s.SetAPITokenBulk(ctx, id, true, t0); !errors.Is(err, ErrNotFound) {
+			t.Errorf("set %s: got %v, want ErrNotFound", id, err)
+		}
+	}
+	for _, id := range []string{expired.ID, revoked.ID} {
+		got, err := s.GetAPIToken(ctx, id)
+		if err != nil || got.AllowBulkUserChanges {
+			t.Errorf("dead token %s changed: %+v %v", id, got, err)
+		}
+	}
+}
+
+func TestCreateAPITokenWithBulkUserChanges(t *testing.T) {
+	s := openTemp(t)
+	mkAdmin(t, s, "adm_a", "Ada")
+	tok := APIToken{ID: NewID("tok_"), Name: "bulk-enabled", Profile: ProfileOperator, Hint: "wxyz", RatePerMin: 120,
+		CreatedBy: "adm_a", CreatedAt: t0, ExpiresAt: t0.Add(90 * 24 * time.Hour), AllowBulkUserChanges: true}
+	// A token created with the exemption persists it through both lookup paths.
+	if err := s.CreateAPIToken(context.Background(), tok, hashOf("bulk-secret-enabled")); err != nil {
+		t.Fatal(err)
+	}
+	for name, read := range map[string]func() (APIToken, error){
+		"get": func() (APIToken, error) { return s.GetAPIToken(context.Background(), tok.ID) },
+		"secret": func() (APIToken, error) {
+			return s.APITokenBySecretHash(context.Background(), hashOf("bulk-secret-enabled"))
+		},
+	} {
+		got, err := read()
+		if err != nil || !got.AllowBulkUserChanges {
+			t.Errorf("%s: %+v %v", name, got, err)
+		}
 	}
 }
 
@@ -278,6 +338,44 @@ func TestPlanApplyStateMachine(t *testing.T) {
 	}
 }
 
+func TestReleaseApplyRestoresOnlyMatchingOpenStatus(t *testing.T) {
+	ctx := context.Background()
+	s := openTemp(t)
+	tok := newTok(t, s, "ops", ProfileAdmin)
+	p := newPlan(t, s, tok.ID, "user_update", false, t0)
+	if _, err := s.BeginApply(ctx, p.ID, tok.ID, p.Tool, p.ParamsHash, p.ConfirmHash, t0.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReleaseApply(ctx, p.ID, PlanApproved); !errors.Is(err, ErrPlanState) {
+		t.Fatalf("release with wrong previous status = %v, want ErrPlanState", err)
+	}
+	if got := planStatus(t, s, p.ID); got != PlanApplying {
+		t.Fatalf("wrong previous status changed plan to %s", got)
+	}
+	if err := s.ReleaseApply(ctx, p.ID, PlanPlanned); err != nil {
+		t.Fatalf("release planned apply: %v", err)
+	}
+	got, err := s.GetMCPPlan(ctx, p.ID)
+	if err != nil || got.Status != PlanPlanned || !got.ExpiresAt.Equal(p.ExpiresAt) || !got.AppliedAt.IsZero() {
+		t.Fatalf("released plan = %+v, %v; expiry must stay %s", got, err, p.ExpiresAt)
+	}
+	if err := s.ReleaseApply(ctx, p.ID, PlanPlanned); stateOf(err) != PlanPlanned {
+		t.Fatalf("release from wrong current status = %v, want planned state error", err)
+	}
+	if err := s.ReleaseApply(ctx, p.ID, PlanAwaiting); err == nil {
+		t.Fatal("release accepted a non-retryable previous status")
+	}
+	if _, err := s.BeginApply(ctx, p.ID, tok.ID, p.Tool, p.ParamsHash, p.ConfirmHash, t0.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishApply(ctx, p.ID, true, "done", "", "", "", t0.Add(3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReleaseApply(ctx, p.ID, PlanPlanned); stateOf(err) != PlanApplied {
+		t.Fatalf("release applied plan = %v, want applied state error", err)
+	}
+}
+
 // What the owner entered when approving (the node_install password) goes to that plan's apply once, and never outlives
 // a plan that can no longer be applied.
 func TestOwnerSecretIsTakenOnceAndNeverOutlivesThePlan(t *testing.T) {
@@ -362,7 +460,7 @@ func TestDangerousPlanNeedsTheOwner(t *testing.T) {
 		t.Fatalf("apply before the owner decided: %v", err)
 	}
 	ap, err := s.DecideMCPPlan(ctx, p.ID, "adm_a", true, t0.Add(time.Minute))
-	if err != nil || ap.Status != PlanApproved || ap.DecidedBy != "adm_a" || ap.DecidedByName != "Ada" || !ap.DecidedAt.Equal(t0.Add(time.Minute)) {
+	if err != nil || ap.Status != PlanApproved || ap.DecidedBy != "adm_a" || ap.DecidedByName != "Ada" || !ap.DecidedAt.Equal(t0.Add(time.Minute)) || !ap.ExpiresAt.Equal(t0.Add(PlanTTL)) {
 		t.Fatalf("approve: %+v %v", ap, err)
 	}
 	if _, err := s.DecideMCPPlan(ctx, p.ID, "adm_a", false, t0.Add(time.Minute)); stateOf(err) != PlanApproved {
@@ -386,6 +484,14 @@ func TestDangerousPlanNeedsTheOwner(t *testing.T) {
 	late := newPlan(t, s, tok.ID, "node_rollback", true, t0)
 	if _, err := s.DecideMCPPlan(ctx, late.ID, "adm_a", true, t0.Add(PlanTTL)); stateOf(err) != PlanExpired {
 		t.Fatalf("approve at expiry: %v", err)
+	}
+	lateApproval := newPlan(t, s, tok.ID, "node_fix", true, t0)
+	approvedLate, err := s.DecideMCPPlan(ctx, lateApproval.ID, "adm_a", true, t0.Add(9*time.Minute))
+	if err != nil || !approvedLate.ExpiresAt.Equal(t0.Add(11*time.Minute)) {
+		t.Fatalf("late approval expiry: %+v %v", approvedLate, err)
+	}
+	if _, err := s.BeginApply(ctx, lateApproval.ID, tok.ID, lateApproval.Tool, lateApproval.ParamsHash, lateApproval.ConfirmHash, t0.Add(10*time.Minute+time.Second)); err != nil {
+		t.Fatalf("apply shortly after original expiry: %v", err)
 	}
 	if _, err := s.DecideMCPPlan(ctx, "pln_none", "adm_a", true, t0); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("approve unknown: %v", err)

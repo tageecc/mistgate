@@ -172,9 +172,10 @@ func TestIPv6SwitchIsOnByDefaultAndStored(t *testing.T) {
 func TestSchedulerRunsTheIPv6RoundNextAndTheSwitchStopsIt(t *testing.T) {
 	e := newEnv(t)
 	now := e.now
-	for _, n := range []struct{ id, address string }{{"de1", "203.0.113.10"}, {"nl1", "203.0.113.20"}} {
-		if _, err := e.st.W.ExecContext(context.Background(), `INSERT INTO node (id, name, address, provider, state, created_at, last_seen_at, last_connected_at)
-			VALUES (?, ?, ?, 'hoster', 'active', 1, ?, ?)`, n.id, n.id, n.address, now.Unix(), now.Unix()); err != nil {
+	// de1's IPv6 entry is on (its IPv4 is seen, so without the entry it would not be measured over IPv6 at all); nl1 has none
+	for _, n := range []struct{ id, address, entry string }{{"de1", "203.0.113.10", "2001:db8::10"}, {"nl1", "203.0.113.20", ""}} {
+		if _, err := e.st.W.ExecContext(context.Background(), `INSERT INTO node (id, name, address, provider, state, created_at, last_seen_at, last_connected_at, ipv6_entry)
+			VALUES (?, ?, ?, 'hoster', 'active', 1, ?, ?, ?)`, n.id, n.id, n.address, now.Unix(), now.Unix(), n.entry); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -262,4 +263,52 @@ type twoNodeFleet struct{ liveFleet }
 
 func (twoNodeFleet) Live(context.Context) ([]store.NodeLiveRow, error) {
 	return []store.NodeLiveRow{{NodeID: "de1", State: "active", Exists: true, Connected: true}, {NodeID: "nl1", State: "active", Exists: true, Connected: true}}, nil
+}
+
+// ProbeTCP6 (fleet.Config.GlobalpingTCP6): the last resort of the IPv6 check of a node.
+func TestProbeTCP6IsOneTCPPingOfTheLiteralFromTwoProbes(t *testing.T) {
+	e := newEnv(t)
+	e.enable("")
+	f := e.fake
+	f.tcp["2001:db8::10:443"] = true
+	answered, connected, err := e.svc.ProbeTCP6(context.Background(), "2001:db8::10", 443)
+	if err != nil || answered != 2 || connected != 2 {
+		t.Fatalf("answered %d, connected %d, %v", answered, connected, err)
+	}
+	posts := f.posts()
+	if len(posts) != 1 {
+		t.Fatalf("%d measurements: %+v", len(posts), posts)
+	}
+	// a literal takes no ipVersion; two probes anywhere (no country: the audience's own probes are not wanted here)
+	want := map[string]any{"type": "ping", "target": "2001:db8::10", "locations": []any{map[string]any{"magic": "world", "limit": 2.0}},
+		"measurementOptions": map[string]any{"protocol": "TCP", "port": 443.0, "packets": 3.0}}
+	if got := jsonOf(t, posts[0].Body); !reflect.DeepEqual(got, want) {
+		t.Fatalf("request = %s", posts[0].Body)
+	}
+	for _, r := range f.requests() {
+		if r.Path == "/v1/probes" {
+			t.Error("the probe list was read")
+		}
+	}
+
+	// the address does not answer: both probes tried and none connected
+	delete(f.tcp, "2001:db8::10:443")
+	if answered, connected, err = e.svc.ProbeTCP6(context.Background(), "2001:db8::10", 443); err != nil || answered != 2 || connected != 0 {
+		t.Fatalf("closed port: answered %d, connected %d, %v", answered, connected, err)
+	}
+	// Globalping refuses: an error, not a verdict
+	f.rateLimited = true
+	if _, _, err = e.svc.ProbeTCP6(context.Background(), "2001:db8::10", 443); err == nil {
+		t.Fatal("a rate limit was not an error")
+	}
+}
+
+func TestProbeTCP6DoesNothingWhileGlobalpingIsOff(t *testing.T) {
+	e := newEnv(t)
+	if _, _, err := e.svc.ProbeTCP6(context.Background(), "2001:db8::10", 443); !errors.Is(err, ErrDisabled) {
+		t.Fatalf("err = %v, want ErrDisabled", err)
+	}
+	if n := e.fake.count(); n != 0 {
+		t.Errorf("%d requests while switched off", n)
+	}
 }

@@ -20,18 +20,22 @@ const (
 	CodeDstateCut       = "dstate_tasks.interrupted"
 	// time_sync: offset_s, ntp_synced (yes | no | unknown)
 	CodeTimeOffset = "time_sync.offset"
-	// resolver: domains, failed_count, failed, median_ms
+	// resolver: domains, failed_count, failed, median_ms, p50_ms, p95_ms (lookup timings of the control domains)
 	CodeResolverOK     = "resolver.ok"
 	CodeResolverFailed = "resolver.failed"
 	// ipv6: ipv6 (yes | no), connect (ok | failed), warp_inbounds, client_ipv6 (off), suggest (client_ipv6_off);
 	// with a global address also iface (interface of the main-table ::/0 route; never mg*, wg*, awg* or other tunnels),
 	// addrs (its stable global addresses "addr/plen", comma-separated, at most 4) and src (the kernel's source address
-	// for an outbound IPv6 connection); each is omitted when unknown
-	CodeIPv6None      = "ipv6.none"
-	CodeIPv6NoneWarp  = "ipv6.none_warp"
-	CodeIPv6OK        = "ipv6.ok"
-	CodeIPv6Stalls    = "ipv6.connect_failed"
-	CodeIPv6ClientOff = "ipv6.client_off" // outbound IPv6 fails, but "IPv6 for clients" is off: clients use IPv4
+	// for an outbound IPv6 connection); each is omitted when unknown. An agent that holds addresses for the panel adds
+	// owned ("addr=state", comma-separated: ok | missing | tentative | dad_failed | denied); a DAD failure or a missing
+	// or denied one warns (owned_dad_failed, owned_missing) unless the result already warns
+	CodeIPv6None           = "ipv6.none"
+	CodeIPv6NoneWarp       = "ipv6.none_warp"
+	CodeIPv6OK             = "ipv6.ok"
+	CodeIPv6Stalls         = "ipv6.connect_failed"
+	CodeIPv6ClientOff      = "ipv6.client_off" // outbound IPv6 fails, but "IPv6 for clients" is off: clients use IPv4
+	CodeIPv6OwnedMissing   = "ipv6.owned_missing"
+	CodeIPv6OwnedDADFailed = "ipv6.owned_dad_failed"
 	// foreign_vpn: names, count, on_our_ports
 	CodeVPNNone  = "foreign_vpn.none"
 	CodeVPNFound = "foreign_vpn.found"
@@ -67,6 +71,15 @@ const (
 	// cpu_softirq: softirq_pct, cpu_pct, samples, need
 	CodeCPULoad       = "cpu_softirq.load"
 	CodeCPUCollecting = "cpu_softirq.collecting"
+	// cpu_steal: steal_pct (mean), steal_max_pct, samples, need
+	CodeStealLoad       = "cpu_steal.load"
+	CodeStealCollecting = "cpu_steal.collecting"
+	// conntrack_fill: count, max, fill_pct
+	CodeConntrackFill      = "conntrack_fill.fill"
+	CodeConntrackNotLoaded = "conntrack_fill.not_loaded"
+	// agent_fds: fds, limit, used_pct
+	CodeFDsUsage   = "agent_fds.usage"
+	CodeFDsUnknown = "agent_fds.unknown"
 	// kernel_headers: kernel, missing, mode (auto | kernel | userspace), virt
 	CodeHeadersNoAwg     = "kernel_headers.no_awg"
 	CodeHeadersContainer = "kernel_headers.container"
@@ -80,6 +93,8 @@ const (
 	CodeAwgRunning     = "awg_backend.running"
 	CodeAwgForwardDrop = "awg_backend.forward_drop"
 	CodeAwgUnavailable = "awg_backend.unavailable"
+	// awg_backend.fallback: backend, version, mode, kernel, reason
+	CodeAwgFallback = "awg_backend.fallback"
 	// warp_path: state, backend, colo, inbounds, hint, error
 	CodeWarpNoManager   = "warp_path.no_manager"
 	CodeWarpUnused      = "warp_path.unused"
@@ -100,6 +115,31 @@ const (
 	CodeUnitOtherUnit     = "unit_generation.other_unit"
 	CodeUnitUnknown       = "unit_generation.unknown"
 	CodeUnitRefreshFailed = "unit_generation.refresh_failed"
+	// security_updates: off (raw settings and timer states)
+	CodeSecurityUpdatesOn           = "security_updates.on"
+	CodeSecurityUpdatesNotInstalled = "security_updates.not_installed"
+	CodeSecurityUpdatesOff          = "security_updates.off"
+	CodeSecurityUpdatesNotAPT       = "security_updates.not_apt"
+	CodeSecurityUpdatesNoSystemd    = "security_updates.no_systemd"
+	CodeSecurityUpdatesEnabling     = "security_updates.enabling"
+	CodeSecurityUpdatesEnableFailed = "security_updates.enable_failed"
+	CodeSecurityUpdatesAutoReboot   = "security_updates.auto_reboot"
+	// nftables: reason
+	CodeNftablesOn            = "nftables.on"
+	CodeNftablesMissing       = "nftables.missing"
+	CodeNftablesInstalling    = "nftables.installing"
+	CodeNftablesInstallFailed = "nftables.install_failed"
+	// reality_target: hint (= the code's tail), inbound_id (the worst one), inbounds (every one with a bad target), target
+	// (host:port), server_name, checked, days_left (expiring)
+	CodeRealityOK           = "reality_target.ok"
+	CodeRealityNone         = "reality_target.none"
+	CodeRealityUnreachable  = "reality_target.unreachable"
+	CodeRealityNoTLS13      = "reality_target.no_tls13"
+	CodeRealityNoMLKEM      = "reality_target.no_mlkem"
+	CodeRealityNameMismatch = "reality_target.name_mismatch"
+	CodeRealityUntrusted    = "reality_target.untrusted"
+	CodeRealityExpired      = "reality_target.expired"
+	CodeRealityExpiring     = "reality_target.expiring"
 	// Any check: why it did not run. skip.unsupported has reason (English, from the host probe).
 	CodeSkipUnsupported = "skip.unsupported"
 	CodeSkipTimeout     = "skip.timeout"
@@ -112,7 +152,7 @@ var Codes = []string{
 	CodeDiskUsage, CodeDiskUnreadable, CodeJournalSize, CodeJournalNone,
 	CodeDstateNone, CodeDstateStuck, CodeDstateLoadIdle, CodeDstateStuckLoad, CodeDstateNoProc, CodeDstateCut,
 	CodeTimeOffset, CodeResolverOK, CodeResolverFailed,
-	CodeIPv6None, CodeIPv6NoneWarp, CodeIPv6OK, CodeIPv6Stalls, CodeIPv6ClientOff,
+	CodeIPv6None, CodeIPv6NoneWarp, CodeIPv6OK, CodeIPv6Stalls, CodeIPv6ClientOff, CodeIPv6OwnedMissing, CodeIPv6OwnedDADFailed,
 	CodeVPNNone, CodeVPNFound, CodeVPNClash,
 	CodeNftClean, CodeNftFound, CodeNftNat, CodeNftHits, CodeNftNone, CodeNftError,
 	CodePortsOK, CodePortsNone, CodePortsHop, CodePortsTLS, CodePortsFailedBnd, CodePortsHeld, CodePortsNoTable,
@@ -120,9 +160,15 @@ var Codes = []string{
 	CodeCertOK, CodeCertAgent, CodeCertInbound, CodeCertUnreadable, CodeCertNone,
 	CodeMemUsage, CodeMemNoInfo, CodeCPULoad, CodeCPUCollecting,
 	CodeHeadersNoAwg, CodeHeadersContainer, CodeHeadersReady, CodeHeadersUserspace, CodeHeadersOptional, CodeHeadersMissing,
-	CodeAwgNone, CodeAwgNoEngine, CodeAwgRunning, CodeAwgForwardDrop, CodeAwgUnavailable,
+	CodeAwgNone, CodeAwgNoEngine, CodeAwgRunning, CodeAwgForwardDrop, CodeAwgUnavailable, CodeAwgFallback,
 	CodeWarpNoManager, CodeWarpUnused, CodeWarpNoAccount, CodeWarpHostClash, CodeWarpUp, CodeWarpCheckFailed, CodeWarpStarting,
 	CodeWarpNoBackend, CodeWarpPausedUsed, CodeWarpPaused, CodeWarpDown, CodeWarpUnknown,
 	CodeUnitCurrent, CodeUnitOutdated, CodeUnitManual, CodeUnitOtherUnit, CodeUnitUnknown, CodeUnitRefreshFailed,
+	CodeSecurityUpdatesOn, CodeSecurityUpdatesNotInstalled, CodeSecurityUpdatesOff, CodeSecurityUpdatesNotAPT, CodeSecurityUpdatesNoSystemd,
+	CodeSecurityUpdatesEnabling, CodeSecurityUpdatesEnableFailed, CodeSecurityUpdatesAutoReboot,
+	CodeNftablesOn, CodeNftablesMissing, CodeNftablesInstalling, CodeNftablesInstallFailed,
+	CodeStealLoad, CodeStealCollecting, CodeConntrackFill, CodeConntrackNotLoaded, CodeFDsUsage, CodeFDsUnknown,
+	CodeRealityOK, CodeRealityNone, CodeRealityUnreachable, CodeRealityNoTLS13, CodeRealityNoMLKEM, CodeRealityNameMismatch,
+	CodeRealityUntrusted, CodeRealityExpired, CodeRealityExpiring,
 	CodeSkipUnsupported, CodeSkipTimeout, CodeSkipInternal, CodeSkipUnknown,
 }

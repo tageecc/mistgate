@@ -10,8 +10,11 @@ import { AlertsTab } from "./alerts";
 import { useFixFlow } from "./fix";
 import { PeopleTab } from "./people";
 
+const dismissAlert = vi.fn((..._a: unknown[]) => Promise.resolve({ alert: {} }));
+let assistantOn = false;
 vi.mock("@/lib/api", () => ({
-  health: { muteAlert: vi.fn(), acceptDoctorItem: vi.fn(), applyFix: vi.fn() },
+  assistant: { getAssistantAccess: () => Promise.resolve({ available: assistantOn }) },
+  health: { muteAlert: vi.fn(), dismissAlert: (...a: unknown[]) => dismissAlert(...a), acceptDoctorItem: vi.fn(), applyFix: vi.fn() },
   nodes: {},
   auth: { me: () => Promise.resolve({ admin: { id: "adm_1", role: Role.OWNER } }) },
   fleet: {},
@@ -138,10 +141,24 @@ async function mount(props: { people?: Alert[]; alerts?: Alert[] }) {
 }
 const text = () => host?.textContent ?? "";
 const cards = () => [...document.querySelectorAll("article")];
+const click = (el: Element | undefined) => act(async () => void el?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+/** The rows open one at a time, as on the board: opens each in turn and gives back what `read` sees in it. */
+async function eachOpen<T>(read: () => T[]): Promise<T[]> {
+  const out: T[] = [];
+  for (const toggle of [...document.querySelectorAll("[data-alert-toggle]")]) {
+    if (toggle.getAttribute("aria-expanded") !== "true") await click(toggle);
+    out.push(...read());
+  }
+  return out;
+}
+
+/** People opens no row of itself (the board keeps its open row on a node alert): the first is opened by a click, as a person does. */
+const openFirst = () => click(document.querySelector("[data-alert-toggle]") ?? undefined);
 
 describe("Health ▸ People", () => {
   it("lists the alerts about people, warnings first, and none about nodes", async () => {
     await mount({ people: [connection(), node(), impacted, ended()] });
+    await openFirst();
     const list = cards();
     expect(list).toHaveLength(2);
     expect(list[0]!.textContent).toContain("Masha");
@@ -158,6 +175,7 @@ describe("Health ▸ People", () => {
 
   it("shows a torrent attempt: who, where, how many, what was caught and the port, and no node alert around it", async () => {
     await mount({ people: [connection(), torrent(), node()] });
+    await openFirst();
     const list = cards();
     expect(list).toHaveLength(2);
     expect(list[0]!.textContent).toContain("alice");
@@ -177,19 +195,56 @@ describe("Health ▸ People", () => {
 
   it("opens the user from the button, by params.user_id (a device alert's subject is the device)", async () => {
     await mount({ people: [ended(), connection()] });
-    const hrefs = [...document.querySelectorAll("a")].filter((a) => a.textContent === "Open user").map((a) => a.getAttribute("href"));
+    const hrefs = await eachOpen(() => [...document.querySelectorAll("a")].filter((a) => a.textContent === "Open user").map((a) => a.getAttribute("href")));
     expect(hrefs).toEqual(["/users/usr_masha", "/users/usr_oleg"]);
+  });
+
+  it("opens the assistant with the access question in the composer, only when the assistant is on", async () => {
+    assistantOn = false;
+    await mount({ people: [ended()] });
+    expect(text()).not.toContain("Sort out reachability");
+    act(() => root?.unmount());
+    host?.remove();
+    assistantOn = true;
+    await mount({ people: [ended()] });
+    const button = [...document.querySelectorAll("button")].find((b) => b.textContent?.trim() === "Ask the assistant")!;
+    expect(button).toBeTruthy();
+    const seen: unknown[] = [];
+    const listen = (e: Event) => seen.push((e as CustomEvent).detail);
+    window.addEventListener("mistgate:assistant-open", listen);
+    await act(async () => void button.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    window.removeEventListener("mistgate:assistant-open", listen);
+    assistantOn = false;
+    expect(seen).toEqual([{ text: "Work out who cannot open what over the last day, and what to fix." }]);
   });
 
   it("offers Mute like the other alerts", async () => {
     await mount({ people: [ended()] });
+    expect(document.querySelector("[data-alert-toggle]")?.getAttribute("aria-expanded")).toBe("false");
+    await openFirst();
     expect([...document.querySelectorAll("button")].some((b) => b.textContent?.includes("Mute"))).toBe(true);
+  });
+
+  it("offers Close on each card and «Close all shown» for the list, asking with the count", async () => {
+    await mount({ people: [connection({ id: "c1" }), connection({ id: "c2", params: { user_name: "Ira", user_id: "usr_ira" } }), ended()] });
+    // a row's own Close is in its open body, one row at a time
+    const closes = await eachOpen(() => [...document.querySelectorAll("button")].filter((b) => b.textContent?.trim() === "Close"));
+    expect(closes.length).toBe(3);
+    const all = [...document.querySelectorAll("button")].find((b) => b.textContent?.trim() === "Close all shown")!;
+    await act(async () => void all.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    expect(document.body.textContent).toContain("Close 3 alerts?");
+    expect(dismissAlert).not.toHaveBeenCalled();
+    const confirm = [...document.querySelectorAll("button")].filter((b) => b.textContent?.trim() === "Close").at(-1)!;
+    await act(async () => void confirm.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    for (let i = 0; i < 4; i++) await act(async () => void (await new Promise((r) => setTimeout(r, 0))));
+    expect(dismissAlert).toHaveBeenCalledTimes(3);
   });
 
   it("says so when nothing is open, even with node alerts around", async () => {
     await mount({ people: [node(), impacted] });
     expect(cards()).toHaveLength(0);
-    expect(text()).toContain("Nobody has trouble connecting.");
+    expect(text()).toContain("All quiet");
+    expect(text()).toContain("No open alerts about people");
   });
 });
 
@@ -206,6 +261,7 @@ describe("Health ▸ Alerts", () => {
   it("is quiet when only people have alerts", async () => {
     await mount({ alerts: [ended(), connection()] });
     expect(cards()).toHaveLength(0);
-    expect(text()).toContain("All quiet.");
+    expect(text()).toContain("All quiet");
+    expect(text()).toContain("No alert in the last 7 days");
   });
 });

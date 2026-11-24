@@ -5,20 +5,22 @@ import { cx } from "@/lib/cx";
 
 export type SegmentedOption<V extends string> = { value: V; label: ReactNode; title?: string };
 
-// thumb: 36px with a sliding selection. inset / flat: the 28px-item groups of Settings and
-// of the list filters.
+// One look, three ways to draw the chosen item. A 28px item in a 2px frame on the page colour; the chosen one is a step lighter.
+// thumb: the lighter plate slides to the chosen item. inset / flat: it just switches.
+const track = "rounded-field border border-line bg-canvas p-0.5";
+const item = "h-7 rounded-ctl px-3 text-[13px] text-sec transition-colors duration-150 ease-out hover:text-fg data-checked:text-fg";
 const looks = {
   thumb: {
-    track: "relative grid h-9 auto-cols-fr grid-flow-col rounded-xl border border-line bg-surface p-[3px]",
-    item: "relative rounded-[9px] px-3 text-xs font-bold text-muted transition-colors duration-300 data-checked:text-fg",
+    track: cx("relative grid h-[34px] auto-cols-fr grid-flow-col", track),
+    item: cx("relative", item),
   },
   inset: {
-    track: "flex gap-0.5 rounded-ctl bg-surface-2 p-0.5",
-    item: "h-7 rounded-[9px] px-3 text-xs font-bold text-muted data-checked:bg-surface data-checked:text-fg",
+    track: cx("flex gap-0.5", track),
+    item: cx(item, "data-checked:bg-surface-2"),
   },
   flat: {
-    track: "flex gap-0.5 rounded-xl border border-line bg-surface p-[3px]",
-    item: "h-7 rounded-[9px] px-3 text-xs font-bold text-muted transition-colors duration-200 data-checked:bg-surface-2 data-checked:text-fg",
+    track: cx("flex gap-0.5", track),
+    item: cx(item, "data-checked:bg-surface-2"),
   },
 } as const;
 
@@ -29,23 +31,25 @@ type Props<V extends string> = {
   variant?: keyof typeof looks;
   "aria-label": string;
   className?: string;
+  /** Long labels wrap onto two lines instead of pushing the control wider than its box (a phone). */
+  wrap?: boolean;
 };
 
-export function Segmented<V extends string>({ value, onValueChange, options, variant = "inset", className, ...rest }: Props<V>) {
+export function Segmented<V extends string>({ value, onValueChange, options, variant = "inset", className, wrap, ...rest }: Props<V>) {
   const look = looks[variant];
   const index = Math.max(0, options.findIndex((o) => o.value === value));
   return (
     <RadioGroup
       value={value}
       onValueChange={(v) => onValueChange(v as V)}
-      className={cx("box-border", look.track, className)}
+      className={cx("box-border", look.track, wrap && "h-auto min-h-[34px]", className)}
       {...rest}
     >
       {variant === "thumb" && (
         <span
           aria-hidden
-          className="absolute top-[3px] bottom-[3px] left-[3px] rounded-[9px] border border-accent-line bg-surface-2 transition-transform duration-[450ms] ease-[cubic-bezier(0.3,1.4,0.5,1)]"
-          style={{ width: `calc((100% - 6px) / ${options.length})`, transform: `translateX(${index * 100}%)` }}
+          className="absolute top-0.5 bottom-0.5 inset-s-0.5 rounded-ctl bg-surface-2 transition-transform duration-[350ms] ease-spring"
+          style={{ width: `calc((100% - 4px) / ${options.length})`, transform: `translateX(calc(${index * 100}% * var(--x-dir)))` }}
         />
       )}
       {options.map((o) => (
@@ -53,7 +57,7 @@ export function Segmented<V extends string>({ value, onValueChange, options, var
           key={o.value}
           value={o.value}
           title={o.title}
-          className={cx("inline-flex cursor-pointer items-center justify-center whitespace-nowrap", look.item)}
+          className={cx("inline-flex cursor-pointer items-center justify-center", wrap ? "py-1 text-center leading-tight" : "whitespace-nowrap", look.item)}
         >
           {o.label}
         </Radio.Root>

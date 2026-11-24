@@ -1,15 +1,19 @@
+import { Scramble } from "@/components/fx/scramble-react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useId, useState, type ReactNode } from "react";
 import { Button, buttonClass } from "@/components/ui/button";
-import { Icon, IconChip } from "@/components/ui/icons";
+import { Icon } from "@/components/ui/icons";
+import { IconButton } from "@/components/ui/icon-button";
+import { ProtocolTag } from "@/components/ui/protocol-tag";
 import { Modal } from "@/components/ui/modal";
-import { EmptyState, Notice } from "@/components/ui/notice";
-import { StatusDot, StatusPill, type StatusKind } from "@/components/ui/status";
+import { Notice } from "@/components/ui/notice";
+import { kindTextClass, StatusDot, type StatusKind } from "@/components/ui/status";
 import { Switch } from "@/components/ui/switch";
 import { TextField } from "@/components/ui/text-field";
 import { useToast } from "@/components/ui/toast";
 import { InboundState, NodeStatus, type Inbound } from "@/gen/mistgate/admin/v1/common_pb";
+import { Role } from "@/gen/mistgate/admin/v1/auth_pb";
 import { DoctorStatus } from "@/gen/mistgate/admin/v1/health_pb";
 import type { GetNodeResponse } from "@/gen/mistgate/admin/v1/node_pb";
 import { useT, type T } from "@/i18n";
@@ -18,23 +22,33 @@ import type { Plain } from "@/lib/plain";
 import { nodes as nodesApi, profiles as profilesApi } from "@/lib/api";
 import { inboundConnParts, nodeConnectionsQuery, type InboundConn } from "@/lib/connections";
 import { cx } from "@/lib/cx";
+import { useEdition } from "@/lib/edition";
 import { errorText } from "@/lib/errors";
 import { useFmt, type Fmt } from "@/lib/format";
-import { doctorQuery } from "@/lib/health";
-import { inboundErrorKind, inboundErrorText } from "@/lib/inbound-error";
+import { cellLook, checksQuery, doctorQuery } from "@/lib/health";
+import { inboundErrorKind, inboundErrorText, nameFixes } from "@/lib/inbound-error";
 import { portNotes, withNotes } from "@/lib/port-check";
 import { agentLinked } from "@/lib/node-status";
 import { protocolName } from "@/lib/series";
 import { useNow } from "@/lib/time";
+import { meQuery } from "@/lib/session";
 import { useIsOwner } from "@/lib/updates";
+import { networkOf } from "@/lib/ways-graph";
 import { profileListQuery } from "@/screens/users/rpc";
-import { PartsLine } from "@/screens/users/user-detail";
+import { PartsLine } from "@/screens/users/user-connection";
 import { AddInbound } from "./add-inbound";
 import { AwgStatusLine } from "./awg-status";
 import { DecoyNotice, portOk, sniPlaceholder, useInboundCheck, useInboundRefresh, WarpWarnings } from "./inbound-check";
 import { LossyNotice, lossyRefusal } from "./port-lossy";
+import { SniScanCard, sniDemo } from "./sni-scan";
+import { tlsHint, useRealityTargetEdit } from "./reality-target";
+import { ShareFix, ShareNotes } from "./share-fix";
+import { SharedPortCards } from "./shared-port";
+import { isShareCode } from "@/lib/tcpshare";
 import { tcpPill, verdictPill } from "./ports";
+import { Fresh } from "@/components/fx/fresh";
 import { alsoRemovesText, useRelaysOf } from "./relays";
+import { nodeTicks } from "@/screens/overview-checks";
 
 export const states: Record<InboundState, { kind: StatusKind; word: MessageKey }> = {
   [InboundState.UNSPECIFIED]: { kind: "off", word: "node.inbound.off" },
@@ -64,7 +78,7 @@ function certCell(t: T, fmt: Fmt, i: Plain<Inbound>, now: number): Cell {
  * every row line up. Anything that is not AmneziaWG reads as TLS.
  */
 function cells(t: T, fmt: Fmt, i: Plain<Inbound>, now: number, dot?: Cell["dot"]): Cell[] {
-  const port: Cell = { label: t("node.profiles.port"), value: i.port ? `${i.protocol === "vless" ? "tcp" : "udp"}/${i.port}` : "", mono: true, dot };
+  const port: Cell = { label: t("node.profiles.port"), value: i.port ? `${networkOf(i.protocol) ?? "udp"}/${i.port}` : "", mono: true, dot };
   const egress: Cell = { label: t("node.profiles.egress"), value: i.egress ? t(i.egress === "warp" ? "node.profiles.egress.warp" : "node.profiles.egress.direct") : "" };
   if (i.protocol === "awg") {
     const a = i.awg;
@@ -79,9 +93,6 @@ function cells(t: T, fmt: Fmt, i: Plain<Inbound>, now: number, dot?: Cell["dot"]
 }
 
 const toneText = { warn: "text-warn-text", bad: "text-danger-text" } as const;
-
-// The last column fits the longest pill ("Не запустился").
-const gridClass = "md:grid-cols-[minmax(0,1.4fr)_92px_minmax(0,0.7fr)_minmax(0,1.3fr)_minmax(0,1fr)_124px]";
 
 /** The last port check of a profile's port, as a dot: its verdict on hover and to a screen reader, the check a click away. */
 function PortDot({ nodeId, dot }: { nodeId: string; dot: NonNullable<Cell["dot"]> }) {
@@ -106,11 +117,11 @@ export function usePortHolders(nodeId: string, enabled = true): Record<string, s
 }
 
 /** Why a profile did not start, in words, with the agent's own text under it. Also on the profile page ("Where it runs"). */
-export function InboundErrorNote({ inbound, process }: { inbound: Pick<Plain<Inbound>, "lastError" | "port">; process?: string }) {
+export function InboundErrorNote({ inbound, process }: { inbound: Pick<Plain<Inbound>, "lastError" | "port" | "protocol">; process?: string }) {
   const t = useT();
   return (
     <div className="flex flex-col gap-0.5 rounded-field border border-[color-mix(in_oklch,var(--danger)_45%,var(--border))] bg-danger-soft px-3 py-2">
-      <p className="text-[13px] leading-snug font-semibold text-danger-text">{inboundErrorText(t, inbound.lastError, { port: inbound.port, process })}</p>
+      <p className="text-[13px] leading-snug font-semibold text-danger-text">{inboundErrorText(t, inbound.lastError, { port: inbound.port, protocol: inbound.protocol, process })}</p>
       <p className="font-mono text-[11px] leading-snug break-words text-muted">{inbound.lastError}</p>
     </div>
   );
@@ -124,12 +135,19 @@ export function ProfilesTab({ data, addProfile, onAddClosed }: { data: Plain<Get
   const fmt = useFmt();
   const now = Math.floor(useNow(60_000) / 1000);
   // addProfile: the profile page sent us here to add that profile: the dialog opens with it chosen
+  const owner = useIsOwner(); // policy.go: a server on a node (CreateInbound, UpdateInbound, DeleteInbound) is the owner's
+  const canRestart = useQuery(meQuery).data?.admin?.role === Role.HELPER || owner; // RestartInbounds is the helper's too
+  const edition = useEdition();
   const [adding, setAddingOpen] = useState(Boolean(addProfile));
   const setAdding = (open: boolean) => {
     setAddingOpen(open);
     if (!open) onAddClosed?.();
   };
-  const [editing, setEditing] = useState<Editing | null>(null);
+  // /dev-kit: the edit window of a server opens by itself (sni=edit)
+  const [editing, setEditing] = useState<Editing | null>(() => {
+    const inbound = sniDemo.current?.edit ? data.inbounds.find((i) => i.id === sniDemo.current?.edit) : undefined;
+    return inbound ? { inbound } : null;
+  });
   const [removing, setRemoving] = useState<Plain<Inbound> | null>(null);
   const [restarting, setRestarting] = useState<Plain<Inbound> | null>(null);
   const node = data.node!;
@@ -140,119 +158,172 @@ export function ProfilesTab({ data, addProfile, onAddClosed }: { data: Plain<Get
   const conn = useQuery({ ...nodeConnectionsQuery(node.id), enabled: data.inbounds.length > 0 && node.status !== NodeStatus.RETIRED }).data;
   const connOf = new Map((conn?.inbounds ?? []).map((x) => [x.inboundId, x]));
   // relays are the owner's (RelayService): removing a server says which relays go with it
-  const owner = useIsOwner();
 
-  const add = (
-    <Button variant="primary" size="md" onClick={() => setAdding(true)}>
-      <Icon name="plus" size={14} />
+  // the checks as a client sees them: a day of hourly cells and the time of each profile (the same round the Overview reads)
+  const checks = useQuery({ ...checksQuery(node.id), enabled: data.inbounds.length > 0 && node.status !== NodeStatus.RETIRED });
+  const checkRow = checks.data?.rows.find((r) => r.nodeId === node.id);
+  const dead = node.status === NodeStatus.DOWN;
+  // "Sites near the node": the node scans its own subnet (ProbeService, the VPS panel only) for the target of a REALITY server, the owner's call
+  const sniCard = owner && !edition.off("sni_scan") && node.status !== NodeStatus.RETIRED && data.inbounds.some((i) => i.protocol === "vless");
+
+  const add = owner ? (
+    <Button variant="primary" size="lg" onClick={() => setAdding(true)}>
+      <Icon name="plus" size={16} />
       {t("node.profiles.add")}
     </Button>
-  );
+  ) : undefined;
 
   return (
-    <div className="flex flex-col gap-2">
+    <div className="flex flex-col gap-4">
       {data.inbounds.length === 0 ? (
-        <div className="rounded-card-lg border border-dashed border-line">
-          <EmptyState title={t("node.profiles.none", { name: node.name })} action={add}>
-            {t("node.profiles.noneBody")}
-          </EmptyState>
-        </div>
+        <section className="flex flex-col items-center gap-2 rounded-card border border-line bg-surface px-6 py-12 text-center">
+          <span aria-hidden className="mb-1 grid size-12 place-items-center rounded-[14px] bg-step text-sec">
+            <Icon name="sliders" size={24} />
+          </span>
+          <b className="text-base font-medium">{t("node.profiles.none", { name: node.name })}</b>
+          <span className="max-w-[420px] text-[13px] text-sec">{t(owner ? "node.profiles.noneBody" : "node.profiles.ownerOnly")}</span>
+          {add && <div className="mt-3">{add}</div>}
+        </section>
       ) : (
         <>
-          {conn && !conn.supported && linked && <p data-testid="conn-unsupported" className="text-xs leading-normal text-pretty text-muted">{t("conn.node.unsupported")}</p>}
-          <div className="flex items-center gap-2 pb-1">
-            <span className="flex-1 text-xs text-muted">{t.n("node.profiles.count", data.inbounds.length)}</span>
-            <Button variant="primary" size="md" onClick={() => setAdding(true)}>
-              <Icon name="plus" size={14} />
-              {t("node.profiles.add")}
-            </Button>
+          <div className="mt-2 flex items-center gap-4 max-[720px]:flex-wrap">
+            <h2 className="me-auto text-xl leading-7 font-medium tracking-[-0.01em]">{t.n("node.profiles.count", data.inbounds.length)}</h2>
+            <span className="text-[13px] text-muted max-[720px]:hidden">{t("np.pf.every")}</span>
+            {add}
           </div>
+          {conn && !conn.supported && linked && (
+            <p data-testid="conn-unsupported" className="text-xs leading-normal text-pretty text-muted">
+              {t("conn.node.unsupported")}
+            </p>
+          )}
+          {!owner && <Notice tone="quiet">{t("node.profiles.ownerOnly")}</Notice>}
         </>
       )}
 
-      {data.inbounds.map((i) => {
-        const s = states[i.state] ?? states[InboundState.UNSPECIFIED];
-        // the last port check of this profile's port: a dot that leads to it in the ways in
-        const tcp = i.protocol === "vless";
-        const checked = tcp ? data.tcpChecks?.find((c) => c.port === i.port && c.verdict) : data.portChecks?.find((c) => c.port === i.port && c.verdict);
-        const cs = cells(t, fmt, i, now, checked && (tcp ? tcpPill(t, checked.verdict) : verdictPill(t, checked as never)));
-        const kind = i.lastError ? inboundErrorKind(i.lastError) : null;
-        const fix: ReactNode =
-          kind === "port" ? (
-            <Button variant="primary" size="sm" onClick={() => setEditing({ inbound: i, focus: "port" })}>
-              {t("node.profiles.changePort")}
-            </Button>
-          ) : kind === "cert" && i.protocol !== "awg" ? (
-            <Button variant="primary" size="sm" onClick={() => setEditing({ inbound: i, focus: "sni" })}>
-              {t("node.profiles.setDomain")}
-            </Button>
-          ) : kind === "warp" ? (
-            <Link to="/nodes/$id" params={{ id: node.id }} search={{ tab: "exit" }} hash="warp" className={buttonClass("primary", "sm")}>
-              {t("warp.open")}
-            </Link>
-          ) : null;
-        return (
-          <div key={i.id} className="flex flex-col gap-2.5 rounded-card border border-line bg-surface px-4 py-3.5">
-            <div className={`grid items-center gap-3 max-md:grid-cols-[minmax(0,1fr)_auto] ${gridClass}`}>
-              <div className="flex min-w-0 items-center gap-2.5">
-                <IconChip icon="sliders" tone="sage" size={28} />
-                <div className="flex min-w-0 flex-col gap-[3px]">
-                  {/* the name is read, never cut: it wraps */}
-                  <Link to="/profiles/$id" params={{ id: i.profileId }} className="text-sm leading-snug font-bold break-words hover:text-accent-text hover:underline">
+      <SharedPortCards data={data} />
+
+      <div className="flex flex-col gap-3">
+        {data.inbounds.map((i) => {
+          const s = states[i.state] ?? states[InboundState.UNSPECIFIED];
+          // the last port check of this profile's port: a dot that leads to it in the ways in
+          const tcp = networkOf(i.protocol) === "tcp";
+          const checked = tcp ? data.tcpChecks?.find((c) => c.port === i.port && c.verdict) : data.portChecks?.find((c) => c.port === i.port && c.verdict);
+          const cs = cells(t, fmt, i, now, checked && (tcp ? tcpPill(t, checked.verdict) : verdictPill(t, checked as never)));
+          const kind = i.lastError ? inboundErrorKind(i.lastError) : null;
+          const cell = checkRow?.cells.find((c) => c.deployed && c.inboundId === i.id);
+          const look = cell && checkRow ? cellLook(t, fmt, cell, checkRow.nodeStatus) : undefined;
+          const ticks = nodeTicks(cell ? { cells: [cell] } : undefined);
+          const st = cell?.stats24h;
+          const okN = cell?.history.reduce((n, h) => n + h.ok, 0) ?? 0;
+          const failN = cell?.history.reduce((n, h) => n + h.failed, 0) ?? 0;
+          const stats: { v: string; k: string; cls?: string }[] = cell
+            ? [
+                { v: fmt.num(okN, 0), k: t("np.pf.ok") },
+                { v: fmt.num(failN, 0), k: t("np.pf.failed"), cls: failN > 0 ? "text-danger-text" : undefined },
+                ...(st && st.responseP50Ms > 0 ? [{ v: `${st.responseP50Ms} ${t("hl.ms")}`, k: t("np.pf.response") }] : []),
+                ...(st && st.connectP50Ms > 0 ? [{ v: `${st.connectP50Ms} ${t("hl.ms")}`, k: t("np.pf.connect") }] : []),
+              ]
+            : [];
+          const fix: ReactNode = !owner ? null : kind === "port" ? (
+              <Button variant="primary" size="md" onClick={() => setEditing({ inbound: i, focus: "port" })}>
+                {t("node.profiles.changePort")}
+              </Button>
+            ) : nameFixes(kind) && i.protocol !== "awg" ? (
+              <Button variant="primary" size="md" onClick={() => setEditing({ inbound: i, focus: "sni" })}>
+                {t("node.profiles.setDomain")}
+              </Button>
+            ) : kind === "share" ? (
+              <Link to="/updates" className={buttonClass("primary", "md")}>
+                {t("share.openUpdates")}
+              </Link>
+            ) : kind === "warp" ? (
+              <Link to="/nodes/$id" params={{ id: node.id }} search={{ tab: "exit" }} hash="warp" className={buttonClass("primary", "md")}>
+                {t("warp.open")}
+              </Link>
+            ) : null;
+          return (
+            <Fresh key={i.id} kind="inbound" id={i.id} className="flex min-w-0 flex-col rounded-card border border-line bg-surface transition-colors duration-200 ease-out hover:border-[color-mix(in_srgb,var(--text)_18%,transparent)]">
+              <div className="grid grid-cols-[28px_minmax(160px,220px)_minmax(120px,170px)_minmax(0,1fr)_88px_auto] items-center gap-4 py-4 ps-6 pe-4 max-[1200px]:grid-cols-[28px_minmax(0,1fr)_auto_auto] max-[1200px]:gap-y-3 max-[720px]:gap-3 max-[720px]:px-4 max-[720px]:py-3.5">
+                <ProtocolTag protocol={i.protocol} compact className="w-7 justify-center px-0" />
+                <div className="flex min-w-0 flex-col">
+                  <Link to="/profiles/$id" params={{ id: i.profileId }} className="truncate font-medium hover:text-accent-text hover:underline">
                     {i.profileName}
                   </Link>
-                  <span className="text-xs text-muted">{protocolName(i.protocol)}</span>
+                  <span className="font-mono text-[11px] font-normal text-muted">{i.port ? `${networkOf(i.protocol) ?? "udp"}/${i.port}` : protocolName(i.protocol)}</span>
+                </div>
+                <span className={cx("inline-flex items-center gap-2 text-[13px] whitespace-nowrap", kindTextClass[s.kind])}>
+                  <StatusDot kind={s.kind} />
+                  {t(s.word)}
+                </span>
+                <span role="img" aria-label={t("ov.tick.aria")} className={cx("nd-tk max-[1200px]:order-5 max-[1200px]:col-[1/4]", dead && "opacity-40")}>
+                  {ticks.map((k, n) => (
+                    <i
+                      key={n}
+                      className={k.state === "ok" ? undefined : k.state}
+                      data-t={k.from ? `${fmt.clock(k.from)}–${fmt.clock(k.to)}` : t("ov.tick.none")}
+                      data-s={k.state === "none" ? (k.from ? t("ov.tick.none") : "") : k.state === "ok" ? t("ov.tick.ok", { ms: k.ms || "–" }) : k.state === "warn" ? t("ov.tick.part", { failed: k.failed, total: k.ok + k.failed }) : t("ov.tick.fail")}
+                    />
+                  ))}
+                </span>
+                <span className={cx("text-end font-mono text-[13px] font-medium whitespace-nowrap tabular-nums max-[1200px]:order-6", look?.kind === "warn" && "text-warn-text", look?.kind === "bad" && "text-danger-text")}>{look && cell && look.label ? <Scramble value={look.label} once /> : ""}</span>
+                <div className="flex items-center gap-1.5 max-[1200px]:order-7 max-[1200px]:col-[1/-1] max-[720px]:[&>*]:flex-1">
+                  {fix}
+                  {owner && (
+                    <Button variant="secondary" size="md" onClick={() => setEditing({ inbound: i })}>
+                      {t("common.edit")}
+                    </Button>
+                  )}
+                  {canRestart && linked && i.state !== InboundState.DISABLED && (
+                    <Button variant="secondary" size="md" onClick={() => setRestarting(i)}>
+                      {t("node.profiles.restart")}
+                    </Button>
+                  )}
+                  {owner && (
+                    <IconButton aria-label={t("node.profiles.remove")} title={t("node.profiles.remove")} className="hover:text-danger-text" onClick={() => setRemoving(i)}>
+                      <Icon name="trash" size={16} />
+                    </IconButton>
+                  )}
                 </div>
               </div>
-              {cs.map((c) => (
-                <div key={c.label} className="min-w-0 max-md:hidden">
-                  <div className="flex min-w-0 flex-col gap-[3px]">
-                    <span className="text-[11px] text-muted">{c.label}</span>
-                    <span title={c.title} className={cx("flex min-w-0 items-center gap-1.5", c.mono ? "font-mono text-[13px] break-all" : "text-xs font-semibold break-words", c.tone && toneText[c.tone])}>
+              {(i.awg || conn?.supported || i.lastError) && (
+                <div className="flex flex-col gap-2.5 px-6 pb-4 max-[720px]:px-4">
+                  {i.awg && <AwgStatusLine awg={i.awg} />}
+                  {conn?.supported && <ConnLine x={connOf.get(i.id)} />}
+                  {i.lastError && <InboundErrorNote inbound={i} process={holders[i.id]} />}
+                </div>
+              )}
+              <dl className="m-0 grid grid-cols-4 gap-4 border-t border-line px-6 py-3.5 max-[1200px]:grid-cols-2 max-[720px]:px-4">
+                {cs.map((c) => (
+                  <div key={c.label} className="flex min-w-0 flex-col gap-0.5">
+                    <dt className="text-xs text-muted">{c.label}</dt>
+                    <dd title={c.title} className={cx("m-0 flex min-w-0 items-center gap-1.5 truncate", c.mono && "font-mono text-[13px] font-normal", c.tone && toneText[c.tone])}>
                       {c.value || "—"}
                       {c.dot && <PortDot nodeId={node.id} dot={c.dot} />}
-                    </span>
+                    </dd>
                   </div>
+                ))}
+              </dl>
+              {stats.length > 0 && (
+                <div className={cx("flex flex-wrap items-center gap-x-5 gap-y-1.5 rounded-b-[15px] border-t border-line bg-step px-6 pt-3 pb-3.5 max-[720px]:px-4", dead && "opacity-40")}>
+                  <span className="text-[13px] text-muted">{t("np.pf.day")}</span>
+                  {stats.map((x) => (
+                    <span key={x.k} className="inline-flex items-baseline gap-1.5 text-[13px] text-sec">
+                      <b className={cx("font-mono text-[13px] font-medium text-fg", x.cls)}>
+                        <Scramble value={x.v} once />
+                      </b>
+                      {x.k}
+                    </span>
+                  ))}
                 </div>
-              ))}
-              <div className="flex justify-end">
-                <StatusPill kind={s.kind} label={t(s.word)} sm />
-              </div>
-            </div>
-            {/* the phone has no columns: each fact with its name */}
-            <dl className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] md:hidden">
-              {cs.map((c) => (
-                <div key={c.label} className="flex min-w-0 gap-1.5">
-                  <dt className="text-muted">{c.label}</dt>
-                  <dd className={cx("flex min-w-0 items-center gap-1.5 font-semibold", c.mono ? "font-mono break-all" : "break-words", c.tone && toneText[c.tone])}>
-                    {c.value || "—"}
-                    {c.dot && <PortDot nodeId={node.id} dot={c.dot} />}
-                  </dd>
-                </div>
-              ))}
-            </dl>
-            {i.awg && <AwgStatusLine awg={i.awg} />}
-            {conn?.supported && <ConnLine x={connOf.get(i.id)} />}
-            {i.lastError && <InboundErrorNote inbound={i} process={holders[i.id]} />}
-            <div className="flex flex-wrap items-center gap-2 border-t border-line pt-2.5">
-              {fix}
-              <Button variant="secondary" size="sm" onClick={() => setEditing({ inbound: i })}>
-                {t("common.edit")}
-              </Button>
-              {linked && i.state !== InboundState.DISABLED && (
-                <Button variant="secondary" size="sm" onClick={() => setRestarting(i)}>
-                  {t("node.profiles.restart")}
-                </Button>
               )}
-              <Button variant="ghostDanger" size="sm" className="ml-auto" onClick={() => setRemoving(i)}>
-                {t("node.profiles.remove")}
-              </Button>
-            </div>
-          </div>
-        );
-      })}
+            </Fresh>
+          );
+        })}
+      </div>
 
-      <AddInbound open={adding} onOpenChange={setAdding} data={data} initialProfile={addProfile} />
+      {sniCard && <SniScanCard nodeId={node.id} nodeName={node.name} linked={linked} servers={data.inbounds.filter((i) => i.protocol === "vless" && !!i.realityTarget && i.state !== InboundState.DISABLED)} />}
+
+      {owner && <AddInbound open={adding} onOpenChange={setAdding} data={data} initialProfile={addProfile} />}
       {editing && (
         <EditInbound key={editing.inbound.id} inbound={editing.inbound} focus={editing.focus} nodeId={node.id} nodeAddress={node.address} onClose={() => setEditing(null)} />
       )}
@@ -267,6 +338,11 @@ function EditInbound({ inbound, focus, nodeId, nodeAddress, onClose }: { inbound
   const toast = useToast();
   const refresh = useInboundRefresh(nodeId);
   const isAwg = inbound.protocol === "awg";
+  // the site this node shows instead of its profile's target (REALITY): its field, and its name is no domain of the node
+  const target = useRealityTargetEdit(inbound, onClose);
+  // VLESS has a name of its own to set only where it has a certificate: the node's own site behind REALITY, or TLS (the
+  // server resolved one, or the admin set one, or it could not for want of a domain); REALITY with another site has none
+  const named = (inbound.protocol !== "vless" || !!inbound.tlsServerName || !!inbound.tlsServerNameOverride || (!!inbound.lastError && nameFixes(inboundErrorKind(inbound.lastError)))) && !target.own;
   const was = { port: inbound.port ? String(inbound.port) : "", sni: inbound.tlsServerName, enabled: inbound.state !== InboundState.DISABLED };
   const [port, setPort] = useState(was.port);
   const [sni, setSni] = useState(was.sni);
@@ -296,6 +372,7 @@ function EditInbound({ inbound, focus, nodeId, nodeAddress, onClose }: { inbound
         portOverride: touched.port ? (port ? Number(port) : 0) : undefined,
         tlsServerNameOverride: touched.sni ? sni.trim() : undefined,
         enabled: touched.enabled ? enabled : undefined,
+        realityTargetOverride: target.save,
         ...(allowLossy && { allowLossyPort: true }),
       }),
     onSuccess: (r) => {
@@ -308,19 +385,22 @@ function EditInbound({ inbound, focus, nodeId, nodeAddress, onClose }: { inbound
   });
 
   const refused = check.state === "refused" ? check : null;
+  const share = refused && isShareCode(refused.code) ? { code: refused.code, vars: refused.vars } : null;
   // the stored checks (before the click) or the real run (the click) found the port losing packets
   const lossy = refused?.code === "port_lossy" ? refused.vars : lossyRefusal(save.error);
   const fieldError = (codes: string[]) => (refused && codes.includes(refused.code) ? t(`err.${refused.code}`, refused.vars) : undefined);
   const portError = !portOk(port) ? t("node.profiles.portError") : fieldError(["port_taken", "port_in_hop", "hop_taken"]);
-  const sniError = fieldError(["sni_needs_domain", "sni_invalid", "acme_needs_domain", "reality_needs_domain"]);
+  const sniError = fieldError(["sni_needs_domain", "sni_invalid", "acme_needs_domain", "reality_needs_domain", "mtproto_needs_domain"]);
   const effective = check.state === "ok" ? check.inbound : undefined;
-  const dirty = touched.port || touched.sni || touched.enabled;
+  const dirty = touched.port || touched.sni || touched.enabled || target.touched;
+  // a refusal no field above words (the Save button is off for it): a notice at the foot says why, so the button is never off in silence
+  const unexplained = refused && !share && !lossy && !portError && !sniError ? refused : null;
   return (
     <Modal open onOpenChange={(o) => !o && onClose()} title={t("node.profiles.editTitle", { name: inbound.profileName })} description={t("node.profiles.editBody")}>
       <form
         onSubmit={(e) => {
           e.preventDefault();
-          if (dirty && portOk(port) && !refused) save.mutate(false);
+          if (dirty && portOk(port) && !refused && !target.blocked) save.mutate(false);
         }}
         className="flex flex-col gap-3.5"
       >
@@ -351,6 +431,22 @@ function EditInbound({ inbound, focus, nodeId, nodeAddress, onClose }: { inbound
             </Button>
           </div>
         )}
+        {share && (
+          <ShareFix
+            code={share.code}
+            vars={share.vars}
+            node={{ name: inbound.nodeName, address: nodeAddress }}
+            onLeave={onClose}
+            onPut={(name) => {
+              setSni(name);
+              save.reset();
+            }}
+            onTake={(p) => {
+              setPort(String(p));
+              save.reset();
+            }}
+          />
+        )}
         {lossy && (
           <LossyNotice
             vars={lossy}
@@ -363,7 +459,7 @@ function EditInbound({ inbound, focus, nodeId, nodeAddress, onClose }: { inbound
             onAnyway={() => save.mutate(true)}
           />
         )}
-        {!isAwg && inbound.protocol !== "vless" && (
+        {!isAwg && named && (
           <TextField
             id={sniId}
             label={t("node.profiles.tlsOverride")}
@@ -371,13 +467,14 @@ function EditInbound({ inbound, focus, nodeId, nodeAddress, onClose }: { inbound
             onChange={(e) => setSni(e.target.value)}
             autoFocus={focus === "sni"}
             placeholder={sniPlaceholder(t, effective?.tlsServerName, nodeAddress)}
-            hint={t("node.profiles.tlsHint")}
+            hint={tlsHint(t, inbound.protocol)}
             error={sniError}
             mono
             autoCapitalize="off"
             spellCheck={false}
           />
         )}
+        {target.field}
         <label className="flex items-center gap-3">
           <span className="flex min-w-0 flex-1 flex-col gap-0.5">
             <span className="text-[13px] font-bold">{t("node.profiles.enabled")}</span>
@@ -387,6 +484,12 @@ function EditInbound({ inbound, focus, nodeId, nodeAddress, onClose }: { inbound
         </label>
         <WarpWarnings check={check} nodeId={nodeId} onLeave={onClose} />
         <DecoyNotice check={check} />
+        {!target.touched && <ShareNotes check={check} node={{ name: inbound.nodeName, address: nodeAddress }} />}
+        {unexplained && (
+          <Notice tone="danger" className="items-start">
+            {t(`err.${unexplained.code}`, unexplained.vars)}
+          </Notice>
+        )}
         {save.isError && !lossyRefusal(save.error) && (
           <Notice tone="danger" className="items-start">
             {errorText(save.error, t)}
@@ -396,7 +499,7 @@ function EditInbound({ inbound, focus, nodeId, nodeAddress, onClose }: { inbound
           <Button variant="ghost" size="md" onClick={onClose}>
             {t("common.cancel")}
           </Button>
-          <Button type="submit" variant="primary" size="md" disabled={!dirty || !portOk(port) || !!refused || save.isPending}>
+          <Button type="submit" variant="primary" size="md" disabled={!dirty || !portOk(port) || !!refused || target.blocked || save.isPending}>
             {save.isPending && touched.port && port ? t("ports.saving", { port }) : t("common.save")}
           </Button>
         </div>

@@ -1,0 +1,330 @@
+import { fa as cloudFa } from "./cloud-usage";
+import type { CoreMessages, Messages } from "./en";
+import { fa as opsFa } from "./ops";
+import { fa as usersFa } from "./users";
+import { fa as securityFa } from "./security";
+import { fa as profilesFa } from "./profiles";
+import { fa as subsFa } from "./subs";
+import { fa as healthFa } from "./health";
+import { fa as updatesFa } from "./updates";
+import { fa as awgFa } from "./awg";
+import { fa as warpFa } from "./warp";
+import { fa as integrationsFa } from "./integrations";
+import { fa as telegramFa } from "./telegram";
+import { fa as portsFa } from "./ports";
+import { fa as editionFa } from "./edition";
+import { fa as decoyFa } from "./decoy";
+import { fa as bulkFa } from "./bulk";
+import { fa as countryFa } from "./country";
+import { fa as probesFa } from "./probes";
+import { fa as connectionsFa } from "./connections";
+import { fa as journalFa } from "./journal";
+import { fa as relayFa } from "./relay";
+import { fa as waysFa } from "./ways";
+import { fa as tgproxyFa } from "./tgproxy";
+import { fa as clientcompatFa } from "./clientcompat";
+import { fa as protocolsFa } from "./protocols";
+import { fa as aiFa } from "./ai";
+import { fa as graphFa } from "./graph";
+import { fa as waysgraphFa } from "./waysgraph";
+import { fa as fleetmapFa } from "./fleetmap";
+import { fa as observabilityFa } from "./observability";
+import { fa as debugFa } from "./debug";
+import { fa as resourcesFa } from "./resources";
+import { fa as tasksFa } from "./tasks";
+import { fa as followupFa } from "./followup";
+import { fa as osupdatesFa } from "./osupdates";
+import { fa as fleetuiFa } from "./fleetui";
+import { fa as clientlogsFa } from "./clientlogs";
+import { fa as trusttunnelFa } from "./trusttunnel";
+import { fa as tcpshareFa } from "./tcpshare";
+import { fa as shellFa } from "./shell";
+import { fa as nodesviewFa } from "./nodesview";
+import { fa as nodeswaysFa } from "./nodesways";
+import { fa as userslistFa } from "./userslist";
+import { fa as userspageFa } from "./userspage";
+import { fa as profilenewFa } from "./profilenew";
+import { fa as settingspageFa } from "./settingspage";
+import { fa as aipageFa } from "./aipage";
+import { fa as igpageFa } from "./igpage";
+import { fa as aspageFa } from "./aspage";
+import { fa as nodeshareFa } from "./nodeshare";
+import { fa as channelFa } from "./channel";
+import { fa as countrynowFa } from "./countrynow";
+import { fa as sniFa } from "./sni";
+import { fa as overviewFa } from "./overview";
+import { fa as windowsFa } from "./windows";
+import { fa as nodepageFa } from "./nodepage";
+import { fa as nodewaysFa } from "./nodeways";
+import { fa as subspnFa } from "./subspn";
+import { fa as subshxFa } from "./subshx";
+import { fa as subsrtFa } from "./subsrt";
+import { fa as subsdnsFa } from "./subsdns";
+import { fa as usersgroupFa } from "./usersgroup";
+import { fa as usersextraFa } from "./usersextra";
+import { fa as decoysitesFa } from "./decoysites";
+import { fa as planwordsFa } from "./planwords";
+import { fa as profilespageFa } from "./profilespage";
+import { fa as healthpageFa } from "./healthpage";
+import { fa as reachpageFa } from "./reachpage";
+import { fa as updatespageFa } from "./updatespage";
+import { fa as profilesrvFa } from "./profilesrv";
+
+// Persian (fa, right to left). Typed against the English shape: a missing or extra key fails `pnpm typecheck`.
+// The admin speaks to the owner as «تو» in standard written Persian (اگر می‌خواهی…، ایجنت را به‌روز کن); buttons and tabs
+// are short infinitives or nouns (ذخیره، افزودن نود). Plurals: one form, no "|" (a noun stays singular after a number, and
+// Intl puts 0 under "one" in fa). Persian punctuation (، ؛ ؟ « »), ZWNJ in می‌/نمی‌, ‌ها/‌های, ‌تر/‌ترین and compounds,
+// «ـهٔ» for the ezafe after ه. Latin digits: numbers, IPs, ports and versions reach the copy as Latin text. Product,
+// protocol and app names stay in Latin (Mistgate, VLESS, REALITY, Hysteria2, AmneziaWG, WARP, Happ, kl!ck, Telegram).
+// Glossary: node نود · server سرور · the fleet همهٔ نودها · profile پروفایل · subscription اشتراک · subscription link
+// لینک اشتراک · group گروه · user کاربر (people counted: نفر) · device دستگاه · alert هشدار · mute بی‌صدا کردن ·
+// doctor عیب‌یاب · Health سلامت · health check بررسی سلامت · check بررسی · probe نقطهٔ سنجش · relay رله ·
+// decoy site سایت پوششی · agent ایجنت · rollout انتشار · rollback بازگردانی · update به‌روزرسانی · owner مالک ·
+// admin مدیر · quota سهمیه · expiry انقضا · key کلید · token توکن · passkey کلید عبور · backup نسخهٔ پشتیبان ·
+// Reachability دسترس‌پذیری · verdict نتیجه · egress خروجی · handshake دست‌دهی · approve تأیید کردن · rule قانون.
+const core: CoreMessages = {
+  "common.loading": "در حال بارگذاری…",
+  "common.retry": "تلاش دوباره",
+  "common.undo": "واگرد",
+  "common.quoted": "«{name}»",
+  "common.labeled": "{label}: {value}",
+  "common.fromTo": "{from} ← {to}",
+  "pager.nav": "صفحه‌ها",
+  "pager.range": "نمایش {from}–{to} از {total}",
+  "pager.rangeFrom": "موارد {from}–{to}",
+  "pager.count": "{n} مورد",
+  "pager.prev": "قبلی",
+  "pager.next": "بعدی",
+  "pager.prevAria": "صفحهٔ قبلی",
+  "pager.nextAria": "صفحهٔ بعدی",
+  "pager.page": "صفحهٔ {n}",
+  "pager.pageOf": "{page} از {count}",
+  "pager.perPage": "{n} مورد در هر صفحه",
+  "pager.perPageLabel": "تعداد ردیف در هر صفحه",
+  "pager.newer": "جدیدتر",
+  "pager.older": "قدیمی‌تر",
+  "pager.toNewest": "به جدیدترین‌ها",
+  "pager.newerAria": "موارد جدیدتر",
+  "pager.olderAria": "موارد قدیمی‌تر",
+  "pager.toNewestAria": "بازگشت به جدیدترین موارد",
+  "nav.overview": "نمای کلی",
+  "nav.nodes": "نودها",
+  "nav.users": "کاربران",
+  "nav.profiles": "پروفایل‌ها",
+  "nav.subscriptions": "اشتراک‌ها",
+  "nav.health": "سلامت",
+  "nav.reachability": "دسترس‌پذیری",
+  "nav.updates": "به‌روزرسانی‌ها",
+  "nav.integrations": "یکپارچه‌سازی‌ها",
+  "nav.settings": "تنظیمات",
+  "nav.more": "بیشتر",
+  "nav.main": "ناوبری اصلی",
+  "nav.skip": "رفتن به محتوا",
+  "nav.group.setup": "راه‌اندازی",
+  "nav.group.ops": "بهره‌برداری",
+  "section.overview.desc": "سلامت همهٔ نودها در یک نگاه: کارت نودها، ترافیک و آخرین رویدادها.",
+  "section.nodes.desc": "سرورهای تو، پروتکل‌ها و بارشان، و راهنمای گام‌به‌گام افزودن نود جدید.",
+  "section.users.desc": "افرادی که دسترسی دارند: برنامه‌ها، دستگاه‌ها، سهمیهٔ ترافیک و تاریخ انقضا.",
+  "section.profiles.desc": "تنظیمات آمادهٔ پروتکل‌ها که روی نودها و کاربران اعمال می‌کنی.",
+  "section.subscriptions.desc": "قالب‌های اشتراک، قانون‌های ارائه و صفحه‌ای که کاربر می‌بیند.",
+  "section.health.desc": "هشدارها، بررسی از دید کلاینت و عیب‌یاب همهٔ نودها.",
+  "section.reachability.desc": "اینکه نودها از داخل یک کشور باز می‌شوند یا نه: منبع‌ها، نتیجهٔ هر نود و هفتهٔ آن.",
+  "section.updates.desc": "نسخه‌های پنل و ایجنت نودها، انتشار مرحله‌ای و بازگردانی.",
+  "section.integrations.desc": "هشدارهای تلگرام: هر مدیر گفتگوی خودش را وصل می‌کند.",
+  "section.settings.desc": "مدیرها، امنیت، نسخه‌های پشتیبان و دامنه‌ها.",
+  "section.empty": "فعلاً اینجا چیزی نیست",
+  "header.search": "جستجوی نودها، کاربران و بخش‌ها",
+  "header.language": "زبان",
+  "header.theme": "تم",
+  "header.signOut": "خروج",
+  "header.version": "نسخهٔ پنل {version}",
+  "stale.title": "پنل به نسخهٔ {version} به‌روز شد",
+  "stale.msg": "صفحه را دوباره بارگذاری کن تا مدیریت با نسخهٔ جدید کار کند.",
+  "stale.reload": "بارگذاری دوباره",
+  "stale.expand": "نمایش یادآوری بارگذاری دوباره",
+  "header.source": "کد منبع",
+  "header.star": "ستاره دادن در GitHub",
+  "health.none": "بدون نود",
+  "health.ok": "همهٔ نودها سالم‌اند",
+  "health.okShort": "همه‌چیز خوب است",
+  "health.problems": "{n} مشکل",
+  "palette.title": "پالت فرمان",
+  "palette.placeholder": "نود، کاربر، بخش یا اقدام",
+  "palette.empty": "چیزی پیدا نشد",
+  "palette.searching": "در حال جستجو…",
+  "palette.nodes": "نودها",
+  "palette.users": "کاربران",
+  "palette.places": "بخش‌ها",
+  "palette.actions": "اقدام‌ها",
+  "palette.createUser": "افزودن کاربر",
+  "palette.newToken": "توکن API جدید",
+  "palette.newProfile": "پروفایل جدید",
+  "palette.approvals": "تأییدیه‌ها",
+  "role.owner": "مالک",
+  "role.helper": "دستیار",
+  "role.readonly": "فقط خواندنی",
+  "role.unknown": "مدیر",
+  "status.ok": "سالم",
+  "status.warn": "توجه",
+  "status.bad": "خراب",
+  "status.off": "خاموش",
+  "status.busy": "در حال به‌روزرسانی",
+  "status.blip": "قطعی کوتاه میزبان",
+  "settings.interface": "رابط کاربری",
+  "settings.system": "سیستم",
+  "settings.admins": "مدیرها",
+  "settings.security": "امنیت",
+  "settings.sessions": "نشست‌ها",
+  "settings.audit": "ممیزی",
+  "settings.backups": "نسخه‌های پشتیبان",
+  "settings.domains": "دامنه‌ها",
+  "settings.nav": "بخش‌های تنظیمات",
+  "settings.language": "زبان",
+  "settings.theme": "تم",
+  "settings.theme.dark": "تاریک",
+  "settings.theme.light": "روشن",
+  "settings.accent": "رنگ تأکیدی",
+  "settings.accent.follow": "مثل پنل",
+  "settings.accent.own": "این دستگاه رنگ خودش را دارد",
+  "settings.accent.reset": "بازنشانی",
+  "settings.accent.custom": "دلخواه",
+  "settings.accent.mint": "نعنایی",
+  "settings.accent.lavender": "اسطوخودوسی",
+  "settings.accent.sky": "آسمانی",
+  "settings.accent.sand": "شنی",
+  "settings.accent.rose": "گل‌رز",
+  "settings.accent.sage": "مریم‌گلی",
+  "settings.local": "این انتخاب‌ها فقط روی همین دستگاه نگه داشته می‌شوند.",
+  "settings.fx": "انیمیشن ظاهر شدن",
+  "settings.device": "فقط روی این دستگاه",
+  "auth.setup.welcomeTitle": "سلام!",
+  "auth.setup.welcomeBody": "این {brand} است، پنلی برای سرورهای VPN تو. اول زبان را انتخاب کن؛ بعداً می‌توانی عوضش کنی.",
+  "auth.next": "ادامه",
+  "auth.setup.adminTitle": "ساخت مدیر",
+  "auth.setup.adminBody": "بهترین راه کلید عبور است: ورود با اثر انگشت یا Face ID، بدون رمز عبور. کلید فقط روی دستگاه خودت می‌ماند.",
+  "auth.login": "نام کاربری",
+  "auth.password": "رمز عبور",
+  "auth.code": "کد برنامهٔ احراز هویت",
+  "auth.createPasskey": "ساخت کلید عبور",
+  "auth.waitingPasskey": "در انتظار کلید عبور",
+  "auth.setup.passkeyHint": "مرورگر اثر انگشت، چهره یا PIN می‌خواهد",
+  "auth.setup.otherWay": "رمز عبور + کد برنامهٔ احراز هویت",
+  "auth.setup.totpScan": "با Google Authenticator، 1Password یا Aegis اسکن کن",
+  "auth.setup.createAdmin": "ساخت مدیر",
+  "auth.setup.doneTitle": "تمام شد",
+  "auth.setup.doneBody": "مدیر ساخته شد. حالا چه کار کنیم؟",
+  "auth.setup.addFirst": "افزودن اولین نود",
+  "auth.setup.addFirstBody": "یک سرور با Ubuntu یا Debian و دسترسی root از راه SSH لازم داری. پنل دستور نصب را به تو می‌دهد.",
+  "auth.setup.later": "بعداً، اول یک نگاهی می‌اندازم",
+  "auth.recover.title": "بازنشانی ورود",
+  "auth.recover.body": "یک رمز عبور جدید و یک کد جدید برنامهٔ احراز هویت می‌گیری. همهٔ نشست‌های این مدیر بسته می‌شوند؛ کلیدهای عبور می‌مانند.",
+  "auth.recover.loginHint": "نام کاربری مدیری که ورودش بازنشانی می‌شود. مدیری که فقط کلید عبور دارد، همین نام کاربری را می‌گیرد.",
+  "auth.recover.refused": "چیزی بازنشانی نشد.",
+  "auth.recover.whichAdmin": "معلوم نیست ورود کدام مدیر باید بازنشانی شود. نام کاربری مدیر را وارد کن و دوباره تلاش کن.",
+  "auth.recover.submit": "بازنشانی ورود",
+  "auth.recover.doneTitle": "اطلاعات جدید ورود",
+  "auth.recover.doneBody": "برای {admin}. همین الان رمز عبور را ذخیره کن و کد QR را اسکن کن.",
+  "auth.recover.password": "رمز عبور جدید",
+  "auth.recover.onceTitle": "فقط یک بار نشان داده می‌شوند.",
+  "auth.recover.onceBody": "بعد از بارگذاری دوباره یا ترک این صفحه دیگر نمی‌شود آن‌ها را دید.",
+  "auth.recover.nextTitle": "گام بعد",
+  "auth.recover.nextSignIn": "با همین نام کاربری، رمز عبور و کدی که برنامه نشان می‌دهد وارد شو.",
+  "auth.recover.nextPasskey": "در تنظیمات ← امنیت یک کلید عبور اضافه کن و کلید گم‌شده را از همانجا حذف کن.",
+  "auth.recover.sessions": "از همهٔ دستگاه‌ها خارج شدی: {n} نشست بسته شد.",
+  "auth.recover.linkTitle": "این لینک کار نمی‌کند",
+  "auth.recover.linkBody": "ناقص است، منقضی شده یا قبلاً استفاده شده. لینک بازیابی فقط یک بار و تا 30 دقیقه کار می‌کند. لینک جدید را روی کامپیوتری که فایل کلیدها را دارد بگیر:",
+  "auth.login.title": "ورود به پنل",
+  "auth.login.body": "admin · {host}",
+  "auth.login.passkey": "ورود با کلید عبور",
+  "auth.login.passkeyHint": "اثر انگشت، Face ID یا کلید امنیتی",
+  "auth.login.otherWay": "روش دیگر",
+  "auth.hideOtherWay": "پنهان کردن",
+  "auth.login.submit": "ورود",
+  "auth.checking": "در حال بررسی…",
+  "auth.noPasskeyTitle": "این مرورگر از کلید عبور پشتیبانی نمی‌کند.",
+  "auth.noPasskeyBody": "با رمز عبور و کد وارد شو، یا پنل را در نسخهٔ جدیدتری از Safari، Chrome یا Firefox باز کن.",
+  "auth.badCode": "کد قبول نشد. مطمئن شو ساعت گوشی روی حالت خودکار تنظیم شده است.",
+  "auth.attemptsLeft": "{n} تلاش باقی مانده",
+  "auth.lockedTitle": "تلاش بیش از حد",
+  "auth.lockedBody": "ورود 15 دقیقه قفل شده است. این قفل‌شدن همراه با آدرس IP و زمان در تنظیمات ← ممیزی ثبت می‌شود.",
+  "auth.missingToken.title": "لینک راه‌اندازی ناقص است",
+  "auth.missingToken.body": "لینک را کامل باز کن، همان‌طور که `mistgate setup` چاپ کرده، با بخش بعد از علامت #. اگر منقضی شده، دستور را دوباره اجرا کن.",
+  "auth.toLogin": "رفتن به صفحهٔ ورود",
+  "auth.step": "گام {n} از {total}",
+  "err.unsupported": "این مرورگر از کلید عبور پشتیبانی نمی‌کند. پنل را با HTTPS در نسخهٔ جدید Chrome، Safari، Firefox یا Edge باز کن.",
+  "err.cancelled": "درخواست کلید عبور لغو شد یا مهلتش تمام شد. هر وقت آماده بودی دوباره تلاش کن.",
+  "err.alreadyRegistered": "این دستگاه از قبل یک کلید عبور برای این پنل دارد.",
+  "err.origin": "مرورگر کلید عبور را برای این آدرس نپذیرفت. دامنهٔ پنل باید با تنظیمات WebAuthn آن یکی باشد.",
+  "err.setupLink": "لینک راه‌اندازی نامعتبر است یا منقضی شده. برای گرفتن لینک جدید `mistgate setup` را اجرا کن.",
+  "err.notRecognised": "این کلید عبور در این پنل ثبت نشده است.",
+  "err.rateLimited": "تلاش بیش از حد. یک دقیقه صبر کن و دوباره امتحان کن.",
+  "err.captcha": "بررسی Cloudflare قبول نشد. صبر کن تمام شود و دوباره تلاش کن.",
+  "err.network": "اتصال به پنل برقرار نمی‌شود. اتصال را بررسی کن و دوباره تلاش کن.",
+  "err.generic": "مشکلی پیش آمد. دوباره تلاش کن.",
+  "err.guard": "پنل بارگذاری نمی‌شود",
+  "err.name_taken": "این نام قبلاً گرفته شده. نام دیگری انتخاب کن.",
+  "err.group_not_empty": "هنوز این کاربران در گروه هستند: {users}. آن‌ها را به گروه دیگری ببر، بعد این گروه را حذف کن.",
+  "err.page_password_removed": "صفحهٔ این شخص اکنون رمزی ندارد. اول رمز را برگردان.",
+  "err.group_in_both": "یک گروه در هر دو فهرست است: یا اضافه‌اش کن یا بردار، نه هر دو.",
+  "err.main_group": "گروه اصلی را نمی‌شود برداشت: به‌جایش گروه دیگری را اصلی کن.",
+  "err.too_many_groups": "هر فرد حداکثر در ۱۶ گروه می‌تواند باشد.",
+  "err.profile_deployed": "پروفایل روی نودهای {nodes} است. اول آن را از آن‌ها بردار.",
+  "err.stale_version": "پروفایل در زبانهٔ دیگری تغییر کرده. صفحه را دوباره بارگذاری کن.",
+  "err.stale_inbound": "تنظیمات این سرور همین چند لحظه پیش جای دیگری تغییر کرد. فهرست تازه شد: آن را بررسی کن و تغییر را دوباره انجام بده.",
+  "err.stale_user": "این کاربر همین چند لحظه پیش جای دیگری تغییر کرد (خاموش، تمدید یا ویرایش شد). صفحه را دوباره بارگذاری کن، کاربر را بررسی کن و تغییر را دوباره انجام بده.",
+  "err.node_offline": "نود متصل نیست. وقتی ایجنتش برگشت دوباره تلاش کن.",
+  "err.agent_too_old": "ایجنت این نود برای این کار خیلی قدیمی است. در صفحهٔ «به‌روزرسانی‌ها» به‌روزش کن.",
+  "err.node_retired": "این نود از رده خارج شده است.",
+  "err.sub_address_missing": "آدرس لینک اشتراک تنظیم نشده است. `mistgate setup` آن را روی سرور پنل تنظیم می‌کند.",
+  "err.preset_is_default": "این پیش‌تنظیم پیش‌فرض است. اول یکی دیگر را پیش‌فرض کن.",
+  "err.preset_builtin": "پیش‌تنظیم داخلی را نمی‌شود حذف کرد.",
+  "field.port.out_of_range": "پورت از 1 تا 65535 است",
+  "field.obfuscation.jc.handshake_budget": "مجموع Jc، بسته‌های غیرخالی I1–I5 و یک بستهٔ دست‌دهی نباید از ۱۲۸ بیشتر شود.",
+  "field.obfuscation.header_protection_key.rt_range_requires_hpk": "با دنباله‌های تصادفی، هر بازهٔ H1–H4 بزرگ‌تر از یک مقدار به کلید محافظت از سرآیند نیاز دارد.",
+  "field.hop.from.invalid": "پورت باید خارج از بازهٔ پرش باشد",
+  "field.hop.from.out_of_range": "شروع بازه بین 1024 و 65535 است، دور از SSH و پورت‌های شناخته‌شدهٔ دیگر",
+  "field.hop.to.too_wide": "بازه حداکثر 20,000 پورت دارد",
+  "field.obfs.password.length": "رمز عبور از 8 تا 128 نویسه است",
+  "field.sni.invalid": "به نظر دامنه نمی‌آید",
+  "field.port.reserved": "پورت 80 برای Let’s Encrypt نگه داشته شده است؛ پورت دیگری انتخاب کن",
+  "field.reality.target.required": "آدرس سایت را بنویس، مثلاً www.example.org:443",
+  "field.reality.target.format": "به شکل host:port بنویس، مثلاً www.example.org:443",
+  "field.reality.target.host": "میزبان یک نام ساده یا آدرس IP است، بدون فاصله و اسلش",
+  "field.reality.target.port_range": "پورت از 1 تا 65535 است",
+  "field.reality.target.same_port": "مقصد به همین سرور اشاره می‌کند: آدرس یا پورت دیگری انتخاب کنید",
+  "field.reality.target.unspecified": "آدرس نامشخص (0.0.0.0، ::) یک سایت نیست: نام یا آدرس واقعی وارد کنید",
+  "field.reality.target.same_node": "مقصد خود همین نود است: آدرس یا پورت دیگری انتخاب کنید",
+  "field.reality.server_names.required": "مقصد یک آدرس IP است: نام‌های داخل گواهی‌اش را فهرست کن",
+  "field.reality.server_names.length": "حداکثر 8 نام",
+  "field.reality.server_names.invalid": "نام میزبان بدون ستاره (wildcard)، مثل www.example.org",
+  "field.reality.server_names.duplicate": "هر نام فقط یک بار",
+  "field.reality.short_ids.invalid": "ارقام هگزادسیمال، تعدادشان زوج، حداکثر 16",
+  "field.reality.short_ids.length": "از 1 تا 8 مقدار",
+  "field.xhttp.path.invalid": "با / شروع می‌شود، بعد حروف، ارقام و / _ -، حداکثر 64 نویسه",
+  "field.xhttp.host.invalid": "خالی، یا نام میزبان مثل cover.example.org",
+  "field.xhttp.mode.invalid": "خودکار، packet up، stream up یا stream one",
+  "field.xhttp.x_padding_bytes.invalid": "به شکل حداقل-حداکثر بنویس، مثلاً 100-1000: هرکدام از 1 تا 4096 و عدد اول بزرگ‌تر از دومی نباشد",
+  "field.reality.short_ids.duplicate": "هر مقدار فقط یک بار",
+  "field.security.invalid_enum": "REALITY یا TLS",
+  "field.transport.invalid_enum": "XHTTP، TCP یا WebSocket",
+  "field.transport.requires_tls": "WebSocket فقط با TLS کار می‌کند: «امنیت» را روی TLS بگذار",
+  "field.transport.unsupported": "TCP با Vision فقط با REALITY کار می‌کند: برای TLS یکی از XHTTP یا WebSocket را انتخاب کن",
+  "field.tls_mode.required": "گواهی نود را انتخاب کن: Let’s Encrypt یا خودامضا",
+  "field.tls_mode.invalid_enum": "Let’s Encrypt یا خودامضا",
+  "field.tls_mode.unsupported": "حالت گواهی مخصوص TLS است؛ REALITY آن را ندارد",
+  "field.sni.format": "یک نام دامنه مثل node.example.org (برای Let’s Encrypt دامنهٔ واقعی لازم است)",
+  "field.sni.unsupported": "نام سرور مخصوص TLS است؛ REALITY آن را ندارد",
+  "field.cdn.unsupported": "CDN مخصوص TLS است؛ REALITY آن را ندارد",
+  "field.cdn.host.required": "گواهی خودامضا به میزبان CDN نیاز دارد: فقط CDN آن را قبول می‌کند",
+  "field.cdn.host.format": "یک نام دامنهٔ ساده مثل cdn.example.org، بدون پروتکل و مسیر",
+  "field.cdn.port.out_of_range": "پورت CDN از 1 تا 65535 است",
+  "field.ws.path.format": "با / شروع می‌شود، بعد حروف، ارقام و / _ -، حداکثر 64 نویسه",
+  "field.ws.host.format": "خالی، یا نام میزبان مثل cover.example.org",
+  "field.xhttp.host.unsupported": "کلاینت‌های TLS میزبان CDN یا نام سرور را به‌عنوان Host می‌گیرند: این را خالی بگذار",
+  "field.egress.invalid_enum": "مستقیم یا WARP",
+  "field.reality.fingerprint.invalid_enum": "Chrome، Firefox، Safari، iOS، Edge یا تصادفی",
+  "field.reality.target_kind.invalid_enum": "سایت همین نود یا سایتی دیگر",
+  "field.hysteria2.tls_mode.unsupported": "گواهی Let’s Encrypt برای نشانی IP هنوز در دسترس نیست: دامنه یا گواهی خودامضا را انتخاب کن",
+};
+
+export const fa: Messages = { ...cloudFa, ...core, ...opsFa, ...usersFa, ...securityFa, ...profilesFa, ...subsFa, ...healthFa, ...updatesFa, ...awgFa, ...warpFa, ...integrationsFa, ...telegramFa, ...portsFa, ...editionFa, ...decoyFa, ...bulkFa, ...countryFa, ...probesFa, ...connectionsFa, ...journalFa, ...relayFa, ...waysFa, ...tgproxyFa, ...clientcompatFa, ...protocolsFa, ...aiFa, ...graphFa, ...waysgraphFa, ...fleetmapFa, ...observabilityFa, ...debugFa, ...resourcesFa, ...tasksFa, ...followupFa, ...osupdatesFa, ...fleetuiFa, ...clientlogsFa, ...trusttunnelFa, ...tcpshareFa, ...shellFa, ...overviewFa, ...nodesviewFa, ...windowsFa, ...nodepageFa, ...userslistFa, ...userspageFa, ...usersgroupFa, ...usersextraFa, ...decoysitesFa, ...planwordsFa, ...nodeswaysFa, ...nodewaysFa, ...profilespageFa, ...healthpageFa, ...reachpageFa, ...profilesrvFa, ...profilenewFa, ...subspnFa, ...subshxFa, ...subsrtFa, ...subsdnsFa, ...updatespageFa, ...settingspageFa, ...aipageFa, ...igpageFa, ...aspageFa, ...nodeshareFa, ...channelFa, ...countrynowFa, ...sniFa };

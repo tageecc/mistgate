@@ -50,6 +50,9 @@ func ReadEnv(ctx context.Context) Env {
 		_, err := os.Stat("/run/systemd/system")
 		e.Systemd = err == nil
 	}
+	// dpkg-query exits 1 when one of the names is unknown to dpkg; the lines it printed still count
+	out, _ = exec.CommandContext(ctx, "dpkg-query", append([]string{"-W", "-f", "${Package} ${db:Status-Abbrev}\n"}, modulePackages...)...).Output()
+	e.Leftover = leftoverPackages(string(out))
 	return e
 }
 
@@ -81,9 +84,16 @@ func RealSys() Sys {
 			}
 			return err
 		},
-		Exists:  func(p string) bool { _, err := os.Stat(p); return err == nil },
-		Probe:   probeModule,
-		AptBusy: aptBusy,
+		ReadFile:       os.ReadFile,
+		SourceDirs:     RealSourceDirs,
+		Exists:         func(p string) bool { _, err := os.Stat(p); return err == nil },
+		Probe:          probeModule,
+		AptBusy:        aptBusy,
+		TryBuilderLock: TryBuilderLock,
+		KernelRelease: func() string {
+			b, _ := os.ReadFile("/proc/sys/kernel/osrelease")
+			return strings.TrimSpace(string(b))
+		},
 	}
 }
 

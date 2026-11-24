@@ -3,6 +3,8 @@ title: DNS
 description: What a DNS preset is, how split DNS works, which preset applies to a person, the DNS a person picks for the apps on the link and per server, how each app receives it, and when a change reaches people.
 ---
 
+![The DNS tab of Subscriptions: the presets, then one opened with its servers and what each app gets, then its split rules](../../images/readme/dns-dark-en.webp)
+
 A DNS preset decides which DNS servers a person's app asks, and how. The queries travel inside the tunnel, so the person's provider does not see them. The panel ships ready presets (one is the default for everyone), and you can make your own and give one to a user or a group. Presets live on the **DNS** tab of **Subscriptions**.
 
 This is the DNS of the apps. The node has DNS settings of its own: see "Node DNS is something else" below.
@@ -15,7 +17,7 @@ This is the DNS of the apps. The node has DNS settings of its own: see "Node DNS
 | **Servers** | The main resolvers, asked in this order: the first one that answers wins. Each is a server **From the catalog** or a **Custom server**. |
 | **How to ask** | The preferred transport: **Plain**, **DoT** or **DoH**. |
 | **Split rules** | Domains that end with given suffixes, or belong to a whole country, are asked on their own servers, not the main ones. |
-| **Options** | **Split domains go direct, bypassing the VPN** and **IPv4 only**. |
+| **Options** | **Block ads and trackers in the apps**, **Split domains go direct, bypassing the VPN** and **IPv4 only**. |
 
 ### Servers
 
@@ -44,9 +46,9 @@ A split rule is a list of suffixes (type one and press Enter: `.ru`, `gosuslugi.
 
 ### Country lists
 
-Next to suffixes (or instead of them) a split rule can name a whole country by a code: `cn` is China, the sites of the country's geosite list and the addresses of its geoip list, thousands of domains that no hand-made list of suffixes would hold. The panel also knows `ir` (Iran), but no built-in preset uses it. A rule needs suffixes or a country list; an unknown code is refused ("unknown country list"). The built-in **China: Chinese sites direct** is such a rule.
+Next to suffixes (or instead of them) a split rule can name a whole country by a code: `cn` is China and `ru` is Russia, the sites of the country's geosite list and the addresses of its geoip list, thousands of domains that no hand-made list of suffixes would hold. The panel also knows `ir` (Iran), but no built-in preset uses it. A rule needs suffixes or a country list; an unknown code is refused ("unknown country list"). The built-ins **China: Chinese sites direct** and **Russia: Russian sites direct (community list)** are such rules. The Russian list (`category-ru` and `ru`, in the `geosite.dat` and `geoip.dat` files of Xray and Happ) holds the well-known Russian services, not every site: what is not in it goes through the VPN.
 
-In the editor, **All sites of a country** under a rule's suffixes switches a country on. For now it offers **China** only: the one with a built-in preset and resolvers checked from inside the country. A rule that already names another code (set through the API, `DnsService`) shows it too, so it can be turned off. A rule with a country and no suffixes is complete: its suffix field just stays empty.
+In the editor, **All sites of a country** under a rule's suffixes switches a country on. It offers **China** and **Russia**: the ones with a built-in preset and resolvers checked from inside the country. A rule that already names another code (set through the API, `DnsService`) shows it too, so it can be turned off. A rule with a country and no suffixes is complete: its suffix field just stays empty. Under the countries, **Site category (geosite)** takes a category by name (see "Site categories").
 
 With **Split domains go direct, bypassing the VPN** on, the country's sites are asked at the rule's servers and open directly. The address lists decide only connections made to an address: a domain is never looked up just to be checked against them. What each app does:
 
@@ -58,11 +60,38 @@ With **Split domains go direct, bypassing the VPN** on, the country's sites are 
 | Happ | `geosite:cn` among the direct sites and `geoip:cn` among the direct addresses; the app carries its own geo files. The first rule's first server is the resolver for the direct traffic, as for suffixes. |
 | AmneziaVPN and AmneziaWG | No routing: everything goes through the tunnel, a country list changes nothing. |
 
+### Site categories
+
+A rule can also name one category of the geosite lists instead of a whole country: `geosite:telegram`, `geosite:category-media-ru`. In the editor, type the name in **Site category (geosite)** under the rule's countries (with or without `geosite:`; commas and spaces separate several), through the API write it in `geo` as `geosite:<name>`. Names are as in the lists of [v2fly/domain-list-community](https://github.com/v2fly/domain-list-community), lower case.
+
+A category is only the domain half of a country list: its sites are asked at the rule's servers and open directly, and there is no address list, so no geoip rule is written anywhere. The apps handle it like the country's geosite list: two `mrs` and `srs` rule sets (`geosite/<name>.mrs` of the MetaCubeX lists, `geosite-<name>.srs` of the SagerNet lists) for the mihomo core and sing-box, `geosite:<name>` for Xray JSON and Happ, nothing for AmneziaWG and the plain link list. A category that Xray's or Happ's own `geosite.dat` does not hold stops the config at its start, as with a country.
+
+The panel checks only how the name is written (lower-case Latin letters, digits, `-`, and `!` or `@` after the first character, at most 64 characters, at most 32 countries and categories in a rule) and carries no list of names, so a mistyped or missing category is not caught when you save: the app shows the error when it loads the list. Check the name against the list before you use it. If a country and a category of the same list (`cn` and `geosite:cn`) are in different rules, the first rule keeps it.
+
 Some apps (Hiddify and others) ignore the routing of a profile and use their own.
 
 ### IPv4 only
 
 Ask for A records only, for tunnels where IPv6 does not work. Happ ignores this option.
+
+### Ads and trackers
+
+**Block ads and trackers in the apps** makes the apps drop the domains of the community list `category-ads-all` themselves, before any other rule: before the split, the direct sites and the tunnel. The DNS servers stay as they are, so the option works with any servers and any split. The panel keeps no list: each app gets it on its own.
+
+| App | What blocks and where the list comes from |
+|:--|:--|
+| Apps on the mihomo core | A rule provider with the list (an `mrs` file from the MetaCubeX rule lists), refreshed once a day and downloaded **through the VPN group**; the first rule of the profile rejects its domains. |
+| sing-box JSON | A remote rule set (an `.srs` file from the SagerNet lists), downloaded through the VPN. Its domains get an empty DNS answer and their connections are refused. |
+| Xray JSON | `geosite:category-ads-all` from the `geosite.dat` file the app carries; connections to its domains go nowhere. An app without the file, or without that code in it, cannot start the config at all, even when the preset has no split. |
+| Happ | `geosite:category-ads-all` among the blocked sites, from the app's own geo files. Happ applies the routing profile to the whole device, so the block also covers the person's other subscriptions in Happ. |
+| AmneziaVPN and AmneziaWG keys | Nothing: a key holds only the addresses of the resolvers. |
+| Other base64 apps (v2rayNG, Hiddify, Streisand, Shadowrocket) | Nothing: they get no rules from the panel. |
+
+The list is not the same everywhere. Mihomo and sing-box get about 900 domains. Xray and Happ use what their geo files hold: Happ's default files (Loyalsoldier) add a large block list of about 195 000 domains, so more is blocked there, and more by mistake.
+
+**What can break.** Some domains on the list do more than show ads: `googleadservices.com` (the ad links in Google search do not open), `doubleclick.net`, `google-analytics.com`, `app-measurement.com`, `adjust.com` (marketplace promo links that go through adjust do not open). There is no list of exceptions yet.
+
+**Turning it off for one person.** Give them a preset without the flag on the user card (**Access** → **DNS**): their own preset goes before the group's and the default. If people pick their DNS on the page, their own pick comes first: they pick another preset there, or you take this one out of the list. To turn it off for everyone, switch the flag off in the preset.
 
 ## The built-in presets
 
@@ -74,18 +103,20 @@ Built-in presets exist on every install. They can be edited, not deleted.
 | Russia | **Russia: all through VPN** | Everything through the VPN, Cloudflare and Google for every domain. For people abroad. |
 | Russia | **Yandex DNS** | Yandex DNS for everything. |
 | China | **China: Chinese sites direct** | The sites of the Chinese lists (see "Country lists") are asked at AliDNS and DNSPod and open directly, bypassing the VPN; everything else goes through the VPN to Cloudflare and Google. For people inside China. Not the default: choose it as the default for everyone, or give it to a group. AliDNS and DNSPod are in the catalog with plain DNS only. |
+| Russia | **Russia: Russian sites direct (community list)** | The same suffixes and Yandex DNS as **Russia: .ru direct**, plus the `ru` country list: the known Russian services of a community list (not every site) open directly, bypassing the VPN, and the app downloads and refreshes the list itself. Everything else goes through the VPN to Cloudflare and Google. Not the default; **Russia: .ru direct** is left as it was. Xray and Happ need the code `category-ru` in the app's `geosite.dat`: an app without it cannot start the config. AmneziaWG keys and the plain link list carry no rules. |
 | Regular | **Cloudflare + Google** | Cloudflare and Google for everything. |
 | Regular | **Cloudflare: no filtering**, **Google: no filtering**, **DNS.SB: no filtering** | One provider, no filtering. |
 | No ads | **AdGuard: no ads** | Blocks ads and trackers. |
+| No ads | **No ads on the device** | The apps block ads and trackers themselves by the `category-ads-all` list (see "Ads and trackers"); Cloudflare and Google for DNS. Nobody is moved to it: give it to a person or a group, or make it the default. |
 | For kids | **AdGuard Family: no ads, no 18+**, **Cloudflare Family: no malware, no 18+**, **Yandex Family: no 18+**, **OpenDNS FamilyShield: no 18+** | Blocks adult content (and ads or malware, as the name says). |
 | Security | **Quad9: malware blocking**, **Cloudflare Security: malware blocking**, **Yandex Safe: malware blocking** | Blocks known malware and phishing domains. |
 
-**How to choose?** on the tab gives the short answer: people in Russia: **Russia: .ru direct**; people abroad: **Russia: all through VPN**; no ads: **AdGuard: no ads**. People inside China: **China: Chinese sites direct**.
+**How to choose?** on the tab gives the short answer: people in Russia: **Russia: .ru direct**; people abroad: **Russia: all through VPN**; no ads: **AdGuard: no ads**. People inside China: **China: Chinese sites direct**. People inside Russia who want the list of known services instead of the suffixes alone: **Russia: Russian sites direct (community list)**. No ads in the apps themselves, whatever the DNS servers: **No ads on the device**. **AdGuard: no ads** filters at the DNS server, so it works in AmneziaWG keys too; **No ads on the device** works with any servers and next to a split, but only in Mihomo, sing-box, Xray JSON and Happ.
 
 ## The DNS tab
 
 - **Default for everyone**: the preset of everyone who has no preset of their own, on the user or on the group.
-- **Presets**: one card per preset, with its badges (**built-in**, **default**, **direct** when its split goes direct) and the number of people it applies to. The chips **All**, **Russia**, **China**, **Regular**, **No ads**, **For kids**, **Security** and **Own** filter the cards.
+- **Presets**: one card per preset, with its badges (**built-in**, **default**, **direct** when its split goes direct, **no ads** when the apps block ads) and the number of people it applies to. The chips **All**, **Russia**, **China**, **Regular**, **No ads**, **For kids**, **Security** and **Own** filter the cards.
 - **New preset** opens the editor; a card opens its preset.
 
 In the editor, **Use as the default** → **Make default** makes the preset the default. **Danger zone** → **Delete preset** removes it: the people who used it switch to the default preset with their next subscription update. The default preset and the built-ins cannot be deleted. Leaving with unsaved changes asks first.
@@ -127,7 +158,7 @@ A preset you set on a user or a group goes before the default of the list: the p
 
 At the top of **Servers** the person sees a card named by their apps: **DNS in Happ and other apps that use the link** (the app is the one the page recommends on that device). It shows what applies and **Change**, which opens the same list as the DNS of a server; the default is listed first under its name. The apps get the new DNS with their next subscription update, within the refresh interval (12 hours by default); the page says so. A person who also uses AmneziaVPN keys reads one line under the card: the keys are not affected, their DNS is on each server's card.
 
-The pick is written to the audit log as `page_link_dns_choice`: the person's name and the preset, never the link or an address. It counts against the limit shared by all actions on the page: 20 changes an hour per link. Turning **DNS choice on the page** off hides the card and keeps the picks made.
+The pick is written to the audit log as `page_link_dns_choice`: the person's name and the preset, never the link or an address. It counts against the limit shared by all actions on the page: 20 changes an hour per client network, up to 100 per link in total. Turning **DNS choice on the page** off hides the card and keeps the picks made.
 
 ## DNS per server
 
@@ -164,7 +195,7 @@ The node's block says so: "Happ, the Mihomo apps, Xray JSON and sing-box have on
 ### What the person does and what you see
 
 - On their page the row is called **Key DNS**, with a key icon, and it is shown only to a person who uses AmneziaVPN keys (the app is on for them, or they hold a key), on a server that carries keys. A person who uses only the apps on the link does not see it.
-- The person picks a preset for each server. The choice is written to the audit log as `page_dns_choice`: the person's name, the node's name and the preset, never the link or an address. It counts against the limit shared by all actions on the page: 20 changes an hour per link.
+- The person picks a preset for each server. The choice is written to the audit log as `page_dns_choice`: the person's name, the node's name and the preset, never the link or an address. It counts against the limit shared by all actions on the page: 20 changes an hour per client network, up to 100 per link in total.
 - On the user card, **DNS picked on the page** lists the person's pick for the apps on the link and their choices per node (read only). **Reset** removes all of them (the owner and helpers may); it is written to the audit log as `user_dns_choices_reset`. See [Users and groups](users-and-groups.md).
 - Turning the switch off does not reset the choices already made: they keep working until you reset them on the user card.
 
@@ -174,7 +205,7 @@ This table is about the preset that applies to the person: for the apps on the l
 
 | App | How the preset arrives | What it can carry |
 |:--|:--|:--|
-| Happ | A routing profile in the `routing` header of the subscription, applied when the app refreshes it. | One resolver for the tunnel and one for direct traffic; plain DNS (port 53 only) and DoH, no DoT. Only the first main server is used. A split works only with **Split domains go direct** on, and then only the split rules with the same servers as the first one (Happ has a single resolver for direct traffic); their suffixes become direct sites. **IPv4 only** is ignored. |
+| Happ | A routing profile in the `routing` header of the subscription, applied when the app refreshes it. If the person's group has an own [routing profile](subscriptions.md#routing-for-happ-and-incy), the preset's resolvers go into that profile in place of its own DNS and the preset's split and ad list are not added; INCY gets the same in its `incy://` form. | One resolver for the tunnel and one for direct traffic; plain DNS (port 53 only) and DoH, no DoT. Only the first main server is used. A split works only with **Split domains go direct** on, and then only the split rules with the same servers as the first one (Happ has a single resolver for direct traffic); their suffixes become direct sites. **IPv4 only** is ignored. |
 | Apps on the mihomo core | The `dns:` section of the Mihomo YAML. | Plain, DoT and DoH, IPv6 addresses too. The main servers are asked through the tunnel; with **Split domains go direct** on, the split's suffixes are asked at their servers directly and their traffic goes direct. Some Mihomo-based apps ignore the section and use their own. |
 | Xray JSON | The `dns` block of every config, and a routing rule `port 53 → dns-out` that hands the DNS queries of the device's apps to it. | Plain DNS (any port) and DoH, no DoT. Every main server, in order: Xray asks the next one when a query fails. The main servers are asked through the tunnel. With **Split domains go direct** on, the split's suffixes are asked at their own servers and their traffic goes direct. Only IPv4 addresses of resolvers are used and only IPv4 answers are asked for, whatever **IPv4 only** says. With no preset that Xray can carry, the config has no `dns` block and the app uses its system resolver. |
 | sing-box JSON | The `dns` block of the profile, and `hijack-dns`, which hands the DNS queries that reach the tunnel to it. | Plain DNS, DoT and DoH. One main resolver: the first of the preset, no fallback; it is asked through the tunnel. With **Split domains go direct** on, the split's suffixes are asked at their own resolver directly and their traffic goes direct. IPv4 only. With no preset that sing-box can carry (or no DNS module), the profile uses a local fallback: the system resolver, which resolves outside the tunnel. |
@@ -193,8 +224,8 @@ Every DNS select (the default, a group's, a user's) says the same under it: "Whe
 
 Two things on the node side also involve DNS, and neither is a preset (the **DNS choice on the user page** block of a node only chooses which presets people may pick: see "DNS per server"):
 
-- **DNS resolvers for this node** on the node's **Exit** tab: the addresses the node and its VPN engines resolve names with, the names in its users' traffic included. The default, **Server's own resolver**, is an empty list: the node uses whatever the server uses (some hosters allow only their own resolvers). **Yandex DNS** (`77.88.8.8`, `77.88.8.1`), **Cloudflare + Google** (`1.1.1.1`, `8.8.8.8`) and **Custom DNS** (IP addresses of your own, up to 8) are choices you make; pick Yandex DNS for a node in Russia, so Russian services such as gosuslugi.ru resolve reliably. See [Nodes](nodes.md) and [Hysteria2](hysteria2.md).
-- **The server's system resolver** is the host DNS used by apt and certificate renewal. Doctor checks it and can offer to set it to the node's resolvers or, when the node has none, to Yandex DNS in Russia and Cloudflare + Google elsewhere. See [Health](../operations/health.md).
+- **DNS resolvers for this node** on the node's **Exit** tab: the addresses the node and its VPN engines resolve names with, the names in its users' traffic included. The default, **Server's own resolver**, is an empty list: the node uses whatever the server uses (some hosters allow only their own resolvers). **Yandex DNS** (`77.88.8.8`, `77.88.8.1`), **Cloudflare + Google** (`1.1.1.1`, `8.8.8.8`) and **Custom DNS** (IP addresses of your own, up to 8) are choices you make; pick Yandex DNS for a node in Russia, so Russian services such as gosuslugi.ru resolve reliably. For a node in China, use **Custom DNS** with AliDNS and DNSPod (`223.5.5.5`, `119.29.29.29`). See [Nodes](nodes.md) and [Hysteria2](hysteria2.md).
+- **The server's system resolver** is the host DNS used by apt and certificate renewal. Doctor checks it and can offer to set it to the node's resolvers or, when the node has none, to Yandex DNS in Russia, AliDNS and DNSPod in China, and Cloudflare + Google elsewhere. See [Health](../operations/health.md).
 
 A preset, on the other hand, goes to the apps in the subscription and is the same on every node the person can use, unless the person chose a DNS for the keys of a server (see "DNS per server"): switching servers does not change it. For example, **Russia: .ru direct** sends Russian domains to Yandex DNS directly and everything else to Cloudflare and Google through the VPN, whichever node the person is on.
 

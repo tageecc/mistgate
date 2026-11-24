@@ -18,6 +18,7 @@ import (
 
 	adminv1 "github.com/mistgate/mistgate/gen/mistgate/admin/v1"
 	agentv1 "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/internal/agentcap"
 	"github.com/mistgate/mistgate/internal/panel/store"
 	"github.com/mistgate/mistgate/internal/plugin"
 	"github.com/mistgate/mistgate/internal/statehash"
@@ -464,7 +465,7 @@ func TestSessionCoreRehydratesStateBetweenEvents(t *testing.T) {
 	run("open", SessionEvent{Kind: EventOpen, At: base}, false)
 	helloAt := base.Add(time.Second)
 	h := hello("instance-replay", 0, "")
-	h.GetHello().Capabilities = []string{capAWG, capBandwidth, capWarp, "doctor/1"}
+	h.GetHello().Capabilities = []string{agentcap.AWG, agentcap.Bandwidth, agentcap.Warp, "doctor/1"}
 	run("hello", SessionEvent{Kind: EventHello, At: helloAt, Frame: h}, false)
 	run("initial desired changed", SessionEvent{Kind: EventDesiredChanged, At: helloAt}, false)
 	run("initial desired prepared", SessionEvent{Kind: EventDesiredPrepared, At: helloAt}, true)
@@ -595,7 +596,7 @@ func TestSessionCoreRehydratesLivenessTimeoutAndDisconnect(t *testing.T) {
 	run("open", SessionEvent{Kind: EventOpen, At: base}, false)
 	helloAt := base.Add(time.Second)
 	h := hello("instance-replay-live", 0, "")
-	h.GetHello().Capabilities = []string{capAWG}
+	h.GetHello().Capabilities = []string{agentcap.AWG}
 	run("hello", SessionEvent{Kind: EventHello, At: helloAt, Frame: h}, false)
 	run("desired changed", SessionEvent{Kind: EventDesiredChanged, At: helloAt}, false)
 	run("desired prepared", SessionEvent{Kind: EventDesiredPrepared, At: helloAt}, true)
@@ -651,6 +652,32 @@ func TestNodeLiveConnectedFollowsHelloAndClose(t *testing.T) {
 	rows, err = e.f.Live(ctx)
 	if err != nil || len(rows) != 1 || rows[0].Connected {
 		t.Fatalf("node_live after close = %+v, %v; want offline", rows, err)
+	}
+}
+
+func TestHelloLinkViaNodeAppearsInLiveProjection(t *testing.T) {
+	e, core, ctx, state, now := coreFixture(t, "core-live-bridge-link")
+	frame := hello("instance-live-bridge-link", 0, "")
+	frame.GetHello().LinkViaNodeId = "nod_msk1"
+	if _, err := core.Step(ctx, &state, SessionEvent{Kind: EventHello, At: now, Frame: frame}); err != nil {
+		t.Fatal(err)
+	}
+	if state.LinkViaNodeID != "nod_msk1" {
+		t.Fatalf("session link_via_node_id = %q, want nod_msk1", state.LinkViaNodeID)
+	}
+	stats := &agentv1.StatsBatch{IntervalStartUnix: now.Add(-10 * time.Second).Unix(), IntervalEndUnix: now.Unix()}
+	if _, err := core.Step(ctx, &state, SessionEvent{Kind: EventAgentFrame, At: now, Frame: &agentv1.ConnectRequest{
+		Seq: 1, Message: &agentv1.ConnectRequest_Stats{Stats: stats},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := e.st.NodeLive(e.ctx, now, state.NodeID, true)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("NodeLive = %+v, %v", rows, err)
+	}
+	view := decodeLiveView(rows[0])
+	if view.LinkViaNodeID != "nod_msk1" {
+		t.Fatalf("live projection link_via_node_id = %q, want nod_msk1", view.LinkViaNodeID)
 	}
 }
 
@@ -971,7 +998,7 @@ func TestSessionCoreHelloDeadlineIsDecidedByAlarm(t *testing.T) {
 func TestSessionCoreAutoBandwidthAlarm(t *testing.T) {
 	_, core, ctx, state, now := coreFixture(t, "core-auto-bandwidth")
 	h := hello("instance-auto-bandwidth", 0, "")
-	h.GetHello().Capabilities = []string{capBandwidth}
+	h.GetHello().Capabilities = []string{agentcap.Bandwidth}
 	tr := stepHello(t, core, ctx, state, now, h.GetHello())
 	want := now.Add(core.f.measureDelay)
 	if !tr.State.AutoBandwidthDeadline.Equal(want) {
@@ -1009,7 +1036,7 @@ func TestSessionCoreAutoBandwidthAlarm(t *testing.T) {
 func TestAutoBandwidthDeadlineStartsInHello(t *testing.T) {
 	e, core, ctx, state, now := coreFixture(t, "core-bw-start")
 	h := hello("instance-auto-bandwidth-start", 0, "")
-	h.GetHello().Capabilities = []string{capBandwidth}
+	h.GetHello().Capabilities = []string{agentcap.Bandwidth}
 	helloTransition, err := coreStep(ctx, core, state, SessionEvent{Kind: EventHello, At: now, Frame: h})
 	if err != nil {
 		t.Fatal(err)
@@ -1025,7 +1052,7 @@ func TestSessionCoreAutoBandwidthResultStoresCapacityInline(t *testing.T) {
 	e.f.measureDelay = 2 * time.Second
 	e.f.measureWait = 3 * time.Second
 	h := hello("instance-auto-bandwidth-result", 0, "")
-	h.GetHello().Capabilities = []string{capBandwidth}
+	h.GetHello().Capabilities = []string{agentcap.Bandwidth}
 	started := stepHello(t, core, ctx, state, now, h.GetHello())
 	due, err := coreStep(ctx, core, started.State, SessionEvent{Kind: EventAlarm, At: started.State.AutoBandwidthDeadline})
 	if err != nil {
@@ -1337,6 +1364,57 @@ func TestSessionCoreDuplicateStatsAndEvents(t *testing.T) {
 	}
 }
 
+func TestSessionCoreStaleStatsSkipHostHistory(t *testing.T) {
+	e, core, ctx, state, now := coreFixture(t, "core-stale-host")
+	connected := stepHello(t, core, ctx, state, now, hello("instance-stale-host", 0, "").GetHello())
+	end := now.Add(-maxStatsAge - time.Hour)
+	frame := &agentv1.ConnectRequest{Seq: 1, Message: &agentv1.ConnectRequest_Stats{Stats: &agentv1.StatsBatch{
+		IntervalStartUnix: end.Add(-10 * time.Second).Unix(), IntervalEndUnix: end.Unix(),
+		Host: &agentv1.HostMetrics{CpuPct: 75, RamUsedBytes: 1024, RamTotalBytes: 2048, NetRxBps: 100, NetTxBps: 200},
+	}}}
+	if _, err := coreStep(ctx, core, connected.State, SessionEvent{Kind: EventAgentFrame, At: now, Frame: frame}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := e.st.NodeHostHours(e.ctx, state.NodeID, now, 1)
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("host history after stale stats = %+v, %v, want no current-hour sample", rows, err)
+	}
+}
+
+func TestBuildFleetLiveKeepsBoundedUnknownRunningInbounds(t *testing.T) {
+	now := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+	health := make([]*agentv1.InboundHealth, maxLiveRunningInbounds+2)
+	known := make(map[string]bool, 64)
+	for i := range 64 {
+		id := fmt.Sprintf("inb_known_%02d", i)
+		known[id] = true
+		health[i] = &agentv1.InboundHealth{InboundId: id, State: agentv1.InboundRunState_INBOUND_RUN_STATE_RUNNING}
+	}
+	health[64] = &agentv1.InboundHealth{InboundId: "inb_unknown_failed", State: agentv1.InboundRunState_INBOUND_RUN_STATE_FAILED}
+	health[65] = &agentv1.InboundHealth{InboundId: "inb_unknown_stopped", State: agentv1.InboundRunState_INBOUND_RUN_STATE_STOPPED}
+	for i := 66; i < len(health); i++ {
+		health[i] = &agentv1.InboundHealth{InboundId: fmt.Sprintf("inb_unknown_%d", i), State: agentv1.InboundRunState_INBOUND_RUN_STATE_STARTING}
+	}
+	stats := &agentv1.StatsBatch{IntervalStartUnix: now.Add(-time.Second).Unix(), IntervalEndUnix: now.Unix(), Health: health}
+	projection, _, tooLarge := buildFleetLive(SessionState{}, stats, nil, now, nil)
+	if tooLarge || !projection.Apply {
+		t.Fatalf("projection = %+v, tooLarge=%t", projection, tooLarge)
+	}
+	var view liveJSONView
+	if err := json.Unmarshal([]byte(projection.LiveJSON), &view); err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Health) != 64 || len(view.RunningInboundIDs) != maxLiveRunningInbounds {
+		t.Fatalf("live bounds: health=%d running inbounds=%d", len(view.Health), len(view.RunningInboundIDs))
+	}
+	unknown := unknownRunningInboundIDs(view.RunningInboundIDs, known)
+	unknownText := strings.Join(unknown, "\n")
+	if len(unknown) == 0 || unknown[0] != "inb_unknown_100" || !strings.Contains(unknownText, "inb_unknown_66") ||
+		strings.Contains(unknownText, "inb_unknown_failed") || strings.Contains(unknownText, "inb_unknown_stopped") {
+		t.Fatalf("unknown running inbounds = %v", unknown)
+	}
+}
+
 func TestNodeLiveProjectionBoundsAndSanitizesStats(t *testing.T) {
 	e, core, ctx, state, now := coreFixture(t, "core-live-bounds")
 	ids := e.fixture(state.NodeID)
@@ -1399,7 +1477,7 @@ func TestBuildFleetLiveIsPureDeterministicAndClipsOnlyAgentFields(t *testing.T) 
 	userID, deviceID, protocol := strings.Repeat("u", 70), strings.Repeat("d", 70), strings.Repeat("p", 70)
 	inboundID, detail := strings.Repeat("i", 80), strings.Repeat("x", 300)
 	state := SessionState{Version: sessionStateVersion, NodeID: "nod_projection_pure", OwnerGeneration: 9,
-		LastEndUnix: now.Add(-time.Minute).Unix(), Pending: map[string]PendingRequest{"pending": {Kind: PendingDoctor}}}
+		Pending: map[string]PendingRequest{"pending": {Kind: PendingDoctor}}}
 	stateBefore := state
 	stateBefore.Pending = map[string]PendingRequest{"pending": state.Pending["pending"]}
 	stats := &agentv1.StatsBatch{IntervalStartUnix: now.Add(-10 * time.Second).Unix(), IntervalEndUnix: now.Unix(),
@@ -1502,7 +1580,7 @@ func TestBuildFleetLiveSkipsOversizedProjection(t *testing.T) {
 	}
 }
 
-func TestOlderStatsBatchLeavesProjectionUnchanged(t *testing.T) {
+func TestOlderNodeIntervalStillProjectsAcceptedStats(t *testing.T) {
 	e, core, ctx, state, now := coreFixture(t, "core-live-older")
 	ids := e.fixture(state.NodeID)
 	tr := stepHello(t, core, ctx, state, now, hello("instance-live-older", 0, "").GetHello())
@@ -1523,16 +1601,16 @@ func TestOlderStatsBatchLeavesProjectionUnchanged(t *testing.T) {
 		IntervalStartUnix: now.Add(-20 * time.Second).Unix(), IntervalEndUnix: now.Add(-time.Second).Unix(),
 		Host: &agentv1.HostMetrics{CpuPct: 99, NetRxBps: 999},
 	}}}
-	second, err := coreStep(ctx, core, first.State, SessionEvent{Kind: EventAgentFrame, At: now, Frame: older})
+	_, err = coreStep(ctx, core, first.State, SessionEvent{Kind: EventAgentFrame, At: now, Frame: older})
 	if err != nil {
 		t.Fatal(err)
 	}
 	afterRows, err := e.st.NodeLive(e.ctx, now, state.NodeID, true)
-	if err != nil || !reflect.DeepEqual(beforeRows, afterRows) {
-		t.Fatalf("older batch changed node_live: before=%+v after=%+v err=%v", beforeRows, afterRows, err)
+	if err != nil || len(afterRows) != 1 || afterRows[0].RxBps != 999 || afterRows[0].CPUPct != 99 || afterRows[0].SampleAt != now.Unix() {
+		t.Fatalf("accepted stats after a node clock step did not refresh the live view: rows=%+v err=%v", afterRows, err)
 	}
-	if second.State.LastEndUnix != first.State.LastEndUnix {
-		t.Fatalf("older batch changed core state: end=%d/%d", first.State.LastEndUnix, second.State.LastEndUnix)
+	if reflect.DeepEqual(beforeRows, afterRows) {
+		t.Fatalf("accepted stats after a node clock step left node_live unchanged: %+v", afterRows)
 	}
 }
 
@@ -1588,7 +1666,36 @@ func TestTopRatesKeepsTheHighest(t *testing.T) {
 	}
 }
 
-func TestSessionCorePoisonBatchDroppedAfterReconnect(t *testing.T) {
+func TestSessionCoreHealthUsesOnlyTheNodesLiveInboundSet(t *testing.T) {
+	e, core, ctx, state, now := coreFixture(t, "core-health-inbound-set")
+	ids := e.fixture(state.NodeID)
+	connected := stepHello(t, core, ctx, state, now, hello("instance-health-inbound-set", 0, "").GetHello())
+	connected.State.L3.AWG = map[string]l3HealthMemo{"inb_retired": {}}
+	health := []*agentv1.InboundHealth{{InboundId: ids.i1, Awg: &agentv1.AwgHealth{}}}
+	pin := strings.Repeat("ab", 32)
+	for i := 0; i < maxLiveRunningInbounds+100; i++ {
+		health = append(health, &agentv1.InboundHealth{InboundId: fmt.Sprintf("inb_fake_%03d", i), Awg: &agentv1.AwgHealth{},
+			CertPinSha256: pin, CertNotAfterUnix: now.Add(time.Hour).Unix()})
+	}
+	batch := &agentv1.ConnectRequest{Seq: 1, Message: &agentv1.ConnectRequest_Stats{Stats: &agentv1.StatsBatch{
+		IntervalStartUnix: now.Add(-10 * time.Second).Unix(), IntervalEndUnix: now.Unix(), Health: health,
+	}}}
+	tr, err := coreStep(ctx, core, connected.State, SessionEvent{Kind: EventAgentFrame, At: now, Frame: batch})
+	if err != nil || tr.Close != nil {
+		t.Fatalf("stats health transition = %+v, err %v", tr, err)
+	}
+	if len(tr.State.L3.AWG) != 1 || tr.State.L3.AWG[ids.i1].At.IsZero() {
+		t.Fatalf("health memo contains non-owned inbounds or lost the owned inbound: %+v", tr.State.L3.AWG)
+	}
+	if _, ok := tr.State.L3.AWG["inb_retired"]; ok {
+		t.Fatal("a memo entry outside the node's live inbound set was retained")
+	}
+	if got := len(certStats(batch.GetStats(), now)); got > maxLiveRunningInbounds {
+		t.Fatalf("certificate health rows processed = %d, want at most %d", got, maxLiveRunningInbounds)
+	}
+}
+
+func TestSessionCorePermanentStatsFailureIsDroppedImmediately(t *testing.T) {
 	e, core, ctx, state, now := coreFixture(t, "core-poison")
 	ids := e.fixture(state.NodeID)
 	tr := stepHello(t, core, ctx, state, now, hello("instance-poison", 0, "").GetHello())
@@ -1601,39 +1708,42 @@ func TestSessionCorePoisonBatchDroppedAfterReconnect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.Close == nil || first.Close.Class != CloseInternal || len(first.Frames) != 0 {
-		t.Fatalf("first refusal = close %v, frames %#v", first.Close, first.Frames)
-	}
-	oldAdapter := newTestSession(e, ctx, nil, state)
-	oldAdapter.persistPoison(first.State.Poison)
-	disconnected, err := coreStep(ctx, core, first.State, SessionEvent{Kind: EventDisconnected, At: now.Add(time.Second)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	oldAdapter.persistPoison(disconnected.State.Poison)
-
-	newOwner, newCtx := e.f.claimOwner(state.NodeID, e.ctx)
-	newCore := NewSessionCore(e.f)
-	newState := SessionState{Version: sessionStateVersion, NodeID: state.NodeID, OwnerGeneration: newOwner,
-		HelloDeadline: now.Add(2 * time.Second).Add(helloTimeout), Poison: e.f.poisonFor(state.NodeID)}
-	newHello, err := coreStep(newCtx, newCore, newState, SessionEvent{Kind: EventHello, At: now.Add(2 * time.Second), Frame: hello("instance-poison", 0, "")})
-	if err != nil || newHello.Close != nil {
-		t.Fatalf("reconnect Hello = close %v, err %v", newHello.Close, err)
-	}
-	second, err := coreStep(newCtx, newCore, newHello.State, SessionEvent{Kind: EventAgentFrame, At: now.Add(3 * time.Second), Frame: batch})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if second.Close != nil || len(second.Frames) != 1 || second.Frames[0].GetAck().GetUpToSeq() != 1 {
-		t.Fatalf("second refusal = close %v, frames %#v", second.Close, second.Frames)
-	}
-	newAdapter := newTestSession(e, newCtx, nil, newState)
-	newAdapter.persistPoison(second.State.Poison)
-	if e.f.poisonFor(state.NodeID) != nil {
-		t.Fatal("the successful drop left poison state behind")
+	if first.Close != nil || len(first.Frames) != 1 || first.Frames[0].GetAck().GetUpToSeq() != 1 || first.State.Poison != nil {
+		t.Fatalf("permanent refusal = close %v, frames %#v, poison %+v", first.Close, first.Frames, first.State.Poison)
 	}
 	if n := e.count(`SELECT count(*) FROM event WHERE node_id = ? AND code = 'stats_dropped'`, state.NodeID); n != 1 {
 		t.Fatalf("stats_dropped events = %d, want 1", n)
+	}
+}
+
+func TestSessionCoreRetriesTransientStatsFailureBeforePoisonWindow(t *testing.T) {
+	e, core, ctx, state, now := coreFixture(t, "core-poison-retry")
+	ids := e.fixture(state.NodeID)
+	connected := stepHello(t, core, ctx, state, now, hello("instance-poison-retry", 0, "").GetHello())
+	batch := &agentv1.ConnectRequest{Seq: 1, Message: &agentv1.ConnectRequest_Stats{Stats: &agentv1.StatsBatch{
+		IntervalStartUnix: now.Add(-10 * time.Second).Unix(), IntervalEndUnix: now.Unix(),
+		Traffic: []*agentv1.TrafficDelta{{CredId: "crd_alice_hy", InboundId: ids.i1, BytesUp: 5}},
+	}}}
+	failedCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	first, err := coreStep(failedCtx, core, connected.State, SessionEvent{Kind: EventAgentFrame, At: now, Frame: batch})
+	if err != nil || first.Close == nil || first.State.Poison == nil {
+		t.Fatalf("first transient refusal = transition %+v, err %v", first, err)
+	}
+	failedCtx, cancel = context.WithCancel(ctx)
+	cancel()
+	second, err := coreStep(failedCtx, core, first.State, SessionEvent{Kind: EventAgentFrame, At: now.Add(4 * time.Minute), Frame: batch})
+	if err != nil || second.Close == nil || len(second.Frames) != 0 {
+		t.Fatalf("second transient refusal = close %v, frames %#v, err %v", second.Close, second.Frames, err)
+	}
+	if second.State.Poison == nil || !second.State.Poison.FirstFailureAt.Equal(now) {
+		t.Fatalf("the first failure time was not retained: %+v", second.State.Poison)
+	}
+	if got := e.count(`SELECT last_seq FROM node WHERE id = ?`, state.NodeID); got != 0 {
+		t.Fatalf("transient failures advanced last_seq to %d", got)
+	}
+	if got := e.count(`SELECT count(*) FROM event WHERE code = 'stats_dropped'`); got != 0 {
+		t.Fatalf("transient failures recorded %d dropped batches", got)
 	}
 }
 
@@ -1641,15 +1751,17 @@ func TestSessionCoreRetainsPoisonWhenDropCannotAdvanceSequence(t *testing.T) {
 	e, core, ctx, state, now := coreFixture(t, "core-poison-skip-error")
 	ids := e.fixture(state.NodeID)
 	connected := stepHello(t, core, ctx, state, now, hello("instance-poison-skip-error", 0, "").GetHello())
-	e.exec(`CREATE TRIGGER reject_core_stats BEFORE INSERT ON traffic_bucket WHEN NEW.user_id = 'usr_alice' BEGIN SELECT RAISE(ABORT, 'test refusal'); END`)
 	batch := &agentv1.ConnectRequest{Seq: 1, Message: &agentv1.ConnectRequest_Stats{Stats: &agentv1.StatsBatch{
 		IntervalStartUnix: now.Add(-10 * time.Second).Unix(), IntervalEndUnix: now.Unix(),
 		Traffic: []*agentv1.TrafficDelta{{CredId: "crd_alice_hy", InboundId: ids.i1, BytesUp: 5}},
 	}}}
-	first, err := coreStep(ctx, core, connected.State, SessionEvent{Kind: EventAgentFrame, At: now, Frame: batch})
+	failedCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	first, err := coreStep(failedCtx, core, connected.State, SessionEvent{Kind: EventAgentFrame, At: now, Frame: batch})
 	if err != nil || first.Close == nil || first.State.Poison == nil {
 		t.Fatalf("first refusal = transition %+v, err %v", first, err)
 	}
+	first.State.Poison.FirstFailureAt = now.Add(-statsPoisonRetryWindow)
 	adapter := newTestSession(e, ctx, nil, state)
 	adapter.persistPoison(first.State.Poison)
 	disconnected, err := coreStep(ctx, core, first.State, SessionEvent{Kind: EventDisconnected, At: now.Add(time.Second)})
@@ -1667,6 +1779,7 @@ func TestSessionCoreRetainsPoisonWhenDropCannotAdvanceSequence(t *testing.T) {
 	if err != nil || newHello.Close != nil {
 		t.Fatalf("reconnect Hello = close %v, err %v", newHello.Close, err)
 	}
+	e.exec(`CREATE TRIGGER reject_core_stats BEFORE INSERT ON traffic_bucket WHEN NEW.user_id = 'usr_alice' BEGIN SELECT RAISE(ABORT, 'test refusal'); END`)
 	e.exec(`CREATE TRIGGER reject_core_skip_seq BEFORE UPDATE OF last_seq ON node WHEN NEW.last_seq > OLD.last_seq BEGIN SELECT RAISE(ABORT, 'test skip refusal'); END`)
 	second, err := coreStep(newCtx, newCore, newHello.State, SessionEvent{Kind: EventAgentFrame,
 		At: now.Add(3 * time.Second), Frame: batch})
@@ -1835,7 +1948,7 @@ func TestSessionCoreCommandLogsAndSupersede(t *testing.T) {
 
 // A new ConnectResponse message must be either an allowlisted admin request or a frame only the panel itself sends.
 func TestSessionCoreAllowlistCoversEveryFrame(t *testing.T) {
-	notRequests := map[protoreflect.Name]bool{"hello_ack": true, "ack": true, "desired_state": true, "kick": true, "log_cancel": true, "ping": true, "renew": true}
+	notRequests := map[protoreflect.Name]bool{"hello_ack": true, "ack": true, "desired_state": true, "kick": true, "log_cancel": true, "ping": true, "renew": true, "debug_capture_ack": true}
 	fields := (&agentv1.ConnectResponse{}).ProtoReflect().Descriptor().Oneofs().ByName("message").Fields()
 	for i := range fields.Len() {
 		fd := fields.Get(i)

@@ -3,7 +3,7 @@ import { App } from "@/gen/mistgate/admin/v1/common_pb";
 import { useT } from "@/i18n";
 import { dns, subscriptions, users } from "@/lib/api";
 import { plain } from "@/lib/plain";
-import type { DnsData, Settings } from "./model";
+import { textKey, type DnsData, type ResponseHeader, type Settings } from "./model";
 
 // Query keys sit under "subs" / "dns". Settings change only when an admin saves, so there is no polling; a save
 // invalidates them. The user card reads the presets through the same key, so a change here shows there.
@@ -13,8 +13,9 @@ export const settingsQuery = queryOptions({
     const r = await subscriptions.getSubscriptionSettings({}, { signal });
     // the servers of the busiest group, for the preview of the server names (empty: the preview makes some up)
     const samples = (r.serverSamples ?? []).map((s) => ({ node: s.node, countryCode: s.countryCode, profile: s.profile, loadPercent: s.loadPercent }));
-    // sharedLinkUsers: people on the place the apps without a device ID share, for the "strict" confirmation
-    return { settings: plain(r.settings!), effectiveTitle: r.effectiveTitle, samples, sampleGroup: r.sampleGroup ?? "", namesLanguage: r.namesLanguage ?? "", sharedLinkUsers: r.sharedLinkUsers ?? 0 };
+    // sharedLinkUsers: people on the place the apps without a device ID share, for the "strict" confirmation; linkAwgKeys: the
+    // AmneziaWG keys the link apps hold, for the confirmation of taking AmneziaWG out of them
+    return { settings: plain(r.settings!), reservedHeaderNames: r.reservedHeaderNames ?? [], effectiveTitle: r.effectiveTitle, samples, sampleGroup: r.sampleGroup ?? "", namesLanguage: r.namesLanguage ?? "", sharedLinkUsers: r.sharedLinkUsers ?? 0, linkAwgKeys: r.linkAwgKeys ?? 0 };
   },
   staleTime: 30_000,
 });
@@ -25,9 +26,14 @@ export const settingsQuery = queryOptions({
  */
 export function useLinkAppNames(): string {
   const t = useT();
-  const { data } = useQuery(settingsQuery);
-  const names = [...new Set((data?.settings.apps ?? []).filter((a) => a.kind === App.HAPP).map((a) => a.name).filter(Boolean))];
+  const names = useLinkAppList();
   return names.length > 0 ? names.join(", ") : t("subs.kind.happ");
+}
+
+/** The names of the apps on the link, each once; empty when the page lists none (a sentence then words it without names). */
+export function useLinkAppList(): string[] {
+  const { data } = useQuery(settingsQuery);
+  return [...new Set((data?.settings.apps ?? []).filter((a) => a.kind === App.HAPP).map((a) => a.name).filter(Boolean))];
 }
 
 export const clientsQuery = queryOptions({
@@ -47,9 +53,30 @@ export const testAgentQuery = (userAgent: string) =>
 /** The user picker of the page preview: the first page of users, enough to see the page as somebody. */
 export const pickerUsersQuery = queryOptions({
   queryKey: ["users", "picker"],
-  queryFn: async ({ signal }) => plain((await users.listUsers({ pageSize: 50 }, { signal })).users).map((u) => ({ id: u.id, name: u.name })),
+  queryFn: async ({ signal }) => plain((await users.listUsers({ pageSize: 50 }, { signal })).users).map((u) => ({ id: u.id, name: u.name, groupId: u.groupId })),
   staleTime: 30_000,
 });
+
+/** What the answer of one person to one User-Agent carries of the headers in `headers` (the editor's draft), asked of the panel. */
+export const headerPreviewQuery = (userId: string, userAgent: string, headers: ResponseHeader[]) =>
+  queryOptions({
+    queryKey: ["subs", "hdr-preview", userId, userAgent, headers],
+    queryFn: async ({ signal }) => plain(await subscriptions.previewResponseHeaders({ userId, userAgent, headers }, { signal })),
+    staleTime: 0,
+  });
+
+/**
+ * What the panel makes of a template text for one person (the profile and what to look at), asked of the text as the form holds it.
+ * A text the panel would refuse comes back as an error (InvalidArgument) that names the line. The key carries a short hash of the
+ * text, not the text; a save refreshes every one of these.
+ */
+export const mihomoPreviewQuery = (userId: string, yaml: string, groupIds: string[]) =>
+  queryOptions({
+    queryKey: ["subs", "mt-preview", userId, textKey(yaml), groupIds],
+    queryFn: async ({ signal }) => plain(await subscriptions.previewMihomoTemplate({ userId, yaml, groupIds }, { signal })),
+    staleTime: 60_000,
+    retry: false,
+  });
 
 export const dnsPresetsQuery = queryOptions({
   queryKey: ["dns", "presets"],
@@ -77,3 +104,15 @@ export function useSaveSettings() {
     },
   });
 }
+
+/**
+ * What the panel makes of a pasted profile (a link, base64 or JSON): the entry it would store, with what it holds, or its refusal as an
+ * error (InvalidArgument) that says what is wrong. The key carries a short hash of the text; nothing is written.
+ */
+export const routingPreviewQuery = (input: string) =>
+  queryOptions({
+    queryKey: ["subs", "rt-preview", textKey(input)],
+    queryFn: async ({ signal }) => plain((await subscriptions.previewRoutingProfile({ input }, { signal })).profile!),
+    staleTime: 60_000,
+    retry: false,
+  });

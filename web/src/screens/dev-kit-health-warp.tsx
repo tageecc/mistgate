@@ -13,7 +13,7 @@ import { AlertsTab } from "@/screens/health/alerts";
 import { DoctorTab } from "@/screens/health/doctor";
 import { useFixFlow } from "@/screens/health/fix";
 import { PeopleTab } from "@/screens/health/people";
-import { ConnectionPanel } from "@/screens/users/user-detail";
+import { ConnectionAlerts } from "@/screens/users/user-connection";
 import { NodeDoctorTab } from "@/screens/node/doctor";
 import { ExitTab } from "@/screens/node/exit";
 import { ServerTab } from "@/screens/node/server";
@@ -122,6 +122,18 @@ const warpCards = [
     data: warp({ health: health({ state: WarpState.DOWN, warpFlag: "off", lastError: "warp_flag_off", consecutiveFailures: 5, probeOtherOk: false, probeOther: dead }), needsAttention: true, attentionReason: "revoked" }),
   },
   {
+    id: "nod_w_plus",
+    name: "de3",
+    title: "Plus: a WARP+ key is set (Details: Change WARP+ key)",
+    data: warp({ account: account({ accountType: "plus", hasLicense: true }) }),
+  },
+  {
+    id: "nod_w_plus_refused",
+    name: "de4",
+    title: "Registered again: Cloudflare would not take the WARP+ key",
+    data: warp({ account: account({ hasLicense: true, licenseError: "license_device_limit" }) }),
+  },
+  {
     id: "nod_w_paused",
     name: "nl1",
     title: "Paused (Resume needs no question)",
@@ -139,7 +151,7 @@ const nodeData = {
   notes: "",
   dnsResolvers: [],
   timeouts: { livenessTimeoutS: 90, applyTimeoutS: 120, dialTimeoutS: 15 },
-  facts: { virt: "kvm" },
+  facts: { virt: "kvm", engines: [] },
 };
 
 // ---- alerts
@@ -163,7 +175,65 @@ const alert = (over: Partial<Alert>): Alert => ({
   actions: ["open_node", "mute"],
   ...over,
 });
+// 38 networks of a country alert as the panel joins them (sorted, as health/country.go does): cheburcheck 34, Globalping 2
+// (a full alert names its networks bare), bsbord 2; regions with their own brackets, MTS seen by three sources
+const cc = (op: string, asn: number, region: string) => `${op} (AS${asn}, ${region}, cheburcheck)`;
+const darkNets = [
+  ...["Кировская область", "Костромская область", "Краснодарский край", "Новосибирская область", "Пермский край", "Республика Карелия", "Свердловская область", "Тюменская область", "Республика Саха (Якутия)"].map((r) => cc("Rostelecom", 12389, r)),
+  cc("Rostelecom", 42610, "Москва"),
+  cc("MTS", 43148, "Курганская область"),
+  cc("MTS", 8359, "Владимирская область"),
+  cc("MTS", 8359, "Кировская область"),
+  cc("MTS", 8359, "Свердловская область"),
+  cc("MTS", 30881, "Республика Саха (Якутия)"),
+  "MTS (AS8359, Москва, bsbord)",
+  "MTS",
+  cc("TTK", 15774, "Республика Саха (Якутия)"),
+  cc("SkyNet", 35807, "Ленинградская область"),
+  cc("SkyNet", 35807, "Санкт-Петербург"),
+  cc("Beeline", 8402, "Москва"),
+  cc("Beeline", 3216, "Санкт-Петербург"),
+  cc("BaikalWestCom", 50187, "Иркутская область"),
+  cc("ELIT-TV", 58096, "Ростовская область"),
+  cc("Intersvyaz", 8369, "Челябинская область"),
+  cc("KomTehCentr", 12668, "Свердловская область"),
+  cc("Lan-Optic", 60931, "Тверская область"),
+  cc("MARK-ITT", 3226, "Удмуртская Республика"),
+  cc("Maxima", 39578, "Новгородская область"),
+  cc("Regionset", 41829, "Курская область"),
+  cc("Russian company", 15493, "Тюменская область"),
+  cc("Signal Service", 42514, "Курская область"),
+  cc("Silinet", 51369, "Московская область"),
+  cc("Subnet", 57227, "Республика Дагестан"),
+  cc("Ufanet", 24955, "Республика Башкортостан"),
+  cc("Tele2", 15378, "Нижегородская область"),
+  "ER-Telecom Holding",
+  "Miranda (Крым, bsbord)",
+].sort();
 const activeAlerts: Alert[] = [
+  // the sources disagree: cheburcheck reaches the node through the TSPU on some networks, Globalping and bsbord get nothing
+  alert({
+    id: "a10",
+    kind: AlertKind.COUNTRY_BLOCKED,
+    nodeId: "nod_nl1",
+    nodeName: "nl1",
+    titleKey: "health.alert.country_blocked.title",
+    whyKey: "health.alert.country_blocked.why.blocked",
+    params: { node: "nl1", country: "RU", verdict: "blocked", confidence: "conflict", sources: "globalping,tspu,cheburcheck,bsbord", networks: darkNets.join(", "), ports: "" },
+    firstSeenUnix: NOW - 23 * 60,
+  }),
+  // blocked from the country, yet everybody given its servers gets there through working relays: quiet info, no Telegram
+  alert({
+    id: "a11",
+    severity: AlertSeverity.INFO,
+    kind: AlertKind.COUNTRY_BLOCKED,
+    nodeId: "nod_de1",
+    nodeName: "de1",
+    titleKey: "health.alert.country_blocked.title",
+    whyKey: "health.alert.country_blocked.why.reached_through_relays",
+    params: { node: "de1", country: "RU", verdict: "blocked", confidence: "eyeball", sources: "globalping,bsbord", networks: "MTS, Rostelecom", ports: "", why: "reached_through_relays" },
+    firstSeenUnix: NOW - 3 * 60 * 60,
+  }),
   alert({
     id: "a1",
     severity: AlertSeverity.CRITICAL,
@@ -210,6 +280,43 @@ const activeAlerts: Alert[] = [
     whyKey: "health.doctor.foreign_vpn.why",
     params: { check: "foreign_vpn", names: "unit:x-ui" },
     actions: ["open_node", "accept", "mute"],
+  }),
+  // the UDP check from two senders: minsk1 (CIS) loses its packets on the way to nl1, de1 gets them through
+  alert({
+    id: "a8",
+    kind: AlertKind.PATH_LOSSY,
+    nodeId: "nod_minsk1",
+    nodeName: "minsk1",
+    subject: "nod_nl1",
+    titleKey: "health.alert.path_lossy.title",
+    whyKey: "health.alert.path_lossy.why",
+    params: { node: "minsk1", target: "nl1", target_id: "nod_nl1", ports: "2053, 2083", sent: "300", got: "236", other: "de1", other_got: "299", region: "cis", other_region: "other", checked_unix: String(NOW - 9 * 60) },
+    firstSeenUnix: NOW - 2 * h,
+  }),
+  // a filter on the way, not a lossy line: from de1 only 443 gets through to fi1, the other ports get nothing, msk1 gets everything
+  alert({
+    id: "a10",
+    kind: AlertKind.PATH_LOSSY,
+    nodeId: "nod_de1",
+    nodeName: "de1",
+    subject: "nod_fi1",
+    titleKey: "health.alert.path_lossy.title",
+    whyKey: "health.alert.path_lossy.why.filtered",
+    params: { node: "de1", target: "fi1", target_id: "nod_fi1", ports: "2053, 8443", open: "443", sent: "300", got: "0", other: "msk1", other_got: "300", region: "other", other_region: "cis", checked_unix: String(NOW - 12 * 60) },
+    firstSeenUnix: NOW - 5 * h,
+  }),
+  // ... and a port both senders lost packets to: the node's own port
+  alert({
+    id: "a9",
+    kind: AlertKind.PORT_LOSSY,
+    nodeId: "nod_de2",
+    nodeName: "de2",
+    subject: "inb_4",
+    titleKey: "health.alert.port_lossy.title",
+    whyKey: "health.alert.port_lossy.why.confirmed",
+    params: { profile: "TUIC · 2083", port: "2083", sent: "300", got: "241", sender: "msk1", confirm_sender: "fi1", confirm_sent: "300", confirm_got: "238", checked_unix: String(NOW - 9 * 60) },
+    actions: ["open_profiles", "open_node", "mute"],
+    firstSeenUnix: NOW - 3 * h,
   }),
   alert({
     id: "a6",
@@ -309,6 +416,12 @@ function Alerts() {
       {flow.modal}
     </>
   );
+}
+
+/** The two path_lossy alerts alone, as the Alerts tab shows them: a lossy line and a filter. */
+function PathAlerts() {
+  const flow = useFixFlow();
+  return <AlertsTab active={activeAlerts.filter((a) => a.kind === AlertKind.PATH_LOSSY)} history={[]} now={NOW} flow={flow} />;
 }
 
 function People({ active = [...peopleAlerts, ...activeAlerts] }: { active?: Alert[] }) {
@@ -509,6 +622,12 @@ export function HealthWarpKit() {
         </Mock>
       </Shot>
 
+      <Shot id="path" title="UDP path alerts: a lossy line (21 % on every port from minsk1) / a filter (from de1 only 443 reaches fi1, the rest gets nothing)">
+        <Mock fill={() => {}}>
+          <PathAlerts />
+        </Mock>
+      </Shot>
+
       <Shot id="people" title="Health ▸ People: access ended (expired, quota), never connected, stale key, silent app; one muted; warnings first">
         <Mock fill={() => {}}>
           <People />
@@ -524,8 +643,8 @@ export function HealthWarpKit() {
       <Shot id="user-connection" title="A user's page ▸ Connection: the open alerts of this person (nothing open: no block)">
         <Mock fill={(c) => c.setQueryData(alertsQuery.queryKey, { nowUnix: NOW, active: [...activeAlerts, ...peopleAlerts], history: [] } as never)}>
           <div className="flex max-w-xl flex-col gap-3">
-            <ConnectionPanel userId="usr_masha" />
-            <ConnectionPanel userId="usr_nobody" />
+            <ConnectionAlerts userId="usr_masha" />
+            <ConnectionAlerts userId="usr_nobody" />
           </div>
         </Mock>
       </Shot>

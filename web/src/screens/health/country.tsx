@@ -1,4 +1,4 @@
-import { Link } from "@tanstack/react-router";
+
 import { useId, useState, type ReactElement } from "react";
 import { Icon } from "@/components/ui/icons";
 import { StatusDot, StatusGlyph } from "@/components/ui/status";
@@ -6,7 +6,8 @@ import { Tip } from "@/components/ui/tooltip";
 import { useT } from "@/i18n";
 import { cx } from "@/lib/cx";
 import { useFmt } from "@/lib/format";
-import { countryIn, countryLook, type BreakdownNet, type CountryCheck, type CountryLook } from "@/lib/health";
+import { Dot, type DotKind } from "@/screens/health/page-parts";
+import { countryIn, countryLook, type BreakdownNet, type CountryCheck, type CountryLook, type OwnPoint } from "@/lib/health";
 
 // What one country makes of a node (GetChecksResponse.country_checks): what Globalping's probes inside it saw, what the TSPU
 // probe (one of the owner's nodes there) saw and what the block lists say of its address, as a column of the Health matrix, a
@@ -18,26 +19,6 @@ import { countryIn, countryLook, type BreakdownNet, type CountryCheck, type Coun
 // networks a partial block cuts off), the probe node with its ports, the times, the lists, and where the verdict comes from.
 
 type Kind = CountryLook["kind"] | "none";
-
-const cellCls: Record<Kind, string> = {
-  ok: "border border-line text-muted",
-  partial: "tone-warn tint tone-text",
-  warn: "tone-warn tint tone-text",
-  bad: "tone-bad tint tone-text",
-  listed: "tone-warn tint tint-dashed tone-text",
-  unknown: "border border-dashed border-line text-muted",
-  none: "border border-line text-faint",
-};
-
-const rowCls: Record<Kind, string> = {
-  ok: "border border-line bg-surface-2",
-  partial: "tone-warn tint",
-  warn: "tone-warn tint",
-  bad: "tone-bad tint",
-  listed: "tone-warn tint tint-dashed",
-  unknown: "border border-dashed border-line",
-  none: "border border-dashed border-line",
-};
 
 /** "In a block list": three lines of a list in the round warn glyph, apart from the "!" of TCP blocked. */
 function ListedGlyph() {
@@ -82,7 +63,7 @@ export function CountryMark({ kind }: { kind: Kind }) {
  * what it got; one that did not count is greyed) and the round's time; the probe node with its ports and the run's time; what
  * the lists add; where it comes from.
  */
-function CountryTip({ look, children }: { look: CountryLook; children: ReactElement }) {
+export function CountryTip({ look, children }: { look: CountryLook; children: ReactElement }) {
   const t = useT();
   const label = (
     <span className="flex flex-col gap-1">
@@ -108,6 +89,12 @@ function CountryTip({ look, children }: { look: CountryLook; children: ReactElem
         </span>
       ))}
       {look.noProbe && <span className="font-medium text-muted">{look.noProbe}</span>}
+      {look.ownPoints.map((p) => (
+        <span key={p.key} className={cx("flex flex-col font-medium", p.kind === "dark" && "tone-warn tone-text", p.kind === "unsure" && "text-muted")}>
+          {p.name}
+          <span className="text-[11px] font-normal text-muted">{[p.what, p.at].join(" · ")}</span>
+        </span>
+      ))}
       {look.at && <span className="font-medium">{look.at}</span>}
       {look.gpNone && <span className="font-medium text-muted">{look.gpNone}</span>}
       {look.tspu && (
@@ -134,154 +121,73 @@ export function useCountryTitle(code: string): string {
   return t("cr.from", { country: countryIn(t, code) });
 }
 
-/** The column's head in the matrix, set apart from the profiles: it is not a client check from the panel's server. It leads to the Reachability page. */
-export function CountryHead({ code }: { code: string }) {
-  const t = useT();
-  const title = useCountryTitle(code);
-  return (
-    <Link
-      to="/reachability"
-      title={t("rc.open")}
-      className="ml-2 flex items-end gap-1 self-end px-1 pb-1 text-[11px] leading-tight font-bold text-muted underline-offset-2 transition-colors hover:text-fg hover:underline"
-    >
-      <Icon name="globe" size={12} aria-hidden className="mb-px flex-none" />
-      {title}
-    </Link>
-  );
-}
+/** The board's pill of a verdict (`.pv-pill` and its dot): the tone and the dot of each look; a block on some networks and TCP blocked are both the warn pill. */
+const pillTone: Record<Kind, "ok" | "part" | "bad" | ""> = { ok: "ok", partial: "part", warn: "part", bad: "bad", listed: "bad", unknown: "", none: "" };
+const pillDot: Record<Kind, DotKind> = { ok: "ok", partial: "part", warn: "part", bad: "bad", listed: "bad", unknown: "none", none: "none" };
 
 /**
- * A node's cell in the matrix. A node with no round yet (new, or offline when the rounds ran) gets a dash. A live verdict
- * whose address is in a block list as well keeps its own look and gets the list mark in the corner.
+ * The verdict as the board's pill (the Reachability page's table): the dot of its state, then its word, with the cell's tooltip. A node with
+ * no row yet gets a dash. `tag`: the address family ("IPv4", "IPv6") while IPv6 is checked too. `inButton`: the pill sits inside a button (a
+ * row that opens), so it is no tab stop of its own and the tooltip comes with the mouse; what it says is in the opened row.
  */
-export function CountryCell({ check, node, code }: { check: CountryCheck | undefined; node: string; code: string }) {
-  const t = useT();
-  const fmt = useFmt();
-  const title = useCountryTitle(code);
-  const box = "relative ml-2 box-border flex h-11 flex-col items-center justify-center rounded-[11px] px-1.5 text-center text-xs leading-tight font-bold";
-  if (!check)
-    return (
-      <span className={cx(box, cellCls.none)} title={t("cr.v.notYet")}>
-        <span aria-hidden>{t("hl.cell.none")}</span>
-        <span className="sr-only">{t("hl.cell.aria", { node, profile: title, state: t("cr.v.notYet") })}</span>
-      </span>
-    );
-  const look = countryLook(t, fmt, check);
-  return (
-    <CountryTip look={look}>
-      <span role="img" tabIndex={0} aria-label={t("hl.cell.aria", { node, profile: title, state: look.state })} className={cx(box, cellCls[look.kind])}>
-        <span className="flex items-center gap-1">
-          <CountryMark kind={look.kind} />
-          {look.label}
-        </span>
-        {look.note && <span className="max-w-full truncate text-[10px] font-semibold text-muted">{look.note}</span>}
-        {look.alsoListed && (
-          <span data-testid="also-listed" className="absolute top-1 right-1 flex">
-            <ListedGlyph />
-          </span>
-        )}
-      </span>
-    </CountryTip>
-  );
-}
-
-/**
- * The verdict as a pill with the cell's second line under it (the Reachability page's table): the same colours, glyphs and
- * tooltip as the cell. A node with no row yet gets a dash. `tag`: the address family ("IPv4", "IPv6") while IPv6 is checked too.
- */
-export function CountryPill({ check, node, code, tag = "" }: { check: CountryCheck | undefined; node: string; code: string; tag?: string }) {
+export function CountryPill({ check, node, code, tag = "", inButton = false }: { check: CountryCheck | undefined; node: string; code: string; tag?: string; inButton?: boolean }) {
   const t = useT();
   const fmt = useFmt();
   const title = [useCountryTitle(code), tag].filter(Boolean).join(" · ");
-  const pill = "inline-flex h-[26px] w-fit max-w-full items-center gap-1.5 rounded-[13px] px-2.5 text-xs leading-none font-bold whitespace-nowrap";
-  const tagged = tag && (
-    <span aria-hidden className="font-mono text-[10px] font-bold opacity-70">
+  const fam = tag && (
+    <span aria-hidden className="rc-fam mono">
       {tag}
     </span>
   );
   if (!check)
     return (
-      <span className={cx(pill, cellCls.none)} title={t("cr.v.notYet")}>
-        {tagged}
-        <span aria-hidden>{t("hl.cell.none")}</span>
+      <span className="pv-pill" title={t("cr.v.notYet")}>
+        {fam}
+        <Dot kind="none" />
+        <span>{t("cr.v.unknown")}</span>
         <span className="sr-only">{t("hl.cell.aria", { node, profile: title, state: t("cr.v.notYet") })}</span>
       </span>
     );
   const look = countryLook(t, fmt, check);
-  return (
-    <span className="flex min-w-0 flex-col items-start gap-1">
-      <CountryTip look={look}>
-        <span role="img" tabIndex={0} aria-label={t("hl.cell.aria", { node, profile: title, state: look.state })} className={cx(pill, cellCls[look.kind])}>
-          {tagged}
-          <CountryMark kind={look.kind} />
-          {look.label}
-          {look.alsoListed && <ListedGlyph />}
-        </span>
-      </CountryTip>
-      {look.note && <span className="text-[11px] leading-tight font-semibold text-muted">{look.note}</span>}
+  const pill = (
+    <span
+      className={cx("pv-pill", pillTone[look.kind])}
+      {...(inButton ? {} : { role: "img", tabIndex: 0, "aria-label": t("hl.cell.aria", { node, profile: title, state: look.state }) })}
+    >
+      {fam}
+      <Dot kind={pillDot[look.kind]} />
+      {look.label}
+      {look.alsoListed && <ListedGlyph />}
     </span>
   );
+  return <CountryTip look={look}>{pill}</CountryTip>;
 }
 
+const pointMark = { ok: ["✓", "tone-ok tone-text"], dark: ["✕", "tone-bad tone-text"], unsure: ["?", "text-muted"] } as const;
+
 /**
- * The same verdict as a row (a node's card on the phone, the node page): its words are what a screen reader reads on focus,
- * and the quiet line says what the tooltip would, for a phone that has no hover. A block on some networks has its breakdown
- * under the row instead of the line, in the same tinted box but outside the tooltip's trigger.
+ * The points of the owner's own probes, a line each: the mark, "Operator · City — probe “dacha”", what it saw and when. Under a
+ * node's row where its verdict has no breakdown (a dark point is in the breakdown already). The name is the owner's own words and
+ * the operator; there is no address in it.
  */
-export function CountryRow({ check, code }: { check: CountryCheck | undefined; code: string }) {
+export function OwnPoints({ points, className }: { points: readonly OwnPoint[]; className?: string }) {
   const t = useT();
-  const fmt = useFmt();
-  const title = useCountryTitle(code);
-  const look = check ? countryLook(t, fmt, check) : null;
-  const kind: Kind = look?.kind ?? "none";
-  const breakdown = look?.breakdown;
-  const row = (
-    <div
-      tabIndex={look ? 0 : undefined}
-      data-testid="country-row"
-      className={cx("flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 rounded-field px-3 py-2.5 text-[13px]", !breakdown && rowCls[kind])}
-    >
-      <span className="flex min-w-0 flex-[1_1_140px] items-center gap-2">
-        <CountryMark kind={kind} />
-        {/* the title leads to the Reachability page, where the sources and the week are */}
-        <Link to="/reachability" title={t("rc.open")} className="font-bold break-words underline-offset-2 hover:underline">
-          {title}
-        </Link>
-      </span>
-      <span className={cx("flex items-center gap-1.5 text-xs font-bold", kind === "ok" || kind === "unknown" || kind === "none" ? "text-muted" : "tone-text")}>
-        {look?.label ?? t("hl.cell.none")}
-        {look?.alsoListed && <ListedGlyph />}
-      </span>
-      {!breakdown && <span className="min-w-0 flex-[2_1_160px] text-[11px] leading-snug text-muted">{look ? <AgeLast line={look.line} /> : t("cr.v.notYet")}</span>}
-    </div>
-  );
-  const tipped = look ? <CountryTip look={look}>{row}</CountryTip> : row;
-  if (!breakdown) return tipped;
   return (
-    <div className={cx("flex min-w-0 flex-col rounded-field", rowCls[kind])}>
-      {tipped}
-      <PartialBreakdown breakdown={breakdown} className="mx-3 border-t border-[color-mix(in_oklch,var(--c)_35%,var(--border))] pt-2.5 pb-3" />
-    </div>
-  );
-}
-
-/**
- * A row's quiet line, its last piece (when it was checked) kept on one line with the word before it: "…MegaFon, / MTS · 7
- * min ago", so a line never starts with the "·" nor splits the time.
- */
-function AgeLast({ line }: { line: string }) {
-  const parts = line.split(" · ");
-  const age = parts.pop() ?? "";
-  const head = parts.join(" · ");
-  const cut = head.lastIndexOf(" ");
-  if (!head) return <span className="whitespace-nowrap">{age}</span>;
-  return (
-    <>
-      {cut > 0 && `${head.slice(0, cut)} `}
-      <span className="whitespace-nowrap">
-        {head.slice(cut + 1)} · {age}
-      </span>
-    </>
+    <ul aria-label={t("pr.points.title")} data-testid="own-points" className={cx("flex min-w-0 flex-col gap-1", className ?? "text-xs")}>
+      {points.map((p) => {
+        const [glyph, cls] = pointMark[p.kind];
+        return (
+          <li key={p.key} className="grid grid-cols-[14px_minmax(0,1fr)] items-baseline gap-x-1.5">
+            <span aria-hidden className={cx("text-center font-semibold", cls)}>
+              {glyph}
+            </span>
+            <span className="min-w-0 break-words">
+              <span className="font-semibold">{p.name}</span> <span className="text-muted">{[p.what, p.at].join(" · ")}</span>
+            </span>
+          </li>
+        );
+      })}
+    </ul>
   );
 }
 
@@ -301,7 +207,7 @@ export function PartialBreakdown({ breakdown, className }: { breakdown: NonNulla
       {breakdown.noProbe && <p className="text-xs leading-snug text-muted">{breakdown.noProbe}</p>}
       <p className="text-xs leading-snug text-pretty">
         {t("cr.part.hint")}{" "}
-        <a href={t("cr.part.guideUrl")} target="_blank" rel="noopener noreferrer" className="font-bold text-accent-text underline decoration-dotted underline-offset-2">
+        <a href={t("cr.part.guideUrl")} target="_blank" rel="noopener noreferrer" className="font-medium text-accent-text underline decoration-dotted underline-offset-2">
           {t("cr.part.guide")}
         </a>
       </p>
@@ -330,13 +236,13 @@ function NetList({ label, nets, mark }: { label: string; nets: readonly Breakdow
   const [glyph, cls] = marks[mark];
   return (
     <div className="flex min-w-0 flex-col gap-1">
-      <span id={id} className="text-xs font-bold">
+      <span id={id} className="text-xs font-medium">
         {label}
       </span>
       <ul id={`${id}-list`} aria-labelledby={id} className="flex flex-col gap-0.5">
         {shown.map((n, i) => (
           <li key={i} className="grid grid-cols-[14px_minmax(0,1fr)] items-baseline gap-x-1.5">
-            <span aria-hidden className={cx("text-center text-xs font-extrabold", cls)}>
+            <span aria-hidden className={cx("text-center text-xs font-semibold", cls)}>
               {glyph}
             </span>
             <span className="min-w-0 break-words">
@@ -351,7 +257,7 @@ function NetList({ label, nets, mark }: { label: string; nets: readonly Breakdow
           aria-expanded={open}
           aria-controls={`${id}-list`}
           onClick={() => setOpen(!open)}
-          className="ml-5 w-fit rounded-sm text-xs font-semibold text-muted underline decoration-dotted underline-offset-2 hover:text-fg"
+          className="ms-5 w-fit rounded-sm text-xs font-semibold text-muted underline decoration-dotted underline-offset-2 hover:text-fg"
         >
           {open ? t("cr.part.fewer") : t("cr.part.more", { n: nets.length - SHORT })}
         </button>

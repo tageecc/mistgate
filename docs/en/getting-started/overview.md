@@ -1,14 +1,17 @@
 ---
 title: Overview
+seoTitle: "What is Mistgate: a VPN panel for a small fleet"
 description: What Mistgate is and is not, who it is for, and how its parts fit together.
 ---
 
 Mistgate is a self-hosted panel for a small VPN fleet that you run on your own servers. This page explains what it does, what it does not do, and the concepts the rest of the documentation is built on.
 
+![A Mistgate demo: a node is added over SSH from the browser, comes online with a profile and appears at once on a person's page](../../images/video/hero-poster-en.webp)
+
 ## What Mistgate is
 
 - **Two programs, no Docker.** `mistgate` is the panel. `mistgate-node` is the agent that runs on every VPN server. Both are single Go binaries for Linux (amd64 and arm64).
-- **One admin for the whole fleet.** The panel keeps people, protocol setups and servers in one SQLite database and shows them in a web admin in English, Russian and Simplified Chinese.
+- **One admin for the whole fleet.** The panel keeps people, protocol setups and servers in one SQLite database and shows them in a web admin in English, Russian, Simplified Chinese, Persian and Turkish.
 - **Agents do the work on the servers.** The agent runs the protocols and keeps the host in the state the panel asks for. It dials the panel, so the panel needs no management port on your servers. The panel logs in to a server over SSH only to install a node (from the admin, or for an AI agent with your approval) and, while that SSH access stays saved, to change or check the server's password at your request.
 - **Protocols.** Hysteria2 (the official core, built into the agent), VLESS REALITY over XHTTP or TCP (xray-core, built into the agent) and AmneziaWG 2.0 and 3.1 (userspace by default, the kernel module per node on request). Cloudflare WARP can be the exit for all three.
 - **One link per person.** A subscription app that opens the link gets the server list in a format it reads (a list of `hysteria2://` and `vless://` links or a Mihomo YAML profile, chosen by User-Agent rules). A browser gets the person's own page with instructions. AmneziaVPN users get a key per device.
@@ -21,13 +24,13 @@ Mistgate is a self-hosted panel for a small VPN fleet that you run on your own s
 
 - **Not a VPN service.** You bring the servers and the domain names and you run everything. Mistgate does not rent servers or sell access.
 - **Not a billing system.** There are no payments, tariffs or invoices. Traffic quotas, terms and device limits are limits you set yourself.
-- **Not a client app.** People connect with existing apps: a subscription app such as Happ, or an app on the mihomo core such as kl!ck (recommended on Windows and macOS), Clash Verge or FlClash, and AmneziaVPN for AmneziaWG keys.
+- **Not a client app.** People connect with existing apps: a subscription app such as Happ, or an app on the mihomo core such as kl!ck (recommended on Windows and macOS), Clash Verge or FlClash, and AmneziaVPN for AmneziaWG keys. Our own app for Windows, [Mistgate](https://github.com/Mistgate/mistgate-client), is a separate project: it works with these panels and with plain subscription links.
 - **Not finished.** This is an early release: the API, the stored settings and the node protocol may still change before 1.0. The data model is sized for about 5000 users and 50 nodes.
-- **Not a one-click installer.** You install the panel by hand, from the Linux binaries of a GitHub release or built from source. A node is added from the admin, either automatically over SSH or with a one-time install command you run on the server. A one-line installer for the panel is **Planned**.
+- **Not a one-click installer.** The panel installs with [one command](install-panel.md#one-line-install) on a server of your own, or by hand from the Linux binaries of a GitHub release or built from source; you bring the server and the domain and create the owner account in your browser. A node is added from the admin, either automatically over SSH or with a one-time install command you run on the server.
 
 ## Who it is for
 
-Mistgate is for a person or a small team that runs a few VPN servers for themselves, family, friends or a small community. You should be comfortable with Linux, SSH, systemd and DNS records. Some defaults lean towards users in Russia (Yandex DNS for nodes in Russia, the doctor's control domains, split-DNS presets); all of them are settings.
+Mistgate is for a person or a small team that runs a few VPN servers for themselves, family, friends or a small community. You should be comfortable with Linux, SSH, systemd and DNS records. Some defaults account for users in Russia and China (Yandex DNS for Russian nodes, AliDNS and DNSPod for Chinese nodes, the doctor's country-specific control domains, split-DNS presets); all of them are settings.
 
 ## Concepts
 

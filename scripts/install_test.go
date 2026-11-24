@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -204,6 +205,66 @@ func TestInstallerAgainstFakeRelease(t *testing.T) {
 	}
 }
 
+func TestInstallerSelectsTheNewestAllowedChannelRelease(t *testing.T) {
+	bash := installerBash(t)
+	base := newFakePanelReleaseForVersion(t, "v1.2.2")
+	releases := []*fakePanelRelease{
+		base,
+		base.withVersion(t, "v1.2.3-testing.1"),
+		base.withVersion(t, "v1.2.4-dev.1"),
+		base.withVersion(t, "v99.0.0"),
+		base.withVersion(t, "v2.0.0-rc.1"),
+	}
+	releases[3].draft = true
+	server, requestedTags := fakePanelReleaseServer(releases...)
+	defer server.Close()
+	for _, tc := range []struct {
+		channel string
+		want    string
+	}{
+		{"stable", "v1.2.2"},
+		{"testing", "v1.2.3-testing.1"},
+		{"dev", "v1.2.4-dev.1"},
+	} {
+		t.Run(tc.channel, func(t *testing.T) {
+			*requestedTags = nil
+			args := []string{"--public-url", "https://panel.example.com", "--channel", tc.channel, "--dry-run"}
+			output, err := runInstaller(t, bash, server.URL, base.publicKey, base.sshPublicKey, filepath.ToSlash(t.TempDir()), "x86_64", args...)
+			if err != nil {
+				t.Fatalf("installer failed: %v\n%s", err, output)
+			}
+			if len(*requestedTags) == 0 || (*requestedTags)[0] != tc.want {
+				t.Fatalf("downloaded tags = %v, want %s", *requestedTags, tc.want)
+			}
+		})
+	}
+}
+
+func TestInstallerAcceptsCanonicalChannelVersionTags(t *testing.T) {
+	bash := installerBash(t)
+	for _, tc := range []struct {
+		tag string
+		ok  bool
+	}{
+		{"v1.2.3", true}, {"v1.2.3-testing.1", true}, {"v1.2.3-dev.4", true},
+		{"v1.2.3-testing.0", false}, {"v1.2.3-dev.01", false}, {"v1.2.3-rc.1", false}, {"v01.2.3", false},
+	} {
+		t.Run(tc.tag, func(t *testing.T) {
+			fake := newFakePanelReleaseForVersion(t, tc.tag)
+			server := fake.server()
+			defer server.Close()
+			args := []string{"--public-url", "https://panel.example.com", "--version", tc.tag, "--dry-run"}
+			output, err := runInstaller(t, bash, server.URL, fake.publicKey, fake.sshPublicKey, filepath.ToSlash(t.TempDir()), "x86_64", args...)
+			if tc.ok && err != nil {
+				t.Fatalf("accepted tag failed: %v\n%s", err, output)
+			}
+			if !tc.ok && (err == nil || !strings.Contains(output, "--version must be a release tag")) {
+				t.Fatalf("invalid tag output %q, error %v", output, err)
+			}
+		})
+	}
+}
+
 func TestInstallerSSHSIGPath(t *testing.T) {
 	bash := installerBash(t)
 	if !installerSSHKeygenYAvailable() {
@@ -335,6 +396,117 @@ func TestInstallerSkipsSystemdInTestMode(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(binDir, "mistgate")); err != nil {
 		t.Fatalf("installed test panel is missing: %v", err)
 	}
+	channelFile := filepath.Join(binDir, "etc", "mistgate", "panel-update-channel")
+	if got, err := os.ReadFile(channelFile); err != nil || string(got) != "stable\n" {
+		t.Fatalf("default allowed channel file = %q, %v; want stable", got, err)
+	}
+	if info, err := os.Stat(channelFile); err != nil || info.Mode().Perm() != 0o644 {
+		t.Fatalf("allowed channel file mode = %v, %v; want 0644", info, err)
+	}
+
+	devBase := t.TempDir()
+	devBinDir := filepath.Join(devBase, "bin")
+	devDataDir := filepath.Join(devBase, "data")
+	devArgs := []string{"--public-url", "https://panel.example.com", "--version", installerTestVersion,
+		"--data-dir", devDataDir, "--yes", "--channel", "dev"}
+	output, err = runInstaller(t, bash, server.URL, release.publicKey, release.sshPublicKey, filepath.ToSlash(devBinDir), "x86_64", devArgs...)
+	if err != nil {
+		t.Fatalf("dev installer failed: %v\n%s", err, output)
+	}
+	devChannelFile := filepath.Join(devBinDir, "etc", "mistgate", "panel-update-channel")
+	if got, err := os.ReadFile(devChannelFile); err != nil || string(got) != "dev\n" {
+		t.Fatalf("selected allowed channel file = %q, %v; want dev", got, err)
+	}
+}
+
+func TestInstallerRestoresAnEncryptedBackupBeforeTheFirstStart(t *testing.T) {
+	bash := installerBash(t)
+	if !installerSSHKeygenYAvailable() && !installerOpenSSL32Available() {
+		t.Skip("neither supported signature verification path is installed")
+	}
+	release := newFakePanelRelease(t)
+	release.assets[installerTestBinary] = []byte(`#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${1:-} == backup && ${2:-} == restore ]]; then
+  shift 2
+  target=""
+  passphrase=""
+  while (($#)); do
+    case "$1" in
+      --data-dir) target=$2; shift 2 ;;
+      --passphrase-file) [[ -r "$2" ]]; passphrase=$(cat -- "$2"); shift 2 ;;
+      --file|--identity-file) [[ -r "$2" ]]; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [[ "$passphrase" != "wrong passphrase" ]] || exit 10
+  [[ -n "$target" ]]
+  mkdir -p -- "$target"
+  printf '%s' restored-master-key > "$target/master.key"
+  printf '%s\n' 'Panel URL: https://panel.example.com/control/'
+  exit 0
+fi
+if [[ ${1:-} == setup ]]; then
+  printf '%s\n' 'Data dir: /tmp/mistgate-test' 'Admin URL: https://panel.example.com/test/' 'Setup link: https://panel.example.com/test/setup#` + installerTestToken + `'
+  exit 0
+fi
+exit 2
+`)
+	release.updateBinaryMetadata(t)
+	release.resign(t)
+	server := release.server()
+	defer server.Close()
+	base := t.TempDir()
+	archive := filepath.Join(base, "mistgate-backup.tar.gz.age")
+	identity := filepath.Join(base, "recovery.txt")
+	passphrase := filepath.Join(base, "passphrase.txt")
+	wrongPassphrase := filepath.Join(base, "wrong-passphrase.txt")
+	for path, value := range map[string]string{archive: "encrypted archive fixture", identity: "AGE-SECRET-KEY-1TEST", passphrase: "installer secret passphrase", wrongPassphrase: "wrong passphrase"} {
+		if err := os.WriteFile(path, []byte(value), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Dry run exercises the same installed binary's backup restore command while leaving the host and install paths alone.
+	dryBinDir := filepath.Join(base, "dry-bin")
+	dryDataDir := filepath.Join(base, "dry-data")
+	output, err := runInstaller(t, bash, server.URL, release.publicKey, release.sshPublicKey, filepath.ToSlash(dryBinDir), "x86_64",
+		"--restore", archive, "--identity-file", identity, "--data-dir", dryDataDir, "--dry-run")
+	if err != nil || !strings.Contains(output, "would restore the verified backup") || !strings.Contains(output, "panel.example.com") || strings.Contains(output, "Setup link") {
+		t.Fatalf("restore dry run output %q, error %v", output, err)
+	}
+	if _, err := os.Stat(dryDataDir); !os.IsNotExist(err) {
+		t.Fatalf("dry run created its requested data directory: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dryBinDir, "mistgate")); !os.IsNotExist(err) {
+		t.Fatalf("dry run installed a binary: %v", err)
+	}
+
+	// The passphrase is read from a file, restored master.key is retained, and no one-time setup link is printed.
+	installBinDir := filepath.Join(base, "install-bin")
+	installDataDir := filepath.Join(base, "installed-data")
+	output, err = runInstaller(t, bash, server.URL, release.publicKey, release.sshPublicKey, filepath.ToSlash(installBinDir), "x86_64",
+		"--restore", archive, "--passphrase-file", wrongPassphrase, "--data-dir", installDataDir, "--yes")
+	if err == nil || !strings.Contains(output, "the backup archive or recovery key could not be verified") {
+		t.Fatalf("wrong-key restore output %q, error %v", output, err)
+	}
+	if _, err := os.Stat(filepath.Join(installBinDir, "mistgate")); !os.IsNotExist(err) {
+		t.Fatalf("wrong key left an installed binary behind: %v", err)
+	}
+	if _, err := os.Stat(installDataDir); !os.IsNotExist(err) {
+		t.Fatalf("wrong key left a data directory behind: %v", err)
+	}
+	output, err = runInstaller(t, bash, server.URL, release.publicKey, release.sshPublicKey, filepath.ToSlash(installBinDir), "x86_64",
+		"--restore", archive, "--passphrase-file", passphrase, "--data-dir", installDataDir, "--yes")
+	if err != nil {
+		t.Fatalf("restore install failed: %v\n%s", err, output)
+	}
+	if !strings.Contains(output, "Point panel.example.com at this server; nodes reconnect by themselves.") || strings.Contains(output, "Setup link") || strings.Contains(output, "installer secret passphrase") {
+		t.Fatalf("restore install output leaked or omitted expected text: %s", output)
+	}
+	if got, err := os.ReadFile(filepath.Join(installDataDir, "master.key")); err != nil || string(got) != "restored-master-key" {
+		t.Fatalf("restored master.key = %q, %v", got, err)
+	}
 }
 
 type fakePanelRelease struct {
@@ -343,6 +515,7 @@ type fakePanelRelease struct {
 	private      ed25519.PrivateKey
 	publicKey    string
 	sshPublicKey string
+	draft        bool
 }
 
 func newFakePanelRelease(t *testing.T) *fakePanelRelease {
@@ -374,6 +547,18 @@ func newFakePanelReleaseForVersion(t *testing.T, version string) *fakePanelRelea
 	return r
 }
 
+func (r *fakePanelRelease) withVersion(t *testing.T, version string) *fakePanelRelease {
+	t.Helper()
+	copyRelease := &fakePanelRelease{
+		assets:   map[string][]byte{installerTestBinary: append([]byte(nil), r.assets[installerTestBinary]...)},
+		manifest: r.manifest, private: r.private, publicKey: r.publicKey, sshPublicKey: r.sshPublicKey,
+	}
+	copyRelease.manifest.Version = version
+	copyRelease.updateBinaryMetadata(t)
+	copyRelease.resign(t)
+	return copyRelease
+}
+
 func (r *fakePanelRelease) updateBinaryMetadata(t *testing.T) {
 	t.Helper()
 	body := r.assets[installerTestBinary]
@@ -400,15 +585,62 @@ func (r *fakePanelRelease) resign(t *testing.T) {
 }
 
 func (r *fakePanelRelease) server() *httptest.Server {
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		asset := filepath.Base(req.URL.Path)
-		body, ok := r.assets[asset]
-		if !ok {
-			http.NotFound(w, req)
+	server, _ := fakePanelReleaseServer(r)
+	return server
+}
+
+func fakePanelReleaseServer(releases ...*fakePanelRelease) (*httptest.Server, *[]string) {
+	var requestedTags []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/releases" && req.URL.Query().Get("per_page") == "30" {
+			// The shape GitHub sends: one line, the author and the assets nested in each release, and notes whose text may
+			// quote the keys the installer looks for (escaped in the JSON, so they must never count).
+			type asset struct {
+				Name  string `json:"name"`
+				Draft bool   `json:"draft"`
+			}
+			type releaseRow struct {
+				URL        string         `json:"url"`
+				Author     map[string]any `json:"author"`
+				TagName    string         `json:"tag_name"`
+				HTMLURL    string         `json:"html_url"`
+				Name       string         `json:"name"`
+				Draft      bool           `json:"draft"`
+				Prerelease bool           `json:"prerelease"`
+				Assets     []asset        `json:"assets"`
+				Body       string         `json:"body"`
+			}
+			list := make([]releaseRow, 0, len(releases))
+			for _, r := range releases {
+				channel, _ := release.ChannelOf(r.manifest.Version)
+				list = append(list, releaseRow{URL: "https://api.github.com/repos/Mistgate/mistgate/releases/1", Author: map[string]any{"login": "github-actions[bot]", "site_admin": false},
+					TagName: r.manifest.Version, HTMLURL: "https://github.com/Mistgate/mistgate/releases/tag/" + r.manifest.Version, Name: r.manifest.Version,
+					Draft: r.draft, Prerelease: channel != release.ChannelStable, Assets: []asset{{Name: "SHA256SUMS"}},
+					Body: "## Notes\r\nNot a release: \"tag_name\":\"v99.0.0\",\"draft\":false"})
+			}
+			body, _ := json.Marshal(list)
+			_, _ = w.Write(body)
 			return
 		}
-		_, _ = w.Write(body)
+		parts := strings.Split(strings.Trim(req.URL.Path, "/"), "/")
+		asset := filepath.Base(req.URL.Path)
+		tag := ""
+		if len(parts) >= 2 {
+			tag = parts[len(parts)-2]
+		}
+		for _, r := range releases {
+			if r.manifest.Version != tag {
+				continue
+			}
+			if body, ok := r.assets[asset]; ok {
+				requestedTags = append(requestedTags, tag)
+				_, _ = w.Write(body)
+				return
+			}
+		}
+		http.NotFound(w, req)
 	}))
+	return server, &requestedTags
 }
 
 func runInstaller(t *testing.T, bash, baseURL, key, sshPublicKey, binDir, arch string, args ...string) (string, error) {
@@ -435,7 +667,7 @@ func runInstallerWithPath(t *testing.T, bash, baseURL, key, sshPublicKey, binDir
 func installerPathWithoutSignatureTools(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	for _, name := range []string{"curl", "sha256sum", "base64", "awk", "grep", "install", "mktemp", "sed", "wc", "tr", "date", "uname", "rm"} {
+	for _, name := range []string{"curl", "sha256sum", "base64", "awk", "grep", "install", "mktemp", "ln", "sed", "wc", "tr", "date", "sort", "tail", "cut", "uname", "rm"} {
 		path, err := exec.LookPath(name)
 		if err != nil {
 			t.Fatalf("required installer command %s: %v", name, err)
@@ -462,6 +694,7 @@ func installerTestEnv(baseURL, key, sshPublicKey, binDir, arch, skipSystemd, ski
 		"MISTGATE_INSTALL_TEST_ARCH="+arch,
 		"MISTGATE_INSTALL_TEST_OS=Linux",
 		"MISTGATE_INSTALL_TEST_BIN_DIR="+binDir,
+		"MISTGATE_INSTALL_TEST_ETC_DIR="+filepath.Join(binDir, "etc"),
 		"MISTGATE_INSTALL_SKIP_SYSTEMD="+skipSystemd,
 		"MISTGATE_INSTALL_SKIP_PORT_CHECK="+skipPortCheck,
 	)
@@ -481,6 +714,10 @@ func TestInstallerUnitMatchesDocs(t *testing.T) {
 		"$service_command", "/usr/local/bin/mistgate serve --listen :443 --acme-domain panel.example.com",
 		"$data_dir", "/var/lib/mistgate",
 	).Replace(string(m[1]))
+	if !strings.Contains(unit, "Environment=MISTGATE_UPDATE_CHANNEL=$channel") {
+		t.Fatal("systemd unit does not pass the installer's update channel")
+	}
+	unit = regexp.MustCompile(`(?m)^Environment=MISTGATE_UPDATE_CHANNEL=\$channel\n`).ReplaceAllString(unit, "")
 	for _, lang := range []string{"en", "ru"} {
 		doc, err := os.ReadFile(filepath.Join("..", "docs", lang, "getting-started", "install-panel.md"))
 		if err != nil {

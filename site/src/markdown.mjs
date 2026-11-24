@@ -3,7 +3,7 @@ import MarkdownIt from "markdown-it";
 import anchor from "markdown-it-anchor";
 import { createHighlighter } from "shiki";
 import { existsSync } from "node:fs";
-import { posix, join } from "node:path";
+import { posix, join, dirname } from "node:path";
 import { pageUrl } from "./urls.mjs";
 import { icon } from "./icons.mjs";
 import { inlineSvg, mermaidSvg } from "./diagrams.mjs";
@@ -11,6 +11,11 @@ import { parseRoadmap, roadmapTokens } from "./roadmap.mjs";
 
 const LANGS = ["sh", "yaml", "json", "ini", "toml", "javascript", "typescript", "go", "sql", "diff"];
 const ALIAS = { bash: "sh", shell: "sh", shellscript: "sh", zsh: "sh", console: "sh", yml: "yaml", js: "javascript", ts: "typescript", conf: "ini", text: "text", txt: "text", plain: "text", plaintext: "text", "": "text" };
+
+// the poster of a product video in the docs: images/video/<name>-poster-<lang>.webp
+const VIDEO_POSTER = /images\/video\/([a-z]+)-poster-([a-z]+)\.webp$/;
+// a loop of the admin (docs/images/readme/<name>-dark-en.webp, and its -light- twin): shown in the theme the reader has
+const CLIP = /images\/readme\/([a-z0-9]+(?:-[a-z0-9]+)*)-dark-([a-z]+)\.webp$/;
 
 export async function createHl() {
   const hl = await createHighlighter({ themes: ["github-light", "github-dark"], langs: LANGS });
@@ -29,19 +34,26 @@ const slugify = (s) => s.trim().toLowerCase().replace(/[^\p{L}\p{N}\s-]/gu, "").
 
 // "> **Note:** ..." and friends; GitHub shows the same blockquote, the wiki turns it into an alert (wiki.mjs ALERTS)
 // zh: "注意：" with the full-width colon inside the bold text is read like "Note:" (confirmed by the zh glossary)
-const CALLOUTS = { note: "note", "важно": "note", "注意": "note", tip: "tip", "совет": "tip", "提示": "tip", warning: "warning", "внимание": "warning", "警告": "warning", danger: "danger", "опасно": "danger", "危险": "danger" };
-const CALLOUT_CHIP = { note: ["info", "lavender"], tip: ["sparkle", "mint"], warning: ["warn", "sand"], danger: ["warn", "rose"] };
+// fa: نکته / توصیه / هشدار / خطر; tr: Not / İpucu / Uyarı / Tehlike. Keys are folded (see fold).
+const CALLOUTS = { note: "note", "важно": "note", "注意": "note", "نکته": "note", not: "note", tip: "tip", "совет": "tip", "提示": "tip", "توصیه": "tip", ipucu: "tip", warning: "warning", "внимание": "warning", "警告": "warning", "هشدار": "warning", uyari: "warning", danger: "danger", "опасно": "danger", "危险": "danger", "خطر": "danger", tehlike: "danger" };
+// case-insensitive for Turkish too: "İ".toLowerCase() is "i" + U+0307 and "I" lowers to "i", not "ı", so both i's fold to
+// a plain i; Arabic yeh and kaf fold to the Persian letters an Arabic keyboard does not type
+export const fold = (s) => s.toLowerCase().replace(/\u0307/g, "").replace(/ı/g, "i").replace(/ي/g, "ی").replace(/ك/g, "ک");
+const CALLOUT_CHIP = { note: ["info", "lavender"], tip: ["bolt", "mint"], warning: ["warn", "sand"], danger: ["warn", "rose"] };
 // code block bar: language name and icon; a word after the language (```ini /etc/x.service) names the file instead
 const CODE_NAME = { sh: "Shell", yaml: "YAML", json: "JSON", ini: "INI", toml: "TOML", javascript: "JavaScript", typescript: "TypeScript", go: "Go", sql: "SQL", diff: "Diff" };
-// a table cell that is a yes / no / partial answer becomes a pill (colour + glyph + word, like the panel's status)
-const ANSWER = /^(yes|no|partial|да|нет|частично|是|否|部分)(?=$|[:：]|\s\(|（)/iu;
-const ANSWER_KIND = { yes: "yes", "да": "yes", no: "no", "нет": "no", partial: "part", "частично": "part", "是": "yes", "否": "no", "部分": "part" };
+// a table cell that starts with a yes / no / partial answer (then the end, a colon, a full stop, a comma or a bracket)
+// becomes a pill (colour + glyph + word, like the panel's status)
+const ANSWER = /^(yes|no|partial|да|нет|частично|是|否|部分|بله|خیر|نه|تا حدی|evet|hayır|kısmen)(?=$|[:：.,،，。]|\s\(|（)/iu;
+const ANSWER_KIND = { yes: "yes", "да": "yes", no: "no", "нет": "no", partial: "part", "частично": "part", "是": "yes", "否": "no", "部分": "part", "بله": "yes", "خیر": "no", "نه": "no", "تا حدی": "part", evet: "yes", "hayır": "no", "kısmen": "part" };
 // a name worth finding: starts with a letter, a dash or an underscore, no placeholders or prose
 const SEARCHABLE = /^(?=.{3,60}$)(?=.*[A-Za-z])[A-Za-z_-][\w.:=/@-]*(?: [\w.:=/@-]+){0,3}$/;
 const NOISE = new Set(["true", "false", "yes", "no", "on", "off", "http", "https", "localhost"]);
+const safeDecode = (s) => { try { return decodeURIComponent(s); } catch { return s; } };
 const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
-/** @returns {(src: string, env: {lang: string, key: string, dirEn: string, pages: Map<string, object>, warn: Function, headings: object[]}) => string} */
+/** env.english(key), for a language still being translated: the ids of the English page `key` (a page this language lacks), or null.
+ *  @returns {(src: string, env: {lang: string, key: string, dirEn: string, pages: Map<string, object>, english?: Function, warn: Function, headings: object[]}) => string} */
 export function createRenderer(lang, t, highlight) {
   const md = new MarkdownIt({ html: false, linkify: false, typographer: false });
 
@@ -73,10 +85,26 @@ export function createRenderer(lang, t, highlight) {
   md.renderer.rules.table_open = (tokens, idx, o, _env, self) => `<div class="table-wrap" role="region" tabindex="0" aria-label="${esc(t.table)}">${self.renderToken(tokens, idx, o)}`;
   md.renderer.rules.table_close = () => "</table></div>\n";
 
-  // ![alt](../diagrams/x.svg) on a line of its own: the SVG is inlined (see diagrams.mjs), alt becomes its name
+  // ![alt](../diagrams/x.svg) on a line of its own: the SVG is inlined (see diagrams.mjs), alt becomes its name;
+  // ![alt](../../images/video/<name>-poster-<lang>.webp): the video it is the poster of, played on the page
   const image = md.renderer.rules.image;
   md.renderer.rules.image = (tokens, idx, o, env, self) => {
     const tok = tokens[idx], src = tok.attrGet("src") ?? "";
+    const clip = CLIP.exec(src);
+    if (clip) {
+      const alt = self.renderInlineAsText(tok.children, o, env);
+      const [, name, l] = clip;
+      return `<figure class="shot shot--clip"><img class="shot__dark" src="/img/readme/${name}-dark-${l}.webp" alt="${esc(alt)}" width="840" loading="lazy"><img class="shot__light" src="/img/readme/${name}-light-${l}.webp" alt="${esc(alt)}" width="840" loading="lazy"></figure>`;
+    }
+    const video = VIDEO_POSTER.exec(src);
+    if (video) {
+      const alt = self.renderInlineAsText(tok.children, o, env);
+      // a language without its own recording or poster yet gets the English one
+      const [, name, l] = video, dir = dirname(join(env.dir, src));
+      const pick = (file) => { if (existsSync(join(dir, file(l)))) return l; env.warn(`${file(l)} does not exist, showing ${file("en")}`); return "en"; };
+      const vl = pick((x) => `${name}-${x}.mp4`), pl = pick((x) => `${name}-poster-${x}.webp`);
+      return `<figure class="shot shot--video"><video src="/video/${name}-${vl}.mp4" poster="/video/${name}-poster-${pl}.webp" width="1280" height="720" controls muted playsinline preload="none" aria-label="${esc(alt)}"></video></figure>`;
+    }
     if (!src.endsWith(".svg") || /^([a-z][a-z0-9+.-]*:|\/)/i.test(src)) return image(tokens, idx, o, env, self);
     const alt = self.renderInlineAsText(tok.children, o, env);
     if (!alt) env.warn(`diagram ${src} has no alt text`);
@@ -90,7 +118,7 @@ export function createRenderer(lang, t, highlight) {
   md.core.ruler.push("mg_figures", (state) => {
     state.tokens.forEach((tok, i) => {
       const ch = tok.type === "inline" && tok.children?.filter((c) => !(c.type === "text" && !c.content.trim()));
-      if (ch?.length === 1 && ch[0].type === "image" && /\.svg$/.test(ch[0].attrGet("src")) && state.tokens[i - 1].type === "paragraph_open") {
+      if (ch?.length === 1 && ch[0].type === "image" && (/\.svg$/.test(ch[0].attrGet("src")) || VIDEO_POSTER.test(ch[0].attrGet("src")) || CLIP.test(ch[0].attrGet("src"))) && state.tokens[i - 1].type === "paragraph_open") {
         state.tokens[i - 1].hidden = state.tokens[i + 1].hidden = true;
       }
     });
@@ -104,17 +132,18 @@ export function createRenderer(lang, t, highlight) {
       const ch = tk[i + 2].children;
       while (ch?.[0]?.type === "text" && ch[0].content === "") ch.shift();
       if (ch?.[0]?.type !== "strong_open" || ch[1]?.type !== "text" || ch[2]?.type !== "strong_close") continue;
-      const kind = CALLOUTS[ch[1].content.replace(/[:：]$/, "").trim().toLowerCase()];
+      const kind = CALLOUTS[fold(ch[1].content.trim().replace(/[:：]$/, "").trim())];
       if (!kind || !/[:：]$/.test(ch[1].content.trim())) continue;
-      const label = ch[1].content.replace(/[:：]$/, "").trim();
+      const label = t.callouts?.[kind] ?? ch[1].content.trim().replace(/[:：]$/, "").trim();
       ch.splice(0, 3);
-      if (ch[0]?.type === "text") ch[0].content = ch[0].content.replace(/^\s+/, "");
+      // the label now stands on its own line, so text that ran on after "Tip:" in lower case starts a sentence (code stays as written)
+      if (ch[0]?.type === "text") ch[0].content = ch[0].content.replace(/^\s+/, "").replace(/^\p{Ll}/u, (c) => c.toLocaleUpperCase(lang));
       let depth = 0, close = -1;
       for (let j = i; j < tk.length; j++) { if (tk[j].type === "blockquote_open") depth++; if (tk[j].type === "blockquote_close" && --depth === 0) { close = j; break; } }
       tk[i].tag = "div"; tk[i].attrJoin("class", `callout callout--${kind}`); tk[i].attrSet("role", "note");
       tk[close].tag = "div";
       const head = new state.Token("html_block", "", 0);
-      head.content = `<div class="callout__label"><span class="id-chip" data-tone="${CALLOUT_CHIP[kind][1]}">${icon(CALLOUT_CHIP[kind][0], 13)}</span><span>${esc(label)}</span></div><div class="callout__body">\n`;
+      head.content = `<div class="callout__label"><span class="id-chip" data-tone="${CALLOUT_CHIP[kind][1]}">${icon(CALLOUT_CHIP[kind][0], 14)}</span><span>${esc(label)}</span></div><div class="callout__body">\n`;
       const tail = new state.Token("html_block", "", 0);
       tail.content = "</div>\n";
       tk.splice(close, 0, tail);
@@ -154,7 +183,7 @@ export function createRenderer(lang, t, highlight) {
             if (!m) return;
             const pill = new state.Token("html_inline", "", 0);
             pill.content = `<span class="yn yn--${ANSWER_KIND[m[1].toLowerCase()]}"><span class="yn__g" aria-hidden="true"></span>${esc(m[1])}</span>`;
-            c.children[0].content = c.children[0].content.slice(m[1].length).replace(/^[:：]\s*/, " ");
+            c.children[0].content = c.children[0].content.slice(m[1].length).replace(/^[:：.,،，。]\s*/, " ");
             c.children.unshift(pill);
           });
         });
@@ -202,12 +231,19 @@ export function createRenderer(lang, t, highlight) {
           const dir = posix.dirname(env.key === "index" ? "index" : env.key);
           const target = posix.normalize(posix.join(dir === "." ? "" : dir, m[1]));
           if (env.pages.has(target)) { tok.attrSet("href", pageUrl(lang, target) + (m[2] ?? "")); stack.push(false); return; }
+          // a language still being translated: the English page, with the anchor when the English page has it
+          const ids = env.english?.(target);
+          if (ids) {
+            let frag = m[2] ?? "";
+            if (frag && !ids.has(safeDecode(frag.slice(1)))) { env.warn(`link ${safeDecode(href)}: the English page has no ${safeDecode(frag)}, linked without it`); frag = ""; }
+            tok.attrSet("href", pageUrl("en", target) + frag); tok.attrSet("hreflang", "en"); stack.push(false); return;
+          }
           env.warn(`link to a page that does not exist yet: ${href}`);
           tok.tag = "span"; tok.attrs = [["class", "pending"], ["title", t.pending]];
           stack.push(true);
         } else if (tok.type === "link_close") {
           if (stack.pop()) tok.tag = "span";
-        } else if (tok.type === "strong_open" && blk.children[n + 1]?.type === "text" && /^(Planned|Планируется|计划中)$/.test(blk.children[n + 1].content)) {
+        } else if (tok.type === "strong_open" && blk.children[n + 1]?.type === "text" && /^(Planned|Планируется|计划中|برنامه\u200c?ریزی\u200c?شده|Planlanıyor)$/.test(blk.children[n + 1].content)) {
           tok.attrJoin("class", "planned");
         }
       });

@@ -4,9 +4,11 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { Role } from "@/gen/mistgate/admin/v1/auth_pb";
 import { NodeStatus } from "@/gen/mistgate/admin/v1/common_pb";
+import { fill, type T } from "@/i18n";
 import { en } from "@/i18n/en";
+import { setEffectsEnabled } from "@/lib/effects";
 import { reasons } from "@/lib/port-check";
-import { CheckPortsButton, Ports, usePortCheck } from "./ports";
+import { CheckPortsButton, Ports, REVEAL_MS, usePortCheck, verdictPill } from "./ports";
 
 /** The block as the Direct way in shows it: the button in its action bar, the rows above. */
 function Block({ data }: { data: never }) {
@@ -26,7 +28,11 @@ vi.mock("@tanstack/react-router", () => ({
 }));
 vi.mock("@/lib/api", async (orig) => ({
   ...(await orig<object>()),
-  nodes: { checkPorts: (...a: unknown[]) => checkPorts(...a) },
+  nodes: {
+    checkPorts: (...a: unknown[]) => checkPorts(...a),
+    // the fleet list names the senders' countries: minsk1 is in the CIS, fi1 outside it
+    listNodes: () => Promise.resolve({ nodes: [{ id: "nod_m", name: "minsk1", countryCode: "BY" }, { id: "nod_f", name: "fi1", countryCode: "FI" }] }),
+  },
   auth: { me: () => Promise.resolve({ admin: { id: "adm_1", role } }) },
 }));
 
@@ -79,7 +85,8 @@ describe("the stored results", () => {
     await mount(data());
     // the title is the Direct way in's block heading (ways.tsx)
     expect(text()).toContain(en["ports.never"]);
-    expect(rows()).toEqual([]);
+    // the profile that listens has its row all the same, with no verdict
+    expect(rows()).toEqual(["hy2 · 443udp/443Not checked—"]);
     expect(button("Check ports")).toBeDefined();
   });
 
@@ -132,6 +139,146 @@ describe("the stored results", () => {
   });
 });
 
+describe("a port checked again from a second sender", () => {
+  const twice = (over: Record<string, unknown>) => check({ sender: "minsk1", senderVerdict: "ok", confirmSender: "fi1", confirmSent: 300, confirmGot: 300, confirmVerdict: "ok", blame: "", ...over });
+  const row = (port: number) => [...document.querySelectorAll("li")].find((li) => li.textContent?.includes(`udp/${port}`));
+
+  it("shows both runs and clears the port when only one sender lost packets, naming that sender and its region", async () => {
+    await mount(
+      data({
+        inbounds: [inbound({}), inbound({ id: "inb_2", profileName: "TUIC · 2053", port: 2053 }), inbound({ id: "inb_3", profileName: "hy2 · 8443", port: 8443 })],
+        portChecks: [
+          twice({}),
+          twice({ port: 2053, got: 236, senderVerdict: "lossy", confirmGot: 299, blame: "path" }),
+          // the confirmation sender is the one that lost them
+          twice({ port: 8443, confirmGot: 262, confirmVerdict: "lossy", blame: "path" }),
+        ],
+      }),
+    );
+    // clean from both: both runs, no verdict line
+    expect(row(443)?.textContent).toContain("from minsk1 300/300 · from fi1 300/300 · 2 min ago");
+    expect(row(443)?.querySelector("[data-blame]")).toBeNull();
+    expect(row(2053)?.textContent).toContain("OK");
+    expect(row(2053)?.textContent).toContain("from minsk1 236/300 · from fi1 299/300 · 2 min ago");
+    expect(row(2053)?.querySelector("[data-blame=path]")?.textContent).toBe("The port is fine: packets get lost on the way from minsk1 (CIS).");
+    expect(row(8443)?.querySelector("[data-blame=path]")?.textContent).toBe("The port is fine: packets get lost on the way from fi1 (outside the CIS).");
+    // the run that lost packets is the one in the warning tone; the single-sender words are gone
+    expect([...row(2053)!.querySelectorAll(".text-warn-text")].map((s) => s.textContent)).toEqual(["from minsk1 236/300"]);
+    expect(row(2053)?.textContent).not.toContain("arrived");
+    // a share lost here and there is a lossy line, not a filter: no caption
+    expect(document.querySelector("[data-testid=udp-filter]")).toBeNull();
+  });
+
+  it("says under the UDP rows that the way from a sender is filtered when some ports arrive whole and the rest get nothing", async () => {
+    await mount(
+      data({
+        inbounds: [inbound({}), inbound({ id: "inb_2", profileName: "TUIC · 2053", port: 2053 }), inbound({ id: "inb_3", profileName: "hy2 · 8443", port: 8443 })],
+        portChecks: [twice({}), twice({ port: 2053, got: 0, senderVerdict: "broken", blame: "path" }), twice({ port: 8443, got: 0, senderVerdict: "broken", blame: "path" })],
+        tcpChecks: [tcp({})],
+      }),
+    );
+    const caption = document.querySelector("[data-testid=udp-filter]");
+    expect(caption?.textContent).toBe(
+      "From minsk1, UDP arrives only on 443: a filter on the way (often the hoster’s DDoS protection). Port checks from minsk1 do not pass; this is not de1 breaking, and people on home networks usually connect.",
+    );
+    // right under the UDP rows, above the TCP ones
+    const items = [...document.querySelectorAll("li")];
+    expect(items.indexOf(caption as HTMLLIElement)).toBe(items.indexOf(row(8443)!) + 1);
+    expect(items.at(-1)?.textContent).toContain("tcp/80");
+    // the ports stay fine; the sender's empty runs are amber, not red, and the line under them names the filter
+    expect(row(2053)?.textContent).toContain("udp/2053OK");
+    expect([...row(2053)!.querySelectorAll(".text-warn-text")].map((s) => s.textContent)).toEqual(["from minsk1 0/300"]);
+    expect(row(2053)?.querySelector(".text-danger-text")).toBeNull();
+    expect(row(8443)?.querySelector("[data-blame=path]")?.textContent).toBe("The port is fine: UDP from minsk1 is filtered on the way.");
+  });
+
+  it("has no filter caption when every run was clean", async () => {
+    await mount(data({ portChecks: [twice({}), twice({ port: 2053 })] }));
+    expect(document.querySelector("[data-testid=udp-filter]")).toBeNull();
+  });
+
+  it("puts the loss on the node's port when both senders lost packets", async () => {
+    await mount(data({ portChecks: [twice({ verdict: "lossy", got: 241, senderVerdict: "lossy", confirmGot: 238, confirmVerdict: "lossy", blame: "node" })] }));
+    expect(rows()[0]).toContain("Loses 20 %");
+    expect(rows()[0]).toContain("from minsk1 241/300 · from fi1 238/300");
+    expect(row(443)?.querySelector("[data-blame=node]")?.textContent).toBe(en["ports.blame.node"]);
+    expect([...row(443)!.querySelectorAll(".text-warn-text")].map((s) => s.textContent)).toEqual(["from minsk1 241/300", "from fi1 238/300"]);
+  });
+
+  it("leaves out the region of a sender the fleet list does not have (the panel)", async () => {
+    await mount(data({ portChecks: [twice({ sender: "panel", got: 236, senderVerdict: "lossy", confirmGot: 299, blame: "path" })] }));
+    expect(rows()[0]).toContain("from the panel 236/300");
+    expect(row(443)?.querySelector("[data-blame=path]")?.textContent).toBe("The port is fine: packets get lost on the way from the panel.");
+  });
+});
+
+describe("a port whose test is blocked while the protocol works", () => {
+  // the hoster's filter in front of de1: only 443 arrives from minsk1 and fi1, the panel's AmneziaWG check through 2053 passes
+  const both = (over: Record<string, unknown>) =>
+    check({ sent: 150, got: 150, sender: "minsk1", senderVerdict: "ok", confirmSender: "fi1", confirmSent: 150, confirmGot: 150, confirmVerdict: "ok", blame: "", ...over });
+  const lost = { verdict: "broken", got: 0, senderVerdict: "broken", confirmGot: 0, confirmVerdict: "broken", blame: "node" };
+  const inbounds = [inbound({ protocol: "hysteria2" }), inbound({ id: "inb_2", profileName: "AWG · 2053", protocol: "awg", port: 2053 }), inbound({ id: "inb_3", profileName: "hy2 · 8443", protocol: "hysteria2", port: 8443 })];
+  const row = (port: number) => [...document.querySelectorAll("li")].find((li) => li.textContent?.includes(`udp/${port}`));
+  const tEn = ((key: keyof typeof en, vars?: Record<string, string | number>) => fill(en[key], vars)) as unknown as T;
+
+  it("says the test is blocked in amber, keeps the counts quiet and names the protocol whose check passes", async () => {
+    await mount(data({ inbounds, portChecks: [both({}), both({ port: 2053, ...lost, protocolOkUnix: now - 60 })] }));
+    expect(row(2053)?.textContent).toContain("udp/2053Test blocked");
+    expect(row(2053)?.textContent).toContain("from minsk1 0/150 · from fi1 0/150 · 2 min ago");
+    expect(row(2053)?.querySelector(".wy-gs.warn")?.textContent).toBe("Test blocked");
+    // no red, no amber in the counts, and the line under them clears the port instead of blaming it
+    expect(row(2053)?.querySelectorAll(".text-danger-text, .text-warn-text")).toHaveLength(0);
+    expect(row(2053)?.querySelector("[data-blame=node]")).toBeNull();
+    expect(row(2053)?.querySelector("[data-blame=blocked]")?.textContent).toBe("The AmneziaWG check through this port passes: the hoster’s filter likely cuts the test packets, not people.");
+    expect(row(2053)?.querySelector("[data-blame=blocked]")?.className).toContain("tone-ok");
+  });
+
+  it("reads the same for a port checked from one sender, with a protocol check up to 15 minutes before the run", async () => {
+    await mount(data({ inbounds, portChecks: [check({ sent: 150, got: 150 }), check({ port: 2053, verdict: "broken", sent: 150, got: 0, protocolOkUnix: now - 120 - 15 * 60 })] }));
+    expect(row(2053)?.textContent).toContain("Test blocked");
+    expect(row(2053)?.textContent).toContain("0 of 150 arrived · 2 min ago · from de2");
+    expect(row(2053)?.querySelector("[data-blame=blocked]")?.textContent).toContain("The AmneziaWG check");
+  });
+
+  it("keeps the loss in red when the protocol check failed too or is older than the window", async () => {
+    await mount(
+      data({
+        inbounds,
+        portChecks: [both({}), both({ port: 8443, ...lost, protocolOkUnix: 0 }), check({ port: 2053, verdict: "lossy", sent: 150, got: 120, protocolOkUnix: now - 120 - 15 * 60 - 1 })],
+      }),
+    );
+    expect(row(8443)?.textContent).toContain("100 % lost");
+    expect(row(8443)?.querySelector("[data-blame=node]")?.textContent).toBe(en["ports.blame.node"]);
+    expect([...row(8443)!.querySelectorAll(".text-danger-text")].map((s) => s.textContent)).toEqual(["from minsk1 0/150", "from fi1 0/150"]);
+    expect(row(2053)?.textContent).toContain("Loses 20 %");
+    expect(row(2053)?.querySelector("[data-blame=blocked]")).toBeNull();
+  });
+
+  it("puts the hoster's filter under the UDP rows when the node is marked filtered, in place of a sender's caption", async () => {
+    // fi1 got through on 2053 where minsk1 got nothing: alone that is minsk1's caption; the node's mark says more
+    const path = both({ port: 2053, got: 0, senderVerdict: "broken", blame: "path" });
+    await mount(data({ inbounds, portChecks: [both({}), path, both({ port: 8443, ...lost, protocolOkUnix: now - 60 })], tcpChecks: [tcp({})], udpFilteredUnix: now - 600 }));
+    const caption = document.querySelector("[data-testid=udp-filtered]");
+    expect(caption?.textContent).toBe(en["ports.filter.hoster"]);
+    expect(document.querySelector("[data-testid=udp-filter]")).toBeNull();
+    const items = [...document.querySelectorAll("li")];
+    expect(items.indexOf(caption as HTMLLIElement)).toBe(items.indexOf(row(8443)!) + 1);
+    expect(caption?.querySelector("svg")?.getAttribute("class")).toContain("tone-warn");
+  });
+
+  it("has no hoster caption without the mark", async () => {
+    await mount(data({ inbounds, portChecks: [both({}), both({ port: 2053, ...lost, protocolOkUnix: now - 60 })], udpFilteredUnix: 0 }));
+    expect(document.querySelector("[data-testid=udp-filtered]")).toBeNull();
+  });
+
+  it("gives the profile row's dot the same calm pill", () => {
+    const c = { verdict: "broken", sent: 150, got: 0, checkedUnix: now - 120 };
+    expect(verdictPill(tEn, { ...c, protocolOkUnix: now - 60 })).toEqual({ kind: "warn", label: "Test blocked" });
+    expect(verdictPill(tEn, { ...c, protocolOkUnix: 0 })).toEqual({ kind: "bad", label: "100 % lost" });
+    expect(verdictPill(tEn, c)).toEqual({ kind: "bad", label: "100 % lost" });
+  });
+});
+
 describe("the TCP rows and the renewal line", () => {
   const vless = inbound({ id: "inb_v", profileName: "VLESS · 443", port: 443, protocol: "vless" });
 
@@ -167,15 +314,17 @@ describe("the TCP rows and the renewal line", () => {
 
   it("shows only TCP rows when there are no UDP ones, and is no longer 'never checked'", async () => {
     await mount(data({ inbounds: [vless], tcpChecks: [tcp({})] }));
-    expect(rows()).toHaveLength(1);
+    // the certificates' port, then the VLESS profile whose port was never probed
+    expect(rows()).toHaveLength(2);
     expect(rows()[0]).toContain("tcp/80");
     expect(text()).not.toContain(en["ports.never"]);
   });
 
   it("names the reason of a row that could not be probed", async () => {
     await mount(data({ tcpChecks: [tcp({ verdict: "", reason: "agent_too_old", sender: "" })] }));
-    expect(rows()[0]).toContain(en["ports.unchecked"]);
-    expect(rows()[0]).toContain(en["ports.short.agent_too_old"]);
+    const tcpRow = rows().find((r) => r?.includes("tcp/80"));
+    expect(tcpRow).toContain(en["ports.unchecked"]);
+    expect(tcpRow).toContain(en["ports.short.agent_too_old"]);
   });
 
   it("says the certificates renew when port 80 is ours", async () => {
@@ -250,7 +399,7 @@ describe("running the check", () => {
     await click(button("Check ports"));
     await settle();
     expect(text()).toContain(en["ports.why.same_host"]);
-    expect(rows()).toEqual([]);
+    expect(rows().join()).not.toContain("tcp/");
   });
 
   it("says why when the TCP part of a run could not probe anything", async () => {
@@ -267,5 +416,39 @@ describe("running the check", () => {
     await click(button("Check ports"));
     await settle();
     expect(text()).toContain(en["err.generic"]);
+  });
+});
+
+describe("the answer read out row by row", () => {
+  const two = () => data({ inbounds: [inbound({}), inbound({ id: "inb_2", profileName: "hy2 · 8443", port: 8443 })], portChecks: [check({}), check({ port: 8443 })] });
+  const phases = () => [...document.querySelectorAll("[data-testid=port-row]")].map((li) => ["now", "wait", "got"].find((c) => li.classList.contains(c)) ?? "");
+
+  it("shows the whole answer at once with the effects off", async () => {
+    setEffectsEnabled(false);
+    checkPorts.mockResolvedValue({ ports: [check({}), check({ port: 8443 })], tcp: [], errorCode: "", sender: "de2" });
+    await mount(two());
+    await click(button("Check ports"));
+    await settle();
+    expect(phases()).toEqual(["", ""]);
+  });
+
+  it("with the effects on: the first row is being checked, the others wait, then the rows get their result one after another", async () => {
+    setEffectsEnabled(true);
+    try {
+      vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+      checkPorts.mockResolvedValue({ ports: [check({}), check({ port: 8443 })], tcp: [], errorCode: "", sender: "de2" });
+      await mount(two());
+      await click(button("Check ports"));
+      await settle();
+      expect(phases()).toEqual(["now", "wait"]);
+      expect(rows()[0]).toContain("Checking…");
+      await act(async () => void vi.advanceTimersByTime(REVEAL_MS));
+      expect(phases()).toEqual(["got", "now"]);
+      await act(async () => void vi.advanceTimersByTime(REVEAL_MS));
+      expect(phases()).toEqual(["", ""]);
+    } finally {
+      vi.useRealTimers();
+      setEffectsEnabled(false);
+    }
   });
 });

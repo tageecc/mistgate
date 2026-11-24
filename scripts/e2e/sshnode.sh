@@ -6,7 +6,8 @@
 # of its own, listens on an address of this run's network namespace and dies with it) on a public-looking address that lives
 # on the namespace's lo (the panel refuses private ones). It runs in a mount namespace of its own (unshare -m), so what the
 # install does to "the host" never reaches the machine the test runs on, and the test itself keeps its /root and /etc:
-#   - /etc/passwd and /etc/shadow: private copies with one-time passwords for root and for one unprivileged login
+#   - /etc: a private copy whose passwd and shadow give root and one unprivileged login one-time passwords (the whole
+#     directory, not files bound over the host's: chpasswd replaces /etc/shadow by a rename, which a bound file refuses)
 #   - /root, /var/lib, /usr/local and /etc/systemd/system: empty tmpfs mounts (the agent lands in /root, /usr/local/bin and
 #     /var/lib/mistgate-node, its unit in /etc/systemd/system)
 #   - /etc/ssl/certs/ca-certificates.crt: the system roots plus the run's CA (the edge edition's Worker serves a certificate
@@ -32,6 +33,7 @@ SSHN_MNT=""
 SSHN_CLOSED_CODE=ssh_fingerprint_unavailable # what a closed port answers; the edge edition's sockets say ssh_target_refused
 SSHN_NODE_BIN_SHA="" # sha256 of the agent the panel is expected to upload (the release's, or the bundle's)
 SSHN_MADE_RUN_SSHD=""
+SSHN_PRIVATE_KEYS=()
 
 # sshn_host <command...>: run something in the sshd's mount namespace, i.e. on "the host"
 sshn_host() { nsenter -t "$SSHN_PID" -m -- "$@"; }
@@ -39,6 +41,7 @@ sshn_host() { nsenter -t "$SSHN_PID" -m -- "$@"; }
 # ---------------------------------------------------------------- sshd and the host around it
 
 sshn_up() {
+  if [ -n "$SSHN_PID" ] && kill -0 "$SSHN_PID" 2>/dev/null; then return 0; fi
   local d=$WORK/sshn
   [ -x /usr/sbin/sshd ] || die "the SSH install steps need openssh-server (/usr/sbin/sshd); apt-get install openssh-server (the system service stays masked)"
   for tool in nsenter unshare ssh-keygen python3; do
@@ -49,6 +52,7 @@ sshn_up() {
   ssh-keygen -q -t ed25519 -N '' -f "$d/host_ed25519" || die "ssh-keygen failed"
   SSHN_FP=$(ssh-keygen -lf "$d/host_ed25519.pub" | awk '{print $2}')
   SSHN_ROOT_PASS=$(openssl rand -hex 12) SSHN_USER_PASS=$(openssl rand -hex 12)
+  SSHN_PASSWORDS=("$SSHN_ROOT_PASS" "$SSHN_USER_PASS")
   SECRETS+=("$SSHN_ROOT_PASS" "$SSHN_USER_PASS")
   # private copies of passwd and shadow: root and the unprivileged login get the one-time passwords
   python3 - "$d" "$SSHN_USER" "$SSHN_ROOT_PASS" "$SSHN_USER_PASS" <<'PY'
@@ -72,6 +76,12 @@ open(d + "/passwd", "w").write(passwd + "%s:x:61999:65534::%s:/bin/sh\n" % (user
 PY
   chmod 600 "$d/shadow"
   cat /etc/ssl/certs/ca-certificates.crt ${CURL_CA:+"$CURL_CA"} >"$d/ca-bundle.crt"
+  # the host's private /etc; the three files are removed first so a symlink among them is replaced, never written through
+  cp -a /etc "$d/etc" || die "could not copy /etc for the SSH host"
+  [ ! -L "$d/etc/ssl" ] && [ ! -L "$d/etc/ssl/certs" ] || die "/etc/ssl/certs is a symlink here; the SSH host needs a directory"
+  rm -f "$d/etc/passwd" "$d/etc/shadow" "$d/etc/ssl/certs/ca-certificates.crt"
+  cp "$d/passwd" "$d/etc/passwd" && cp -p "$d/shadow" "$d/etc/shadow" && cp "$d/ca-bundle.crt" "$d/etc/ssl/certs/ca-certificates.crt" \
+    || die "could not prepare the SSH host's /etc"
   sshn_write_shims
   # sshd insists on its privilege separation directory; the mount namespace cannot hide one that the host lacks
   [ -d /run/sshd ] || { mkdir -p /run/sshd && SSHN_MADE_RUN_SSHD=1; }
@@ -80,10 +90,10 @@ Port 22
 ListenAddress $SSHN_IP
 HostKey $d/host_ed25519
 PidFile $d/sshd.pid
-AuthorizedKeysFile none
+AuthorizedKeysFile .ssh/authorized_keys
 PasswordAuthentication yes
 KbdInteractiveAuthentication no
-PubkeyAuthentication no
+PubkeyAuthentication yes
 UsePAM no
 PermitRootLogin yes
 PermitUserEnvironment yes
@@ -93,9 +103,7 @@ LogLevel VERBOSE
 CONF
   cat >"$d/launch.sh" <<LAUNCH
 set -e
-mount --bind $d/passwd /etc/passwd
-mount --bind $d/shadow /etc/shadow
-mount --bind $d/ca-bundle.crt /etc/ssl/certs/ca-certificates.crt
+mount --bind $d/etc /etc
 mount -t tmpfs -o size=1g,mode=0700 tmpfs /root
 mount -t tmpfs tmpfs /var/lib
 mount -t tmpfs tmpfs /usr/local
@@ -199,7 +207,7 @@ sshn_reset_host() {
   fi
   : >"$WORK/sshn-shim.log"
   rm -f "$SSHN_D/flags/agent.pid" "$SSHN_D/flags/cat-mode" "$SSHN_D/flags/hold-agent"
-  sshn_host sh -c 'rm -rf /var/lib/mistgate-node /root/mistgate-node /root/mistgate-node.new /usr/local/bin/mistgate-node* /etc/systemd/system/mistgate-node.service; mkdir /var/lib/mistgate-node'
+  sshn_host sh -c 'rm -f /root/.ssh/authorized_keys; rm -rf /var/lib/mistgate-node /root/mistgate-node /root/mistgate-node.new /usr/local/bin/mistgate-node* /etc/systemd/system/mistgate-node.service; mkdir /var/lib/mistgate-node'
 }
 
 # sshn_reap: whatever of the host is still running when the test ends: the agent the stand-in started, and anything else in
@@ -219,10 +227,10 @@ ssh_attempts() { grep -c 'Failed password\|Accepted password' "$WORK/sshd.log" |
 
 # ---------------------------------------------------------------- helpers over the admin API
 
-sshn_start() { # <node name> [username] [password]: starts the install job, sets SSHN_JOB and SSHN_NODE_ID
-  local out
-  out=$(mutate ProvisioningService/StartNodeProvision "$(jq -nc --arg n "$1" --arg h "$SSHN_IP" --arg f "$SSHN_FP" --arg u "${2:-root}" --arg p "${3:-$SSHN_ROOT_PASS}" \
-    '{confirmInstall:true, name:$n, address:$h, countryCode:"DE", location:"Test", provider:"e2e", sshHost:$h, sshPort:22, fingerprint:$f, sshUsername:$u, password:$p}')") \
+sshn_start() { # <node name> [username] [password] [use panel key] [private key] [install panel key]: starts the install job
+  local out key_mode=${4:-false} private_key=${5:-} install_panel_key=${6:-true}
+  out=$(mutate ProvisioningService/StartNodeProvision "$(jq -nc --arg n "$1" --arg h "$SSHN_IP" --arg f "$SSHN_FP" --arg u "${2:-root}" --arg p "${3-$SSHN_ROOT_PASS}" --arg key "$private_key" --argjson k "$key_mode" --argjson ipk "$install_panel_key" \
+    '{confirmInstall:true, name:$n, address:$h, countryCode:"DE", location:"Test", provider:"e2e", sshHost:$h, sshPort:22, fingerprint:$f, sshUsername:$u} + (if $k then {usePanelKey:true} elif $key != "" then {privateKey:$key} else {password:$p} end) + (if $ipk then {installPanelKey:true} else {} end)')") \
     || die "StartNodeProvision($1) failed"
   SSHN_JOB=$(jq -r .job.id <<<"$out") SSHN_NODE_ID=$(jq -r .job.nodeId <<<"$out") SSHN_NODE_NAME=$1
   [ -n "$SSHN_JOB" ] && [ "$SSHN_JOB" != null ] || die "StartNodeProvision returned no job: $out"
@@ -269,17 +277,18 @@ sshn_load_stop() { :; }
 # sshn_wizard: the checks the wizard makes before an install: the host key without a login, a closed port, a wrong password,
 # a wrong host key (the password must not be sent), an unprivileged login (gets in, stops at the preflight) and root (passes it).
 sshn_wizard() {
-  local err fp before check_ssh out
+  local err fp before initial check_ssh out
+  initial=$(ssh_attempts)
   fp=$(api ProvisioningService/GetSSHFingerprint "{\"host\":\"$SSHN_IP\",\"port\":22}" | jq -r .fingerprint) || die "GetSSHFingerprint failed"
   [ "$fp" = "$SSHN_FP" ] || die "the wizard read host key '$fp', sshd has '$SSHN_FP'"
-  [ "$(ssh_attempts)" = 0 ] || die "reading the host key sent a login to sshd"
+  [ "$(ssh_attempts)" = "$initial" ] || die "reading the host key sent a login to sshd"
   err=$(api ProvisioningService/GetSSHFingerprint "{\"host\":\"$SSHN_IP\",\"port\":2299}" 2>&1 >/dev/null || true)
   grep -q "$SSHN_CLOSED_CODE" <<<"$err" || die "a closed port did not answer $SSHN_CLOSED_CODE: $err"
   stepup || die "step-up failed"
   check_ssh() { jq -nc --arg h "$SSHN_IP" --arg f "$1" --arg u "$2" --arg p "$3" '{host:$h, port:22, fingerprint:$f, username:$u, password:$p}'; }
   err=$(api ProvisioningService/CheckSSH "$(check_ssh "$SSHN_FP" root "wrong-$(openssl rand -hex 6)")" 2>&1 >/dev/null || true)
   grep -q 'ssh_authentication_failed' <<<"$err" || die "a wrong password did not answer ssh_authentication_failed: $err"
-  [ "$(ssh_attempts)" = 1 ] || die "sshd saw $(ssh_attempts) login attempts after the wrong password, want 1"
+  [ "$(ssh_attempts)" = "$((initial + 1))" ] || die "sshd saw $(( $(ssh_attempts) - initial )) login attempts after the wrong password, want 1"
   err=$(api ProvisioningService/CheckSSH "$(check_ssh "$SSHN_FP" "$SSHN_USER" "$SSHN_USER_PASS")" 2>&1 >/dev/null || true)
   grep -q "Accepted password for $SSHN_USER" "$WORK/sshd.log" || die "sshd never accepted the password of the unprivileged login: $err"
   ! grep -q 'ssh_authentication_failed\|ssh_connection\|ssh_target' <<<"$err" || die "the unprivileged login did not get through the login: $err"
@@ -431,11 +440,170 @@ sshn_scn_full() {
   pass "retire of the installed node: agent notified, exited, its nft table removed, node RETIRED"
 }
 
+# sshn_scn_panel_key <name>: install with the panel's public key and rotate a password through that key, including after
+# password authentication is disabled. The panel must never need a saved password to reach this host.
+sshn_scn_panel_key() {
+  local name=$1 public_key key_fingerprint before err out access password agent_pid
+  sshn_reset_host
+  stepup || die "step-up failed"
+  out=$(api ProvisioningService/GetPanelSSHKey '{}') || die "GetPanelSSHKey failed"
+  public_key=$(jq -er .publicKey <<<"$out") || die "GetPanelSSHKey returned no public key: $out"
+  key_fingerprint=$(jq -er .fingerprint <<<"$out") || die "GetPanelSSHKey returned no fingerprint: $out"
+  printf '%s\n' "$public_key" | sshn_host sh -c 'umask 077; cat > /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys'
+
+  before=$(ssh_attempts)
+  out=$(api ProvisioningService/CheckSSH "$(jq -nc --arg h "$SSHN_IP" --arg f "$SSHN_FP" '{host:$h, port:22, fingerprint:$f, username:"root", usePanelKey:true}')") \
+    || die "CheckSSH with the panel key failed: $out"
+  [ "$(ssh_attempts)" = "$before" ] || die "panel-key CheckSSH changed the password-attempt count"
+  grep -q 'Accepted publickey for root' "$WORK/sshd.log" || die "sshd never accepted the panel public key"
+
+  sshn_start "$name" root "" true
+  wait_for 240 "the panel-key install to end" sshn_terminal || die "the panel-key install did not end: $(sshn_job)"
+  [ "$(sshn_jstate)" = completed ] || die "the panel-key install ended as $(sshn_job)"
+  [ "$(sshn_secret_len)" = 0 ] || die "the completed panel-key job still holds its sealed login"
+  access=$(api ProvisioningService/ListNodeServerAccess '{}' | jq -ce --arg id "$SSHN_NODE_ID" '.access[] | select(.nodeId == $id)') \
+    || die "the panel-key install has no saved server access"
+  jq -e --arg f "$key_fingerprint" '(.passwordSaved // false) == false and (.passwordLogin // false) == false and .panelKeyFingerprint == $f' <<<"$access" >/dev/null \
+    || die "panel-key access metadata is wrong: $access"
+  err=$(api ProvisioningService/RevealNodeServerPassword "$(jq -nc --arg id "$SSHN_NODE_ID" '{nodeId:$id}')" 2>&1 >/dev/null || true)
+  grep -q 'node_server_password_not_saved' <<<"$err" || die "an unsaved panel-key password did not return node_server_password_not_saved: $err"
+
+  mutate ProvisioningService/RotateNodeServerPassword "$(jq -nc --arg id "$SSHN_NODE_ID" '{nodeId:$id, confirm:true, generate:true}')" >/dev/null \
+    || die "the first generated password rotation through the panel key failed"
+  out=$(api ProvisioningService/RevealNodeServerPassword "$(jq -nc --arg id "$SSHN_NODE_ID" '{nodeId:$id}')") \
+    || die "RevealNodeServerPassword after the first rotation failed"
+  password=$(jq -er .password <<<"$out") || die "the first generated password was not revealed: $out"
+  SSHN_PASSWORDS+=("$password") SECRETS+=("$password")
+  access=$(api ProvisioningService/ListNodeServerAccess '{}' | jq -ce --arg id "$SSHN_NODE_ID" '.access[] | select(.nodeId == $id)') \
+    || die "server access disappeared after the first rotation"
+  jq -e '.passwordSaved == true and .passwordLogin == true' <<<"$access" >/dev/null \
+    || die "the verified password login was not recorded: $access"
+
+  cat >>"$SSHN_D/sshd_config" <<'CONF'
+Match User root
+  PasswordAuthentication no
+CONF
+  /usr/sbin/sshd -t -f "$SSHN_D/sshd_config" || die "the panel-key sshd configuration is not valid"
+  kill -HUP "$SSHN_PID" || die "could not reload the sshd started by this scenario"
+  wait_for 10 "sshd to reload its configuration" grep -q 'Received SIGHUP' "$WORK/sshd.log" || die "sshd did not reload after SIGHUP"
+
+  mutate ProvisioningService/RotateNodeServerPassword "$(jq -nc --arg id "$SSHN_NODE_ID" '{nodeId:$id, confirm:true, generate:true}')" >/dev/null \
+    || die "the second generated password rotation through the panel key failed with password auth disabled"
+  out=$(api ProvisioningService/RevealNodeServerPassword "$(jq -nc --arg id "$SSHN_NODE_ID" '{nodeId:$id}')") \
+    || die "RevealNodeServerPassword after the second rotation failed"
+  password=$(jq -er .password <<<"$out") || die "the second generated password was not revealed: $out"
+  SSHN_PASSWORDS+=("$password") SECRETS+=("$password")
+  access=$(api ProvisioningService/ListNodeServerAccess '{}' | jq -ce --arg id "$SSHN_NODE_ID" '.access[] | select(.nodeId == $id)') \
+    || die "server access disappeared after the second rotation"
+  jq -e --arg f "$key_fingerprint" '.passwordSaved == true and (.passwordLogin // false) == false and .panelKeyFingerprint == $f' <<<"$access" >/dev/null \
+    || die "password login remained enabled after sshd rejected it: $access"
+
+  agent_pid=$(cat "$SSHN_D/flags/agent.pid")
+  out=$(mutate NodeService/RetireNode "$(jq -nc --arg id "$SSHN_NODE_ID" --arg n "$name" '{nodeId:$id, confirmName:$n}')") \
+    || die "RetireNode($name) failed after the panel-key install"
+  jq -e '.agentNotified == true' <<<"$out" >/dev/null || die "RetireNode($name) did not notify the installed agent: $out"
+  wait_for 30 "the panel-key installed agent to exit" not_alive "$agent_pid" || die "the panel-key installed agent kept running after retire"
+  [ "$(sshn_node_status "$name")" = NODE_STATUS_RETIRED ] || die "the panel-key installed node is not RETIRED"
+  pass "panel-key install: CheckSSH and install used the pinned panel key, the password was initially absent, rotations succeeded both before and after password auth was disabled, and passwordLogin reflected the server (job $SSHN_JOB)"
+}
+
+# sshn_scn_own_key: the owner checks and installs with an encrypted-job-only private key. The worker must add and prove the
+# panel key for future access; the owner key itself must not be saved after the job ends.
+sshn_scn_own_key() {
+  local name=$1 private_key panel_key_fp access out public_before public_after
+  sshn_reset_host
+  ssh-keygen -q -t ed25519 -N '' -f "$WORK/sshn-owner-ed25519" || die "could not make the one-run owner SSH key"
+  private_key=$(cat "$WORK/sshn-owner-ed25519")
+  SSHN_PRIVATE_KEYS+=("$private_key") SECRETS+=("$private_key")
+  printf '%s\n' "$(cat "$WORK/sshn-owner-ed25519.pub")" | sshn_host sh -c 'umask 077; cat > /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys'
+  stepup || die "step-up failed"
+  public_before=$(grep -c 'Accepted publickey for root' "$WORK/sshd.log" || true)
+  out=$(api ProvisioningService/CheckSSH "$(jq -nc --arg h "$SSHN_IP" --arg f "$SSHN_FP" --arg key "$private_key" '{host:$h, port:22, fingerprint:$f, username:"root", privateKey:$key}')") \
+    || die "CheckSSH with the owner's private key failed: $out"
+  public_after=$(grep -c 'Accepted publickey for root' "$WORK/sshd.log" || true)
+  [ "$public_after" -gt "$public_before" ] || die "sshd never accepted the owner's private key"
+  sshn_start "$name" root "" false "$private_key" true
+  wait_for 240 "the owner-key install to end" sshn_terminal || die "the owner-key install did not end: $(sshn_job)"
+  [ "$(sshn_jstate)" = completed ] || die "the owner-key install ended as $(sshn_job)"
+  sshn_has_event installing_panel_key || die "the owner-key install did not journal panel-key installation"
+  [ "$(sshn_secret_len)" = 0 ] || die "the completed owner-key job retained its sealed login"
+  out=$(api ProvisioningService/GetPanelSSHKey '{}') || die "GetPanelSSHKey failed"
+  panel_key_fp=$(jq -er .fingerprint <<<"$out") || die "the panel SSH key has no fingerprint: $out"
+  access=$(api ProvisioningService/ListNodeServerAccess '{}' | jq -ce --arg id "$SSHN_NODE_ID" '.access[] | select(.nodeId == $id)') \
+    || die "the owner-key install has no saved server access"
+  jq -e --arg f "$panel_key_fp" '(.passwordSaved // false) == false and (.passwordLogin // false) == false and .panelKeyFingerprint == $f' <<<"$access" >/dev/null \
+    || die "the owner-key access metadata is wrong: $access"
+  SSHN_NODE_NAME=$name
+  pass "owner private-key install: CheckSSH and install used the pinned key, the worker installed and proved the panel key, the owner key was not saved, and the job secret was erased ($SSHN_JOB)"
+}
+
+# sshn_scn_keys: on the live owner-key-installed node, list keys, add/remove another owner's public key, and refuse to remove
+# the only panel login when there is no saved password. It retires the scenario node after the checks.
+sshn_scn_keys() {
+  local node_id=$SSHN_NODE_ID name=$SSHN_NODE_NAME panel_fp public_key fingerprint listed agent_pid err out
+  [ -n "$node_id" ] || die "key scenario has no owner-key-installed node"
+  stepup || die "step-up failed" # here, not inside $(mutate ...): a subshell's step-up is lost and its code reused
+  out=$(api ProvisioningService/GetPanelSSHKey '{}') || die "GetPanelSSHKey failed"
+  panel_fp=$(jq -er .fingerprint <<<"$out") || die "the panel SSH key has no fingerprint: $out"
+  listed=$(api ProvisioningService/ListNodeServerKeys "$(jq -nc --arg id "$node_id" '{nodeId:$id}')") || die "ListNodeServerKeys failed"
+  jq -e --arg f "$panel_fp" '[(.keys // [])[] | select(.fingerprint == $f and .panelKey == true)] | length == 1' <<<"$listed" >/dev/null \
+    || die "the panel key was not listed on the owner-key-installed node: $listed"
+
+  ssh-keygen -q -t ed25519 -N '' -f "$WORK/sshn-extra-ed25519" || die "could not make the one-run public test key"
+  public_key=$(cat "$WORK/sshn-extra-ed25519.pub")
+  fingerprint=$(ssh-keygen -lf "$WORK/sshn-extra-ed25519.pub" | awk '{print $2}')
+  mutate ProvisioningService/AddNodeServerKey "$(jq -nc --arg id "$node_id" --arg key "$public_key" '{nodeId:$id, publicKey:$key, confirm:true}')" >/dev/null \
+    || die "AddNodeServerKey failed"
+  listed=$(api ProvisioningService/ListNodeServerKeys "$(jq -nc --arg id "$node_id" '{nodeId:$id}')") || die "ListNodeServerKeys after add failed"
+  jq -e --arg f "$fingerprint" '[(.keys // [])[] | select(.fingerprint == $f)] | length == 1' <<<"$listed" >/dev/null \
+    || die "the newly added public key was not listed: $listed"
+  mutate ProvisioningService/RemoveNodeServerKey "$(jq -nc --arg id "$node_id" --arg f "$fingerprint" '{nodeId:$id, fingerprint:$f, confirm:true}')" >/dev/null \
+    || die "RemoveNodeServerKey failed"
+  listed=$(api ProvisioningService/ListNodeServerKeys "$(jq -nc --arg id "$node_id" '{nodeId:$id}')") || die "ListNodeServerKeys after remove failed"
+  jq -e --arg f "$fingerprint" '[(.keys // [])[] | select(.fingerprint == $f)] | length == 0' <<<"$listed" >/dev/null \
+    || die "the removed public key remained in the list: $listed"
+  err=$(api ProvisioningService/RemoveNodeServerKey "$(jq -nc --arg id "$node_id" --arg f "$panel_fp" '{nodeId:$id, fingerprint:$f, confirm:true, confirmPanelKey:true}')" 2>&1 >/dev/null || true)
+  grep -q 'ssh_key_last_panel_login' <<<"$err" || die "removing the only panel login without a saved password was not refused: $err"
+  listed=$(api ProvisioningService/ListNodeServerKeys "$(jq -nc --arg id "$node_id" '{nodeId:$id}')") || die "ListNodeServerKeys after refused panel-key removal failed"
+  jq -e --arg f "$panel_fp" '[(.keys // [])[] | select(.fingerprint == $f and .panelKey == true)] | length == 1' <<<"$listed" >/dev/null \
+    || die "the panel key disappeared after the removal refusal: $listed"
+  agent_pid=$(cat "$SSHN_D/flags/agent.pid")
+  out=$(mutate NodeService/RetireNode "$(jq -nc --arg id "$node_id" --arg n "$name" '{nodeId:$id, confirmName:$n}')") || die "RetireNode($name) failed after key checks"
+  jq -e '.agentNotified == true' <<<"$out" >/dev/null || die "RetireNode($name) did not notify the installed agent"
+  wait_for 30 "the key scenario agent to exit" not_alive "$agent_pid" || die "the key scenario agent kept running after retire"
+  [ "$(sshn_node_status "$name")" = NODE_STATUS_RETIRED ] || die "the key scenario node is not RETIRED"
+  SSHN_NODE_ID= SSHN_NODE_NAME=
+  pass "server key management: listed the panel key, added and removed a public key, and refused to remove the last panel login without a saved password"
+}
+
+# sshn_scn_attach <live node id>: attach saved SSH access to an already enrolled node after the remote preflight proves the
+# exact node id. The E2E caller retires that node and forgets this access row after the test.
+sshn_scn_attach() {
+  local node_id=$1 out access keys
+  stepup || die "step-up failed" # in this shell: a step-up inside $(mutate ...) is lost and its TOTP code reused
+  sshn_reset_host
+  sshn_host mkdir -p /var/lib/mistgate-node
+  sshn_host sh -c 'printf enrolled >/var/lib/mistgate-node/identity.pem'
+  printf '{"node_id":"%s"}\n' "$node_id" | sshn_host sh -c 'cat > /var/lib/mistgate-node/agent.json'
+  out=$(mutate ProvisioningService/AttachNodeServerAccess "$(jq -nc --arg id "$node_id" --arg h "$SSHN_IP" --arg f "$SSHN_FP" --arg p "$SSHN_ROOT_PASS" \
+    '{nodeId:$id, sshHost:$h, sshPort:22, fingerprint:$f, username:"root", password:$p, installPanelKey:true, confirm:true}')") \
+    || die "AttachNodeServerAccess failed for the matching remote node id: $out"
+  access=$(jq -ce '.access' <<<"$out") || die "AttachNodeServerAccess returned no saved access: $out"
+  jq -e --arg id "$node_id" '(.nodeId == $id) and .passwordSaved and .passwordLogin and (.panelKeyFingerprint | length > 0)' <<<"$access" >/dev/null \
+    || die "attached access metadata is wrong: $access"
+  keys=$(api ProvisioningService/ListNodeServerKeys "$(jq -nc --arg id "$node_id" '{nodeId:$id}')") || die "ListNodeServerKeys after attach failed"
+  jq -e --arg f "$(jq -r .panelKeyFingerprint <<<"$access")" '[(.keys // [])[] | select(.fingerprint == $f and .panelKey == true)] | length == 1' <<<"$keys" >/dev/null \
+    || die "AttachNodeServerAccess did not install and prove the panel key: $keys"
+  sshn_reset_host # the scenarios after this one start from a host with no node on it
+  : >"$WORK/sshd.log" # sshn_wizard later expects a baseline with no prior login attempts
+  pass "attach access: SSH preflight matched node $node_id, saved the password login and installed and proved the panel key"
+}
+
 # sshn_scan_state <dir>...: no plaintext SSH password and no key in the panel's stored state (the sealed copies must not
 # reveal them): the database and its journal, the Durable Object files of the edge
 sshn_scan_state() {
   local s hits=0
-  for s in "$SSHN_ROOT_PASS" "$SSHN_USER_PASS"; do
+  for s in "${SSHN_PASSWORDS[@]}" "${SSHN_PRIVATE_KEYS[@]}"; do
     if python3 - "$s" "$@" <<'PY'
 import os, sys
 needle = sys.argv[1].encode()
@@ -453,7 +621,7 @@ sys.exit(1)
 PY
     then hits=$((hits + 1)); fi
   done
-  [ "$hits" = 0 ] || die "$hits SSH password(s) found in plaintext in the panel's stored state"
+  [ "$hits" = 0 ] || die "$hits SSH credential(s) found in plaintext in the panel's stored state"
 }
 
 # ---------------------------------------------------------------- the VPS edition
@@ -472,18 +640,21 @@ PY
 # scenario restored. Needs those base steps, so --m3-only and --old-node skip it.
 sshn_run_vps() {
   local manifest=$DATA/dist/manifest.json
-  step "10b. SSH install: the wizard and four installs on a real OpenSSH host (VPS edition: the agent is the trusted bundle's, the node enrols over mTLS)"
+  step "10b. SSH install: the wizard and installs on a real OpenSSH host (VPS edition: the agent is the trusted bundle's, the node enrols over mTLS)"
   SSHN_SQL=sshn_sql_vps
   [ "$(jq -r '.files | length' "$manifest")" = 1 ] || die "the data directory has no single-file bundle to install from"
   SSHN_NODE_BIN=$DATA/dist/$(jq -r '.files[0].name' "$manifest")
   SSHN_NODE_BIN_SHA=$(jq -r '.files[0].sha256' "$manifest")
   [ "$(sha256sum "$SSHN_NODE_BIN" | cut -d' ' -f1)" = "$SSHN_NODE_BIN_SHA" ] || die "the bundle's binary does not match its manifest"
-  sshn_up
+  [ -n "$SSHN_D" ] || sshn_up # step 10 started the host already for the attach scenario
   sshn_wizard
   sshn_scn_cancel sshn-cancel
   sshn_scn_retire_waiting sshn-wait
   sshn_scn_truncated sshn-trunc
   sshn_scn_full sshn-full
+  sshn_scn_panel_key sshn-panel-key
+  sshn_scn_own_key sshn-owner-key
+  sshn_scn_keys
   sshn_scan_state "$DATA"
-  pass "the stored state holds no plaintext SSH password (database and journal of the data directory)"
+  pass "the stored state holds no plaintext SSH password or owner private key (database and journal of the data directory)"
 }

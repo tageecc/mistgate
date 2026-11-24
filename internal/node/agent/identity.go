@@ -28,6 +28,7 @@ import (
 
 	pb "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
 	"github.com/mistgate/mistgate/gen/mistgate/agent/v1/agentv1connect"
+	"github.com/mistgate/mistgate/internal/agentlink"
 	"github.com/mistgate/mistgate/internal/buildinfo"
 )
 
@@ -37,11 +38,12 @@ const apiVersion = 1
 // Files in the state directory (directory 0700, files 0600). The key and the leaf certificate live in ONE
 // file so that a renewal (a new key every time) is a single atomic rename.
 const (
-	fileIdentity   = "identity.pem"       // EC PRIVATE KEY + CERTIFICATE
-	filePendingKey = "enroll-pending.pem" // private key kept only for a retried, interrupted enrollment
-	fileCA         = "ca.pem"             // the panel CA; from enrollment on it is the only trust anchor
-	fileMeta       = "agent.json"         // panel address, agent SNI, node id
-	fileState      = "state.json"         // last applied desired state
+	fileIdentity   = "identity.pem"           // EC PRIVATE KEY + CERTIFICATE
+	filePendingKey = "enroll-pending.pem"     // private key kept only for a retried, interrupted enrollment
+	fileCA         = "ca.pem"                 // the panel CA; from enrollment on it is the only trust anchor
+	fileMeta       = "agent.json"             // panel address, agent SNI, node id
+	fileState      = "state.json"             // last applied desired state
+	fileApplyMark  = "applying-inbounds.json" // inbounds whose apply did not return before the last process exit
 )
 
 // renewBefore is how long before expiry the agent renews (day 20 of 30).
@@ -85,7 +87,8 @@ type EnrollConfig struct {
 	ResumePendingKey bool   // persist and reuse the CSR key if enrollment is interrupted
 	Timeout          time.Duration
 	// LinkURL (wss://host/<secret-prefix>/) enrols over the panel's public link route instead of the pinned mTLS
-	// endpoint: system-root TLS carries the token, the CA pin then vouches for the panel. Exclusive with Panel and SNI.
+	// endpoint: system-root TLS carries the token (a proven "mg2_" token only as a signature over the CSR), the CA pin
+	// then vouches for the panel. Exclusive with Panel and SNI.
 	LinkURL string
 
 	httpClient *http.Client // test seam for LinkURL; nil = system roots
@@ -158,10 +161,14 @@ func Enroll(ctx context.Context, cfg EnrollConfig) (Meta, error) {
 	defer client.CloseIdleConnections()
 	cctx, cancel := context.WithTimeout(ctx, cfg.Timeout)
 	defer cancel()
+	enrollReq := &pb.EnrollRequest{CsrDer: csr, AgentVersion: cfg.Version, ApiVersion: apiVersion}
+	if agentlink.ProvesEnrollToken(cfg.Token) {
+		enrollReq.EnrollmentKey, enrollReq.EnrollmentSignature = agentlink.SignEnroll(cfg.Token, csr)
+	} else {
+		enrollReq.EnrollmentToken = cfg.Token // an older panel's token: it has no key to prove
+	}
 	resp, err := agentv1connect.NewEnrollmentServiceClient(client, enrollBase, connect.WithReadMaxBytes(1<<20)).Enroll(cctx,
-		connect.NewRequest(&pb.EnrollRequest{
-			EnrollmentToken: cfg.Token, CsrDer: csr, AgentVersion: cfg.Version, ApiVersion: apiVersion,
-		}))
+		connect.NewRequest(enrollReq))
 	if err != nil {
 		var urlErr *url.Error
 		if cfg.LinkURL != "" && errors.As(err, &urlErr) {
@@ -171,8 +178,8 @@ func Enroll(ctx context.Context, cfg EnrollConfig) (Meta, error) {
 	}
 	m := resp.Msg
 
-	// The TLS chain already ended in a CA with the pinned fingerprint; require the CA we are about to
-	// store to be that very CA, and the leaf to be ours and to chain to it.
+	// Over mTLS the chain already ended in a CA with the pinned fingerprint; over the link it did not. Either way require
+	// the CA we are about to store to be the pinned one, and the leaf to be ours and to chain to it.
 	caCert, err := parseOneCert([]byte(m.CaCertificatePem))
 	if err != nil {
 		return Meta{}, fmt.Errorf("panel CA certificate: %w", err)
@@ -418,7 +425,7 @@ func (a *Agent) renewLoop(ctx context.Context) {
 		wait := a.renewEvery
 		if until := time.Until(a.id.Load().notAfter()); until < renewBefore {
 			if err := a.renew(ctx); err != nil {
-				a.log.Warn("certificate renewal failed", "err", err, "expires_in", until.Round(time.Minute))
+				a.log.Warn("certificate renewal failed", "code", "certificate_renewal_failed", "err", err, "expires_in", until.Round(time.Minute))
 				if errors.Is(err, errNoSession) { // a link-only agent back from an outage: do not wait an hour for its session
 					wait = min(wait, a.renewNoSessionWait())
 				}

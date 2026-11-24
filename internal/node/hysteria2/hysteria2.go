@@ -114,7 +114,7 @@ func New(env engine.Env) (engine.Engine, error) {
 func (e *eng) Protocol() string { return Protocol }
 
 func (e *eng) Version() string {
-	v := "v2.12.3"
+	v := "v2.13.0"
 	if bi, ok := debug.ReadBuildInfo(); ok {
 		for _, d := range bi.Deps {
 			if d.Path == "github.com/apernet/hysteria/core/v2" && d.Version != "" {
@@ -168,6 +168,10 @@ type inbound struct {
 	handshakes      atomic.Uint32
 	accepted        atomic.Uint32
 	hellosForeign   atomic.Uint32
+	hsUnfinished    atomic.Uint32 // links/3 (handshake.go)
+	tlsAlertsSent   atomic.Uint32
+	tlsAlertsRecv   atomic.Uint32
+	tlsCertRefused  atomic.Uint32
 	mu              sync.Mutex // guards the fields below
 	state           plugin.RunState
 	requestMu       sync.Mutex
@@ -199,15 +203,30 @@ func (e *eng) Apply(ctx context.Context, spec plugin.InboundSpec, creds []plugin
 	if old != nil {
 		oldIdx = old.idx.Load()
 	}
-	ix, err := buildIndex(spec.ID, oldIdx, creds, e.users)
-	if err != nil {
-		return engine.ApplyReport{SpecHash: sh}, fmt.Errorf("hysteria2 inbound %q: %w", spec.ID, err)
+	ix, skipped := buildIndex(spec.ID, oldIdx, creds, e.users)
+	accepted := make(map[string]bool, len(ix.byID))
+	for id := range ix.byID {
+		accepted[id] = true
+	}
+	kept := creds[:0]
+	for _, cred := range creds {
+		if accepted[cred.CredID] {
+			kept = append(kept, cred)
+			delete(accepted, cred.CredID)
+		}
+	}
+	creds = kept
+	warnings := make([]string, len(skipped))
+	for i, err := range skipped {
+		warnings[i] = err.Error()
 	}
 
 	// Same spec, and either serving or deliberately stopped: a users-only change. Swap the index.
 	if old != nil && old.specHash == sh && old.torrentVersion == e.torrentVersion && old.settled() {
 		e.swapIndex(old, oldIdx, ix, creds)
-		return e.report(old, len(creds), false), nil
+		report := e.report(old, len(creds), false)
+		report.Warnings = warnings
+		return report, nil
 	}
 
 	// New inbound, changed spec, or a retry of one that failed: (re)build it.
@@ -232,7 +251,9 @@ func (e *eng) Apply(ctx context.Context, spec plugin.InboundSpec, creds []plugin
 
 	if !spec.Enabled {
 		in.setState(plugin.RunStopped, "disabled")
-		return e.report(in, len(creds), restarted), nil
+		report := e.report(in, len(creds), restarted)
+		report.Warnings = warnings
+		return report, nil
 	}
 	if err := in.start(ctx); err != nil {
 		e.log.Error("hysteria2 inbound failed to start", "inbound", spec.ID, "err", err)
@@ -240,7 +261,9 @@ func (e *eng) Apply(ctx context.Context, spec plugin.InboundSpec, creds []plugin
 		in.setState(plugin.RunFailed, err.Error())
 		return engine.ApplyReport{SpecHash: sh, CredCount: len(creds)}, fmt.Errorf("hysteria2 inbound %q: %w", spec.ID, err)
 	}
-	return e.report(in, len(creds), restarted), nil
+	report := e.report(in, len(creds), restarted)
+	report.Warnings = warnings
+	return report, nil
 }
 
 func (e *eng) report(in *inbound, n int, restarted bool) engine.ApplyReport {
@@ -348,6 +371,7 @@ func (in *inbound) start(ctx context.Context) error {
 	if in.e.quicIdleTimeout > 0 {
 		serverCfg.QUICConfig.MaxIdleTimeout = in.e.quicIdleTimeout
 	}
+	serverCfg.QUICConfig.ConnContext = in.connContext
 	srv, err := server.NewServer(serverCfg)
 	if err != nil {
 		conn.Close() // NewServer only closes it on some failures
@@ -544,7 +568,7 @@ func (e *eng) Collect(ctx context.Context) (engine.Collected, error) {
 		}
 	}
 	links := func(stat plugin.LinkStat) {
-		if stat.Connects|stat.Rejects|stat.Drops|stat.Stalls|stat.UnknownKeys|stat.Hellos|stat.Handshakes|stat.ClientCloses|stat.Freezes|stat.Quiet|stat.Accepted|stat.HellosForeign|stat.RTTSamples != 0 || stat.RTTMSSum|stat.PktsSent|stat.PktsLost != 0 {
+		if !stat.Zero() {
 			out.Links = append(out.Links, stat)
 		}
 	}

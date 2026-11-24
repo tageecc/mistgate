@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mistgate/mistgate/internal/panel/adminqr"
 	"github.com/mistgate/mistgate/internal/panel/securitylimit"
 )
 
@@ -32,6 +34,14 @@ func (*recoveryTestLimiter) Peek(context.Context, securitylimit.Window, string) 
 
 func (*recoveryTestLimiter) Record(context.Context, securitylimit.Window, string) (securitylimit.Decision, error) {
 	return securitylimit.Decision{Allowed: true}, nil
+}
+
+func (*recoveryTestLimiter) RecordN(context.Context, securitylimit.Window, string, int) (securitylimit.Decision, error) {
+	return securitylimit.Decision{Allowed: true}, nil
+}
+
+func (*recoveryTestLimiter) UndoN(context.Context, securitylimit.Window, string, int, time.Time) error {
+	return nil
 }
 
 func (*recoveryTestLimiter) Reset(context.Context, securitylimit.Window, string) error { return nil }
@@ -64,6 +74,9 @@ func TestRecoveryHTTPResetsOnceAndLimitsGenericRefusals(t *testing.T) {
 	if recovered.Code != http.StatusOK || json.Unmarshal(recovered.Body.Bytes(), &details) != nil || details.Login != "alice" || details.Password == "" ||
 		!strings.HasPrefix(details.TOTPURI, "otpauth://totp/") || details.TOTPSecret == "" {
 		t.Fatal("valid recovery token did not return new sign-in details")
+	}
+	if want := adminqr.Encode(details.TOTPURI); details.TOTPQr == nil || details.TOTPQr.N != want.N || !bytes.Equal(details.TOTPQr.Bits, want.Bits) || details.TOTPQr.Window != want.Window {
+		t.Fatalf("recovery brings no code of the new secret: %+v", details.TOTPQr)
 	}
 	used := post(token, "alice")
 	wrong := post(strings.Repeat("b", 43), "alice")
@@ -248,5 +261,41 @@ func TestRecoveryConcurrentPostsOnlyOneWins(t *testing.T) {
 	}
 	if wins != 1 || refusals != 1 {
 		t.Fatalf("concurrent recovery results = %d winners, %d refusals; want one each", wins, refusals)
+	}
+}
+
+// A reset that fails after the token was spent gives the token back: the link still works once the cause is gone.
+func TestRecoveryFailedResetGivesTheTokenBack(t *testing.T) {
+	limiter := &recoveryTestLimiter{allowed: 10}
+	clock := time.Now().UTC()
+	s, st, now := newTestServiceWithLimiter(t, limiter, &clock)
+	s.SetEdge(true)
+	passwordAdmin(t, s, st, "alice")
+	const token = "cccccccccccccccccccccccccccccccccccccccccc3"
+	if _, err := st.OfferRecoveryToken(context.Background(), hashToken(token), now.Add(RecoveryTokenTTL)); err != nil {
+		t.Fatal("offer recovery token")
+	}
+	post := func() *httptest.ResponseRecorder {
+		body, _ := json.Marshal(recoveryRequest{RecoveryToken: token, Login: "alice"})
+		req := httptest.NewRequest(http.MethodPost, "https://example.com/test-admin/api/recover-login", strings.NewReader(string(body)))
+		req.RemoteAddr = "203.0.113.7:443"
+		w := httptest.NewRecorder()
+		s.RecoveryHandler().ServeHTTP(w, req)
+		return w
+	}
+	v := s.vault
+	s.vault = nil // ResetLogin fails right after the token is spent
+	if failed := post(); failed.Code != http.StatusInternalServerError {
+		t.Fatalf("failed reset = %d %s; want 500", failed.Code, failed.Body.String())
+	}
+	if live, err := st.RecoveryTokenLive(context.Background(), hashToken(token), *now); err != nil || !live {
+		t.Fatalf("the failed reset kept the token spent: live=%v err=%v", live, err)
+	}
+	s.vault = v
+	if ok := post(); ok.Code != http.StatusOK {
+		t.Fatalf("the retry = %d %s; want 200", ok.Code, ok.Body.String())
+	}
+	if again := post(); again.Code != http.StatusForbidden {
+		t.Fatalf("a used token = %d; want 403", again.Code)
 	}
 }

@@ -1,34 +1,19 @@
 import { useState } from "react";
+import { cx } from "@/lib/cx";
+import { PanelSSHKey, usePanelKeyInUse } from "@/components/panel-ssh-key";
+import { PlanTitle } from "@/components/plan-title";
 import { Button } from "@/components/ui/button";
-import { SectionLabel } from "@/components/ui/bits";
 import { Icon } from "@/components/ui/icons";
-import { Pagination } from "@/components/ui/pagination";
-import { StatusPill } from "@/components/ui/status";
-import { TextField } from "@/components/ui/text-field";
-import { ApprovalState } from "@/gen/mistgate/admin/v1/integrations_pb";
+import { Segmented } from "@/components/ui/segmented";
+import { SecureField } from "@/components/assistant/secure-field";
 import { useT } from "@/i18n";
 import { useFmt } from "@/lib/format";
-import { clampPage, usePaging } from "@/lib/paging";
 import { safeHttpUrl } from "@/lib/warp";
-import {
-  approvalStateInfo,
-  clockText,
-  dangerText,
-  factLabel,
-  factWords,
-  outcomeText,
-  secondsLeft,
-  toolTitle,
-  useApprovalActions,
-  useTick,
-  type Approval,
-  type Approvals,
-  type Fact,
-} from "@/lib/integrations";
-import { card, ProfileChip } from "./parts";
+import { approvalTitle, clockText, dangerText, factLabel, factWords, pieceText, secondsLeft, useApprovalActions, type Approval, type Approvals, type Fact } from "@/lib/integrations";
+import { ProfileChip } from "./parts";
 
 /** One fact. A value that came from data (a name, a node's own text) is quoted and apart from the panel's wording, so it cannot pass for it. */
-function FactRow({ fact }: { fact: Fact }) {
+export function FactRow({ fact }: { fact: Fact }) {
   const t = useT();
   const fmt = useFmt();
   const termsUrl = fact.key === "terms_url" ? safeHttpUrl(fact.value) : "";
@@ -57,11 +42,15 @@ function FactRow({ fact }: { fact: Fact }) {
 }
 
 /**
- * node_install: the owner compares the host key the panel read (its fact, never the agent's word) and types the server
- * password here. The agent never sees the password; the panel seals it to this plan for its apply.
+ * node_install: the owner compares the host key the panel read (its fact, never the agent's word) and picks how the panel
+ * logs in: its own key (offered when the plan names it), or the server password typed here. The agent never sees the
+ * password; the panel seals the choice to this plan for its apply.
  */
-function NodeInstallFields({ a, password, setPassword, confirmed, setConfirmed }: {
+function NodeInstallFields({ a, keyInUse, viaKey, setViaKey, password, setPassword, confirmed, setConfirmed }: {
   a: Approval;
+  keyInUse: boolean;
+  viaKey: boolean;
+  setViaKey: (v: boolean) => void;
   password: string;
   setPassword: (v: string) => void;
   confirmed: boolean;
@@ -69,9 +58,10 @@ function NodeInstallFields({ a, password, setPassword, confirmed, setConfirmed }
 }) {
   const t = useT();
   const fact = (key: string) => a.facts.find((f) => f.key === key)?.value ?? "";
+  const [howTo, setHowTo] = useState<boolean | null>(null);
   return (
-    <div className="flex flex-col gap-2.5 rounded-field border border-line bg-canvas p-3">
-      <p className="text-xs leading-snug text-pretty text-muted">{t("int.ap.ssh.body")}</p>
+    <div className="flex flex-col gap-3 rounded-field border border-line bg-canvas p-3">
+      <p className="text-xs leading-snug text-pretty text-muted">{t(viaKey ? "int.ap.ssh.bodyKey" : "int.ap.ssh.body")}</p>
       <div className="flex flex-col gap-1">
         <span className="text-[11px] font-bold tracking-[0.1em] text-muted uppercase">{t("int.ap.ssh.fingerprint", { algorithm: fact("host_key_algorithm") || "?" })}</span>
         <code data-testid="host-key" className="block font-mono text-xs break-all wrap-anywhere select-all">{fact("host_key")}</code>
@@ -80,31 +70,89 @@ function NodeInstallFields({ a, password, setPassword, confirmed, setConfirmed }
         <input type="checkbox" checked={confirmed} onChange={(e) => setConfirmed(e.target.checked)} className="mt-0.5 size-4 flex-none accent-accent" />
         <span>{t("int.ap.ssh.confirmKey")}</span>
       </label>
-      <TextField label={t("int.ap.ssh.password")} type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="off" maxLength={1024} />
+      {fact("panel_ssh_key") && (
+        <div className="flex flex-col gap-2 border-t border-line pt-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
+          <span className="text-[11px] font-bold tracking-[0.1em] text-muted uppercase">{t("node.ssh.method")}</span>
+          <Segmented
+            variant="thumb"
+            aria-label={t("node.ssh.method")}
+            value={viaKey ? "key" : "password"}
+            onValueChange={(m) => {
+              setViaKey(m === "key");
+              setPassword("");
+            }}
+            options={[
+              { value: "key", label: t("panelKey.title") },
+              { value: "password", label: t("node.ssh.methodPassword") },
+            ]}
+            className="w-full sm:w-72"
+          />
+        </div>
+      )}
+      {viaKey ? (
+        <PanelSSHKey howTo={howTo ?? !keyInUse} onHowTo={setHowTo} />
+      ) : (
+        <>
+          <SecureField label={t("int.ap.ssh.password")} value={password} onChange={setPassword} maxLength={1024} />
+          {/* an approved password install always adds the panel key too (the panel decides it, not the agent) */}
+          <p className="flex items-start gap-2 text-xs leading-snug text-pretty text-muted">
+            <Icon name="key" size={14} className="mt-px flex-none" />
+            {t("int.ap.ssh.alsoKey")}
+          </p>
+        </>
+      )}
     </div>
   );
 }
 
 /** What an agent asked for, in the panel's words, with Approve and Reject. The countdown is the panel's 10 minutes from the plan. */
-function ApprovalCard({ a, data, nowMs }: { a: Approval; data: Approvals; nowMs: number }) {
+export function ApprovalCard({ a, data, nowMs, focused, onDecided }: { a: Approval; data: Approvals; nowMs: number; focused?: boolean; onDecided?: () => void }) {
   const t = useT();
   const { approve, reject, busy } = useApprovalActions();
   const left = secondsLeft(a, data, nowMs);
   const expired = left === 0;
-  const tool = toolTitle(t, a.tool);
+  const fmt = useFmt();
+  const title = approvalTitle(t, fmt, a);
+  const tool = pieceText(title);
   const install = a.tool === "node_install";
   const hostKey = a.facts.find((f) => f.key === "host_key")?.value ?? "";
+  // a plan from before the panel key has no panel_ssh_key fact: the panel refuses the key for it, so only the password
+  const keyOffered = install && a.facts.some((f) => f.key === "panel_ssh_key" && f.value !== "");
+  const keyInUse = usePanelKeyInUse(keyOffered);
+  const [chosenKey, setChosenKey] = useState<boolean | null>(null);
+  const viaKey = keyOffered && (chosenKey ?? keyInUse);
   const [password, setPassword] = useState("");
   const [keyConfirmed, setKeyConfirmed] = useState(false);
-  const installReady = !install || (password !== "" && keyConfirmed && hostKey !== "");
+  const installReady = !install || ((viaKey || password !== "") && keyConfirmed && hostKey !== "");
   const onApprove = () =>
-    approve.mutate(install ? { id: a.id, sshPassword: password, confirmedFingerprint: hostKey } : { id: a.id }, { onSettled: () => setPassword("") });
+    approve.mutate(
+      !install ? { id: a.id } : viaKey ? { id: a.id, usePanelKey: true, confirmedFingerprint: hostKey } : { id: a.id, sshPassword: password, confirmedFingerprint: hostKey },
+      {
+        onSuccess: onDecided,
+        onSettled: () => {
+          setPassword("");
+          approve.reset(); // the mutation's variables held the password; gcTime 0 drops it from the cache now
+        },
+      },
+    );
+  // the panel key is shown under the login choice; in the facts it would be the same long line twice
+  const facts = install ? a.facts.filter((f) => f.key !== "panel_ssh_key") : a.facts;
 
   return (
-    <article className="flex min-w-0 flex-col gap-3.5 rounded-card-lg border border-warn-line bg-warn-soft p-4 md:p-[18px]">
+    <article
+      id={`approval-${a.id}`}
+      ref={(el) => {
+        // opened from the assistant's card ("Open and confirm"): this plan is brought into view once
+        if (el && focused) el.scrollIntoView?.({ block: "center", behavior: "smooth" });
+      }}
+      data-focused={focused || undefined}
+      className={cx("flex min-w-0 flex-col gap-3.5 rounded-card-lg border border-warn-line bg-warn-soft p-4 md:p-[18px]", focused && "ring-2 ring-accent")}
+    >
       <div className="flex flex-wrap items-start gap-x-3 gap-y-1.5">
         <div className="flex min-w-[200px] flex-1 flex-col gap-1.5">
-          <h3 className="text-[17px] leading-tight font-extrabold tracking-[-0.02em]">{tool}</h3>
+          <h3 className="text-[17px] leading-tight font-extrabold tracking-[-0.02em]">
+            <PlanTitle pieces={title} />
+          </h3>
           <span className="flex flex-wrap items-center gap-2 text-xs text-muted">
             {t("int.ap.by", { token: a.tokenName })}
             <ProfileChip profile={a.tokenProfile} />
@@ -115,9 +163,9 @@ function ApprovalCard({ a, data, nowMs }: { a: Approval; data: Approvals; nowMs:
           {expired ? t("int.ap.expired") : t("int.ap.left", { time: clockText(left) })}
         </span>
       </div>
-      {a.facts.length > 0 && (
+      {facts.length > 0 && (
         <dl className="flex flex-col gap-1.5">
-          {a.facts.map((f, i) => (
+          {facts.map((f, i) => (
             <FactRow key={`${f.key}-${i}`} fact={f} />
           ))}
         </dl>
@@ -135,83 +183,22 @@ function ApprovalCard({ a, data, nowMs }: { a: Approval; data: Approvals; nowMs:
       {a.reason && (
         <figure className="flex flex-col gap-1">
           <figcaption className="text-[11px] font-bold tracking-[0.1em] text-muted uppercase">{t("int.ap.reason")}</figcaption>
-          <blockquote className="border-l-2 border-line pl-3 text-[13px] leading-normal break-words whitespace-pre-wrap text-muted italic">{t("common.quoted", { name: a.reason })}</blockquote>
+          <blockquote className="border-s-2 border-line ps-3 text-[13px] leading-normal break-words whitespace-pre-wrap text-muted italic">{t("common.quoted", { name: a.reason })}</blockquote>
           <span className="text-[11px] text-faint">{t("int.ap.reason.note")}</span>
         </figure>
       )}
-      {install && <NodeInstallFields a={a} password={password} setPassword={setPassword} confirmed={keyConfirmed} setConfirmed={setKeyConfirmed} />}
+      {install && (
+        <NodeInstallFields a={a} keyInUse={keyInUse} viaKey={viaKey} setViaKey={setChosenKey} password={password} setPassword={setPassword} confirmed={keyConfirmed} setConfirmed={setKeyConfirmed} />
+      )}
       <div className="flex flex-wrap items-center gap-2">
         <Button variant="primary" size="md" disabled={busy || expired || !installReady} aria-label={t("int.ap.approve.aria", { tool })} onClick={onApprove}>
           {t("int.ap.approve")}
         </Button>
-        <Button variant="secondary" size="md" disabled={busy || expired} aria-label={t("int.ap.reject.aria", { tool })} onClick={() => reject.mutate(a.id)}>
+        <Button variant="secondary" size="md" disabled={busy || expired} aria-label={t("int.ap.reject.aria", { tool })} onClick={() => reject.mutate(a.id, { onSuccess: onDecided })}>
           {t("int.ap.reject")}
         </Button>
-        <span className="text-xs text-muted">{installReady ? t("int.ap.approve.hint") : t("int.ap.ssh.needed")}</span>
+        <span className="text-xs text-muted">{installReady ? t("int.ap.approve.hint") : t(viaKey ? "int.ap.ssh.neededKey" : "int.ap.ssh.needed")}</span>
       </div>
     </article>
-  );
-}
-
-/** The queue: changes an agent planned that wait for the owner. It sits at the top of the screen and is only there while something waits. */
-export function ApprovalQueue({ data }: { data: Approvals }) {
-  const t = useT();
-  const waiting = data.approvals.filter((a) => a.state === ApprovalState.AWAITING);
-  const nowMs = useTick(waiting.length > 0);
-  if (waiting.length === 0) return null;
-  return (
-    <section aria-labelledby="int-queue" className="flex flex-col gap-2.5">
-      <div className="flex flex-col gap-0.5">
-        <SectionLabel as="h2" icon="shield" tone="lavender">
-          <span id="int-queue">{t("int.ap.title")}</span>
-        </SectionLabel>
-        <span className="text-xs text-muted">{t("int.ap.sub")}</span>
-      </div>
-      {waiting.map((a) => (
-        <ApprovalCard key={a.id} a={a} data={data} nowMs={nowMs} />
-      ))}
-    </section>
-  );
-}
-
-const pageSize = 10;
-
-/** What was decided and what came of it, newest first, ten to a page (the panel sends the latest hundred). */
-export function ApprovalHistory({ data }: { data: Approvals }) {
-  const t = useT();
-  const fmt = useFmt();
-  const paging = usePaging({ sizes: [pageSize], defaultSize: pageSize });
-  const rows = data.approvals.filter((a) => a.state !== ApprovalState.AWAITING);
-  if (rows.length === 0) return null;
-  const page = clampPage(paging.page, rows.length, pageSize);
-  const shown = rows.slice((page - 1) * pageSize, page * pageSize);
-  return (
-    <section className={card}>
-      <SectionLabel as="h2" icon="list" tone="sand">
-        {t("int.ap.history")}
-      </SectionLabel>
-      <ul className="flex flex-col">
-        {shown.map((a) => {
-          const s = approvalStateInfo(a.state);
-          const at = a.appliedUnix || a.decidedUnix || a.createdUnix;
-          // our words for the outcome where the panel's code has them, else the panel's own line
-          const said = outcomeText(t, fmt, a);
-          return (
-            <li key={a.id} className="flex flex-wrap items-start gap-x-3 gap-y-1.5 border-t border-line py-2.5">
-              <div className="flex min-w-[200px] flex-1 flex-col gap-0.5">
-                <b className="text-[13px]">{toolTitle(t, a.tool)}</b>
-                <span className="text-[11px] leading-snug text-pretty text-muted">
-                  {[a.tokenName, a.decidedByName ? t("int.ap.decidedBy", { name: a.decidedByName }) : "", fmt.ago(at)].filter(Boolean).join(" · ")}
-                </span>
-                {a.error && <span className="text-[11px] leading-snug text-pretty text-danger-text">{said ?? a.error}</span>}
-                {!a.error && (said ?? a.result) && <span className="text-[11px] leading-snug text-pretty text-muted">{said ?? a.result}</span>}
-              </div>
-              <StatusPill kind={s.kind} label={t(s.key)} sm />
-            </li>
-          );
-        })}
-      </ul>
-      <Pagination total={rows.length} page={page} size={pageSize} onPage={paging.setPage} label={t("int.ap.history")} />
-    </section>
   );
 }

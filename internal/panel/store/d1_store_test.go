@@ -10,6 +10,7 @@ import (
 	"embed"
 	"errors"
 	"strings"
+	"sync"
 	"syscall/js"
 	"testing"
 	"time"
@@ -70,6 +71,110 @@ func TestD1MigrationParity(t *testing.T) {
 	}
 }
 
+func TestD1APITokenBulkUserChangesRoundTrip(t *testing.T) {
+	binding := js.Global().Get("__d1")
+	binding.Call("__reset")
+	st, err := OpenD1(context.Background(), binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	ctx := context.Background()
+	now := time.Unix(123, 0).UTC()
+	tok := APIToken{ID: "tok_bulk", Name: "bulk", Profile: ProfileOperator, Hint: "wxyz", RatePerMin: 120,
+		CreatedBy: "adm_owner", CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour), AllowBulkUserChanges: true}
+	hash := sha256.Sum256([]byte("bulk-secret"))
+	if err := st.CreateAPIToken(ctx, tok, hash[:]); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetAPIToken(ctx, tok.ID)
+	if err != nil || !got.AllowBulkUserChanges {
+		t.Fatalf("get created token: %+v %v", got, err)
+	}
+	listed, err := st.ListAPITokens(ctx)
+	if err != nil || len(listed) != 1 || !listed[0].AllowBulkUserChanges {
+		t.Fatalf("list token: %+v %v", listed, err)
+	}
+	got, err = st.SetAPITokenBulk(ctx, tok.ID, false, now)
+	if err != nil || got.AllowBulkUserChanges {
+		t.Fatalf("set token: %+v %v", got, err)
+	}
+	if _, err := st.SetAPITokenBulk(ctx, "tok_missing", true, now); err != ErrNotFound {
+		t.Fatalf("set unknown token = %v, want ErrNotFound", err)
+	}
+}
+
+func TestD1InboundDirectInSubscriptionsRoundTripsAndDefaultsTrue(t *testing.T) {
+	binding := js.Global().Get("__d1")
+	binding.Call("__reset")
+	st, err := OpenD1(context.Background(), binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	ctx := context.Background()
+	now := time.Unix(123, 0).UTC()
+	if _, err := st.W.ExecContext(ctx, `INSERT INTO node (id, name, address, state, created_at) VALUES (?, ?, ?, ?, ?)`,
+		"nod_direct", "de1", "de1.example.com", "active", now.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	a := st.Access()
+	if err := a.CreateProfile(ctx, AccessProfile{ID: "prf_direct", Protocol: "hysteria2", Name: "direct", SettingsJSON: "{}", Version: 1, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.CreateInbound(ctx, AccessInbound{ID: "inb_direct", ProfileID: "prf_direct", NodeID: "nod_direct", Enabled: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	in, err := a.Inbound(ctx, "inb_direct")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !in.DirectInSubscriptions {
+		t.Fatal("D1 did not apply the listed-by-default migration value")
+	}
+	full, err := a.InboundsFull(ctx, "nod_direct")
+	if err != nil {
+		t.Fatal(err)
+	}
+	byNode, err := a.InboundsOfNode(ctx, "nod_direct")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(full) != 1 || !full[0].Inbound.DirectInSubscriptions || len(byNode) != 1 || !byNode[0].DirectInSubscriptions {
+		t.Fatalf("D1 inbound readers missed the default: full=%+v byNode=%+v", full, byNode)
+	}
+	was := in
+	in.DirectInSubscriptions = false
+	if err := a.UpdateInbound(ctx, in, was, false, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.UpdateInbound(ctx, in, was, false, now.Add(2*time.Second)); !errors.Is(err, ErrAccessVersion) { // the same read again: D1 refuses it as SQLite does
+		t.Fatalf("D1 write over a stale read = %v", err)
+	}
+	got, err := a.Inbound(ctx, in.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fleet, err := st.FleetInbound(ctx, in.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.DirectInSubscriptions || fleet.DirectInSubscriptions {
+		t.Fatalf("D1 round trip: access=%+v fleet=%+v", got, fleet)
+	}
+	full, err = a.InboundsFull(ctx, "nod_direct")
+	if err != nil {
+		t.Fatal(err)
+	}
+	byNode, err = a.InboundsOfNode(ctx, "nod_direct")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(full) != 1 || full[0].Inbound.DirectInSubscriptions || len(byNode) != 1 || byNode[0].DirectInSubscriptions {
+		t.Fatalf("D1 inbound readers missed the update: full=%+v byNode=%+v", full, byNode)
+	}
+}
+
 // D1 rejects a batch whose statement ends in a comment ("SQL code did not contain a statement"), which a SQLite-backed
 // fake does not notice, so the shape is checked here.
 func TestD1MigrationStatementsEndInCode(t *testing.T) {
@@ -118,6 +223,156 @@ func TestD1StoreSmoke(t *testing.T) {
 	rows, err := st.ListAudit(ctx, "", 0, 10)
 	if err != nil || len(rows) != 1 || rows[0].Action != "edge.smoke" {
 		t.Fatalf("ListAudit() = %+v, %v", rows, err)
+	}
+}
+
+func TestD1SubscriptionAutoSelectSettingRoundTrips(t *testing.T) {
+	binding := js.Global().Get("__d1")
+	binding.Call("__reset")
+	st, err := OpenD1(context.Background(), binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	ctx := context.Background()
+	for _, value := range []string{`{"link_auto_select":true}`, `{"link_auto_select":false}`, `{"title":"old settings"}`} {
+		if err := st.SetSettings(ctx, map[string]string{"subscription_settings": value}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := st.Setting(ctx, "subscription_settings")
+		if err != nil || got != value {
+			t.Fatalf("D1 subscription_settings = %q, %v; want %q", got, err, value)
+		}
+	}
+}
+
+func TestD1AssistantBudgetSettingsAndConversationBehavior(t *testing.T) {
+	ctx := context.Background()
+	st := openD1Store(t)
+	now := time.Unix(1_800_000_000, 0).UTC()
+	if _, err := st.W.ExecContext(ctx, `INSERT INTO assistant_settings(id) VALUES(1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveAssistantSettings(ctx, nil, true, 2, 2, 1, 0, []byte("sealed-notes"), 30, now); err != nil {
+		t.Fatal(err)
+	}
+	var clear string
+	var notes []byte
+	if err := st.R.QueryRowContext(ctx, `SELECT panel_notes,panel_notes_enc FROM assistant_settings WHERE id=1`).Scan(&clear, &notes); err != nil {
+		t.Fatal(err)
+	}
+	if clear != "" || string(notes) != "sealed-notes" {
+		t.Fatalf("D1 did not save encrypted assistant notes: clear=%q enc=%q", clear, notes)
+	}
+
+	month, provider := now.UTC().Format("2006-01"), int32(2)
+	if _, err := st.W.ExecContext(ctx, `INSERT INTO assistant_provider(provider,budget_usd) VALUES(?,1)`, provider); err != nil {
+		t.Fatal(err)
+	}
+	firstID, secondID := "asres_d1_first", "asres_d1_second"
+	if ok, err := st.ReserveAssistantBudget(ctx, firstID, month, "adm_d1", provider, "deepseek-flash", .7, 1, now, now.Add(-time.Minute)); err != nil || !ok {
+		t.Fatalf("first D1 reservation: accepted=%v err=%v", ok, err)
+	}
+	if ok, err := st.ReserveAssistantBudget(ctx, secondID, month, "adm_d1", provider, "deepseek-flash", .4, 1, now, now.Add(-time.Minute)); err != nil || ok {
+		t.Fatalf("D1 reservation exceeded provider budget: accepted=%v err=%v", ok, err)
+	}
+	if err := st.ReconcileAssistantBudget(ctx, firstID, month, "adm_d1", provider, 10, 4, .25, true, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ReconcileAssistantBudget(ctx, firstID, month, "adm_d1", provider, 10, 4, .25, true, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var usd float64
+	var input, output, turns int64
+	if err := st.R.QueryRowContext(ctx, `SELECT usd,input_tokens,output_tokens,turns FROM assistant_usage WHERE month=? AND admin_id=? AND provider=?`, month, "adm_d1", provider).Scan(&usd, &input, &output, &turns); err != nil {
+		t.Fatal(err)
+	}
+	if usd != .25 || input != 10 || output != 4 || turns != 1 {
+		t.Fatalf("D1 reconciled assistant usage: usd=%v input=%d output=%d turns=%d", usd, input, output, turns)
+	}
+	if ok, err := st.ReserveAssistantBudget(ctx, secondID, month, "adm_d1", provider, "deepseek-flash", .7, 1, now, now.Add(-time.Minute)); err != nil || !ok {
+		t.Fatalf("D1 did not release reconciled reservation headroom: accepted=%v err=%v", ok, err)
+	}
+	previousMonth := now.AddDate(0, -1, 0).UTC().Format("2006-01")
+	if err := st.ReconcileAssistantBudget(ctx, "asres_d1_previous", previousMonth, "adm_d1", provider, 1, 1, .01, true, now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if deleted, err := st.DeleteStaleAssistantBudgetReservations(ctx, now.Add(-time.Minute), now); err != nil || deleted != 1 {
+		t.Fatalf("D1 earlier-month cleanup deleted=%d err=%v", deleted, err)
+	}
+	var previousRows, currentRows int
+	if err := st.R.QueryRowContext(ctx, `SELECT count(*) FROM assistant_budget_reservation WHERE month=?`, previousMonth).Scan(&previousRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.R.QueryRowContext(ctx, `SELECT count(*) FROM assistant_budget_reservation WHERE month=?`, month).Scan(&currentRows); err != nil {
+		t.Fatal(err)
+	}
+	if previousRows != 0 || currentRows != 2 {
+		t.Fatalf("D1 cleanup left previous=%d current=%d reservation rows", previousRows, currentRows)
+	}
+
+	if _, err := st.W.ExecContext(ctx, `INSERT INTO assistant_conversation(id,admin_id,title_enc,summary_enc,created_at,updated_at) VALUES('cnv_d1','adm_d1',X'01',X'02',?,?)`, now.Unix(), now.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.W.ExecContext(ctx, `INSERT INTO assistant_message(id,conversation_id,admin_id,role,body_enc,created_at) VALUES('msg_d1','cnv_d1','adm_d1','user',X'03',?)`, now.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if deleted, err := st.DeleteAssistantConversation(ctx, "adm_d1", "cnv_d1"); err != nil || !deleted {
+		t.Fatalf("D1 conversation delete: deleted=%v err=%v", deleted, err)
+	}
+	var count int
+	if err := st.R.QueryRowContext(ctx, `SELECT count(*) FROM assistant_message WHERE conversation_id='cnv_d1'`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("D1 conversation delete left messages: count=%d err=%v", count, err)
+	}
+	result, err := st.W.ExecContext(ctx, `INSERT INTO assistant_message(id,conversation_id,admin_id,role,body_enc,created_at)
+		SELECT 'msg_late','cnv_d1','adm_d1','assistant',X'04',? WHERE EXISTS (SELECT 1 FROM assistant_conversation WHERE id='cnv_d1' AND admin_id='adm_d1')`, now.Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows, err := result.RowsAffected(); err != nil || rows != 0 {
+		t.Fatalf("D1 accepted a message after its conversation was deleted: rows=%d err=%v", rows, err)
+	}
+}
+
+func TestD1PanelSSHKeyConcurrentCreateHasOneWinner(t *testing.T) {
+	ctx := context.Background()
+	st := openD1Store(t)
+	key := PanelSSHKey{PrivateKey: []byte("sealed-key"), PublicKey: "ssh-ed25519 AAAA test", Fingerprint: "SHA256:fp", CreatedAt: time.Unix(1_800_000_000, 0)}
+	start := make(chan struct{})
+	created := make(chan bool, 2)
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			won, err := st.CreatePanelSSHKeyIfAbsent(ctx, key)
+			created <- won
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(created)
+	close(errs)
+	winners := 0
+	for won := range created {
+		if won {
+			winners++
+		}
+	}
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("concurrent inserts had %d winners, want 1", winners)
+	}
+	got, err := st.PanelSSHKey(ctx)
+	if err != nil || string(got.PrivateKey) != string(key.PrivateKey) || got.PublicKey != key.PublicKey || got.Fingerprint != key.Fingerprint {
+		t.Fatalf("stored D1 panel key = %+v, err %v", got, err)
 	}
 }
 
@@ -312,11 +567,11 @@ func TestD1FleetBatchSmoke(t *testing.T) {
 	if _, _, err := st.NodeHello(ctx, node.ID, 1, HelloInfo{AgentVersion: "test", Instance: "d1-instance"}, now); err != nil {
 		t.Fatalf("NodeHello() before stats = %v", err)
 	}
-	if err := st.Access().CreateGroup(ctx, AccessGroup{ID: "grp_d1_stats", Name: "d1-stats", CreatedAt: now}); err != nil {
+	if err := st.Access().CreateGroup(ctx, AccessGroup{ID: "grp_d1_stats", Name: "d1-stats", ProfileIDs: []string{"prf_d1_stats"}, CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.W.ExecContext(ctx, `INSERT INTO user (id, name, group_id, period_start, sub_token_hash, sub_token_enc, created_at)
-		VALUES ('usr_d1_stats', 'd1-stats-user', 'grp_d1_stats', ?, ?, ?, ?)`, now.Unix(), []byte("d1-stats-sub"), []byte{1}, now.Unix()); err != nil {
+	if _, err := st.W.ExecContext(ctx, `INSERT INTO user (id, name, group_id, all_nodes, period_start, sub_token_hash, sub_token_enc, created_at)
+		VALUES ('usr_d1_stats', 'd1-stats-user', 'grp_d1_stats', 1, ?, ?, ?, ?)`, now.Unix(), []byte("d1-stats-sub"), []byte{1}, now.Unix()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.W.ExecContext(ctx, `INSERT INTO device (id, user_id, hwid_hash, first_seen_at, last_seen_at, created_at)
@@ -380,7 +635,7 @@ func TestD1FleetBatchSmoke(t *testing.T) {
 		if err != nil || len(pairs) != 1 || pairs[0] != [2]string{"dev_d1_stats", node.ID} {
 			t.Fatalf("D1 OnlineDevices = %v, %v", pairs, err)
 		}
-		data, err := st.Access().SubscriptionData(ctx, "usr_d1_stats", "grp_d1_stats", now, false, now, nil)
+		data, err := st.Access().SubscriptionData(ctx, "usr_d1_stats", now, false, now, nil)
 		if err != nil || len(data.OnlineDevices["dev_d1_stats"]) != 1 || data.OnlineDevices["dev_d1_stats"][0] != node.ID {
 			t.Fatalf("D1 SubscriptionData.OnlineDevices = %v, %v", data.OnlineDevices, err)
 		}
@@ -540,6 +795,10 @@ func TestD1NodeLiveSessionGuardsAndDuplicateStats(t *testing.T) {
 
 func TestD1PortChecksStorage(t *testing.T) {
 	portCheckStoreProof(t, openD1Store(t))
+}
+
+func TestD1UDPPathLossStorage(t *testing.T) {
+	udpPathLossStoreProof(t, openD1Store(t))
 }
 
 func TestD1PortChecksUseOneStatement(t *testing.T) {
@@ -879,6 +1138,52 @@ func TestD1RewrittenAuthStoreMethods(t *testing.T) {
 		if _, err := st.RecordLoginFailure(ctx, "owner", now, 3, time.Hour, time.Minute); err != nil {
 			t.Fatal(err)
 		}
+		if err := st.ReleaseLoginFailure(ctx, "owner", 3); err != nil {
+			t.Fatalf("release reserved failure: %v", err)
+		}
+		cred, err := st.PasswordByAdmin(ctx, a.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.RecordLoginFailure(ctx, "owner", now, 3, time.Hour, time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		sess := Session{TokenHash: []byte("session-clears-failures"), AdminID: a.ID, CreatedAt: now, LastSeenAt: now, ExpiresAt: now.Add(time.Hour)}
+		if err := st.CreatePasswordSession(ctx, sess, cred); err != nil {
+			t.Fatalf("create session and clear prior failures: %v", err)
+		}
+		if failure, err := st.LoginFailures(ctx, "owner", now, time.Hour); err != nil || failure.Failures != 0 {
+			t.Fatalf("successful password session left failures: %+v, %v", failure, err)
+		}
+		if err := st.DeleteSession(ctx, sess.TokenHash); err != nil {
+			t.Fatalf("delete verification session: %v", err)
+		}
+		for range 3 {
+			if _, err := st.RecordLoginFailure(ctx, "owner", now, 3, time.Hour, time.Minute); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if failure, err := st.LockLoginFailure(ctx, "owner", 3, now, time.Hour, time.Minute); err != nil || !failure.Locked(now) {
+			t.Fatalf("lock reserved failures: %+v, %v", failure, err)
+		}
+		if err := st.ClearLoginFailures(ctx, "owner"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("PasswordSessionLockout", func(t *testing.T) {
+		for range 3 {
+			if _, err := st.RecordLoginFailure(ctx, "owner", now, 3, time.Hour, time.Minute); err != nil {
+				t.Fatal(err)
+			}
+		}
+		cred, err := st.PasswordByAdmin(ctx, a.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sess := Session{TokenHash: []byte("locked-session"), AdminID: a.ID, CreatedAt: now, LastSeenAt: now, ExpiresAt: now.Add(time.Hour)}
+		if err := st.CreatePasswordSession(ctx, sess, cred); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("CreatePasswordSession under lock: %v", err)
+		}
 	})
 	if _, err := st.W.ExecContext(ctx, `INSERT INTO session (token_hash, admin_id, created_at, last_seen_at, expires_at, ip, user_agent) VALUES (?, ?, ?, ?, ?, '', '')`, []byte("session-one"), a.ID, now.Unix(), now.Unix(), now.Add(time.Hour).Unix()); err != nil {
 		t.Fatal(err)
@@ -930,6 +1235,54 @@ func TestD1RewrittenAuthStoreMethods(t *testing.T) {
 		}
 		if cred, err := fresh.PasswordByLogin(ctx, "first"); err != nil || cred.AdminID != admin.ID {
 			t.Fatalf("CreateFirstAdminPassword: %+v %v", cred, err)
+		}
+	})
+	t.Run("AuthCeremonyClassBudgets", func(t *testing.T) {
+		fresh := openD1Store(t)
+		put := func(id, kind, source string) error {
+			return fresh.PutAuthCeremony(ctx, AuthCeremony{
+				ID: id, Kind: kind, Source: source, SessionData: "{}", ExpiresAt: now.Add(time.Minute),
+			}, now, 2, 2)
+		}
+		for _, row := range [][3]string{{"anon_b", "login", "source_a"}, {"anon_a", "setup", "source_b"}} {
+			if err := put(row[0], row[1], row[2]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := put("anon_c", "login", "source_c"); err != nil {
+			t.Fatalf("anonymous insert at capacity: %v", err)
+		}
+		if _, err := fresh.GetAuthCeremony(ctx, "anon_b", now); !errors.Is(err, ErrAuthCeremonyNotFound) {
+			t.Fatalf("oldest login ceremony survived: %v", err)
+		}
+		if _, err := fresh.GetAuthCeremony(ctx, "anon_a", now); err != nil {
+			t.Fatalf("setup ceremony was evicted: %v", err)
+		}
+		full := openD1Store(t)
+		for _, row := range [][3]string{{"setup_one", "setup", "source_a"}, {"setup_two", "setup-password", "source_b"}} {
+			if err := full.PutAuthCeremony(ctx, AuthCeremony{
+				ID: row[0], Kind: row[1], Source: row[2], SessionData: "{}", ExpiresAt: now.Add(time.Minute),
+			}, now, 2, 2); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := full.PutAuthCeremony(ctx, AuthCeremony{
+			ID: "login_when_no_login_can_be_evicted", Kind: "login", Source: "source_c", SessionData: "{}", ExpiresAt: now.Add(time.Minute),
+		}, now, 2, 2); !errors.Is(err, ErrAuthCeremonyLimit) {
+			t.Fatalf("login insertion into a full non-login class = %v, want limit", err)
+		}
+		for _, id := range []string{"setup_one", "setup_two"} {
+			if _, err := full.GetAuthCeremony(ctx, id, now); err != nil {
+				t.Errorf("non-login ceremony %q was evicted: %v", id, err)
+			}
+		}
+		for _, row := range [][3]string{{"bound_a", "stepup", "source_b"}, {"bound_b", "totp-enroll", "source_b"}} {
+			if err := put(row[0], row[1], row[2]); err != nil {
+				t.Fatalf("session-bound insert with a full anonymous class: %v", err)
+			}
+		}
+		if err := put("bound_c", "add-passkey", "source_c"); !errors.Is(err, ErrAuthCeremonyLimit) {
+			t.Fatalf("session-bound capacity: %v", err)
 		}
 	})
 }
@@ -1000,6 +1353,24 @@ func TestD1RewrittenTokenAndMCPPlanMethods(t *testing.T) {
 		}
 		if _, err := st.TakeMCPPlanOwnerSecret(ctx, secretPlan.ID, token.ID, secretPlan.Tool); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("take twice: %v", err)
+		}
+	})
+	t.Run("ReleaseApply", func(t *testing.T) {
+		if err := st.ReleaseApply(ctx, secretPlan.ID, PlanPlanned); !errors.Is(err, ErrPlanState) {
+			t.Fatalf("release with wrong previous status: %v", err)
+		}
+		if got, err := st.GetMCPPlan(ctx, secretPlan.ID); err != nil || got.Status != PlanApplying {
+			t.Fatalf("wrong previous status changed plan: %+v %v", got, err)
+		}
+		if err := st.ReleaseApply(ctx, secretPlan.ID, PlanApproved); err != nil {
+			t.Fatalf("release approved apply: %v", err)
+		}
+		got, err := st.GetMCPPlan(ctx, secretPlan.ID)
+		if err != nil || got.Status != PlanApproved || !got.ExpiresAt.Equal(now.Add(PlanTTL)) || !got.AppliedAt.IsZero() {
+			t.Fatalf("released plan: %+v %v", got, err)
+		}
+		if err := st.ReleaseApply(ctx, secretPlan.ID, PlanApproved); !errors.Is(err, ErrPlanState) {
+			t.Fatalf("release from wrong current status: %v", err)
 		}
 	})
 
@@ -1111,7 +1482,7 @@ func TestD1RewrittenAccessMethods(t *testing.T) {
 		if got, err := st.Access().User(ctx, "usr_user"); err != nil || got.Name != "User" || len(got.NodeIDs) != 1 || got.NodeIDs[0] != "nod_user" {
 			t.Fatalf("user = %+v, %v", got, err)
 		}
-		data, err := st.Access().SubscriptionData(ctx, u.ID, "grp_user", now, true, now, nil)
+		data, err := st.Access().SubscriptionData(ctx, u.ID, now, true, now, nil)
 		if err != nil || data.Device.ID != dev.ID || len(data.DeviceCreds) != 1 || data.DeviceCreds[0].ID != cred.ID {
 			t.Fatalf("user implicit credentials = %+v, %+v", data, err)
 		}
@@ -1125,12 +1496,28 @@ func TestD1RewrittenAccessMethods(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		was := u
 		u.Name, u.AllNodes, u.NodeIDs = "After", false, []string{"nod_update_user"}
-		if err := st.Access().UpdateUser(ctx, u, true); err != nil {
+		if err := st.Access().UpdateUser(ctx, u, was, true, AccessGroupChange{}); err != nil {
 			t.Fatal(err)
 		}
 		if got, err := st.Access().User(ctx, u.ID); err != nil || got.Name != "After" || len(got.NodeIDs) != 1 || got.NodeIDs[0] != "nod_update_user" {
 			t.Fatalf("user = %+v, %v", got, err)
+		}
+		// the same read again: the row and the node list have moved on, so nothing is written over them
+		if err := st.Access().UpdateUser(ctx, u, was, true, AccessGroupChange{}); !errors.Is(err, ErrAccessVersion) {
+			t.Fatalf("write over an old read = %v, want ErrAccessVersion", err)
+		}
+		gone := u
+		gone.ID = "usr_nope"
+		if err := st.Access().UpdateUser(ctx, gone, gone, false, AccessGroupChange{}); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("missing person = %v, want ErrNotFound", err)
+		}
+		if err := st.Access().SetUserExpiry(ctx, u.ID, time.Time{}, time.Unix(1_900_000_000, 0)); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.Access().SetUserExpiry(ctx, u.ID, time.Time{}, time.Unix(1_900_000_001, 0)); !errors.Is(err, ErrAccessVersion) {
+			t.Fatalf("extension over an old term end = %v, want ErrAccessVersion", err)
 		}
 	})
 	t.Run("EnsureImplicitDeviceWithoutCredentials", func(t *testing.T) {
@@ -1142,7 +1529,7 @@ func TestD1RewrittenAccessMethods(t *testing.T) {
 		if err != nil || created || got.ID != "" || len(live) != 0 {
 			t.Fatalf("EnsureImplicitDevice without credentials = %+v, %+v, %v, %v", got, live, created, err)
 		}
-		if data, err := st.Access().SubscriptionData(ctx, dev.UserID, "grp_add_device", now, false, now, nil); err != nil || data.Device.ID != "" || len(data.Devices) != 0 {
+		if data, err := st.Access().SubscriptionData(ctx, dev.UserID, now, false, now, nil); err != nil || data.Device.ID != "" || len(data.Devices) != 0 {
 			t.Fatalf("device after empty ensure = %+v, %v, want none", data.Device, err)
 		}
 	})
@@ -1156,7 +1543,7 @@ func TestD1RewrittenAccessMethods(t *testing.T) {
 		if err != nil || !created || got.ID != dev.ID || len(live) != 1 || live[0].ID != cred.ID {
 			t.Fatalf("EnsureImplicitDevice = %+v, %+v, %v, %v", got, live, created, err)
 		}
-		data, err := st.Access().SubscriptionData(ctx, dev.UserID, "grp_add_creds", now, false, now, nil)
+		data, err := st.Access().SubscriptionData(ctx, dev.UserID, now, false, now, nil)
 		if err != nil || len(data.Devices) != 1 || data.Devices[0].ID != dev.ID || len(data.Devices[0].Protocols) != 1 || data.Devices[0].Protocols[0] != cred.Protocol {
 			t.Fatalf("subscription devices after add credentials = %+v, %v", data.Devices, err)
 		}
@@ -1246,7 +1633,7 @@ func TestD1RewrittenAccessMethods(t *testing.T) {
 			t.Fatalf("a device over the ceiling: %v", err)
 		}
 		for hash, want := range map[string]string{string(hashA): "dev_link_shared", string(hashB): "dev_link_b", string(hashC): ""} {
-			data, err := st.Access().SubscriptionData(ctx, userID, "grp_link_hwid", now, false, now, []byte(hash))
+			data, err := st.Access().SubscriptionData(ctx, userID, now, false, now, []byte(hash))
 			if err != nil || data.Device.ID != want || len(data.Devices) != 2 {
 				t.Fatalf("SubscriptionData by hash: device %q of %d, %v; want %q", data.Device.ID, len(data.Devices), err, want)
 			}
@@ -1268,7 +1655,7 @@ func TestD1RewrittenAccessMethods(t *testing.T) {
 			t.Fatalf("SubscriptionFetchAt = %d, want the touch of the second device %d", fetched, now.Add(2*time.Hour).Unix())
 		}
 	})
-	t.Run("LinkDeviceBlockAndEviction", func(t *testing.T) {
+	t.Run("LinkDeviceBlockAndIdle", func(t *testing.T) {
 		st := openD1Store(t)
 		createGroup(t, st, "grp_link_limit", nil)
 		createUser(t, st, "usr_link_limit", "Link limit", "grp_link_limit")
@@ -1297,20 +1684,20 @@ func TestD1RewrittenAccessMethods(t *testing.T) {
 		if _, err := ensure("c"); !errors.As(err, &limit) || limit.Mode != LinkModeEnforce {
 			t.Fatalf("a third device at the limit: %v", err)
 		}
-		// A device silent for 31 days gives its place: the guard of the batch checks the victim and the count.
+		// A device silent for 31 days is idle and stops filling a place, but it is kept: the third device is born next to it.
 		if _, err := st.W.ExecContext(ctx, `UPDATE device SET last_seen_at = ? WHERE id = 'dev_ll_a'`, now.Add(-31*24*time.Hour).Unix()); err != nil {
 			t.Fatal(err)
 		}
 		c, err := ensure("c")
-		if err != nil || c.Device.ID != "dev_ll_c" || c.Replaced != "dev_ll_a" || len(c.Added) != 1 {
-			t.Fatalf("a third device with a silent one = %+v, %v", c, err)
+		if err != nil || c.Device.ID != "dev_ll_c" || c.Replaced != "" || !c.Born || len(c.Added) != 1 {
+			t.Fatalf("a third device with an idle one = %+v, %v", c, err)
 		}
 		var live, replaced, liveCreds int
 		st.R.QueryRowContext(ctx, `SELECT count(*) FROM device WHERE user_id = ? AND revoked_at IS NULL`, userID).Scan(&live)
 		st.R.QueryRowContext(ctx, `SELECT count(*) FROM event WHERE code = 'device_replaced' AND user_id = ?`, userID).Scan(&replaced)
 		st.R.QueryRowContext(ctx, `SELECT count(*) FROM device_credential WHERE device_id = 'dev_ll_a' AND revoked_at IS NULL`).Scan(&liveCreds)
-		if live != 2 || replaced != 1 || liveCreds != 0 {
-			t.Fatalf("live %d, device_replaced events %d, live credentials of the replaced device %d; want 2, 1, 0", live, replaced, liveCreds)
+		if live != 3 || replaced != 0 || liveCreds != 1 {
+			t.Fatalf("live %d, device_replaced events %d, live credentials of the idle device %d; want 3, 0, 1", live, replaced, liveCreds)
 		}
 
 		// The block: the device is revoked, its HWID is not born again, the snapshot says so, and the unblock lets it back.
@@ -1323,7 +1710,7 @@ func TestD1RewrittenAccessMethods(t *testing.T) {
 		if _, err := ensure("b"); !errors.Is(err, ErrAccessBlocked) {
 			t.Fatalf("the blocked HWID = %v, want ErrAccessBlocked", err)
 		}
-		data, err := st.Access().SubscriptionData(ctx, userID, "grp_link_limit", now, false, now, hash("b"))
+		data, err := st.Access().SubscriptionData(ctx, userID, now, false, now, hash("b"))
 		if err != nil || !data.Blocked || data.LinkMode != LinkModeEnforce {
 			t.Fatalf("snapshot: blocked %v, mode %q, %v", data.Blocked, data.LinkMode, err)
 		}
@@ -1338,11 +1725,14 @@ func TestD1RewrittenAccessMethods(t *testing.T) {
 		}
 
 		// STRICT revokes the shared devices in the batch that stores the mode; a revoked row older than the cutoff is pruned.
+		if _, err := st.Access().RevokeDevice(ctx, "dev_ll_a", now); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := st.W.ExecContext(ctx, `UPDATE device SET revoked_at = 5 WHERE id = 'dev_ll_a'`); err != nil {
 			t.Fatal(err)
 		}
 		if n, err := st.PruneRevokedDevices(ctx, now.Add(-time.Hour), 10); err != nil || n != 1 {
-			t.Fatalf("PruneRevokedDevices = %d, %v; want the replaced device", n, err)
+			t.Fatalf("PruneRevokedDevices = %d, %v; want the revoked device", n, err)
 		}
 		if n, err := st.SaveSubscriptionSettings(ctx, nil, LinkModeStrict, now); err != nil || n != 0 {
 			t.Fatalf("SaveSubscriptionSettings = %d, %v", n, err)
@@ -1363,7 +1753,7 @@ func TestD1RewrittenAccessMethods(t *testing.T) {
 		if userID, err := st.Access().RevokeDevice(ctx, dev.ID, now); err != nil || userID != dev.UserID {
 			t.Fatalf("revoke = %q, %v", userID, err)
 		}
-		data, err := st.Access().SubscriptionData(ctx, dev.UserID, "grp_revoke_device", now, false, now, nil)
+		data, err := st.Access().SubscriptionData(ctx, dev.UserID, now, false, now, nil)
 		if err != nil || len(data.Devices) != 0 {
 			t.Fatalf("subscription devices after revoke = %+v, %v", data.Devices, err)
 		}
@@ -1449,6 +1839,287 @@ func TestD1RewrittenAccessMethods(t *testing.T) {
 	})
 }
 
+func TestD1ClientDeviceKeyMethodsUseGuardedBatch(t *testing.T) {
+	ctx := context.Background()
+	st := openD1Store(t)
+	now := time.Unix(1_800_000_000, 0).UTC()
+	if err := st.Access().CreateGroup(ctx, AccessGroup{ID: "grp_client_api", Name: "Client API", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	u := AccessUser{ID: "usr_alice", Name: "alice", GroupID: "grp_client_api", Status: "active", AppHapp: true, AppAmnezia: true,
+		AllNodes: true, QuotaReset: "month", PeriodStart: now, DeviceLimit: 5, SubTokenHash: []byte("subscription-hash"),
+		SubTokenEnc: []byte("sealed"), CreatedAt: now}
+	if err := st.Access().CreateUser(ctx, u, AccessDevice{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetSettings(ctx, map[string]string{SettingLinkDeviceLimit: LinkModeEnforce}); err != nil {
+		t.Fatal(err)
+	}
+	issue := func(tag string) LinkIssue {
+		return func(string, map[string]bool) ([]AccessCred, error) {
+			return []AccessCred{{ID: "crd_" + tag, UserID: u.ID, Protocol: "hysteria2", SecretEnc: []byte("sealed"), DataJSON: `{}`}}, nil
+		}
+	}
+	hwid := HWIDHash(u.ID, "aaaaaaaaaaaaaaaa")
+	old, err := st.Access().EnsureLinkDevice(ctx, AccessDevice{ID: "dev_basic", UserID: u.ID, HWIDHash: hwid, Kind: DeviceKindLink}, 5, now, issue("basic"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyHash, enrolHash := sha256.Sum256([]byte("key")), sha256.Sum256([]byte("enrol"))
+	var enrolled LinkDeviceResult
+	counts := countD1Queries(t, js.Global().Get("__d1"), "client-api-enrol-keyless", func() {
+		enrolled, err = st.Access().EnrolLinkDevice(ctx,
+			AccessDevice{ID: "dev_ignored", UserID: u.ID, HWIDHash: hwid, KeyHash: keyHash[:], EnrolTokenHash: enrolHash[:]}, 5, now.Add(time.Minute), issue("enrolled"))
+		if err != nil {
+			t.Fatalf("enrol over a keyless device: %v", err)
+		}
+	})
+	if counts.batches != 2 { // the state is read in one batch, and everything the enrolment writes goes in one
+		t.Fatalf("enrolment over a keyless device made %d batches, want a read batch and one atomic write batch", counts.batches)
+	}
+	if enrolled.Device.ID != old.Device.ID || !bytes.Equal(enrolled.Device.KeyHash, keyHash[:]) || len(enrolled.Creds) != 1 || enrolled.Creds[0].ID != "crd_enrolled" {
+		t.Fatalf("enrolment result = %+v", enrolled)
+	}
+	var liveOld, liveNew int
+	if err := st.R.QueryRowContext(ctx, `SELECT count(*) FROM device_credential WHERE device_id = 'dev_basic' AND revoked_at IS NULL AND id = 'crd_basic'`).Scan(&liveOld); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.R.QueryRowContext(ctx, `SELECT count(*) FROM device_credential WHERE device_id = 'dev_basic' AND revoked_at IS NULL AND id = 'crd_enrolled'`).Scan(&liveNew); err != nil {
+		t.Fatal(err)
+	}
+	if liveOld != 0 || liveNew != 1 {
+		t.Fatalf("live credentials: old %d, new %d; want 0 and 1", liveOld, liveNew)
+	}
+	device, owner, err := st.Access().LinkDeviceByKeyHash(ctx, keyHash[:])
+	if err != nil || device.ID != "dev_basic" || owner.UserID != u.ID || !bytes.Equal(device.EnrolTokenHash, enrolHash[:]) {
+		t.Fatalf("lookup = device %+v owner %+v err %v", device, owner, err)
+	}
+
+	// A new HWID: one batch for the device, its credentials and both hashes.
+	secondKey := sha256.Sum256([]byte("second key"))
+	counts = countD1Queries(t, js.Global().Get("__d1"), "client-api-enrol-new", func() {
+		enrolled, err = st.Access().EnrolLinkDevice(ctx,
+			AccessDevice{ID: "dev_second", UserID: u.ID, HWIDHash: HWIDHash(u.ID, "bbbbbbbbbbbbbbbb"), KeyHash: secondKey[:], EnrolTokenHash: enrolHash[:]}, 5, now.Add(time.Minute), issue("second"))
+		if err != nil {
+			t.Fatalf("enrol a new HWID: %v", err)
+		}
+	})
+	if counts.batches != 2 || enrolled.Device.ID != "dev_second" || !enrolled.Born || len(enrolled.Creds) != 1 {
+		t.Fatalf("new HWID enrolment: %d batches, %+v", counts.batches, enrolled)
+	}
+	// The same HWID again is refused before any write; a repeated key hash fails the batch as a whole and writes nothing.
+	if _, err := st.Access().EnrolLinkDevice(ctx,
+		AccessDevice{UserID: u.ID, HWIDHash: HWIDHash(u.ID, "bbbbbbbbbbbbbbbb"), KeyHash: keyHash[:], EnrolTokenHash: enrolHash[:]}, 5, now.Add(time.Minute), issue("again")); !errors.Is(err, ErrAccessExists) {
+		t.Fatalf("enrol of an enrolled HWID = %v, want ErrAccessExists", err)
+	}
+	counts = countD1Queries(t, js.Global().Get("__d1"), "client-api-enrol-duplicate-key", func() {
+		_, err = st.Access().EnrolLinkDevice(ctx,
+			AccessDevice{ID: "dev_dup", UserID: u.ID, HWIDHash: HWIDHash(u.ID, "cccccccccccccccc"), KeyHash: keyHash[:], EnrolTokenHash: enrolHash[:]}, 5, now.Add(time.Minute), issue("dup"))
+	})
+	if !errors.Is(err, ErrAccessExists) || counts.batches != 2 {
+		t.Fatalf("enrol with a duplicate key hash = %v after %d batches; want ErrAccessExists after the read and one failed write (not retried)", err, counts.batches)
+	}
+	var dupRows int
+	if err := st.R.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM device WHERE id = 'dev_dup') + (SELECT count(*) FROM device_credential WHERE id = 'crd_dup')`).Scan(&dupRows); err != nil || dupRows != 0 {
+		t.Fatalf("the failed batch left %d rows (%v)", dupRows, err)
+	}
+
+	// The key hash of a device that was set is compared to the expected one, with the user in the guard.
+	if changed, err := st.Access().SetLinkDeviceKeyHash(ctx, "usr_bob", device.ID, keyHash[:], secondKey[:], enrolHash[:]); err != nil || changed {
+		t.Fatalf("set by a foreign user = %v, %v; want no change", changed, err)
+	}
+	if _, err := st.Access().SetLinkDeviceKeyHash(ctx, u.ID, device.ID, keyHash[:], secondKey[:], enrolHash[:]); !errors.Is(err, ErrAccessExists) {
+		t.Fatalf("set of a key hash that is taken = %v, want ErrAccessExists", err)
+	}
+	rotatedHash := sha256.Sum256([]byte("rotated-key"))
+	counts = countD1Queries(t, js.Global().Get("__d1"), "client-api-key-rotation", func() {
+		changed, err := st.Access().SetLinkDeviceKeyHash(ctx, u.ID, device.ID, keyHash[:], rotatedHash[:], enrolHash[:])
+		if err != nil || !changed {
+			t.Fatalf("rotate device key = %v, %v", changed, err)
+		}
+	})
+	if counts.batches != 1 {
+		t.Fatalf("key update made %d batches, want one atomic update", counts.batches)
+	}
+	if _, _, err := st.Access().LinkDeviceByKeyHash(ctx, keyHash[:]); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("old key lookup after rotation = %v", err)
+	}
+	if device, _, err := st.Access().LinkDeviceByKeyHash(ctx, rotatedHash[:]); err != nil || device.ID != "dev_basic" {
+		t.Fatalf("rotated key lookup = %+v, %v", device, err)
+	}
+
+	// Removed and blocked devices keep their hashes: the lookup says so and returns no device.
+	if _, err := st.Access().RevokeDevice(ctx, "dev_basic", now.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if device, owner, err := st.Access().LinkDeviceByKeyHash(ctx, rotatedHash[:]); !errors.Is(err, ErrDeviceRevoked) || device.ID != "" || owner.UserID != u.ID {
+		t.Fatalf("removed device lookup = %+v %+v %v", device, owner, err)
+	}
+	if _, err := st.Access().BlockDevice(ctx, "dev_second", now.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if device, owner, err := st.Access().LinkDeviceByKeyHash(ctx, secondKey[:]); !errors.Is(err, ErrAccessBlocked) || device.ID != "" || owner.UserID != u.ID {
+		t.Fatalf("blocked device lookup = %+v %+v %v", device, owner, err)
+	}
+	if _, _, err := st.Access().LinkDeviceByKeyHash(ctx, sha256.New().Sum(nil)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown key lookup = %v", err)
+	}
+	if changed, err := st.Access().SetLinkDeviceKeyHash(ctx, u.ID, old.Device.ID, nil, keyHash[:], enrolHash[:]); err != nil || changed {
+		t.Fatalf("set key on revoked row = %v, %v; want no change", changed, err)
+	}
+}
+
+func TestD1LinkAWGKeyCountAndRevoke(t *testing.T) {
+	ctx := context.Background()
+	st := openD1Store(t)
+	now := time.Unix(1_800_000_000, 0).UTC()
+	if err := st.Access().CreateGroup(ctx, AccessGroup{ID: "grp_link_awg", Name: "Link AWG", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	user := AccessUser{ID: "usr_link_awg", Name: "Link AWG", GroupID: "grp_link_awg", Status: "active", AppHapp: true,
+		AppAmnezia: true, AllNodes: true, QuotaReset: "none", PeriodStart: now, DeviceLimit: 5, SubTokenHash: []byte("link-awg-hash"),
+		SubTokenEnc: []byte("sealed"), CreatedAt: now}
+	if err := st.Access().CreateUser(ctx, user, AccessDevice{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	profileID := "prf_link_awg"
+	if err := st.Access().CreateProfile(ctx, AccessProfile{ID: profileID, Protocol: "awg", Name: profileID, SettingsJSON: "{}", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	want := []AWGImplicitWant{{ProfileID: profileID, MaxIdx: 8, Issue: func(int) (AccessCred, string, error) {
+		return AccessCred{ID: "crd_link_awg", Protocol: "awg", SecretEnc: []byte("sealed"), DataJSON: `{}`}, "pub_link_awg", nil
+	}}}
+	link, err := st.Access().EnsureLinkAWGCreds(ctx, AccessDevice{ID: "dev_link_awg", UserID: user.ID, Implicit: true}, user.DeviceLimit, now, want)
+	if err != nil || len(link.Added) != 1 {
+		t.Fatalf("link AWG credential = %+v, %v", link, err)
+	}
+	if _, err := st.Access().AddAWGDevice(ctx, AWGDeviceAdd{Device: AccessDevice{ID: "dev_explicit_awg", UserID: user.ID}, ProfileID: profileID, MaxIdx: 8, Limit: 5}, now,
+		func(int) (AccessCred, string, error) {
+			return AccessCred{ID: "crd_explicit_awg", Protocol: "awg", SecretEnc: []byte("sealed"), DataJSON: `{}`}, "pub_explicit_awg", nil
+		}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := st.Access().CountLinkAWGKeys(ctx); err != nil || got != 1 {
+		t.Fatalf("CountLinkAWGKeys = %d, %v; want only the link peer", got, err)
+	}
+	if dropped, err := st.Access().RevokeLinkAWGCreds(ctx, link.Device, now); err != nil || dropped != 1 {
+		t.Fatalf("RevokeLinkAWGCreds = %d, %v; want one", dropped, err)
+	}
+	if got, err := st.Access().CountLinkAWGKeys(ctx); err != nil || got != 0 {
+		t.Fatalf("CountLinkAWGKeys after revoke = %d, %v; want zero", got, err)
+	}
+	var released, revoked int
+	if err := st.R.QueryRowContext(ctx, `SELECT p.released_at, c.revoked_at FROM awg_peer p JOIN device_credential c ON c.id = p.credential_id WHERE c.id = 'crd_link_awg'`).Scan(&released, &revoked); err != nil || int64(released) != now.Unix() || int64(revoked) != now.Unix() {
+		t.Fatalf("link peer released/revoked = %d/%d, %v; want %d", released, revoked, err, now.Unix())
+	}
+	keys, err := st.Access().AWGDevices(ctx, user.ID)
+	if err != nil || len(keys) != 1 || keys[0].ID != "dev_explicit_awg" {
+		t.Fatalf("explicit AmneziaVPN keys = %+v, %v; want the original key", keys, err)
+	}
+}
+
+// Sync and leave of the client API on D1: the credentials an enrolled device is missing are issued in one write batch after the
+// read, a sync with nothing to issue is the read alone, and a leave is one atomic batch. The basic guards stay.
+func TestD1EnrolledDeviceIssueAndLeaveAreOneWriteBatch(t *testing.T) {
+	ctx := context.Background()
+	st := openD1Store(t)
+	now := time.Unix(1_800_000_000, 0).UTC()
+	if err := st.Access().CreateGroup(ctx, AccessGroup{ID: "grp_enrolled_sync", Name: "Enrolled sync", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	u := AccessUser{ID: "usr_enrolled_sync", Name: "alice", GroupID: "grp_enrolled_sync", Status: "active", AppHapp: true, AppAmnezia: true,
+		AllNodes: true, QuotaReset: "none", PeriodStart: now, DeviceLimit: 5, SubTokenHash: []byte("enrolled-sync-hash"),
+		SubTokenEnc: []byte("sealed"), CreatedAt: now}
+	if err := st.Access().CreateUser(ctx, u, AccessDevice{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetSettings(ctx, map[string]string{SettingLinkDeviceLimit: LinkModeEnforce}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Access().CreateProfile(ctx, AccessProfile{ID: "prf_enrolled_sync", Protocol: "awg", Name: "awg", SettingsJSON: "{}", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	basic := func(string, map[string]bool) ([]AccessCred, error) {
+		return []AccessCred{{ID: "crd_enrolled_sync_hy2", UserID: u.ID, Protocol: "hysteria2", SecretEnc: []byte("sealed"), DataJSON: `{}`}}, nil
+	}
+	none := func(string, map[string]bool) ([]AccessCred, error) { return nil, nil }
+	hwid := HWIDHash(u.ID, "aaaaaaaaaaaaaaaa")
+	keyHash, enrolHash := sha256.Sum256([]byte("enrolled-sync-key")), sha256.Sum256([]byte("enrolled-sync-link"))
+	if _, err := st.W.ExecContext(ctx, `UPDATE user SET sub_token_hash = ? WHERE id = ?`, enrolHash[:], u.ID); err != nil { // the device's link is the current one
+		t.Fatal(err)
+	}
+	if _, err := st.Access().EnrolLinkDevice(ctx, AccessDevice{ID: "dev_enrolled_sync", UserID: u.ID, HWIDHash: hwid, KeyHash: keyHash[:], EnrolTokenHash: enrolHash[:]}, 5, now, basic); err != nil {
+		t.Fatal(err)
+	}
+	dev, _, err := st.Access().LinkDeviceByKeyHash(ctx, keyHash[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []AWGImplicitWant{{ProfileID: "prf_enrolled_sync", MaxIdx: 8, Issue: func(int) (AccessCred, string, error) {
+		return AccessCred{ID: "crd_enrolled_sync_awg", Protocol: "awg", SecretEnc: []byte("sealed"), DataJSON: `{}`}, "pub_enrolled_sync", nil
+	}}}
+
+	var issued LinkDeviceResult
+	counts := countD1Queries(t, js.Global().Get("__d1"), "enrolled-issue", func() {
+		issued, err = st.Access().EnsureEnrolledLinkDevice(ctx, dev, now.Add(time.Minute), none, want)
+		if err != nil {
+			t.Fatalf("issue to an enrolled device: %v", err)
+		}
+	})
+	if counts.batches != 2 { // the state is read in one batch, and the peer, its credential and its address go in one
+		t.Fatalf("issuing to an enrolled device made %d batches, want a read batch and one atomic write batch", counts.batches)
+	}
+	if issued.Device.ID != dev.ID || len(issued.Added) != 1 || issued.Added[0].Protocol != "awg" || len(issued.Creds) != 2 {
+		t.Fatalf("issue result = %+v", issued)
+	}
+	var peers int
+	if err := st.R.QueryRowContext(ctx, `SELECT count(*) FROM awg_peer WHERE credential_id = 'crd_enrolled_sync_awg' AND released_at = 0`).Scan(&peers); err != nil || peers != 1 {
+		t.Fatalf("live peers = %d, %v", peers, err)
+	}
+	counts = countD1Queries(t, js.Global().Get("__d1"), "enrolled-nothing-to-issue", func() {
+		issued, err = st.Access().EnsureEnrolledLinkDevice(ctx, dev, now.Add(2*time.Minute), none, want)
+		if err != nil || len(issued.Added) != 0 || issued.Device.ID != dev.ID {
+			t.Fatalf("nothing to issue = %+v, %v", issued, err)
+		}
+	})
+	if counts.batches != 1 {
+		t.Fatalf("a sync with nothing to issue made %d batches, want the read alone", counts.batches)
+	}
+	// The basic paths still refuse the HWID of the enrolled device.
+	if _, err := st.Access().EnsureLinkAWGCreds(ctx, AccessDevice{ID: "dev_ignored", UserID: u.ID, HWIDHash: hwid}, 5, now, want); !errors.Is(err, ErrDeviceEnrolled) {
+		t.Fatalf("basic AWG path on an enrolled HWID = %v, want ErrDeviceEnrolled", err)
+	}
+	if _, err := st.Access().EnsureLinkDevice(ctx, AccessDevice{ID: "dev_ignored", UserID: u.ID, HWIDHash: hwid}, 5, now, basic); !errors.Is(err, ErrDeviceEnrolled) {
+		t.Fatalf("basic device path on an enrolled HWID = %v, want ErrDeviceEnrolled", err)
+	}
+	// A key that is no longer the device's gets nothing, and the failed write is not retried into success.
+	stale := dev
+	stale.KeyHash = sha256.New().Sum(nil)
+	if _, err := st.Access().EnsureEnrolledLinkDevice(ctx, stale, now.Add(3*time.Minute), none, want); !errors.Is(err, ErrAccessExists) {
+		t.Fatalf("issue with a stale key = %v, want ErrAccessExists", err)
+	}
+
+	counts = countD1Queries(t, js.Global().Get("__d1"), "enrolled-leave", func() {
+		if err := st.Access().RevokeEnrolledLinkDevice(ctx, dev, now.Add(4*time.Minute)); err != nil {
+			t.Fatalf("leave: %v", err)
+		}
+	})
+	if counts.batches != 1 {
+		t.Fatalf("a leave made %d batches, want one atomic batch", counts.batches)
+	}
+	var live, quarantined int
+	if err := st.R.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM device_credential WHERE device_id = 'dev_enrolled_sync' AND revoked_at IS NULL),
+		(SELECT count(*) FROM awg_peer WHERE credential_id = 'crd_enrolled_sync_awg' AND released_at > 0)`).Scan(&live, &quarantined); err != nil || live != 0 || quarantined != 1 {
+		t.Fatalf("after the leave: %d live credentials, %d quarantined peers, %v", live, quarantined, err)
+	}
+	if _, _, err := st.Access().LinkDeviceByKeyHash(ctx, keyHash[:]); !errors.Is(err, ErrDeviceRevoked) {
+		t.Fatalf("key after the leave = %v, want ErrDeviceRevoked", err)
+	}
+	if err := st.Access().RevokeEnrolledLinkDevice(ctx, dev, now.Add(5*time.Minute)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("second leave = %v, want ErrNotFound", err)
+	}
+}
+
 func TestD1RewrittenDNSAndSettingsMethods(t *testing.T) {
 	ctx := context.Background()
 	now := time.Unix(1_800_000_000, 0).UTC()
@@ -1467,6 +2138,22 @@ func TestD1RewrittenDNSAndSettingsMethods(t *testing.T) {
 		var dns sql.NullString
 		if err := st.R.QueryRowContext(ctx, `SELECT dns_preset_id FROM user_group WHERE id = 'grp_dns_delete'`).Scan(&dns); err != nil || dns.Valid {
 			t.Fatalf("group DNS reference = %v, %v", dns, err)
+		}
+	})
+	t.Run("DNSBlockAdsRoundTrip", func(t *testing.T) {
+		st := openD1Store(t)
+		id := "dns_block_ads"
+		if err := st.DNS().Create(ctx, DNSPreset{ID: id, Name: id, ServersJSON: `[]`, SplitJSON: `[]`, Transport: "plain", BlockAds: true, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatal(err)
+		}
+		if p, err := st.DNS().Get(ctx, id); err != nil || !p.BlockAds {
+			t.Fatalf("after create: %+v %v", p, err)
+		}
+		if err := st.DNS().Update(ctx, DNSPreset{ID: id, Name: id, ServersJSON: `[]`, SplitJSON: `[]`, Transport: "plain", UpdatedAt: now}); err != nil {
+			t.Fatal(err)
+		}
+		if p, err := st.DNS().Get(ctx, id); err != nil || p.BlockAds {
+			t.Fatalf("after update: %+v %v", p, err)
 		}
 	})
 	t.Run("SetNodeOptions", func(t *testing.T) {
@@ -1806,6 +2493,10 @@ func TestD1CountryChecksStorage(t *testing.T) {
 	countryCheckStoreProof(t, openD1Store(t))
 }
 
+func TestD1IPv6Entry(t *testing.T) {
+	ipv6EntryProof(t, openD1Store(t))
+}
+
 func TestD1CountryCheckFamilies(t *testing.T) {
 	countryCheckFamilyProof(t, openD1Store(t))
 }
@@ -1822,8 +2513,51 @@ func TestD1ExtChecksStorage(t *testing.T) {
 	extCheckStoreProof(t, openD1Store(t))
 }
 
+func TestD1OwnProbeStorage(t *testing.T) {
+	ownProbeStoreProof(t, openD1Store(t))
+}
+
+func TestD1OwnProbeEnrollUsesOneStatement(t *testing.T) {
+	binding := js.Global().Get("__d1")
+	st := openD1Store(t)
+	t.Cleanup(func() { _ = st.Close() })
+	ctx := context.Background()
+	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	tokenHash, secretHash := sha256.Sum256([]byte("mgp_test_d1_token")), sha256.Sum256([]byte("mgps_test_d1_secret"))
+	if err := st.CreateOwnProbe(ctx, OwnProbe{ID: "prb_d1_count", Name: "probe-de1", City: "de1", Kind: "home",
+		TokenHash: tokenHash[:], TokenExpires: now.Add(time.Hour), CreatedAt: now, CreatedBy: "adm_test"}); err != nil {
+		t.Fatal(err)
+	}
+	calls := countD1Queries(t, binding, "EnrollOwnProbe", func() {
+		if _, err := st.EnrollOwnProbe(ctx, tokenHash[:], secretHash[:], 64512, "ExampleNet", "ExampleNet", "abcdef012345", now); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if calls.queries != 1 || calls.batches != 0 {
+		t.Fatalf("EnrollOwnProbe used %d sequential D1 calls and %d batches, want one UPDATE RETURNING", calls.queries, calls.batches)
+	}
+}
+
+// The extra groups of a person on D1: the same proof as on SQLite (extra_group_test.go).
+func TestD1ExtraGroups(t *testing.T) {
+	extraGroupStoreProof(t, openD1Store)
+}
+
+// The state of a person's page password on D1: the same proof as on SQLite (page_password_store_test.go).
+func TestD1PagePassword(t *testing.T) {
+	pagePasswordStoreProof(t, openD1Store)
+}
+
 func TestD1RelaysStorage(t *testing.T) {
 	relayStoreProof(t, openD1Store(t))
+}
+
+func TestD1RelayModeStorage(t *testing.T) {
+	relayModeStoreProof(t, openD1Store(t))
+}
+
+func TestD1RelayCountersStorage(t *testing.T) {
+	relayCounterStoreProof(t, openD1Store(t))
 }
 
 func TestD1RelayRace(t *testing.T) {
@@ -1832,6 +2566,18 @@ func TestD1RelayRace(t *testing.T) {
 
 func TestD1ClientProbeReportsStorage(t *testing.T) {
 	clientProbeStoreProof(t, openD1Store(t))
+}
+
+func TestD1LinkReasonsStorage(t *testing.T) {
+	linkReasonsStoreProof(t, openD1Store(t))
+}
+
+func TestD1TunnelRefusalsStorage(t *testing.T) {
+	tunnelRefusalsStoreProof(t, openD1Store(t))
+}
+
+func TestD1HelloKexStorage(t *testing.T) {
+	helloKexStoreProof(t, openD1Store(t))
 }
 
 func TestD1LinkHourStorage(t *testing.T) {
@@ -1942,5 +2688,99 @@ func TestD1LinkDNS(t *testing.T) {
 	}
 	if eff, err := d.EffectiveData(ctx, "usr_link_dns"); err != nil || eff.LinkPick != "" || len(eff.LinkOptions) != 1 || eff.LinkOptions[0].Default {
 		t.Fatalf("after the preset was deleted: %+v %v", eff, err)
+	}
+}
+
+func TestD1NodeRuntimeStorage(t *testing.T) {
+	nodeRuntimeStoreProof(t, openD1Store(t))
+}
+
+// The client catalogue's device query is a plain read of the link devices with a VLESS credential; D1 answers it like SQLite.
+func TestD1ClientCompatDevices(t *testing.T) {
+	ctx := context.Background()
+	st := openD1Store(t)
+	now := time.Unix(1_800_000_000, 0).UTC()
+	if err := st.Access().CreateGroup(ctx, AccessGroup{ID: "grp_compat", Name: "Compat", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	u := AccessUser{ID: "usr_alice", Name: "alice", GroupID: "grp_compat", Status: "active", AppHapp: true, AppAmnezia: true,
+		AllNodes: true, QuotaReset: "month", PeriodStart: now, DeviceLimit: 5, SubTokenHash: []byte("subscription-hash"),
+		SubTokenEnc: []byte("sealed"), CreatedAt: now}
+	if err := st.Access().CreateUser(ctx, u, AccessDevice{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	issue := func(tag, protocol string) LinkIssue {
+		return func(string, map[string]bool) ([]AccessCred, error) {
+			return []AccessCred{{ID: "crd_" + tag, UserID: u.ID, Protocol: protocol, SecretEnc: []byte("sealed"), DataJSON: `{}`}}, nil
+		}
+	}
+	dev := func(tag string) AccessDevice {
+		return AccessDevice{ID: "dev_" + tag, UserID: u.ID, HWIDHash: HWIDHash(u.ID, tag+"aaaaaaaaaaaaaaaa"), Kind: DeviceKindLink, Platform: "android", Client: "Happ/3.4.2"}
+	}
+	if _, err := st.Access().EnsureLinkDevice(ctx, dev("vless"), 5, now, issue("vless", "vless")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Access().EnsureLinkDevice(ctx, dev("hy2"), 5, now, issue("hy2", "hysteria2")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.Access().ClientCompatDevices(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != "dev_vless" || got[0].Client != "Happ/3.4.2" || got[0].Platform != "android" || got[0].Shared || got[0].LastSeenAt.IsZero() {
+		t.Fatalf("devices = %+v", got)
+	}
+}
+
+func TestD1RelayAudienceStorage(t *testing.T) {
+	relayAudienceProof(t, openD1Store(t))
+}
+
+// How a node is handed out runs on D1 too: the first node goes to every group, a later one to none, a group made later does not
+// get a held node, and a share set afterwards reads back.
+func TestD1NodeShare(t *testing.T) {
+	st := openD1Store(t)
+	ctx := context.Background()
+	now := time.Unix(1_700_000_000, 0).UTC()
+	for _, g := range []string{"family", "friends"} {
+		if err := st.Access().CreateGroup(ctx, AccessGroup{ID: "grp_" + g, Name: g, CreatedAt: now}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, n := range []string{"de1", "nl1"} {
+		if _, err := st.CreateEnrollment(ctx, &NodeRow{ID: "nod_" + n, Name: n, Address: n + ".example.com"}, "", []byte("tok-"+n), "adm_test", now, now.Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.Access().CreateGroup(ctx, AccessGroup{ID: "grp_later", Name: "later", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	shares, err := st.NodeShares(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if shares["nod_de1"].Mode() != ShareAll || shares["nod_de1"].Receiving != 3 || shares["nod_nl1"].Mode() != ShareNone || shares["nod_nl1"].Groups != 3 {
+		t.Fatalf("shares: %+v", shares)
+	}
+	if err := st.Access().SetNodeShare(ctx, "nod_nl1", NodeShareChoice{Mode: ShareListed, GroupIDs: []string{"grp_family", "grp_later"}}, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if shares, err = st.NodeShares(ctx); err != nil || shares["nod_nl1"].Mode() != ShareListed || shares["nod_nl1"].Receiving != 2 || shares["nod_nl1"].ChangedAt.Unix() != now.Add(time.Hour).Unix() {
+		t.Fatalf("after listing: %+v %v", shares["nod_nl1"], err)
+	}
+	groups, err := st.Access().Groups(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, g := range groups {
+		if want := g.Name == "friends"; want != (len(g.DisabledNodeIDs) == 1 && g.DisabledNodeIDs[0] == "nod_nl1") {
+			t.Errorf("group %s: disabled %v", g.Name, g.DisabledNodeIDs)
+		}
+	}
+	if err := st.Access().SetNodeShare(ctx, "nod_nl1", NodeShareChoice{Mode: ShareAll}, now.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if shares, err = st.NodeShares(ctx); err != nil || shares["nod_nl1"].Mode() != ShareAll || shares["nod_nl1"].Receiving != 3 {
+		t.Fatalf("after all: %+v %v", shares["nod_nl1"], err)
 	}
 }

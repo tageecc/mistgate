@@ -49,8 +49,14 @@ type WarpAccount struct {
 	RegisteredWith string `protobuf:"bytes,17,opt,name=registered_with,json=registeredWith,proto3" json:"registered_with,omitempty"`
 	CreatedUnix    int64  `protobuf:"varint,18,opt,name=created_unix,json=createdUnix,proto3" json:"created_unix,omitempty"`
 	UpdatedUnix    int64  `protobuf:"varint,19,opt,name=updated_unix,json=updatedUnix,proto3" json:"updated_unix,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// The owner gave a WARP+ license key (SetWarpLicense); the key itself is never sent out.
+	HasLicense bool `protobuf:"varint,20,opt,name=has_license,json=hasLicense,proto3" json:"has_license,omitempty"`
+	// Why the key of the replaced account was not bound to the new device by a re-registration, which went through and
+	// left the account "free" (license_invalid, license_device_limit, license_rate_limited, account_revoked,
+	// license_rejected, cloudflare_unreachable); empty = nothing to report.
+	LicenseError  string `protobuf:"bytes,21,opt,name=license_error,json=licenseError,proto3" json:"license_error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *WarpAccount) Reset() {
@@ -214,6 +220,20 @@ func (x *WarpAccount) GetUpdatedUnix() int64 {
 		return x.UpdatedUnix
 	}
 	return 0
+}
+
+func (x *WarpAccount) GetHasLicense() bool {
+	if x != nil {
+		return x.HasLicense
+	}
+	return false
+}
+
+func (x *WarpAccount) GetLicenseError() string {
+	if x != nil {
+		return x.LicenseError
+	}
+	return ""
 }
 
 // agent.v1.WarpHealth as the panel last stored it.
@@ -455,8 +475,13 @@ func (x *WarpProbeResult) GetFailureCode() string {
 }
 
 type GetWarpRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	NodeId        string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	NodeId string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	// Also ask the node to check the sites of the reach settings now, out of turn ("Check now" of the sites card). The call does not
+	// wait for it: reach_check says what became of the request and, while the check runs (up to a minute), reach_check.running is set
+	// and the next reads carry the result in reach. At most once in 2 minutes per node (reach_check.asked = "too_soon"); never an error.
+	// The Cloudflare edition runs no such check and ignores the flag.
+	CheckReachNow bool `protobuf:"varint,2,opt,name=check_reach_now,json=checkReachNow,proto3" json:"check_reach_now,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -498,6 +523,13 @@ func (x *GetWarpRequest) GetNodeId() string {
 	return ""
 }
 
+func (x *GetWarpRequest) GetCheckReachNow() bool {
+	if x != nil {
+		return x.CheckReachNow
+	}
+	return false
+}
+
 type GetWarpResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Unset = no account on this node.
@@ -518,7 +550,17 @@ type GetWarpResponse struct {
 	AttentionReason string `protobuf:"bytes,8,opt,name=attention_reason,json=attentionReason,proto3" json:"attention_reason,omitempty"`
 	// The node's enabled profiles that exit through WARP: they stop while WARP is down or paused (the pause dialog
 	// names them and how many are connected through them now).
-	Inbounds      []*WarpInbound `protobuf:"bytes,9,rep,name=inbounds,proto3" json:"inbounds,omitempty"`
+	Inbounds []*WarpInbound `protobuf:"bytes,9,rep,name=inbounds,proto3" json:"inbounds,omitempty"`
+	// What the sites of the reach settings showed through this node's WARP the last time the node checked; unset while it has no
+	// result (see reach_state).
+	Reach *WarpReachView `protobuf:"bytes,10,opt,name=reach,proto3" json:"reach,omitempty"`
+	// Why reach is, or is not, set: "ready" (reach is the node's latest result), "waiting" (the check is on and the node has
+	// not answered yet: it is offline, its WARP is not up, or the first round has not come), "disabled" (the owner's list is
+	// empty, or the Cloudflare edition, which runs no check: reach is then unset) or "agent_too_old" (the node's agent lacks
+	// "warp-reach/1", so the panel sends it nothing; the rest of this response is unaffected).
+	ReachState string `protobuf:"bytes,11,opt,name=reach_state,json=reachState,proto3" json:"reach_state,omitempty"`
+	// The state of the check of the sites on this node. Unset while none was asked or ran since the panel started.
+	ReachCheck    *WarpReachCheck `protobuf:"bytes,12,opt,name=reach_check,json=reachCheck,proto3" json:"reach_check,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -616,6 +658,260 @@ func (x *GetWarpResponse) GetInbounds() []*WarpInbound {
 	return nil
 }
 
+func (x *GetWarpResponse) GetReach() *WarpReachView {
+	if x != nil {
+		return x.Reach
+	}
+	return nil
+}
+
+func (x *GetWarpResponse) GetReachState() string {
+	if x != nil {
+		return x.ReachState
+	}
+	return ""
+}
+
+func (x *GetWarpResponse) GetReachCheck() *WarpReachCheck {
+	if x != nil {
+		return x.ReachCheck
+	}
+	return nil
+}
+
+// The check of the sites on a node (the schedule's, every 15 minutes, or the one asked with GetWarpRequest.check_reach_now).
+type WarpReachCheck struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// A check of this node is running now: the node has been asked and has not answered yet.
+	Running bool `protobuf:"varint,1,opt,name=running,proto3" json:"running,omitempty"`
+	// What the request of this call (check_reach_now) did, empty when it was not set: "started" (the node was asked), "running" (a check
+	// was on already), "too_soon" (asked less than 2 minutes ago: retry_after_s), "agent_too_old" (no "warp-reach/1"), "node_offline",
+	// "warp_down" (the tunnel is not up, or WARP is paused: nothing to open the sites with), "disabled" (the list is empty, or the
+	// Cloudflare edition).
+	Asked string `protobuf:"bytes,2,opt,name=asked,proto3" json:"asked,omitempty"`
+	// With asked = "too_soon": the seconds until the next check by hand.
+	RetryAfterS uint32 `protobuf:"varint,3,opt,name=retry_after_s,json=retryAfterS,proto3" json:"retry_after_s,omitempty"`
+	// How the newest check of this node ended since the panel started: "ok", or why not: "busy" (the node ran one of its own), "too_soon"
+	// (the node had run one a moment before), "warp_down", "failed" (no answer: the link was lost or the time ran out). Empty: none yet.
+	Last string `protobuf:"bytes,4,opt,name=last,proto3" json:"last,omitempty"`
+	// When it ended (unix seconds), 0 when last is empty.
+	LastUnix      int64 `protobuf:"varint,5,opt,name=last_unix,json=lastUnix,proto3" json:"last_unix,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WarpReachCheck) Reset() {
+	*x = WarpReachCheck{}
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WarpReachCheck) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WarpReachCheck) ProtoMessage() {}
+
+func (x *WarpReachCheck) ProtoReflect() protoreflect.Message {
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WarpReachCheck.ProtoReflect.Descriptor instead.
+func (*WarpReachCheck) Descriptor() ([]byte, []int) {
+	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *WarpReachCheck) GetRunning() bool {
+	if x != nil {
+		return x.Running
+	}
+	return false
+}
+
+func (x *WarpReachCheck) GetAsked() string {
+	if x != nil {
+		return x.Asked
+	}
+	return ""
+}
+
+func (x *WarpReachCheck) GetRetryAfterS() uint32 {
+	if x != nil {
+		return x.RetryAfterS
+	}
+	return 0
+}
+
+func (x *WarpReachCheck) GetLast() string {
+	if x != nil {
+		return x.Last
+	}
+	return ""
+}
+
+func (x *WarpReachCheck) GetLastUnix() int64 {
+	if x != nil {
+		return x.LastUnix
+	}
+	return 0
+}
+
+// One site's answer in WarpReachView.
+type WarpReachDomain struct {
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Domain string                 `protobuf:"bytes,1,opt,name=domain,proto3" json:"domain,omitempty"`
+	// "ok" | "blocked" | "unreachable" | "error". blocked: a block page (451, or a 403 page of Cloudflare error 1006-1012/1020,
+	// Akamai, CloudFront's country block, a site's own "not available in your country"); unreachable: no answer (DNS, connect,
+	// TLS, time); error: an answer that is neither (a server error, a rate limit, a challenge, a 403 the node cannot place).
+	Verdict string `protobuf:"bytes,2,opt,name=verdict,proto3" json:"verdict,omitempty"`
+	// HTTP status of the page the verdict is about; 0 = no answer.
+	HttpStatus uint32 `protobuf:"varint,3,opt,name=http_status,json=httpStatus,proto3" json:"http_status,omitempty"`
+	LatencyMs  uint32 `protobuf:"varint,4,opt,name=latency_ms,json=latencyMs,proto3" json:"latency_ms,omitempty"`
+	// How many checks of this node said "blocked" since the last "ok" (a timeout or an error between them does not end it). The
+	// Health alert WARP_REACH is open from 2 until the next "ok".
+	BlockedStreak uint32 `protobuf:"varint,5,opt,name=blocked_streak,json=blockedStreak,proto3" json:"blocked_streak,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WarpReachDomain) Reset() {
+	*x = WarpReachDomain{}
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WarpReachDomain) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WarpReachDomain) ProtoMessage() {}
+
+func (x *WarpReachDomain) ProtoReflect() protoreflect.Message {
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WarpReachDomain.ProtoReflect.Descriptor instead.
+func (*WarpReachDomain) Descriptor() ([]byte, []int) {
+	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *WarpReachDomain) GetDomain() string {
+	if x != nil {
+		return x.Domain
+	}
+	return ""
+}
+
+func (x *WarpReachDomain) GetVerdict() string {
+	if x != nil {
+		return x.Verdict
+	}
+	return ""
+}
+
+func (x *WarpReachDomain) GetHttpStatus() uint32 {
+	if x != nil {
+		return x.HttpStatus
+	}
+	return 0
+}
+
+func (x *WarpReachDomain) GetLatencyMs() uint32 {
+	if x != nil {
+		return x.LatencyMs
+	}
+	return 0
+}
+
+func (x *WarpReachDomain) GetBlockedStreak() uint32 {
+	if x != nil {
+		return x.BlockedStreak
+	}
+	return 0
+}
+
+// The node's latest reach check.
+type WarpReachView struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// When the panel stored it.
+	CheckedUnix int64 `protobuf:"varint,1,opt,name=checked_unix,json=checkedUnix,proto3" json:"checked_unix,omitempty"`
+	// The Cloudflare colo of the node's WARP exit at that run ("" = the trace failed).
+	Colo string `protobuf:"bytes,2,opt,name=colo,proto3" json:"colo,omitempty"`
+	// In the order of the settings at that time.
+	Domains       []*WarpReachDomain `protobuf:"bytes,3,rep,name=domains,proto3" json:"domains,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WarpReachView) Reset() {
+	*x = WarpReachView{}
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WarpReachView) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WarpReachView) ProtoMessage() {}
+
+func (x *WarpReachView) ProtoReflect() protoreflect.Message {
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WarpReachView.ProtoReflect.Descriptor instead.
+func (*WarpReachView) Descriptor() ([]byte, []int) {
+	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *WarpReachView) GetCheckedUnix() int64 {
+	if x != nil {
+		return x.CheckedUnix
+	}
+	return 0
+}
+
+func (x *WarpReachView) GetColo() string {
+	if x != nil {
+		return x.Colo
+	}
+	return ""
+}
+
+func (x *WarpReachView) GetDomains() []*WarpReachDomain {
+	if x != nil {
+		return x.Domains
+	}
+	return nil
+}
+
 // A profile on the node whose traffic leaves through WARP.
 type WarpInbound struct {
 	state       protoimpl.MessageState `protogen:"open.v1"`
@@ -629,7 +925,7 @@ type WarpInbound struct {
 
 func (x *WarpInbound) Reset() {
 	*x = WarpInbound{}
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[5]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -641,7 +937,7 @@ func (x *WarpInbound) String() string {
 func (*WarpInbound) ProtoMessage() {}
 
 func (x *WarpInbound) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[5]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -654,7 +950,7 @@ func (x *WarpInbound) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WarpInbound.ProtoReflect.Descriptor instead.
 func (*WarpInbound) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{5}
+	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *WarpInbound) GetInboundId() string {
@@ -695,7 +991,7 @@ type RegisterWarpRequest struct {
 
 func (x *RegisterWarpRequest) Reset() {
 	*x = RegisterWarpRequest{}
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[6]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -707,7 +1003,7 @@ func (x *RegisterWarpRequest) String() string {
 func (*RegisterWarpRequest) ProtoMessage() {}
 
 func (x *RegisterWarpRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[6]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -720,7 +1016,7 @@ func (x *RegisterWarpRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegisterWarpRequest.ProtoReflect.Descriptor instead.
 func (*RegisterWarpRequest) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{6}
+	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *RegisterWarpRequest) GetNodeId() string {
@@ -760,7 +1056,7 @@ type RegisterWarpResponse struct {
 
 func (x *RegisterWarpResponse) Reset() {
 	*x = RegisterWarpResponse{}
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[7]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -772,7 +1068,7 @@ func (x *RegisterWarpResponse) String() string {
 func (*RegisterWarpResponse) ProtoMessage() {}
 
 func (x *RegisterWarpResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[7]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -785,7 +1081,7 @@ func (x *RegisterWarpResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegisterWarpResponse.ProtoReflect.Descriptor instead.
 func (*RegisterWarpResponse) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{7}
+	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *RegisterWarpResponse) GetAccount() *WarpAccount {
@@ -808,7 +1104,7 @@ type ImportWarpRequest struct {
 
 func (x *ImportWarpRequest) Reset() {
 	*x = ImportWarpRequest{}
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[8]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -820,7 +1116,7 @@ func (x *ImportWarpRequest) String() string {
 func (*ImportWarpRequest) ProtoMessage() {}
 
 func (x *ImportWarpRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[8]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -833,7 +1129,7 @@ func (x *ImportWarpRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportWarpRequest.ProtoReflect.Descriptor instead.
 func (*ImportWarpRequest) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{8}
+	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *ImportWarpRequest) GetNodeId() string {
@@ -866,7 +1162,7 @@ type ImportWarpResponse struct {
 
 func (x *ImportWarpResponse) Reset() {
 	*x = ImportWarpResponse{}
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[9]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -878,7 +1174,7 @@ func (x *ImportWarpResponse) String() string {
 func (*ImportWarpResponse) ProtoMessage() {}
 
 func (x *ImportWarpResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[9]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -891,10 +1187,107 @@ func (x *ImportWarpResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportWarpResponse.ProtoReflect.Descriptor instead.
 func (*ImportWarpResponse) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{9}
+	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *ImportWarpResponse) GetAccount() *WarpAccount {
+	if x != nil {
+		return x.Account
+	}
+	return nil
+}
+
+type SetWarpLicenseRequest struct {
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	NodeId string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	// The WARP+ license key (secret). Trimmed; 16 to 64 letters, digits and dashes.
+	LicenseKey    string `protobuf:"bytes,2,opt,name=license_key,json=licenseKey,proto3" json:"license_key,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetWarpLicenseRequest) Reset() {
+	*x = SetWarpLicenseRequest{}
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetWarpLicenseRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetWarpLicenseRequest) ProtoMessage() {}
+
+func (x *SetWarpLicenseRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetWarpLicenseRequest.ProtoReflect.Descriptor instead.
+func (*SetWarpLicenseRequest) Descriptor() ([]byte, []int) {
+	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *SetWarpLicenseRequest) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
+func (x *SetWarpLicenseRequest) GetLicenseKey() string {
+	if x != nil {
+		return x.LicenseKey
+	}
+	return ""
+}
+
+type SetWarpLicenseResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Account       *WarpAccount           `protobuf:"bytes,1,opt,name=account,proto3" json:"account,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetWarpLicenseResponse) Reset() {
+	*x = SetWarpLicenseResponse{}
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetWarpLicenseResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetWarpLicenseResponse) ProtoMessage() {}
+
+func (x *SetWarpLicenseResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetWarpLicenseResponse.ProtoReflect.Descriptor instead.
+func (*SetWarpLicenseResponse) Descriptor() ([]byte, []int) {
+	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *SetWarpLicenseResponse) GetAccount() *WarpAccount {
 	if x != nil {
 		return x.Account
 	}
@@ -911,7 +1304,7 @@ type SetWarpEnabledRequest struct {
 
 func (x *SetWarpEnabledRequest) Reset() {
 	*x = SetWarpEnabledRequest{}
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[10]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -923,7 +1316,7 @@ func (x *SetWarpEnabledRequest) String() string {
 func (*SetWarpEnabledRequest) ProtoMessage() {}
 
 func (x *SetWarpEnabledRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[10]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -936,7 +1329,7 @@ func (x *SetWarpEnabledRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetWarpEnabledRequest.ProtoReflect.Descriptor instead.
 func (*SetWarpEnabledRequest) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{10}
+	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *SetWarpEnabledRequest) GetNodeId() string {
@@ -962,7 +1355,7 @@ type SetWarpEnabledResponse struct {
 
 func (x *SetWarpEnabledResponse) Reset() {
 	*x = SetWarpEnabledResponse{}
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[11]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -974,7 +1367,7 @@ func (x *SetWarpEnabledResponse) String() string {
 func (*SetWarpEnabledResponse) ProtoMessage() {}
 
 func (x *SetWarpEnabledResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[11]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -987,7 +1380,7 @@ func (x *SetWarpEnabledResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetWarpEnabledResponse.ProtoReflect.Descriptor instead.
 func (*SetWarpEnabledResponse) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{11}
+	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *SetWarpEnabledResponse) GetAccount() *WarpAccount {
@@ -1006,7 +1399,7 @@ type RestartWarpRequest struct {
 
 func (x *RestartWarpRequest) Reset() {
 	*x = RestartWarpRequest{}
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[12]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1018,7 +1411,7 @@ func (x *RestartWarpRequest) String() string {
 func (*RestartWarpRequest) ProtoMessage() {}
 
 func (x *RestartWarpRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[12]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1031,7 +1424,7 @@ func (x *RestartWarpRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestartWarpRequest.ProtoReflect.Descriptor instead.
 func (*RestartWarpRequest) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{12}
+	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *RestartWarpRequest) GetNodeId() string {
@@ -1053,7 +1446,7 @@ type RestartWarpResponse struct {
 
 func (x *RestartWarpResponse) Reset() {
 	*x = RestartWarpResponse{}
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[13]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1065,7 +1458,7 @@ func (x *RestartWarpResponse) String() string {
 func (*RestartWarpResponse) ProtoMessage() {}
 
 func (x *RestartWarpResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[13]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1078,7 +1471,7 @@ func (x *RestartWarpResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestartWarpResponse.ProtoReflect.Descriptor instead.
 func (*RestartWarpResponse) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{13}
+	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *RestartWarpResponse) GetAccount() *WarpAccount {
@@ -1104,7 +1497,7 @@ type RefreshWarpRequest struct {
 
 func (x *RefreshWarpRequest) Reset() {
 	*x = RefreshWarpRequest{}
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[14]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1116,7 +1509,7 @@ func (x *RefreshWarpRequest) String() string {
 func (*RefreshWarpRequest) ProtoMessage() {}
 
 func (x *RefreshWarpRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[14]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1129,7 +1522,7 @@ func (x *RefreshWarpRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RefreshWarpRequest.ProtoReflect.Descriptor instead.
 func (*RefreshWarpRequest) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{14}
+	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *RefreshWarpRequest) GetNodeId() string {
@@ -1148,7 +1541,7 @@ type RefreshWarpResponse struct {
 
 func (x *RefreshWarpResponse) Reset() {
 	*x = RefreshWarpResponse{}
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[15]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1160,7 +1553,7 @@ func (x *RefreshWarpResponse) String() string {
 func (*RefreshWarpResponse) ProtoMessage() {}
 
 func (x *RefreshWarpResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[15]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1173,7 +1566,7 @@ func (x *RefreshWarpResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RefreshWarpResponse.ProtoReflect.Descriptor instead.
 func (*RefreshWarpResponse) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{15}
+	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *RefreshWarpResponse) GetAccount() *WarpAccount {
@@ -1194,7 +1587,7 @@ type DeleteWarpRequest struct {
 
 func (x *DeleteWarpRequest) Reset() {
 	*x = DeleteWarpRequest{}
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[16]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1206,7 +1599,7 @@ func (x *DeleteWarpRequest) String() string {
 func (*DeleteWarpRequest) ProtoMessage() {}
 
 func (x *DeleteWarpRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[16]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1219,7 +1612,7 @@ func (x *DeleteWarpRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteWarpRequest.ProtoReflect.Descriptor instead.
 func (*DeleteWarpRequest) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{16}
+	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *DeleteWarpRequest) GetNodeId() string {
@@ -1247,7 +1640,7 @@ type DeleteWarpResponse struct {
 
 func (x *DeleteWarpResponse) Reset() {
 	*x = DeleteWarpResponse{}
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[17]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1259,7 +1652,7 @@ func (x *DeleteWarpResponse) String() string {
 func (*DeleteWarpResponse) ProtoMessage() {}
 
 func (x *DeleteWarpResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[17]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1272,7 +1665,7 @@ func (x *DeleteWarpResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteWarpResponse.ProtoReflect.Descriptor instead.
 func (*DeleteWarpResponse) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{17}
+	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *DeleteWarpResponse) GetRemoteDeleted() bool {
@@ -1300,7 +1693,7 @@ type WarpRegistrationParams struct {
 
 func (x *WarpRegistrationParams) Reset() {
 	*x = WarpRegistrationParams{}
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[18]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1312,7 +1705,7 @@ func (x *WarpRegistrationParams) String() string {
 func (*WarpRegistrationParams) ProtoMessage() {}
 
 func (x *WarpRegistrationParams) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[18]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1325,7 +1718,7 @@ func (x *WarpRegistrationParams) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WarpRegistrationParams.ProtoReflect.Descriptor instead.
 func (*WarpRegistrationParams) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{18}
+	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *WarpRegistrationParams) GetApiVersion() string {
@@ -1371,7 +1764,7 @@ type GetWarpRegistrationParamsRequest struct {
 
 func (x *GetWarpRegistrationParamsRequest) Reset() {
 	*x = GetWarpRegistrationParamsRequest{}
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[19]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1383,7 +1776,7 @@ func (x *GetWarpRegistrationParamsRequest) String() string {
 func (*GetWarpRegistrationParamsRequest) ProtoMessage() {}
 
 func (x *GetWarpRegistrationParamsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[19]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1396,7 +1789,7 @@ func (x *GetWarpRegistrationParamsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetWarpRegistrationParamsRequest.ProtoReflect.Descriptor instead.
 func (*GetWarpRegistrationParamsRequest) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{19}
+	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{24}
 }
 
 type GetWarpRegistrationParamsResponse struct {
@@ -1412,7 +1805,7 @@ type GetWarpRegistrationParamsResponse struct {
 
 func (x *GetWarpRegistrationParamsResponse) Reset() {
 	*x = GetWarpRegistrationParamsResponse{}
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[20]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1424,7 +1817,7 @@ func (x *GetWarpRegistrationParamsResponse) String() string {
 func (*GetWarpRegistrationParamsResponse) ProtoMessage() {}
 
 func (x *GetWarpRegistrationParamsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[20]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1437,7 +1830,7 @@ func (x *GetWarpRegistrationParamsResponse) ProtoReflect() protoreflect.Message 
 
 // Deprecated: Use GetWarpRegistrationParamsResponse.ProtoReflect.Descriptor instead.
 func (*GetWarpRegistrationParamsResponse) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{20}
+	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *GetWarpRegistrationParamsResponse) GetParams() *WarpRegistrationParams {
@@ -1470,7 +1863,7 @@ type UpdateWarpRegistrationParamsRequest struct {
 
 func (x *UpdateWarpRegistrationParamsRequest) Reset() {
 	*x = UpdateWarpRegistrationParamsRequest{}
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[21]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1482,7 +1875,7 @@ func (x *UpdateWarpRegistrationParamsRequest) String() string {
 func (*UpdateWarpRegistrationParamsRequest) ProtoMessage() {}
 
 func (x *UpdateWarpRegistrationParamsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[21]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1495,7 +1888,7 @@ func (x *UpdateWarpRegistrationParamsRequest) ProtoReflect() protoreflect.Messag
 
 // Deprecated: Use UpdateWarpRegistrationParamsRequest.ProtoReflect.Descriptor instead.
 func (*UpdateWarpRegistrationParamsRequest) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{21}
+	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *UpdateWarpRegistrationParamsRequest) GetParams() *WarpRegistrationParams {
@@ -1515,7 +1908,7 @@ type UpdateWarpRegistrationParamsResponse struct {
 
 func (x *UpdateWarpRegistrationParamsResponse) Reset() {
 	*x = UpdateWarpRegistrationParamsResponse{}
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[22]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1527,7 +1920,7 @@ func (x *UpdateWarpRegistrationParamsResponse) String() string {
 func (*UpdateWarpRegistrationParamsResponse) ProtoMessage() {}
 
 func (x *UpdateWarpRegistrationParamsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[22]
+	mi := &file_mistgate_admin_v1_warp_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1540,7 +1933,7 @@ func (x *UpdateWarpRegistrationParamsResponse) ProtoReflect() protoreflect.Messa
 
 // Deprecated: Use UpdateWarpRegistrationParamsResponse.ProtoReflect.Descriptor instead.
 func (*UpdateWarpRegistrationParamsResponse) Descriptor() ([]byte, []int) {
-	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{22}
+	return file_mistgate_admin_v1_warp_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *UpdateWarpRegistrationParamsResponse) GetParams() *WarpRegistrationParams {
@@ -1561,7 +1954,7 @@ var File_mistgate_admin_v1_warp_proto protoreflect.FileDescriptor
 
 const file_mistgate_admin_v1_warp_proto_rawDesc = "" +
 	"\n" +
-	"\x1cmistgate/admin/v1/warp.proto\x12\x11mistgate.admin.v1\x1a\x1emistgate/admin/v1/common.proto\"\x92\x05\n" +
+	"\x1cmistgate/admin/v1/warp.proto\x12\x11mistgate.admin.v1\x1a\x1emistgate/admin/v1/common.proto\"\xd8\x05\n" +
 	"\vWarpAccount\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x125\n" +
 	"\x06source\x18\x02 \x01(\x0e2\x1d.mistgate.admin.v1.WarpSourceR\x06source\x12!\n" +
@@ -1586,7 +1979,10 @@ const file_mistgate_admin_v1_warp_proto_rawDesc = "" +
 	"\x11tos_accepted_unix\x18\x10 \x01(\x03B\x020\x02R\x0ftosAcceptedUnix\x12'\n" +
 	"\x0fregistered_with\x18\x11 \x01(\tR\x0eregisteredWith\x12%\n" +
 	"\fcreated_unix\x18\x12 \x01(\x03B\x020\x02R\vcreatedUnix\x12%\n" +
-	"\fupdated_unix\x18\x13 \x01(\x03B\x020\x02R\vupdatedUnix\"\xa9\x05\n" +
+	"\fupdated_unix\x18\x13 \x01(\x03B\x020\x02R\vupdatedUnix\x12\x1f\n" +
+	"\vhas_license\x18\x14 \x01(\bR\n" +
+	"hasLicense\x12#\n" +
+	"\rlicense_error\x18\x15 \x01(\tR\flicenseError\"\xa9\x05\n" +
 	"\x0eWarpHealthView\x122\n" +
 	"\x05state\x18\x01 \x01(\x0e2\x1c.mistgate.admin.v1.WarpStateR\x05state\x12\x18\n" +
 	"\abackend\x18\x02 \x01(\tR\abackend\x12\x1a\n" +
@@ -1612,9 +2008,10 @@ const file_mistgate_admin_v1_warp_proto_rawDesc = "" +
 	"\n" +
 	"latency_ms\x18\x02 \x01(\rR\tlatencyMs\x12\x1b\n" +
 	"\aat_unix\x18\x03 \x01(\x03B\x020\x02R\x06atUnix\x12!\n" +
-	"\ffailure_code\x18\x04 \x01(\tR\vfailureCode\")\n" +
+	"\ffailure_code\x18\x04 \x01(\tR\vfailureCode\"Q\n" +
 	"\x0eGetWarpRequest\x12\x17\n" +
-	"\anode_id\x18\x01 \x01(\tR\x06nodeId\"\x9c\x03\n" +
+	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12&\n" +
+	"\x0fcheck_reach_now\x18\x02 \x01(\bR\rcheckReachNow\"\xb9\x04\n" +
 	"\x0fGetWarpResponse\x128\n" +
 	"\aaccount\x18\x01 \x01(\v2\x1e.mistgate.admin.v1.WarpAccountR\aaccount\x129\n" +
 	"\x06health\x18\x02 \x01(\v2!.mistgate.admin.v1.WarpHealthViewR\x06health\x12#\n" +
@@ -1625,7 +2022,31 @@ const file_mistgate_admin_v1_warp_proto_rawDesc = "" +
 	"\atos_url\x18\x06 \x01(\tR\x06tosUrl\x12'\n" +
 	"\x0fneeds_attention\x18\a \x01(\bR\x0eneedsAttention\x12)\n" +
 	"\x10attention_reason\x18\b \x01(\tR\x0fattentionReason\x12:\n" +
-	"\binbounds\x18\t \x03(\v2\x1e.mistgate.admin.v1.WarpInboundR\binbounds\"g\n" +
+	"\binbounds\x18\t \x03(\v2\x1e.mistgate.admin.v1.WarpInboundR\binbounds\x126\n" +
+	"\x05reach\x18\n" +
+	" \x01(\v2 .mistgate.admin.v1.WarpReachViewR\x05reach\x12\x1f\n" +
+	"\vreach_state\x18\v \x01(\tR\n" +
+	"reachState\x12B\n" +
+	"\vreach_check\x18\f \x01(\v2!.mistgate.admin.v1.WarpReachCheckR\n" +
+	"reachCheck\"\x99\x01\n" +
+	"\x0eWarpReachCheck\x12\x18\n" +
+	"\arunning\x18\x01 \x01(\bR\arunning\x12\x14\n" +
+	"\x05asked\x18\x02 \x01(\tR\x05asked\x12\"\n" +
+	"\rretry_after_s\x18\x03 \x01(\rR\vretryAfterS\x12\x12\n" +
+	"\x04last\x18\x04 \x01(\tR\x04last\x12\x1f\n" +
+	"\tlast_unix\x18\x05 \x01(\x03B\x020\x02R\blastUnix\"\xaa\x01\n" +
+	"\x0fWarpReachDomain\x12\x16\n" +
+	"\x06domain\x18\x01 \x01(\tR\x06domain\x12\x18\n" +
+	"\averdict\x18\x02 \x01(\tR\averdict\x12\x1f\n" +
+	"\vhttp_status\x18\x03 \x01(\rR\n" +
+	"httpStatus\x12\x1d\n" +
+	"\n" +
+	"latency_ms\x18\x04 \x01(\rR\tlatencyMs\x12%\n" +
+	"\x0eblocked_streak\x18\x05 \x01(\rR\rblockedStreak\"\x88\x01\n" +
+	"\rWarpReachView\x12%\n" +
+	"\fchecked_unix\x18\x01 \x01(\x03B\x020\x02R\vcheckedUnix\x12\x12\n" +
+	"\x04colo\x18\x02 \x01(\tR\x04colo\x12<\n" +
+	"\adomains\x18\x03 \x03(\v2\".mistgate.admin.v1.WarpReachDomainR\adomains\"g\n" +
 	"\vWarpInbound\x12\x1d\n" +
 	"\n" +
 	"inbound_id\x18\x01 \x01(\tR\tinboundId\x12!\n" +
@@ -1644,6 +2065,12 @@ const file_mistgate_admin_v1_warp_proto_rawDesc = "" +
 	"\fprofile_conf\x18\x02 \x01(\tR\vprofileConf\x12!\n" +
 	"\faccount_toml\x18\x03 \x01(\tR\vaccountToml\"N\n" +
 	"\x12ImportWarpResponse\x128\n" +
+	"\aaccount\x18\x01 \x01(\v2\x1e.mistgate.admin.v1.WarpAccountR\aaccount\"Q\n" +
+	"\x15SetWarpLicenseRequest\x12\x17\n" +
+	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x1f\n" +
+	"\vlicense_key\x18\x02 \x01(\tR\n" +
+	"licenseKey\"R\n" +
+	"\x16SetWarpLicenseResponse\x128\n" +
 	"\aaccount\x18\x01 \x01(\v2\x1e.mistgate.admin.v1.WarpAccountR\aaccount\"J\n" +
 	"\x15SetWarpEnabledRequest\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x18\n" +
@@ -1685,7 +2112,7 @@ const file_mistgate_admin_v1_warp_proto_rawDesc = "" +
 	"\x06params\x18\x01 \x01(\v2).mistgate.admin.v1.WarpRegistrationParamsR\x06params\x12\x1e\n" +
 	"\n" +
 	"customised\x18\x02 \x01(\bR\n" +
-	"customised2\xb4\a\n" +
+	"customised2\x9b\b\n" +
 	"\vWarpService\x12P\n" +
 	"\aGetWarp\x12!.mistgate.admin.v1.GetWarpRequest\x1a\".mistgate.admin.v1.GetWarpResponse\x12_\n" +
 	"\fRegisterWarp\x12&.mistgate.admin.v1.RegisterWarpRequest\x1a'.mistgate.admin.v1.RegisterWarpResponse\x12Y\n" +
@@ -1693,7 +2120,8 @@ const file_mistgate_admin_v1_warp_proto_rawDesc = "" +
 	"ImportWarp\x12$.mistgate.admin.v1.ImportWarpRequest\x1a%.mistgate.admin.v1.ImportWarpResponse\x12e\n" +
 	"\x0eSetWarpEnabled\x12(.mistgate.admin.v1.SetWarpEnabledRequest\x1a).mistgate.admin.v1.SetWarpEnabledResponse\x12\\\n" +
 	"\vRestartWarp\x12%.mistgate.admin.v1.RestartWarpRequest\x1a&.mistgate.admin.v1.RestartWarpResponse\x12\\\n" +
-	"\vRefreshWarp\x12%.mistgate.admin.v1.RefreshWarpRequest\x1a&.mistgate.admin.v1.RefreshWarpResponse\x12Y\n" +
+	"\vRefreshWarp\x12%.mistgate.admin.v1.RefreshWarpRequest\x1a&.mistgate.admin.v1.RefreshWarpResponse\x12e\n" +
+	"\x0eSetWarpLicense\x12(.mistgate.admin.v1.SetWarpLicenseRequest\x1a).mistgate.admin.v1.SetWarpLicenseResponse\x12Y\n" +
 	"\n" +
 	"DeleteWarp\x12$.mistgate.admin.v1.DeleteWarpRequest\x1a%.mistgate.admin.v1.DeleteWarpResponse\x12\x86\x01\n" +
 	"\x19GetWarpRegistrationParams\x123.mistgate.admin.v1.GetWarpRegistrationParamsRequest\x1a4.mistgate.admin.v1.GetWarpRegistrationParamsResponse\x12\x8f\x01\n" +
@@ -1712,74 +2140,85 @@ func file_mistgate_admin_v1_warp_proto_rawDescGZIP() []byte {
 	return file_mistgate_admin_v1_warp_proto_rawDescData
 }
 
-var file_mistgate_admin_v1_warp_proto_msgTypes = make([]protoimpl.MessageInfo, 23)
+var file_mistgate_admin_v1_warp_proto_msgTypes = make([]protoimpl.MessageInfo, 28)
 var file_mistgate_admin_v1_warp_proto_goTypes = []any{
 	(*WarpAccount)(nil),                          // 0: mistgate.admin.v1.WarpAccount
 	(*WarpHealthView)(nil),                       // 1: mistgate.admin.v1.WarpHealthView
 	(*WarpProbeResult)(nil),                      // 2: mistgate.admin.v1.WarpProbeResult
 	(*GetWarpRequest)(nil),                       // 3: mistgate.admin.v1.GetWarpRequest
 	(*GetWarpResponse)(nil),                      // 4: mistgate.admin.v1.GetWarpResponse
-	(*WarpInbound)(nil),                          // 5: mistgate.admin.v1.WarpInbound
-	(*RegisterWarpRequest)(nil),                  // 6: mistgate.admin.v1.RegisterWarpRequest
-	(*RegisterWarpResponse)(nil),                 // 7: mistgate.admin.v1.RegisterWarpResponse
-	(*ImportWarpRequest)(nil),                    // 8: mistgate.admin.v1.ImportWarpRequest
-	(*ImportWarpResponse)(nil),                   // 9: mistgate.admin.v1.ImportWarpResponse
-	(*SetWarpEnabledRequest)(nil),                // 10: mistgate.admin.v1.SetWarpEnabledRequest
-	(*SetWarpEnabledResponse)(nil),               // 11: mistgate.admin.v1.SetWarpEnabledResponse
-	(*RestartWarpRequest)(nil),                   // 12: mistgate.admin.v1.RestartWarpRequest
-	(*RestartWarpResponse)(nil),                  // 13: mistgate.admin.v1.RestartWarpResponse
-	(*RefreshWarpRequest)(nil),                   // 14: mistgate.admin.v1.RefreshWarpRequest
-	(*RefreshWarpResponse)(nil),                  // 15: mistgate.admin.v1.RefreshWarpResponse
-	(*DeleteWarpRequest)(nil),                    // 16: mistgate.admin.v1.DeleteWarpRequest
-	(*DeleteWarpResponse)(nil),                   // 17: mistgate.admin.v1.DeleteWarpResponse
-	(*WarpRegistrationParams)(nil),               // 18: mistgate.admin.v1.WarpRegistrationParams
-	(*GetWarpRegistrationParamsRequest)(nil),     // 19: mistgate.admin.v1.GetWarpRegistrationParamsRequest
-	(*GetWarpRegistrationParamsResponse)(nil),    // 20: mistgate.admin.v1.GetWarpRegistrationParamsResponse
-	(*UpdateWarpRegistrationParamsRequest)(nil),  // 21: mistgate.admin.v1.UpdateWarpRegistrationParamsRequest
-	(*UpdateWarpRegistrationParamsResponse)(nil), // 22: mistgate.admin.v1.UpdateWarpRegistrationParamsResponse
-	(WarpSource)(0),                              // 23: mistgate.admin.v1.WarpSource
-	(WarpState)(0),                               // 24: mistgate.admin.v1.WarpState
+	(*WarpReachCheck)(nil),                       // 5: mistgate.admin.v1.WarpReachCheck
+	(*WarpReachDomain)(nil),                      // 6: mistgate.admin.v1.WarpReachDomain
+	(*WarpReachView)(nil),                        // 7: mistgate.admin.v1.WarpReachView
+	(*WarpInbound)(nil),                          // 8: mistgate.admin.v1.WarpInbound
+	(*RegisterWarpRequest)(nil),                  // 9: mistgate.admin.v1.RegisterWarpRequest
+	(*RegisterWarpResponse)(nil),                 // 10: mistgate.admin.v1.RegisterWarpResponse
+	(*ImportWarpRequest)(nil),                    // 11: mistgate.admin.v1.ImportWarpRequest
+	(*ImportWarpResponse)(nil),                   // 12: mistgate.admin.v1.ImportWarpResponse
+	(*SetWarpLicenseRequest)(nil),                // 13: mistgate.admin.v1.SetWarpLicenseRequest
+	(*SetWarpLicenseResponse)(nil),               // 14: mistgate.admin.v1.SetWarpLicenseResponse
+	(*SetWarpEnabledRequest)(nil),                // 15: mistgate.admin.v1.SetWarpEnabledRequest
+	(*SetWarpEnabledResponse)(nil),               // 16: mistgate.admin.v1.SetWarpEnabledResponse
+	(*RestartWarpRequest)(nil),                   // 17: mistgate.admin.v1.RestartWarpRequest
+	(*RestartWarpResponse)(nil),                  // 18: mistgate.admin.v1.RestartWarpResponse
+	(*RefreshWarpRequest)(nil),                   // 19: mistgate.admin.v1.RefreshWarpRequest
+	(*RefreshWarpResponse)(nil),                  // 20: mistgate.admin.v1.RefreshWarpResponse
+	(*DeleteWarpRequest)(nil),                    // 21: mistgate.admin.v1.DeleteWarpRequest
+	(*DeleteWarpResponse)(nil),                   // 22: mistgate.admin.v1.DeleteWarpResponse
+	(*WarpRegistrationParams)(nil),               // 23: mistgate.admin.v1.WarpRegistrationParams
+	(*GetWarpRegistrationParamsRequest)(nil),     // 24: mistgate.admin.v1.GetWarpRegistrationParamsRequest
+	(*GetWarpRegistrationParamsResponse)(nil),    // 25: mistgate.admin.v1.GetWarpRegistrationParamsResponse
+	(*UpdateWarpRegistrationParamsRequest)(nil),  // 26: mistgate.admin.v1.UpdateWarpRegistrationParamsRequest
+	(*UpdateWarpRegistrationParamsResponse)(nil), // 27: mistgate.admin.v1.UpdateWarpRegistrationParamsResponse
+	(WarpSource)(0),                              // 28: mistgate.admin.v1.WarpSource
+	(WarpState)(0),                               // 29: mistgate.admin.v1.WarpState
 }
 var file_mistgate_admin_v1_warp_proto_depIdxs = []int32{
-	23, // 0: mistgate.admin.v1.WarpAccount.source:type_name -> mistgate.admin.v1.WarpSource
-	24, // 1: mistgate.admin.v1.WarpHealthView.state:type_name -> mistgate.admin.v1.WarpState
+	28, // 0: mistgate.admin.v1.WarpAccount.source:type_name -> mistgate.admin.v1.WarpSource
+	29, // 1: mistgate.admin.v1.WarpHealthView.state:type_name -> mistgate.admin.v1.WarpState
 	2,  // 2: mistgate.admin.v1.WarpHealthView.probe_cloudflare:type_name -> mistgate.admin.v1.WarpProbeResult
 	2,  // 3: mistgate.admin.v1.WarpHealthView.probe_other:type_name -> mistgate.admin.v1.WarpProbeResult
 	0,  // 4: mistgate.admin.v1.GetWarpResponse.account:type_name -> mistgate.admin.v1.WarpAccount
 	1,  // 5: mistgate.admin.v1.GetWarpResponse.health:type_name -> mistgate.admin.v1.WarpHealthView
-	5,  // 6: mistgate.admin.v1.GetWarpResponse.inbounds:type_name -> mistgate.admin.v1.WarpInbound
-	0,  // 7: mistgate.admin.v1.RegisterWarpResponse.account:type_name -> mistgate.admin.v1.WarpAccount
-	0,  // 8: mistgate.admin.v1.ImportWarpResponse.account:type_name -> mistgate.admin.v1.WarpAccount
-	0,  // 9: mistgate.admin.v1.SetWarpEnabledResponse.account:type_name -> mistgate.admin.v1.WarpAccount
-	0,  // 10: mistgate.admin.v1.RestartWarpResponse.account:type_name -> mistgate.admin.v1.WarpAccount
-	0,  // 11: mistgate.admin.v1.RefreshWarpResponse.account:type_name -> mistgate.admin.v1.WarpAccount
-	18, // 12: mistgate.admin.v1.GetWarpRegistrationParamsResponse.params:type_name -> mistgate.admin.v1.WarpRegistrationParams
-	18, // 13: mistgate.admin.v1.GetWarpRegistrationParamsResponse.defaults:type_name -> mistgate.admin.v1.WarpRegistrationParams
-	18, // 14: mistgate.admin.v1.UpdateWarpRegistrationParamsRequest.params:type_name -> mistgate.admin.v1.WarpRegistrationParams
-	18, // 15: mistgate.admin.v1.UpdateWarpRegistrationParamsResponse.params:type_name -> mistgate.admin.v1.WarpRegistrationParams
-	3,  // 16: mistgate.admin.v1.WarpService.GetWarp:input_type -> mistgate.admin.v1.GetWarpRequest
-	6,  // 17: mistgate.admin.v1.WarpService.RegisterWarp:input_type -> mistgate.admin.v1.RegisterWarpRequest
-	8,  // 18: mistgate.admin.v1.WarpService.ImportWarp:input_type -> mistgate.admin.v1.ImportWarpRequest
-	10, // 19: mistgate.admin.v1.WarpService.SetWarpEnabled:input_type -> mistgate.admin.v1.SetWarpEnabledRequest
-	12, // 20: mistgate.admin.v1.WarpService.RestartWarp:input_type -> mistgate.admin.v1.RestartWarpRequest
-	14, // 21: mistgate.admin.v1.WarpService.RefreshWarp:input_type -> mistgate.admin.v1.RefreshWarpRequest
-	16, // 22: mistgate.admin.v1.WarpService.DeleteWarp:input_type -> mistgate.admin.v1.DeleteWarpRequest
-	19, // 23: mistgate.admin.v1.WarpService.GetWarpRegistrationParams:input_type -> mistgate.admin.v1.GetWarpRegistrationParamsRequest
-	21, // 24: mistgate.admin.v1.WarpService.UpdateWarpRegistrationParams:input_type -> mistgate.admin.v1.UpdateWarpRegistrationParamsRequest
-	4,  // 25: mistgate.admin.v1.WarpService.GetWarp:output_type -> mistgate.admin.v1.GetWarpResponse
-	7,  // 26: mistgate.admin.v1.WarpService.RegisterWarp:output_type -> mistgate.admin.v1.RegisterWarpResponse
-	9,  // 27: mistgate.admin.v1.WarpService.ImportWarp:output_type -> mistgate.admin.v1.ImportWarpResponse
-	11, // 28: mistgate.admin.v1.WarpService.SetWarpEnabled:output_type -> mistgate.admin.v1.SetWarpEnabledResponse
-	13, // 29: mistgate.admin.v1.WarpService.RestartWarp:output_type -> mistgate.admin.v1.RestartWarpResponse
-	15, // 30: mistgate.admin.v1.WarpService.RefreshWarp:output_type -> mistgate.admin.v1.RefreshWarpResponse
-	17, // 31: mistgate.admin.v1.WarpService.DeleteWarp:output_type -> mistgate.admin.v1.DeleteWarpResponse
-	20, // 32: mistgate.admin.v1.WarpService.GetWarpRegistrationParams:output_type -> mistgate.admin.v1.GetWarpRegistrationParamsResponse
-	22, // 33: mistgate.admin.v1.WarpService.UpdateWarpRegistrationParams:output_type -> mistgate.admin.v1.UpdateWarpRegistrationParamsResponse
-	25, // [25:34] is the sub-list for method output_type
-	16, // [16:25] is the sub-list for method input_type
-	16, // [16:16] is the sub-list for extension type_name
-	16, // [16:16] is the sub-list for extension extendee
-	0,  // [0:16] is the sub-list for field type_name
+	8,  // 6: mistgate.admin.v1.GetWarpResponse.inbounds:type_name -> mistgate.admin.v1.WarpInbound
+	7,  // 7: mistgate.admin.v1.GetWarpResponse.reach:type_name -> mistgate.admin.v1.WarpReachView
+	5,  // 8: mistgate.admin.v1.GetWarpResponse.reach_check:type_name -> mistgate.admin.v1.WarpReachCheck
+	6,  // 9: mistgate.admin.v1.WarpReachView.domains:type_name -> mistgate.admin.v1.WarpReachDomain
+	0,  // 10: mistgate.admin.v1.RegisterWarpResponse.account:type_name -> mistgate.admin.v1.WarpAccount
+	0,  // 11: mistgate.admin.v1.ImportWarpResponse.account:type_name -> mistgate.admin.v1.WarpAccount
+	0,  // 12: mistgate.admin.v1.SetWarpLicenseResponse.account:type_name -> mistgate.admin.v1.WarpAccount
+	0,  // 13: mistgate.admin.v1.SetWarpEnabledResponse.account:type_name -> mistgate.admin.v1.WarpAccount
+	0,  // 14: mistgate.admin.v1.RestartWarpResponse.account:type_name -> mistgate.admin.v1.WarpAccount
+	0,  // 15: mistgate.admin.v1.RefreshWarpResponse.account:type_name -> mistgate.admin.v1.WarpAccount
+	23, // 16: mistgate.admin.v1.GetWarpRegistrationParamsResponse.params:type_name -> mistgate.admin.v1.WarpRegistrationParams
+	23, // 17: mistgate.admin.v1.GetWarpRegistrationParamsResponse.defaults:type_name -> mistgate.admin.v1.WarpRegistrationParams
+	23, // 18: mistgate.admin.v1.UpdateWarpRegistrationParamsRequest.params:type_name -> mistgate.admin.v1.WarpRegistrationParams
+	23, // 19: mistgate.admin.v1.UpdateWarpRegistrationParamsResponse.params:type_name -> mistgate.admin.v1.WarpRegistrationParams
+	3,  // 20: mistgate.admin.v1.WarpService.GetWarp:input_type -> mistgate.admin.v1.GetWarpRequest
+	9,  // 21: mistgate.admin.v1.WarpService.RegisterWarp:input_type -> mistgate.admin.v1.RegisterWarpRequest
+	11, // 22: mistgate.admin.v1.WarpService.ImportWarp:input_type -> mistgate.admin.v1.ImportWarpRequest
+	15, // 23: mistgate.admin.v1.WarpService.SetWarpEnabled:input_type -> mistgate.admin.v1.SetWarpEnabledRequest
+	17, // 24: mistgate.admin.v1.WarpService.RestartWarp:input_type -> mistgate.admin.v1.RestartWarpRequest
+	19, // 25: mistgate.admin.v1.WarpService.RefreshWarp:input_type -> mistgate.admin.v1.RefreshWarpRequest
+	13, // 26: mistgate.admin.v1.WarpService.SetWarpLicense:input_type -> mistgate.admin.v1.SetWarpLicenseRequest
+	21, // 27: mistgate.admin.v1.WarpService.DeleteWarp:input_type -> mistgate.admin.v1.DeleteWarpRequest
+	24, // 28: mistgate.admin.v1.WarpService.GetWarpRegistrationParams:input_type -> mistgate.admin.v1.GetWarpRegistrationParamsRequest
+	26, // 29: mistgate.admin.v1.WarpService.UpdateWarpRegistrationParams:input_type -> mistgate.admin.v1.UpdateWarpRegistrationParamsRequest
+	4,  // 30: mistgate.admin.v1.WarpService.GetWarp:output_type -> mistgate.admin.v1.GetWarpResponse
+	10, // 31: mistgate.admin.v1.WarpService.RegisterWarp:output_type -> mistgate.admin.v1.RegisterWarpResponse
+	12, // 32: mistgate.admin.v1.WarpService.ImportWarp:output_type -> mistgate.admin.v1.ImportWarpResponse
+	16, // 33: mistgate.admin.v1.WarpService.SetWarpEnabled:output_type -> mistgate.admin.v1.SetWarpEnabledResponse
+	18, // 34: mistgate.admin.v1.WarpService.RestartWarp:output_type -> mistgate.admin.v1.RestartWarpResponse
+	20, // 35: mistgate.admin.v1.WarpService.RefreshWarp:output_type -> mistgate.admin.v1.RefreshWarpResponse
+	14, // 36: mistgate.admin.v1.WarpService.SetWarpLicense:output_type -> mistgate.admin.v1.SetWarpLicenseResponse
+	22, // 37: mistgate.admin.v1.WarpService.DeleteWarp:output_type -> mistgate.admin.v1.DeleteWarpResponse
+	25, // 38: mistgate.admin.v1.WarpService.GetWarpRegistrationParams:output_type -> mistgate.admin.v1.GetWarpRegistrationParamsResponse
+	27, // 39: mistgate.admin.v1.WarpService.UpdateWarpRegistrationParams:output_type -> mistgate.admin.v1.UpdateWarpRegistrationParamsResponse
+	30, // [30:40] is the sub-list for method output_type
+	20, // [20:30] is the sub-list for method input_type
+	20, // [20:20] is the sub-list for extension type_name
+	20, // [20:20] is the sub-list for extension extendee
+	0,  // [0:20] is the sub-list for field type_name
 }
 
 func init() { file_mistgate_admin_v1_warp_proto_init() }
@@ -1794,7 +2233,7 @@ func file_mistgate_admin_v1_warp_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_mistgate_admin_v1_warp_proto_rawDesc), len(file_mistgate_admin_v1_warp_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   23,
+			NumMessages:   28,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

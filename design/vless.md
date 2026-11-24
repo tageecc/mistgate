@@ -40,8 +40,8 @@ v1 combinations (one inbound = one port = one combination):
 
 Features in v1: several REALITY `server_names` and `short_ids` (each credential gets one, chosen deterministically);
 client fingerprint `fp` in links; XHTTP `mode` auto / packet-up / stream-up / stream-one in the link (the server
-accepts all); `x_padding_bytes`; a CDN address override (`cdn.host`, `cdn.port`); sniffing (http, tls, quic) so the
-node resolves sniffed names; egress direct or WARP; per-credential rate limit, hard expiry and kick; torrent guard parity
+accepts all); `x_padding_bytes`; a CDN address override (`cdn.host`, `cdn.port`);
+egress direct or WARP; per-credential rate limit, hard expiry and kick; torrent guard parity
 with hysteria2.
 
 The panel-side synthetic VLESS check runs xray-core in one short-lived helper process per attempt. The panel process
@@ -78,8 +78,7 @@ the AWG PSK); document it in agent.proto next to the AWG `data_json` line.
 
 Instance per inbound: `core.New(&core.Config{...})` with apps `dispatcher.Config{}`, `proxyman.InboundConfig{}`,
 `proxyman.OutboundConfig{}`, `policy.Config{Level: {0: {Buffer: {Connection: 64 KiB}}}}` (explicit). One inbound tagged
-with the inbound id: `ReceiverConfig{PortList, Listen, StreamSettings, SniffingSettings{Enabled, DestinationOverride:
-http,tls,quic}}`, `vlessin.Config{Clients, Decryption:"none"}`. Stream settings: `ProtocolName "splithttp"` with
+with the inbound id: `ReceiverConfig{PortList, Listen, StreamSettings}` (no sniffing: nothing routes by a sniffed name, and the sniffer can hold the first datagram of a flow for up to 200 ms), `vlessin.Config{Clients, Decryption:"none"}`. Stream settings: `ProtocolName "splithttp"` with
 `splithttp.Config{Path, Host, Mode:"auto", XPaddingBytes}`, or `"tcp"`; REALITY `reality.Config{Dest: target,
 Type:"tcp", ServerNames, PrivateKey, ShortIds}`; ws `websocket.Config{Path, Host}`. After `core.New`,
 `outbound.Manager.AddHandler(ctx, egressHandler)` then `Start()`; the first handler added is the default, no router.
@@ -107,7 +106,7 @@ Engine contract (`internal/node/engine/engine.go`):
 - Health per inbound: state, detail, restarts, cert pin (TLS only); details `listen: …`, `reality_target:
   unreachable|no_tls13|no_mlkem` (the target probed once at start with a TLS 1.3 handshake offering X25519MLKEM768; a
   bad target is a warning, never a failure).
-- Version `"xray-core v26.3.27"` from `debug.ReadBuildInfo`.
+- Version `"xray-core v26.11.9"` from `debug.ReadBuildInfo`.
 - Logs: `xlog.RegisterHandler` once in `New`; `*GeneralMessage` ≤ Warning → slog `source=xray`; access messages and
   everything below Warning dropped (they carry destinations and credential ids).
 - No Vision splice (needs xray's freedom outbound); Vision copies through user space; the CPU cost is accepted.
@@ -230,6 +229,10 @@ Upstream on Windows: xray's readv there is a blocking WSARecv (`common/buf/readv
 ## 6. Decisions on the open questions
 
 1. Xray version: stable v26.3.27, bumped deliberately (not v26.9.x pre-releases). — owner: yes (2026-10-09)
+   Moved to v26.11.9 on 2026-11 (compat plan stage C3): the REALITY library is vendored in `third_party/reality` with a switch that keeps
+   accepting classical (non-post-quantum) ClientHellos, so no client notices; the node turns it on for every inbound.
+   Xray itself comes through a `replace` to the public fork `github.com/Mistgate/Xray-core` (upstream plus one commit: Vision's
+   `TrafficState` fields atomic, a data race upstream declined to fix), so `internal/node/vless` runs under `-race` in CI.
 2. REALITY target: no default; required; the node probe checks TLS 1.3 and MLKEM; no shared-CDN sites (can be abused as
    a forwarder). — owner: yes (2026-10-09)
 3. CDN host: profile-level `cdn.host`, one origin node per CDN profile in v1; per-inbound later. — owner: yes (2026-10-09)

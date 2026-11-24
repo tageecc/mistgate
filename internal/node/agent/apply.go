@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -38,11 +39,20 @@ func (a *Agent) applyDesired(ctx context.Context, ds *pb.DesiredState) *pb.Apply
 		res.Status = pb.ApplyStatus_APPLY_STATUS_APPLIED
 		res.StateHash = a.observedHash(cur)
 		res.Inbounds = a.cachedResults(cur)
+		res.Status = applyStatus(res.Inbounds)
+		if cur.partial {
+			res.Status = pb.ApplyStatus_APPLY_STATUS_PARTIAL
+		}
 		res.Relays = a.relay.results
+		res.Bridges = a.bridgeResults()
 		return done()
 	}
 
 	next, err := merge(cur, ds, a.knows)
+	var partial *partialStateError
+	if err != nil && errors.As(err, &partial) {
+		err = nil
+	}
 	switch {
 	case errors.Is(err, errBaseMismatch):
 		a.log.Info("delta on the wrong base", "base", ds.BaseRevision, "applied", cur.revision)
@@ -50,26 +60,39 @@ func (a *Agent) applyDesired(ctx context.Context, ds *pb.DesiredState) *pb.Apply
 		res.StateHash = a.observedHash(cur)
 		return done()
 	case err != nil:
-		a.log.Warn("desired state rejected", "revision", ds.Revision, "err", err)
+		a.log.Warn("desired state rejected", "code", "desired_state_rejected", "revision", ds.Revision, "err", err)
 		res.Status, res.Error = pb.ApplyStatus_APPLY_STATUS_REJECTED, err.Error()
 		res.StateHash = a.observedHash(cur)
 		return done()
 	}
+	if partial != nil {
+		a.reportStateIssues(partial.issues)
+	}
+	a.clearChangedApplyMarkers(ds, next)
 	if ds.Settings != nil {
 		a.settings.Store(ds.Settings)
+		if ds.Settings.GetOsStatus() {
+			a.wakeOsStatusReader()
+		}
+		a.configureNetworks(ds.Settings)
 	}
+	a.startAwgKmod(ctx, next)
 	if ds.StateHash != "" && ds.StateHash != next.hash() {
 		// Not fatal: the authoritative comparison is the observed hash below, but this tells us whether the
 		// merge itself diverged from the panel's idea of the state.
-		a.log.Warn("merged state hash differs from the panel's", "revision", ds.Revision, "base", ds.BaseRevision)
+		a.log.Warn("merged state hash differs from the panel's", "code", "state_hash_mismatch", "revision", ds.Revision, "base", ds.BaseRevision)
 	}
 
 	results := a.reconcile(ctx, next, nil)
 	a.setModel(next)
 	a.persistModel(next, false)
 	res.Status = applyStatus(results)
+	if partial != nil || next.partial {
+		res.Status = pb.ApplyStatus_APPLY_STATUS_PARTIAL
+	}
 	res.Inbounds = results
 	res.Relays = a.relay.results
+	res.Bridges = a.bridgeResults()
 	res.StateHash = a.observedHash(next)
 	if ds.BaseRevision == 0 { // deltas are frequent; only a full apply is an event worth reporting
 		added, removed, changed, users := diffModels(cur, next)
@@ -130,43 +153,76 @@ func diffModels(cur, next *model) (added, removed, changed, creds int) {
 func (a *Agent) reconcile(ctx context.Context, next *model, force map[string]bool) []*pb.InboundResult {
 	prev := a.snapshotModel()
 	prevRelayClaims := a.relay.claims
+	fronts := a.planShares(next) // before the removal below, which needs to know who changes place
 	// The host side of the L3 protocols comes first (l3.go): WARP, then the routes and the firewall of the tunnel
 	// interfaces, then the engines that create those interfaces. An inbound that depends on a step that failed is
 	// blocked (a.blocked) instead of started.
 	a.engineSettings(ctx, next)
 	a.syncWarp(ctx, next)
 	a.syncTunnels(ctx, next)
+	reverseClaims := a.reverseRelayTCPClaims(next)
+	if len(reverseClaims) > 0 || (next.bridgeServe != nil && next.bridgeServe.Port != 0) {
+		preRelayClaims := withRelayClaims(tcpPortClaims(next), reverseClaims)
+		preRelayClaims = mergeTCPPortClaims(withRelayClaims(tcpPortClaims(prev), prevRelayClaims), preRelayClaims)
+		a.syncTCPClaims(ctx, preRelayClaims)
+	}
+	a.syncBridgeServe(ctx, next)
 	// The forwards come before the engines too: a TCP port a forward holds is a claim like an inbound's, so a decoy site
 	// gives it up while the forward is installed and keeps it when the forward failed.
 	a.syncRelays(ctx, next)
 	nextTCP := withRelayClaims(tcpPortClaims(next), a.relay.claims)
 	claimedTCP := mergeTCPPortClaims(withRelayClaims(tcpPortClaims(prev), prevRelayClaims), nextTCP)
+	var removedFailures []*pb.InboundResult
 	for _, id := range prev.ids() {
 		old := prev.inbounds[id]
-		if n := next.inbounds[id]; n != nil && n.spec.Protocol == old.spec.Protocol {
+		n := next.inbounds[id]
+		// An inbound that runs somewhere else than the plan puts it (alone, behind a front, or not at all) is removed and
+		// applied again: a port is held by the front or by one engine, never by both.
+		moved := a.held[id] != nil && a.held[id].place != a.place[id]
+		if n != nil && n.parseErr == "" && n.applyErr == "" && n.spec.Protocol == old.spec.Protocol && !moved {
 			continue
 		}
+		if moved && n != nil {
+			if a.replaced == nil {
+				a.replaced = map[string]bool{}
+			}
+			a.replaced[id] = true
+		}
 		if e := a.engines[old.spec.Protocol]; e != nil {
-			if err := e.Remove(ctx, id); err != nil {
-				a.log.Warn("remove inbound", "inbound", id, "err", err)
+			if err := a.removeEngine(ctx, old.spec.Protocol, e, id); err != nil {
+				if isEnginePanic(err) {
+					if n != nil {
+						n.applyErr = err.Error()
+					} else {
+						removedFailures = append(removedFailures, &pb.InboundResult{InboundId: id, State: pb.InboundRunState_INBOUND_RUN_STATE_FAILED, Error: err.Error()})
+						a.event(pb.Severity_SEVERITY_ERROR, "engine_failed", id, map[string]string{"error": err.Error()})
+					}
+				} else {
+					a.log.Warn("remove inbound", "code", "inbound_remove_failed", "inbound", id, "err", err)
+				}
 			}
 		}
 		delete(a.held, id)
 	}
-	a.syncTCPClaims(ctx, claimedTCP)
+	a.syncTCPClaims(ctx, claimedTCP) // a Hysteria2 site gives its TCP port up here, before the front binds it
+	a.syncFronts(fronts)
 	now := a.now()
 	results := make([]*pb.InboundResult, 0, len(next.inbounds))
 	for _, id := range next.ids() {
 		results = append(results, a.applyInbound(ctx, next.inbounds[id], now, force[id]))
 	}
 	a.syncTCPClaims(ctx, nextTCP)
+	a.markRoutes(results)
 	// NFQUEUE rules are installed before an AWG interface is created. Refresh its interface-index map now that
 	// the engines have applied, so packets use exact active interface identities from this point on.
 	a.syncTorrentGuardApplied(ctx, next, results)
 	active := successfullyAppliedEnabledInbounds(results)
 	hops := a.syncHops(ctx, next, results, active)
-	a.syncInboundPorts(ctx, next, active, hops)
+	firewallReady := a.syncInboundPorts(ctx, next, active, hops)
+	a.startReverseRelays(firewallReady)
+	a.syncBridgeDials(ctx, next, results)
 	a.noteCerts(results)
+	results = append(results, removedFailures...)
 	var failed []string
 	for _, r := range results {
 		if r.Error != "" {
@@ -174,6 +230,7 @@ func (a *Agent) reconcile(ctx context.Context, next *model, force map[string]boo
 		}
 	}
 	a.failedApply.Store(&failed)
+	a.publishBridgeInfo()
 	return results
 }
 
@@ -181,10 +238,15 @@ func tcpPortClaims(next *model) map[uint16]string {
 	claimed := make(map[uint16]string)
 	for _, id := range next.ids() {
 		spec := next.inbounds[id].spec
-		if spec.Enabled && spec.Listen.Network == "tcp" {
+		if next.inbounds[id].parseErr == "" && next.inbounds[id].applyErr == "" && spec.Enabled && spec.Listen.Network == "tcp" {
 			if _, exists := claimed[spec.Listen.Port]; !exists { // ids are sorted; keep the same lower-id winner as hop checks
 				claimed[spec.Listen.Port] = id
 			}
+		}
+	}
+	if next.bridgeServe != nil && next.bridgeServe.Port != 0 {
+		if _, exists := claimed[next.bridgeServe.Port]; !exists {
+			claimed[next.bridgeServe.Port] = "bridge-site"
 		}
 	}
 	return claimed
@@ -220,7 +282,8 @@ func (a *Agent) applyInbound(ctx context.Context, in *inbound, now time.Time, fo
 	// the cache: a running one is stopped, there is never a silent direct exit.
 	why, blocked := a.blocked[spec.ID]
 	blocked = blocked && spec.Enabled
-	if !blocked && h != nil && !force && h.spec == sh && h.creds == ch && h.res.Error == "" {
+	if !blocked && in.parseErr == "" && in.applyErr == "" && a.noRun[spec.ID] == "" && h != nil && !force && h.spec == sh && h.creds == ch &&
+		h.res.State != pb.InboundRunState_INBOUND_RUN_STATE_FAILED {
 		res := proto.Clone(h.res).(*pb.InboundResult)
 		a.refreshState(res)
 		return res
@@ -228,18 +291,30 @@ func (a *Agent) applyInbound(ctx context.Context, in *inbound, now time.Time, fo
 
 	var rep engine.ApplyReport
 	var err error
-	if blocked {
+	if a.crashSkips[spec.ID] {
+		delete(a.crashSkips, spec.ID)
+		err = errors.New("skipped after a crash while applying it")
+	} else if in.applyErr != "" {
+		err = errors.New(in.applyErr)
+	} else if in.parseErr != "" {
+		err = errors.New(in.parseErr)
+	} else if msg := a.noRun[spec.ID]; msg != "" {
+		err = errors.New(msg)
+	} else if blocked {
 		err = a.blockedFail(ctx, spec, why)
 	} else {
-		rep, err = eng.Apply(ctx, spec, creds)
+		rep, err = a.applyEngine(ctx, spec, creds, eng)
 	}
 	res := &pb.InboundResult{InboundId: spec.ID, SpecHash: sh}
-	wasFailing := h != nil && h.res.Error != ""
+	replaced := a.replaced[spec.ID]
+	delete(a.replaced, spec.ID)
+	wasFailing := h != nil && h.res.State == pb.InboundRunState_INBOUND_RUN_STATE_FAILED
 	if err != nil {
-		res.State = pb.InboundRunState_INBOUND_RUN_STATE_FAILED
-		res.Error = err.Error()
-		if h == nil || h.res.Error != res.Error {
-			a.log.Error("inbound failed", "inbound", spec.ID, "err", err)
+		res.State, res.Error = pb.InboundRunState_INBOUND_RUN_STATE_FAILED, err.Error()
+		if h == nil || h.res.Error != res.Error || h.res.State != pb.InboundRunState_INBOUND_RUN_STATE_FAILED {
+			if !isEnginePanic(err) {
+				a.log.Error("inbound failed", "code", "inbound_apply_failed", "inbound", spec.ID, "err", err)
+			}
 			if isBackendUnavailable(err) { // agent.proto "AWG AND WARP": awg_backend_unavailable {reason}
 				a.event(pb.Severity_SEVERITY_ERROR, "awg_backend_unavailable", spec.ID, map[string]string{"reason": res.Error})
 			} else {
@@ -252,6 +327,9 @@ func (a *Agent) applyInbound(ctx context.Context, in *inbound, now time.Time, fo
 		}
 		res.CredCount = uint32(rep.CredCount)
 		res.Restarted = rep.Restarted
+		if w := append(append([]string(nil), in.credWarn...), rep.Warnings...); len(w) != 0 {
+			res.Error = fmt.Sprintf("%d credential%s skipped: %s", len(w), plural(len(w)), strings.Join(w, "; "))
+		}
 		res.CertPinSha256 = rep.Cert.PinSHA256
 		if !rep.Cert.NotAfter.IsZero() {
 			res.CertNotAfterUnix = rep.Cert.NotAfter.Unix()
@@ -265,6 +343,8 @@ func (a *Agent) applyInbound(ctx context.Context, in *inbound, now time.Time, fo
 		// protocol are joined in by the event list).
 		switch {
 		case !spec.Enabled:
+		case replaced: // the port it runs on changed hands (a front came or went): the same inbound, started again
+			a.event(pb.Severity_SEVERITY_INFO, "engine_restarted", spec.ID, map[string]string{"protocol": spec.Protocol, "reason": "config_changed"})
 		case force:
 			a.event(pb.Severity_SEVERITY_INFO, "engine_restarted", spec.ID, map[string]string{"protocol": spec.Protocol, "reason": "restart_command"})
 		case rep.Restarted && h != nil && !wasFailing:
@@ -287,8 +367,147 @@ func (a *Agent) applyInbound(ctx context.Context, in *inbound, now time.Time, fo
 	if expired > prevExpired {
 		a.event(pb.Severity_SEVERITY_INFO, "credential_expired", spec.ID, map[string]string{"count": strconv.Itoa(expired - prevExpired)})
 	}
-	a.held[spec.ID] = &held{spec: sh, creds: ch, expired: expired, res: proto.Clone(res).(*pb.InboundResult)}
+	a.held[spec.ID] = &held{spec: sh, creds: ch, place: a.place[spec.ID], expired: expired, res: proto.Clone(res).(*pb.InboundResult)}
 	return res
+}
+
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}
+
+type enginePanicError struct{ reason string }
+
+func (e *enginePanicError) Error() string { return e.reason }
+
+func enginePanicReason(v any) string {
+	var detail string
+	switch p := v.(type) {
+	case string:
+		detail = p
+	case error:
+		detail = p.Error()
+	default:
+		detail = fmt.Sprintf("%T", p)
+	}
+	detail = strings.TrimSpace(detail)
+	if detail == "" {
+		detail = fmt.Sprintf("%T", v)
+	}
+	if len(detail) > 160 {
+		detail = detail[:160]
+	}
+	return "engine panic: " + detail
+}
+
+func isEnginePanic(err error) bool {
+	var target *enginePanicError
+	return errors.As(err, &target)
+}
+
+func (a *Agent) applyEngine(ctx context.Context, spec plugin.InboundSpec, creds []plugin.UserCred, eng engine.Engine) (rep engine.ApplyReport, err error) {
+	prior := a.beginApplyMarker(spec.ID, statehash.Spec(spec))
+	defer func() {
+		if v := recover(); v != nil {
+			err = &enginePanicError{reason: enginePanicReason(v)}
+			a.log.Error("engine panic", "code", "engine_apply_panic", "protocol", spec.Protocol, "inbound", spec.ID, "operation", "apply", "panic", fmt.Sprint(v), "stack", string(debug.Stack()))
+		}
+		if err == nil || !prior {
+			a.finishApplyMarker(spec.ID)
+		}
+	}()
+	// This catches synchronous engine panics only; panics in goroutines started by an engine are out of scope.
+	return eng.Apply(ctx, spec, creds)
+}
+
+func (a *Agent) removeEngine(ctx context.Context, protocol string, eng engine.Engine, id string) (err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			err = &enginePanicError{reason: enginePanicReason(v)}
+			a.log.Error("engine panic", "code", "engine_remove_panic", "protocol", protocol, "inbound", id, "operation", "remove", "panic", fmt.Sprint(v), "stack", string(debug.Stack()))
+		}
+	}()
+	return eng.Remove(ctx, id)
+}
+
+func (a *Agent) loadApplyMarkers() {
+	if a.applyMarkersLoaded {
+		return
+	}
+	markers, err := loadApplyMarkers(a.cfg.StateDir)
+	if err != nil {
+		a.log.Warn("apply crash marker ignored", "code", "apply_crash_marker_read_failed", "err", err)
+		markers = map[string]string{}
+		_ = saveApplyMarkers(a.cfg.StateDir, markers)
+	}
+	a.applyMarkers, a.applyMarkersLoaded = markers, true
+	a.crashSkips = make(map[string]bool, len(markers))
+	for id := range markers {
+		a.crashSkips[id] = true
+	}
+}
+
+func (a *Agent) beginApplyMarker(id, specHash string) bool {
+	a.loadApplyMarkers()
+	prior := a.applyMarkers[id] == specHash
+	a.applyMarkers[id] = specHash
+	if err := saveApplyMarkers(a.cfg.StateDir, a.applyMarkers); err != nil {
+		a.log.Error("write apply crash marker", "code", "apply_crash_marker_write_failed", "inbound", id, "err", err)
+	}
+	return prior
+}
+
+func (a *Agent) finishApplyMarker(id string) {
+	a.loadApplyMarkers()
+	delete(a.applyMarkers, id)
+	if err := saveApplyMarkers(a.cfg.StateDir, a.applyMarkers); err != nil {
+		a.log.Warn("clear apply crash marker", "code", "apply_crash_marker_clear_failed", "inbound", id, "err", err)
+	}
+}
+
+func (a *Agent) clearChangedApplyMarkers(ds *pb.DesiredState, next *model) {
+	a.loadApplyMarkers()
+	removed := make(map[string]bool, len(ds.RemovedInboundIds))
+	for _, id := range ds.RemovedInboundIds {
+		removed[id] = true
+	}
+	sentSpecs := make(map[string]string, len(ds.Inbounds))
+	for _, is := range ds.Inbounds {
+		if is != nil && is.InboundId != "" && is.Spec != nil {
+			if in := next.inbounds[is.InboundId]; in != nil {
+				sentSpecs[is.InboundId] = statehash.Spec(in.spec)
+			}
+		}
+	}
+	changed := false
+	for id, hash := range a.applyMarkers {
+		if newHash, sent := sentSpecs[id]; sent && newHash == hash {
+			continue
+		}
+		if _, sent := sentSpecs[id]; !sent && ds.BaseRevision != 0 && !removed[id] {
+			continue
+		}
+		delete(a.applyMarkers, id)
+		delete(a.crashSkips, id)
+		changed = true
+	}
+	if changed {
+		if err := saveApplyMarkers(a.cfg.StateDir, a.applyMarkers); err != nil {
+			a.log.Warn("clear changed apply crash marker", "code", "apply_crash_marker_clear_failed", "err", err)
+		}
+	}
+}
+
+func (a *Agent) reportStateIssues(issues []stateIssue) {
+	for _, issue := range issues {
+		if issue.kind == "inbound" {
+			continue // applyInbound reports the failed inbound with its parse reason.
+		}
+		a.log.Warn("desired state item skipped", "code", "desired_item_skipped", "kind", issue.kind, "id", issue.id, "reason", issue.reason)
+		a.event(pb.Severity_SEVERITY_ERROR, "desired_state_item_skipped", issue.id, map[string]string{"kind": issue.kind, "error": issue.reason})
+	}
 }
 
 // refreshState takes the live run state from the engine's health, which can change after Apply.
@@ -299,7 +518,7 @@ func (a *Agent) refreshState(res *pb.InboundResult) {
 				continue
 			}
 			res.State = pb.InboundRunState(hh.State)
-			if hh.State == plugin.RunFailed && res.Error == "" {
+			if hh.State == plugin.RunFailed && hh.Detail != "" {
 				res.Error = hh.Detail
 			}
 			// the certificate may have been issued (ACME) or renewed after the engine answered Apply; a result that
@@ -343,7 +562,7 @@ func (a *Agent) syncHops(ctx context.Context, next *model, results []*pb.Inbound
 	}
 	for id, msg := range rej {
 		if a.hopRej[id] != msg {
-			a.log.Error("port hop rejected", "inbound", id, "reason", msg)
+			a.log.Error("port hop rejected", "code", "port_hop_rejected", "inbound", id, "reason", msg)
 			a.event(pb.Severity_SEVERITY_ERROR, "hop_rejected", id, map[string]string{"error": msg})
 		}
 	}
@@ -354,7 +573,10 @@ func (a *Agent) syncHops(ctx context.Context, next *model, results []*pb.Inbound
 	}
 	if err := a.host.SetPortHops(ctx, hops); err != nil {
 		a.hopsSet = false
-		a.log.Error("port hopping not installed", "err", err)
+		if a.nftNote(err) != nil { // a missing nft is said once (nft.go), not at every sweep
+			a.log.Error("port hopping not installed", "code", "port_hop_sync_failed", "err", err)
+			a.event(pb.Severity_SEVERITY_ERROR, "hop_failed", "", map[string]string{"error": err.Error()})
+		}
 		for _, r := range results {
 			for _, h := range hops {
 				if h.InboundID == r.InboundId && r.Error == "" {
@@ -362,17 +584,17 @@ func (a *Agent) syncHops(ctx context.Context, next *model, results []*pb.Inbound
 				}
 			}
 		}
-		a.event(pb.Severity_SEVERITY_ERROR, "hop_failed", "", map[string]string{"error": err.Error()})
 		return nil
 	}
 	a.hops, a.hopsSet = hops, true
+	a.nftOK()
 	return hops
 }
 
 // syncInboundPorts mirrors only enabled listeners whose engine apply succeeded. UDP hop ranges are included only after
 // their exact nft redirect was accepted and installed. A failure is a node-level warning, not an inbound error: the
 // listener runs, and the host firewall may well be open by the owner's own rules.
-func (a *Agent) syncInboundPorts(ctx context.Context, next *model, active map[string]bool, hops []hostctl.Hop) {
+func (a *Agent) syncInboundPorts(ctx context.Context, next *model, active map[string]bool, hops []hostctl.Hop) bool {
 	byHop := make(map[string]hostctl.Hop, len(hops))
 	for _, h := range hops {
 		byHop[h.InboundID] = h
@@ -402,6 +624,29 @@ func (a *Agent) syncInboundPorts(ctx context.Context, next *model, active map[st
 			}
 			tcpSet[s.Listen.Port] = struct{}{}
 		}
+		for _, side := range plugin.SideListens(s) {
+			switch side.Network {
+			case "udp":
+				if side.Port != 0 {
+					udpSet[hostctl.UDPInboundPort{Port: side.Port}] = struct{}{}
+				}
+			case "tcp":
+				if side.Port != 0 {
+					tcpSet[side.Port] = struct{}{}
+				}
+			}
+		}
+	}
+	if a.bridgeSite != nil {
+		if port := a.bridgeSite.Port(); port != 0 {
+			tcpSet[port] = struct{}{}
+		}
+	}
+	for port := range a.relay.listenerPorts {
+		tcpSet[port] = struct{}{}
+	}
+	for _, listener := range a.relay.pending {
+		tcpSet[listener.Port] = struct{}{}
 	}
 	udp := make([]hostctl.UDPInboundPort, 0, len(udpSet))
 	for port := range udpSet {
@@ -426,9 +671,11 @@ func (a *Agent) syncInboundPorts(ctx context.Context, next *model, active map[st
 	}
 	if err := errors.Join(errs...); err != nil {
 		a.markHostFirewallSyncFailure(err, udp, tcp)
+		return false
 	} else {
 		a.clearHostFirewallSyncFailure()
 	}
+	return true
 }
 
 // markHostFirewallSyncFailure reports one warning per distinct failure; the same failure on later reconciles is quiet.
@@ -437,7 +684,7 @@ func (a *Agent) markHostFirewallSyncFailure(err error, udp []hostctl.UDPInboundP
 	errMsg := err.Error()
 	if a.hostFirewallErr != errMsg {
 		a.hostFirewallErr = errMsg
-		a.log.Warn("host firewall inbound rules were not fully reconciled", "err", err)
+		a.log.Warn("host firewall inbound rules were not fully reconciled", "code", "host_firewall_sync_failed", "err", err)
 		list := make([]string, len(udp))
 		for i, p := range udp {
 			if p.Port != 0 {
@@ -524,8 +771,8 @@ func (a *Agent) cachedResults(m *model) []*pb.InboundResult {
 
 // observedHash hashes what the engines ACTUALLY hold (Engine.Observed), with two deliberate additions so
 // that intended behaviour is not reported as drift: credentials the agent withheld because their term
-// ended (the panel still lists them until it recomputes), and inbounds that are disabled (an engine keeps
-// nothing for them, the panel still lists them).
+// ended (the panel still lists them until it recomputes), and inbounds that are disabled or that lost their name on a
+// shared port (an engine keeps nothing for them, the panel still lists them).
 func (a *Agent) observedHash(m *model) string {
 	now := a.now()
 	var all []statehash.Inbound
@@ -540,11 +787,11 @@ func (a *Agent) observedHash(m *model) string {
 		}
 	}
 	for id, in := range m.inbounds {
-		if !in.spec.Enabled && !have[id] {
+		if in.parseErr == "" && in.applyErr == "" && (!in.spec.Enabled || a.isNoRun(id)) && !have[id] {
 			all = append(all, statehash.Inbound{Spec: in.spec, Creds: in.sortedCreds()})
 		}
 	}
-	return statehash.StateRelays(all, m.warp, m.relays)
+	return statehash.StateBridge(all, m.warp, m.relays, m.bridgeServe, m.bridgeDials)
 }
 
 func withExpired(held []plugin.UserCred, in *inbound, now time.Time) []plugin.UserCred {
@@ -572,7 +819,10 @@ func (m *model) hash() string {
 	all := make([]statehash.Inbound, 0, len(m.inbounds))
 	for _, id := range m.ids() {
 		in := m.inbounds[id]
+		if in.parseErr != "" {
+			continue
+		}
 		all = append(all, statehash.Inbound{Spec: in.spec, Creds: in.sortedCreds()})
 	}
-	return statehash.StateRelays(all, m.warp, m.relays)
+	return statehash.StateBridge(all, m.warp, m.relays, m.bridgeServe, m.bridgeDials)
 }

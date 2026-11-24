@@ -1,10 +1,12 @@
-import { UserStatus } from "@/gen/mistgate/admin/v1/user_pb";
+import type { Group } from "@/gen/mistgate/admin/v1/group_pb";
+import { DeviceKind, UserStatus } from "@/gen/mistgate/admin/v1/user_pb";
 import { App } from "@/gen/mistgate/admin/v1/common_pb";
 import type { Tone } from "@/components/ui/icons";
-import type { StatusKind } from "@/components/ui/status";
 import { agoOf, scaleBytes, type Fmt } from "@/lib/format";
-import type { UserN as User } from "./model";
+import type { DeviceN, UserN as User } from "./model";
 import type { Key, Tx } from "./t";
+
+export { avatarIndex } from "@/components/ui/bits";
 
 // Traffic is decimal across the panel (lib/format.ts), so a quota of "100 GB" is 100e9 bytes.
 export const GB = 1e9;
@@ -15,13 +17,6 @@ export const nowSec = () => Math.floor(Date.now() / 1000);
 /** Whole days until `expiresUnix` (rounded up; <= 0 once it has passed); null = never expires. */
 export function daysLeft(expiresUnix: number, now = nowSec()): number | null {
   return expiresUnix === 0 ? null : Math.ceil((expiresUnix - now) / DAY);
-}
-
-/** Stable colour slot for an avatar, so a user keeps their colour in the list and on their page. */
-export function avatarIndex(id: string): number {
-  let h = 0;
-  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
-  return h % 9;
 }
 
 /**
@@ -62,20 +57,27 @@ export function shownStatus(u: User): Shown {
   }
 }
 
-export const shownKind: Record<Shown, StatusKind> = { active: "ok", expired: "bad", quota: "warn", devices: "warn", disabled: "off" };
+/** Active in the API's eyes, yet the person's page would give nothing: no subscription link, no AmneziaVPN keys, no Telegram. */
+/**
+ * What the groups of a person reach together, for the hint "the group gives nothing": the nodes of the main group and of the extra
+ * ones added up (it is 0 only when none of them reaches a node). Undefined while the main group is not in the list.
+ */
+export type Reach = { happNodes: number; amneziaNodes: number };
+export function reachOf(u: Pick<User, "groupId" | "extraGroupIds">, groups: readonly Pick<Group, "id" | "happNodes" | "amneziaNodes">[]): Reach | undefined {
+  const main = groups.find((g) => g.id === u.groupId);
+  if (!main) return undefined;
+  const mine = [main, ...u.extraGroupIds.map((id) => groups.find((g) => g.id === id)).filter((g) => g !== undefined)];
+  return { happNodes: mine.reduce((n, g) => n + g.happNodes, 0), amneziaNodes: mine.reduce((n, g) => n + g.amneziaNodes, 0) };
+}
+
+export const noAccess = (u: Pick<User, "accessHapp" | "accessAmnezia" | "accessTelegram">) => !u.accessHapp && !u.accessAmnezia && !u.accessTelegram;
+
 export const shownKey: Record<Shown, Key> = {
   active: "users.status.active",
   expired: "users.status.expired",
   quota: "users.status.quota",
   devices: "users.status.devices",
   disabled: "users.status.disabled",
-};
-export const shownText: Record<Shown, string> = {
-  active: "text-muted",
-  expired: "text-danger-text",
-  quota: "text-warn-text",
-  devices: "text-warn-text",
-  disabled: "text-faint",
 };
 
 /**
@@ -93,15 +95,19 @@ export function usage(used: number, quota: number, fmt: Fmt) {
   return { used: n, of, text: `${n} / ${of}`, pct, tone: pct >= 1 ? ("over" as const) : pct >= 0.8 ? ("high" as const) : ("ok" as const) };
 }
 
-export const barTone = {
-  ok: "bg-[color-mix(in_oklch,var(--muted)_70%,var(--surface))]",
-  high: "bg-warn",
-  over: "bg-danger",
-} as const;
-
 /** The panel's short "5 min ago / 3 h ago / 2 d ago" (fmt.ago) for a Unix time; "—" when it is 0 (never). */
 export function agoText(unix: number, t: Tx, now = nowSec()): string {
   return unix === 0 ? "—" : agoOf(t, unix, now);
+}
+
+/**
+ * When the nodes last counted a connection of a device (0 = never). For an app on the link `lastSeenUnix` is its last subscription
+ * fetch, not a connection, so the panel sends the connection time apart; a key (AmneziaVPN, Telegram, TrustTunnel) has its own
+ * last handshake or session in `lastSeenUnix`, which may be newer than the counters.
+ */
+export function lastOnlineOf(d: Pick<DeviceN, "kind" | "lastSeenUnix" | "lastHandshakeUnix" | "lastOnlineUnix">): number {
+  const link = d.kind === DeviceKind.LINK || d.kind === DeviceKind.LINK_SHARED;
+  return Math.max(d.lastOnlineUnix ?? 0, link ? 0 : Math.max(d.lastSeenUnix, d.lastHandshakeUnix));
 }
 
 /** Last-seen column: "now" while online, else how long ago. */
@@ -109,21 +115,56 @@ export function seenText(u: User, t: Tx, now = nowSec()): string {
   return u.online ? t("users.now") : agoText(u.lastSeenUnix, t, now);
 }
 
-/** Term column: days left ("0 d", red, once expired), or "∞" for no expiry; a week or less is in the text colour. */
-export function termText(u: User, t: Tx, now = nowSec()): { text: string; tone: "muted" | "fg" | "bad" } {
+/** What the user actually connected with in the last 7 days: by the subscription link, by an AmneziaVPN key, by a TrustTunnel key, or several. */
+export function viaOf(u: User): { link: boolean; keys: boolean; trustTunnel: boolean } {
+  return { link: u.via.includes(App.HAPP), keys: u.via.includes(App.AMNEZIA), trustTunnel: u.via.includes(App.TRUST_TUNNEL) };
+}
+
+// ---------------------------------------------------------------------------------------------------
+// The people table of the redesign (list.tsx, users-table.tsx): what each cell says and in which tone.
+
+/** The tone of a cell of the table: nothing, amber, red, or quiet (the person is off). */
+export type CellTone = "" | "warn" | "crit" | "off";
+
+/** The term column: days left (amber in the last week), "expired" in red, "no expiry", or "off" for a person who is disabled. */
+export function termView(u: User, t: Tx, now = nowSec()): { text: string; tone: CellTone } {
+  if (u.status === UserStatus.DISABLED) return { text: t("ul.term.off"), tone: "off" };
+  if (u.status === UserStatus.EXPIRED || (u.expiresUnix > 0 && u.expiresUnix <= now)) return { text: t("ul.term.expired"), tone: "crit" };
   const d = daysLeft(u.expiresUnix, now);
-  if (d === null) return { text: "∞", tone: "muted" };
-  if (u.expiresUnix <= now) return { text: t("users.days", { n: 0 }), tone: "bad" };
-  return { text: t("users.days", { n: d }), tone: d <= 7 ? "fg" : "muted" };
+  if (d === null) return { text: t("ul.term.never"), tone: "" };
+  return { text: t.n("ul.days", d), tone: d <= 7 ? "warn" : "" };
 }
 
-/** What the user actually connected with in the last 7 days: by the subscription link, by an AmneziaVPN key, or both. */
-export function viaOf(u: User): { link: boolean; keys: boolean } {
-  return { link: u.via.includes(App.HAPP), keys: u.via.includes(App.AMNEZIA) };
+/** The devices cell: "2/5", how full it is (the bar), and whether the limit is reached; no limit has no bar. */
+export function devicesView(u: Pick<User, "devicesUsed" | "deviceLimit">) {
+  const limit = u.deviceLimit;
+  return {
+    text: `${u.devicesUsed}/${limit > 0 ? limit : "∞"}`,
+    full: limit > 0 && u.devicesUsed >= limit,
+    /** A limit of up to six is drawn as a dot per place, a bigger one as a bar; no limit is neither. */
+    dots: limit > 0 && limit <= 6 ? limit : 0,
+    pct: limit > 0 ? Math.min(100, Math.round((u.devicesUsed / limit) * 100)) : 0,
+  };
 }
 
-/** "Link + AmneziaVPN keys", "Subscription link" or "AmneziaVPN keys": the ways the admin switched on. */
-export function appsText(u: User, t: Tx): string {
-  if (u.apps?.happ && u.apps.amnezia) return t("users.appsBoth");
-  return u.apps?.amnezia ? t("users.appsAwg") : t("users.appsHapp");
+/** The traffic cell's bar: the share of the quota, amber from 80 %, red once used up; no quota is a dashed line. */
+export function trafficTone(u: Pick<User, "usedBytes" | "quotaBytes" | "status">): "" | "warn" | "crit" | "inf" {
+  if (u.quotaBytes <= 0) return "inf";
+  const pct = u.usedBytes / u.quotaBytes;
+  return u.status === UserStatus.LIMITED || pct >= 1 ? "crit" : pct >= 0.8 ? "warn" : "";
+}
+
+/** The line at the head of an open row: what is wrong with the person (or what to do), and in which tone. `info` is the quiet one. */
+export type RowWarn = { tone: "crit" | "warn" | "info"; text: string };
+
+export function warnOf(u: User, group: Reach | undefined, t: Tx, fmt: Fmt, now = nowSec()): RowWarn | null {
+  const d = daysLeft(u.expiresUnix, now);
+  if (u.status === UserStatus.DISABLED) return { tone: "crit", text: t("ul.warn.off") };
+  if (u.status === UserStatus.EXPIRED) return { tone: "crit", text: t.n("ul.warn.expired", Math.max(0, -(d ?? 0)) || 0) };
+  if (u.status === UserStatus.LIMITED) return { tone: "crit", text: u.nextResetUnix > 0 ? t("ul.warn.quota", { date: fmt.date(u.nextResetUnix) }) : t("ul.warn.quotaNoReset") };
+  if (noAccess(u)) return { tone: "warn", text: t(!group || (group.happNodes === 0 && group.amneziaNodes === 0) ? "users.noAccessGroup" : "users.noAccessApps") };
+  if (d !== null && d <= 7) return { tone: "warn", text: t.n("ul.warn.soon", Math.max(0, d)) };
+  if (u.deviceLimit > 0 && u.devicesUsed >= u.deviceLimit) return { tone: "warn", text: t("ul.warn.full", { n: u.deviceLimit }) };
+  if (u.lastSeenUnix === 0 && u.devicesUsed === 0) return { tone: "info", text: t("ul.warn.new") };
+  return null;
 }

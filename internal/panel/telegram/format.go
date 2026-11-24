@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/mistgate/mistgate/internal/panel/access"
+	"github.com/mistgate/mistgate/internal/panel/countryreach"
 	"github.com/mistgate/mistgate/internal/panel/store"
 )
 
@@ -144,6 +145,10 @@ var checkTitles = map[string]localizedText{
 	"cert_expiry":     {en: "Certificates", ru: "Сертификаты", zh: "证书"},
 	"memory_pressure": {en: "Memory", ru: "Память", zh: "内存"},
 	"cpu_softirq":     {en: "CPU softirq", ru: "CPU softirq", zh: "CPU softirq"},
+	"cpu_steal":       {en: "CPU steal", ru: "CPU steal", zh: "CPU 窃取时间"},
+	"conntrack_fill":  {en: "Connection tracking", ru: "Таблица соединений", zh: "连接跟踪表"},
+	"agent_fds":       {en: "Agent's open files", ru: "Открытые файлы агента", zh: "Agent 打开的文件"},
+	"reality_target":  {en: "REALITY target site", ru: "Сайт-цель REALITY", zh: "REALITY 目标站点"},
 	"kernel_headers":  {en: "Kernel headers", ru: "Заголовки ядра", zh: "内核头文件"},
 	"awg_backend":     {en: "AmneziaWG module", ru: "Модуль AmneziaWG", zh: "AmneziaWG 模块"},
 	"warp_path":       {en: "WARP is down", ru: "WARP не работает", zh: "WARP 异常"},
@@ -154,6 +159,7 @@ var whyVariants = map[string]localizedText{
 	"via_cdn":          {en: "the check goes through the CDN; check the CDN and the origin", ru: "проверка идёт через CDN; проверьте CDN и источник", zh: "检测请求经过 CDN，请检查 CDN 和源站"},
 	"udp_blocked":      {en: "the hoster seems to block UDP on this port", ru: "хостер, похоже, режет UDP на этом порту", zh: "服务商似乎封锁了这个端口的 UDP"},
 	"udp_all_blocked":  {en: "the hoster seems to block UDP on the whole node", ru: "хостер, похоже, режет весь UDP на ноде", zh: "服务商似乎封锁了整个节点的 UDP"},
+	"panel_udp_path":   {en: "the panel's path to this UDP port loses packets; other nodes reach it", ru: "UDP теряется на пути от панели; другие ноды порт достают", zh: "面板到此 UDP 端口的链路丢包，其他节点可以连通"},
 	"timeout":          {en: "the handshake does not complete", ru: "рукопожатие не завершается", zh: "握手无法完成"},
 	"auth":             {en: "the panel’s check account is refused", ru: "проверочная учётка панели отклонена", zh: "面板的检测账户被拒绝"},
 	"tls":              {en: "the certificate does not match", ru: "сертификат не подходит", zh: "证书不匹配"},
@@ -174,7 +180,7 @@ var updateReasons = map[string]localizedText{
 	"inbound_failed":       {en: "a profile that worked before broke", ru: "сломался профиль, который работал до обновления", zh: "之前正常的协议配置出了故障"},
 	"probe_failed":         {en: "the client-eye check failed", ru: "не прошла проверка глазами клиента", zh: "客户端视角检测失败"},
 	"not_reconnected":      {en: "the node did not come back within 3 minutes", ru: "нода не вернулась на связь за 3 минуты", zh: "节点未在 3 分钟内重新连接"},
-	"no_answer":            {en: "the node did not answer the update command in 10 minutes", ru: "нода не ответила на команду обновления за 10 минут", zh: "节点未在 10 分钟内响应更新命令"},
+	"no_answer":            {en: "the node did not answer within its download window", ru: "нода не ответила в отведённое для загрузки время", zh: "节点未在其下载窗口内响应"},
 	"rolled_back_by_agent": {en: "the node went back to the previous version by itself", ru: "нода сама вернулась на прошлую версию", zh: "节点自行回到了上一个版本"},
 	"agent_failed":         {en: "the node reported that the update failed", ru: "нода сообщила, что обновление не удалось", zh: "节点报告更新失败"},
 }
@@ -218,6 +224,8 @@ func alertTitle(l L, a store.HealthAlert) string {
 		return l.pick("Certificate is about to expire", "Сертификат скоро истечёт", "证书即将到期")
 	case "update_failed":
 		return l.pick("The update is paused", "Обновление остановилось", "更新已暂停")
+	case "os_update_failed":
+		return osUpdateTitle.forLanguage(l)
 	case "quota":
 		return l.pick("A user reached the quota", "Пользователь выбрал квоту", "有用户已达流量配额")
 	case "subscription_shared_suspect":
@@ -232,6 +240,16 @@ func alertTitle(l L, a store.HealthAlert) string {
 		return l.pick("Torrent attempts", "Попытки качать торренты", "BT 下载尝试")
 	case "port_lossy":
 		return l.pick("UDP packets are being lost", "Теряются UDP-пакеты", "UDP 正在丢包")
+	case "agent_crash_loop":
+		return l.pick("The node agent keeps crashing", "Агент ноды постоянно падает", "节点 Agent 反复崩溃")
+	case "warp_reach":
+		return warpReachTitle(l)
+	case "scheduled_check":
+		return l.pick("Scheduled check found a problem", "Задача по расписанию нашла проблему", "计划任务发现了问题")
+	case "scheduled_task_failing":
+		return l.pick("Scheduled task keeps failing", "Задача по расписанию не выполняется", "计划任务持续失败")
+	case "path_lossy":
+		return l.pick("UDP packets are lost on the way to a node", "UDP-пакеты потеряны по пути к ноде", "UDP 测试包在到达节点的路上丢失")
 	case "device_limit":
 		return l.pick("An app was turned away at the device limit", "Приложению отказали: лимит устройств", "有应用因设备数上限被拒绝")
 	case "country_blocked":
@@ -337,6 +355,8 @@ func alertReason(l L, a store.HealthAlert) string {
 		case p["days_left"] != "":
 			return l.pick("“"+who+"”: "+data(p["days_left"], 4)+" days left.", "«"+who+"»: осталось "+data(p["days_left"], 4)+" дн.", "「"+who+"」：剩余 "+data(p["days_left"], 4)+" 天。")
 		}
+	case "os_update_failed":
+		return osUpdateReason(l, p)
 	case "update_failed":
 		if v, ok := updateReasons[p["reason"]]; ok {
 			return upperFirst(v.forLanguage(l)) + l.stop()
@@ -367,13 +387,30 @@ func alertReason(l L, a store.HealthAlert) string {
 		return deviceLimitReason(l, p)
 	case "port_lossy":
 		return portLossReason(l, p)
+	case "scheduled_check":
+		task, summary := data(p["task"], 80), data(p["summary"], 300)
+		return l.pick("Task "+task+": "+summary, "Задача "+task+": "+summary, "任务 "+task+"："+summary)
+	case "scheduled_task_failing":
+		task, n, reason := data(p["task"], 80), data(p["count"], 4), data(p["reason"], 40)
+		return l.pick("Task "+task+" failed "+n+" runs in a row ("+reason+").", "Задача "+task+" не выполнилась "+n+" раз подряд ("+reason+").",
+			"任务 "+task+" 连续 "+n+" 次运行失败（"+reason+"）。")
+	case "warp_reach":
+		return warpReachReason(l, p)
+	case "agent_crash_loop":
+		n, w := data(p["count"], 4), data(p["window_min"], 4)
+		return l.pick("The agent crashed and restarted "+n+" times in "+w+" minutes.", "Агент упал и перезапустился "+n+" раз за "+w+" минут.", "Agent 在 "+w+" 分钟内崩溃并重启了 "+n+" 次。")
+	case "path_lossy":
+		return pathLossReason(l, p)
 	case "country_blocked":
 		reason := countryBlockedReason(l, p)
 		if countryPartial(a) {
 			reason = countryPartialReason(l, p)
 		}
-		if p["ipv6"] == "open" { // the IPv4 alert of a node the IPv6 rounds reach: a hint, not a message of its own
+		switch p["ipv6"] { // the IPv4 alert of a node the IPv6 rounds reach: a hint, not a message of its own
+		case "open":
 			reason += "\n" + l.pick("Reachable over IPv6.", "По IPv6 доступна.", "通过 IPv6 可以访问。")
+		case "entry": // it has the IPv6 entry and the IPv6 rounds reach it
+			reason += "\n" + l.pick("People with IPv6 connect through the IPv6 entry.", "Люди с IPv6 подключаются через вход по IPv6.", "有 IPv6 的人通过 IPv6 入口连接。")
 		}
 		return reason
 	case "users_impacted":
@@ -397,6 +434,36 @@ func alertReason(l L, a store.HealthAlert) string {
 	return ""
 }
 
+// networksText is the alert's network list ("MTS (AS30881, Республика Саха (Якутия), cheburcheck), Beeline") cut to whole
+// networks within n runes, "…" for the rest: a plain cut would end inside a bracket. One network longer than that keeps its name.
+func networksText(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return data(s, n)
+	}
+	depth, end, open := 0, 0, 0
+	for i, c := range r[:n] {
+		switch {
+		case c == '(':
+			if depth == 0 && open == 0 {
+				open = i
+			}
+			depth++
+		case c == ')' && depth > 0:
+			depth--
+		case c == ',' && depth == 0:
+			end = i
+		}
+	}
+	if end == 0 {
+		end = open
+	}
+	if end == 0 {
+		return data(s, n)
+	}
+	return data(strings.TrimSpace(string(r[:end]))+"…", n)
+}
+
 // countryPartial: the alert is about some networks only. The IPv4 subject is "partial", the IPv6 one "ipv6/partial".
 func countryPartial(a store.HealthAlert) bool {
 	return a.Subject == "partial" || strings.HasSuffix(a.Subject, "/partial")
@@ -411,7 +478,7 @@ func countryBlockedReason(l L, p map[string]string) string {
 	sources := strings.Split(p["sources"], ",")
 	has := func(name string) bool { return slices.Contains(sources, name) }
 	where := ""
-	if nets := data(p["networks"], 160); nets != "" {
+	if nets := networksText(p["networks"], 160); nets != "" {
 		where = l.pick(" ("+nets+")", " ("+nets+")", "（"+nets+"）")
 	}
 	var line string
@@ -436,38 +503,32 @@ func countryBlockedReason(l L, p map[string]string) string {
 }
 
 func countryPartialReason(l L, p map[string]string) string {
-	nets := data(p["networks"], 160)
+	nets := networksText(p["networks"], 160)
 	line := l.pick("Probes on "+nets+" get nothing from it while they reach your other nodes.",
 		"Зонды в сетях "+nets+" не получают от неё ответов, хотя доходят до других ваших нод.",
 		"位于"+nets+"的探测点收不到它的响应，但能到达您的其他节点。")
 	return countrySeenBy(l, p, line)
 }
 
+// countrySourceNames is how the alert names each source that can raise it: English, Russian, Chinese. A source of
+// countryreach.Sources that raises an alert and is missing here is left out of "Seen by" (a test holds the two together).
+var countrySourceNames = map[string][3]string{
+	countryreach.SourceGlobalping:     {"Globalping", "Globalping", "Globalping"},
+	countryreach.SourceTSPU:           {"the TSPU probe on your node", "зонд ТСПУ на вашей ноде", "您节点上的 TSPU 探测"},
+	countryreach.SourceCheburcheck:    {"cheburcheck", "cheburcheck", "cheburcheck"},
+	countryreach.SourceCheburcheckOwn: {"your cheburcheck probe", "ваш зонд cheburcheck", "您的 cheburcheck 探测点"},
+	countryreach.SourceBsbord:         {"bsbord", "bsbord", "bsbord"},
+	countryreach.SourceBsbordTunnel:   {"bsbord tunnel checks", "проверки туннелей bsbord", "bsbord 隧道检查"},
+	countryreach.SourceBsbordGeo:      {"bsbord GEO", "bsbord GEO", "bsbord GEO"},
+	countryreach.SourceProbes:         {"your own probes", "ваши зонды", "您自己的探测点"},
+}
+
 func countrySeenBy(l L, p map[string]string, line string) string {
 	sources := strings.Split(p["sources"], ",")
-	has := func(name string) bool { return slices.Contains(sources, name) }
 	var seen []string
-	if has("globalping") {
-		seen = append(seen, l.pick("Globalping", "Globalping", "Globalping"))
-	}
-	if has("tspu") {
-		seen = append(seen, l.pick("the TSPU probe on your node", "зонд ТСПУ на вашей ноде", "您节点上的 TSPU 探测"))
-	}
-	for _, source := range []string{"cheburcheck", "cheburcheck_own", "bsbord", "bsbord_tunnel", "bsbord_geo"} {
-		if !has(source) {
-			continue
-		}
-		switch source {
-		case "cheburcheck":
-			seen = append(seen, l.pick("cheburcheck", "cheburcheck", "cheburcheck"))
-		case "cheburcheck_own":
-			seen = append(seen, l.pick("your cheburcheck probe", "ваш зонд cheburcheck", "您的 cheburcheck 探测点"))
-		case "bsbord":
-			seen = append(seen, l.pick("bsbord", "bsbord", "bsbord"))
-		case "bsbord_tunnel":
-			seen = append(seen, l.pick("bsbord tunnel checks", "проверки туннелей bsbord", "bsbord 隧道检查"))
-		case "bsbord_geo":
-			seen = append(seen, l.pick("bsbord GEO", "bsbord GEO", "bsbord GEO"))
+	for _, src := range countryreach.Sources {
+		if names, ok := countrySourceNames[src.ID]; ok && slices.Contains(sources, src.ID) {
+			seen = append(seen, l.pick(names[0], names[1], names[2]))
 		}
 	}
 	if len(seen) == 0 {
@@ -496,6 +557,46 @@ func portLossReason(l L, p map[string]string) string {
 
 // deviceLimitReason is the sentence of a DEVICE_LIMIT alert: who is at the limit and what they can do about it. The owner is
 // the reader, so it says what the person can do too. Values from data go through data().
+func pathLossReason(l L, p map[string]string) string {
+	sender, target := data(p["node"], 60), data(p["target"], 60)
+	other, ports := data(p["other"], 60), data(p["ports"], 100)
+	region := udpRegionWord(l, p["region"])
+	otherRegion := udpRegionWord(l, p["other_region"])
+	sent, sentErr := strconv.ParseUint(p["sent"], 10, 32)
+	got, gotErr := strconv.ParseUint(p["got"], 10, 32)
+	percent := "?"
+	if sentErr == nil && gotErr == nil && sent > 0 && got <= sent {
+		percent = strconv.FormatUint(((sent-got)*100+sent/2)/sent, 10)
+	}
+	arrived := data(p["other_got"], 6) + "/" + data(p["sent"], 6)
+	if open := data(p["open"], 100); open != "" {
+		// A filter, not a lossy line: some ports arrive whole, the rest not at all (health.alert.path_lossy.why.filtered).
+		return l.pick("UDP from "+sender+" ("+region+") reaches "+target+" only on "+open+"; ports "+ports+" get nothing, "+
+			"while from "+other+" ("+otherRegion+") everything arrives. A filter on the way, often the hoster's DDoS protection against "+
+			"data-centre traffic: "+target+" itself is fine and people on home networks usually connect, but port checks (and a relay) from "+
+			sender+" cannot pass.",
+			"UDP от "+sender+" ("+region+") доходит до "+target+" только на "+open+"; на порты "+ports+" — ничего, "+
+				"а от "+other+" ("+otherRegion+") доходит всё. Это фильтр по пути, часто защита хостера от DDoS из датацентров: сам "+
+				target+" в порядке и люди из домашних сетей обычно подключаются, но проверки портов (и ретрансляция) от "+sender+" не пройдут.",
+			"从"+sender+"（"+region+"）到"+target+"的 UDP 只在 "+open+" 上能到达；端口 "+ports+" 完全收不到，"+
+				"而从"+other+"（"+otherRegion+"）全部到达。这是路径上的过滤，常见于服务商针对数据中心流量的 DDoS 防护："+target+
+				"本身正常，家庭网络的用户通常能连接，但来自"+sender+"的端口检测（以及中转）无法通过。")
+	}
+	return l.pick("UDP from "+sender+" ("+region+") to "+target+" loses "+percent+"% on ports "+ports+
+		"; from "+other+" ("+otherRegion+") it arrives "+arrived+". The loss is on the way from "+sender+", not on "+target+".",
+		"UDP от "+sender+" ("+region+") к "+target+" теряет "+percent+"% пакетов на портах "+ports+
+			"; от "+other+" ("+otherRegion+") доходит "+arrived+". Потери на пути от "+sender+", а не на "+target+".",
+		"UDP 流量从"+sender+"（"+region+"）到"+target+"时在端口 "+ports+" 丢失 "+percent+"%；从"+
+			other+"（"+otherRegion+"）到达 "+arrived+"。问题在"+sender+"前往"+target+"的路上，不在"+target+"上。")
+}
+
+func udpRegionWord(l L, region string) string {
+	if region == "cis" {
+		return l.pick("CIS", "СНГ", "CIS")
+	}
+	return l.pick("other region", "другой регион", "其他地区")
+}
+
 func deviceLimitReason(l L, p map[string]string) string {
 	name, used, limit := data(p["user_name"], 60), data(p["used"], 6), data(p["limit"], 6)
 	return l.pick(name+" is at the device limit ("+used+" of "+limit+"): an app asking for a new place was turned away. "+
@@ -709,7 +810,7 @@ func alertResolved(l L, a store.HealthAlert, node string) string {
 		line = upperFirst(tail)
 	}
 	reason := ""
-	if a.Kind == "port_lossy" {
+	if a.Kind == "port_lossy" || a.Kind == "path_lossy" {
 		reason = alertReason(l, a)
 	}
 	return join("<b>"+l.pick("Resolved: ", "Решено: ", "已解决：")+alertTitle(l, a)+"</b>", line, reason, againLine(l, a))
@@ -771,28 +872,77 @@ func backupRecoveredText(l L) string {
 	return "<b>" + l.pick("Resolved: the panel backup works again", "Решено: бэкап панели снова работает", "已解决：面板备份已恢复正常") + "</b>"
 }
 
-// toolTitles are the MCP tools that can wait for the owner (the admin screen's "approval.tool.*").
+// toolTitles are the plan tools of the registry (by the name of the change, without _plan), worded as the admin screen's
+// "approval.tool.*", for the message that a plan waits for the owner. TestToolTitlesCoverEveryPlanTool fails for a plan tool
+// that has none.
 var toolTitles = map[string]localizedText{
-	"user_create":                 {en: "Create a user", ru: "Создать пользователя", zh: "创建用户"},
-	"user_update":                 {en: "Change a user", ru: "Изменить пользователя", zh: "更改用户"},
-	"user_disable":                {en: "Disable users", ru: "Отключить пользователей", zh: "停用用户"},
-	"user_enable":                 {en: "Enable users", ru: "Включить пользователей", zh: "启用用户"},
-	"user_reset_traffic":          {en: "Reset users’ traffic", ru: "Сбросить трафик пользователей", zh: "重置用户流量"},
-	"device_revoke":               {en: "Remove a device", ru: "Удалить устройство", zh: "移除设备"},
-	"alert_mute":                  {en: "Mute an alert", ru: "Заглушить алерт", zh: "静默告警"},
-	"node_fix":                    {en: "Fix a node", ru: "Исправить ноду", zh: "修复节点"},
-	"rollout_start":               {en: "Update a node now", ru: "Обновить ноду сейчас", zh: "立即更新节点"},
-	"rollout_pause":               {en: "Pause the rollout", ru: "Поставить раскатку на паузу", zh: "暂停滚动更新"},
-	"rollout_resume":              {en: "Resume the rollout", ru: "Продолжить раскатку", zh: "继续滚动更新"},
-	"rollout_cancel":              {en: "Cancel the rollout", ru: "Отменить раскатку", zh: "取消滚动更新"},
-	"node_update_schedule":        {en: "Schedule a node update", ru: "Запланировать обновление ноды", zh: "定时更新节点"},
-	"node_update_schedule_cancel": {en: "Cancel a scheduled node update", ru: "Отменить запланированное обновление ноды", zh: "取消节点的定时更新"},
-	"update_timezone":             {en: "Change the time zone of update schedules", ru: "Сменить часовой пояс расписания обновлений", zh: "更改更新计划的时区"},
-	"node_rollback":               {en: "Roll a node back", ru: "Откатить ноду", zh: "回滚节点"},
-	"node_install":                {en: "Install a node over SSH", ru: "Установить ноду по SSH", zh: "通过 SSH 安装节点"},
-	"node_server_password_rotate": {en: "Change a node’s SSH password", ru: "Сменить SSH-пароль ноды", zh: "更改节点的 SSH 密码"},
-	"subscription_app_upsert":     {en: "Add or change an app on the user page", ru: "Добавить или изменить приложение на странице пользователя", zh: "添加或更改用户页面上的应用"},
-	"subscription_app_remove":     {en: "Remove an app from the user page", ru: "Убрать приложение со страницы пользователя", zh: "移除用户页面上的应用"},
+	"user_create":                      {en: "Create a user", ru: "Создать пользователя", zh: "创建用户"},
+	"user_update":                      {en: "Change a user", ru: "Изменить пользователя", zh: "更改用户"},
+	"user_disable":                     {en: "Disable users", ru: "Отключить пользователей", zh: "停用用户"},
+	"user_enable":                      {en: "Enable users", ru: "Включить пользователей", zh: "启用用户"},
+	"user_reset_traffic":               {en: "Reset users’ traffic", ru: "Сбросить трафик пользователей", zh: "重置用户流量"},
+	"device_revoke":                    {en: "Remove a device", ru: "Удалить устройство", zh: "移除设备"},
+	"alert_mute":                       {en: "Mute an alert", ru: "Заглушить алерт", zh: "静默告警"},
+	"alert_close":                      {en: "Close an alert", ru: "Закрыть алерт", zh: "关闭告警"},
+	"node_fix":                         {en: "Fix a node", ru: "Исправить ноду", zh: "修复节点"},
+	"rollout_start":                    {en: "Update a node now", ru: "Обновить ноду сейчас", zh: "立即更新节点"},
+	"os_rollout_start":                 {en: "Update the operating system of a node", ru: "Обновить операционную систему ноды", zh: "更新节点的操作系统"},
+	"os_rollout_cancel":                {en: "Close the OS update of a node", ru: "Закрыть обновление ОС ноды", zh: "关闭节点的系统更新"},
+	"rollout_pause":                    {en: "Pause the rollout", ru: "Поставить раскатку на паузу", zh: "暂停滚动更新"},
+	"rollout_resume":                   {en: "Resume the rollout", ru: "Продолжить раскатку", zh: "继续滚动更新"},
+	"rollout_cancel":                   {en: "Cancel the rollout", ru: "Отменить раскатку", zh: "取消滚动更新"},
+	"node_update_schedule":             {en: "Schedule a node update", ru: "Запланировать обновление ноды", zh: "定时更新节点"},
+	"node_update_schedule_cancel":      {en: "Cancel a scheduled node update", ru: "Отменить запланированное обновление ноды", zh: "取消节点的定时更新"},
+	"update_timezone":                  {en: "Change the time zone of update schedules", ru: "Сменить часовой пояс расписания обновлений", zh: "更改更新计划的时区"},
+	"update_download_timeout":          {en: "Change the update download timeout", ru: "Изменить тайм-аут загрузки обновлений", zh: "更改更新下载超时"},
+	"retention":                        {en: "Change how long the panel keeps its data", ru: "Изменить сроки хранения данных панели", zh: "更改面板的数据保留时间"},
+	"node_rollback":                    {en: "Roll a node back", ru: "Откатить ноду", zh: "回滚节点"},
+	"node_install":                     {en: "Install a node over SSH", ru: "Установить ноду по SSH", zh: "通过 SSH 安装节点"},
+	"node_server_password_rotate":      {en: "Change a node’s SSH password", ru: "Сменить SSH-пароль ноды", zh: "更改节点的 SSH 密码"},
+	"node_server_key_add":              {en: "Add a node SSH key", ru: "Добавить SSH-ключ ноды", zh: "添加节点 SSH 密钥"},
+	"node_server_key_remove":           {en: "Remove a node SSH key", ru: "Удалить SSH-ключ ноды", zh: "移除节点 SSH 密钥"},
+	"subscription_app_upsert":          {en: "Add or change an app on the user page", ru: "Добавить или изменить приложение на странице пользователя", zh: "添加或更改用户页面上的应用"},
+	"subscription_app_remove":          {en: "Remove an app from the user page", ru: "Убрать приложение со страницы пользователя", zh: "移除用户页面上的应用"},
+	"channel_measure":                  {en: "Measure a node’s channel", ru: "Измерить канал ноды", zh: "测量节点的通道"},
+	"decoy_site_assign":                {en: "Put a decoy site on nodes or the panel", ru: "Поставить сайт-ширму на ноды или на панель", zh: "将伪装站点放到节点或面板上"},
+	"decoy_site_delete":                {en: "Delete a decoy site", ru: "Удалить сайт-ширму", zh: "删除伪装站点"},
+	"decoy_site_ready":                 {en: "Mark a decoy site ready", ru: "Пометить сайт-ширму готовым", zh: "将伪装站点标记为就绪"},
+	"decoy_site_revert":                {en: "Return a decoy site to an earlier version", ru: "Вернуть сайт-ширму к прежней версии", zh: "将伪装站点恢复到早期版本"},
+	"decoy_site_unassign":              {en: "Take a decoy site off nodes or the panel", ru: "Снять сайт-ширму с нод или с панели", zh: "将伪装站点从节点或面板上撤下"},
+	"decoy_site_version":               {en: "Save a new version of a decoy site", ru: "Сохранить новую версию сайта-ширмы", zh: "保存伪装站点的新版本"},
+	"dns_preset_create":                {en: "Create a DNS preset", ru: "Создать набор DNS", zh: "创建 DNS 预设"},
+	"dns_preset_delete":                {en: "Delete a DNS preset", ru: "Удалить набор DNS", zh: "删除 DNS 预设"},
+	"dns_preset_update":                {en: "Change a DNS preset", ru: "Изменить набор DNS", zh: "更改 DNS 预设"},
+	"dns_settings_set":                 {en: "Change the DNS settings", ru: "Изменить настройки DNS", zh: "更改 DNS 设置"},
+	"group_create":                     {en: "Create a group", ru: "Создать группу", zh: "创建分组"},
+	"group_delete":                     {en: "Delete a group", ru: "Удалить группу", zh: "删除分组"},
+	"group_update":                     {en: "Change a group", ru: "Изменить группу", zh: "更改分组"},
+	"log_level":                        {en: "Change the panel’s log level", ru: "Изменить уровень журнала панели", zh: "更改面板的日志级别"},
+	"node_awg_backend":                 {en: "Change how a node runs AmneziaWG", ru: "Изменить, как нода запускает AmneziaWG", zh: "更改节点运行 AmneziaWG 的方式"},
+	"node_debug_capture":               {en: "Capture a node’s debug log", ru: "Снять отладочный журнал ноды", zh: "抓取节点的调试日志"},
+	"node_decoy":                       {en: "Change a node’s decoy site", ru: "Изменить сайт-ширму ноды", zh: "更改节点的伪装站点"},
+	"node_ipv6":                        {en: "Turn a node’s IPv6 entry on or off", ru: "Включить или выключить IPv6-вход ноды", zh: "开启或关闭节点的 IPv6 入口"},
+	"node_server_keys_add":             {en: "Add an SSH key to several nodes", ru: "Добавить SSH-ключ на несколько нод", zh: "向多个节点添加 SSH 密钥"},
+	"node_sharing_set":                 {en: "Change who gets a node", ru: "Изменить, кому выдаётся нода", zh: "更改谁能获得该节点"},
+	"node_update":                      {en: "Change a node’s settings", ru: "Изменить настройки ноды", zh: "更改节点设置"},
+	"os_rollout_pause":                 {en: "Pause the system update", ru: "Поставить обновление системы на паузу", zh: "暂停系统更新"},
+	"os_rollout_resume":                {en: "Resume the system update", ru: "Продолжить обновление системы", zh: "继续系统更新"},
+	"path_speed":                       {en: "Test the speed between two nodes", ru: "Проверить скорость между двумя нодами", zh: "测试两个节点之间的速度"},
+	"profile_create":                   {en: "Create a profile", ru: "Создать профиль", zh: "创建协议配置"},
+	"profile_deploy":                   {en: "Change a profile’s nodes and groups", ru: "Изменить ноды и группы профиля", zh: "更改协议配置的节点和分组"},
+	"profile_update":                   {en: "Change a profile", ru: "Изменить профиль", zh: "更改协议配置"},
+	"relay":                            {en: "Change a relay", ru: "Изменить ретрансляцию", zh: "更改中转"},
+	"subscription_link_limits_set":     {en: "Change the limits of subscription links", ru: "Изменить ограничения ссылок подписки", zh: "更改订阅链接的限制"},
+	"subscription_mihomo_template_set": {en: "Change a Mihomo template", ru: "Изменить шаблон Mihomo", zh: "更改 Mihomo 模板"},
+	"subscription_page_set":            {en: "Change the user page", ru: "Изменить страницу пользователя", zh: "更改用户页面"},
+	"subscription_routing_set":         {en: "Change a routing profile", ru: "Изменить профиль маршрутизации", zh: "更改路由配置"},
+	"subscription_rules_set":           {en: "Change the subscription rules", ru: "Изменить правила подписки", zh: "更改订阅规则"},
+	"subscription_texts_set":           {en: "Change the subscription texts", ru: "Изменить тексты подписки", zh: "更改订阅文字"},
+	"task_create":                      {en: "Create a scheduled task", ru: "Создать задачу по расписанию", zh: "创建计划任务"},
+	"task_delete":                      {en: "Delete a scheduled task", ru: "Удалить задачу по расписанию", zh: "删除计划任务"},
+	"task_update":                      {en: "Change a scheduled task", ru: "Изменить задачу по расписанию", zh: "修改计划任务"},
+	"warp_reregister":                  {en: "Register a new WARP device", ru: "Зарегистрировать новое устройство WARP", zh: "注册新的 WARP 设备"},
+	"warp_restart":                     {en: "Restart WARP on a node", ru: "Перезапустить WARP на ноде", zh: "重启节点上的 WARP"},
 }
 
 // planWaitingText says an agent's plan waits for the owner. It never says what the plan contains beyond the tool's title:
@@ -810,6 +960,14 @@ func planWaitingText(l L, tool, token, adminURL string) string {
 	)
 }
 
+func followUpProblemText(l L, summary, adminURL string) string {
+	return join(
+		"<b>"+l.pick("The assistant came back with a problem", "Ассистент вернулся с проблемой", "AI 助手回来报告了一个问题")+"</b>",
+		data(summary, 300),
+		link(adminURL, "ai?tab=memory", l.pick("Open the conversation in AI → Memory", "Открыть разговор в «ИИ» → «Память»", "在「AI → 记忆」中打开对话")),
+	)
+}
+
 func awgPrepareFailedText(l L, node, code, adminURL string) string {
 	return join(
 		"<b>"+l.pick("The AmneziaWG kernel module could not be built", "Не удалось собрать модуль ядра AmneziaWG", "无法构建 AmneziaWG 内核模块")+"</b>",
@@ -817,6 +975,45 @@ func awgPrepareFailedText(l L, node, code, adminURL string) string {
 		l.pick("The node keeps running the userspace version. Reason code: ", "Нода продолжает работать на userspace-версии. Код причины: ", "节点继续使用用户态版本运行。原因代码：")+data(code, 32)+l.stop(),
 		link(adminURL, "health", l.pick("Open Health", "Открыть «Здоровье»", "打开「运行状况」")),
 	)
+}
+
+// ClientLogsNews is the owner's news about the logs of a person's app (clientdebug.Notice, which the app wiring turns into this): the
+// kind is "received" (the owner asked and they came), "unasked" (the person sent them on their own) or "declined" (the person refused
+// the request). Only metadata: who, from which device, how many lines.
+type ClientLogsNews struct {
+	Kind   string
+	UserID string
+	Person string
+	Device string
+	Lines  int
+}
+
+func clientLogsText(l L, n ClientLogsNews, adminURL string) string {
+	var title string
+	switch n.Kind {
+	case "unasked":
+		title = l.pick("A person sent the logs of the Mistgate app on their own", "Человек сам прислал журналы приложения Mistgate", "有用户主动发来了 Mistgate 应用的日志")
+	case "declined":
+		title = l.pick("A person declined to send the logs of the Mistgate app", "Человек отказался присылать журналы приложения Mistgate", "有用户拒绝发送 Mistgate 应用的日志")
+	default:
+		title = l.pick("The logs of the Mistgate app came", "Пришли журналы приложения Mistgate", "收到了 Mistgate 应用的日志")
+	}
+	lines := ""
+	if n.Kind != "declined" {
+		lines = l.pick("Lines: ", "Строк: ", "行数：") + strconv.Itoa(n.Lines)
+	}
+	person, device := "", ""
+	if n.Person != "" {
+		person = l.pick("Person: ", "Человек: ", "用户：") + "<b>" + data(n.Person, 60) + "</b>"
+	}
+	if n.Device != "" {
+		device = l.pick("Device: ", "Устройство: ", "设备：") + data(n.Device, 60)
+	}
+	page := ""
+	if n.UserID != "" {
+		page = link(adminURL, "users/"+n.UserID+"#client-logs", l.pick("Open the person’s page", "Открыть страницу человека", "打开用户页面"))
+	}
+	return join("<b>"+title+"</b>", person, device, lines, page)
 }
 
 func testText(l L, brand string) string {

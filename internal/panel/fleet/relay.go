@@ -15,9 +15,11 @@ import (
 
 // relayForwards lists the forwards of the entry node n, sorted by relay id. A relay is in it when it is switched on and
 // store.RelayLink.Live holds (the exit's server is on, not failed, on an enrolled node); the target is the exit node's
-// address and the server's own port (a hop range is not forwarded). A server whose spec does not build leaves the list: it
+// address and the server's own port (a hop range is not forwarded). A relay that stands in the reverse way, between two agents that
+// list "relay-reverse/1" and with a bridge path on the entry, carries its mode and the exit it is bridged to (reverseCarried); every other
+// one is the plain forward. A server whose spec does not build leaves the list: it
 // is reported on its own, and the forward would point nowhere.
-func (f *Fleet) relayForwards(ctx context.Context, n store.NodeRow) ([]plugin.RelayForward, error) {
+func (f *Fleet) relayForwards(ctx context.Context, n store.NodeRow, caps []string) ([]plugin.RelayForward, error) {
 	links, err := f.st.RelayLinks(ctx, store.RelayFilter{ViaNodeID: n.ID, EnabledOnly: true})
 	if err != nil || len(links) == 0 {
 		return nil, err
@@ -40,7 +42,11 @@ func (f *Fleet) relayForwards(ctx context.Context, n store.NodeRow) ([]plugin.Re
 			f.log.Warn("relay: the server's spec does not build, the forward is left out", "relay", l.ID, "inbound", l.InboundID, "err", err)
 			continue
 		}
-		out = append(out, plugin.RelayForward{ID: l.ID, Network: l.Network, Port: l.Port, ToHost: exit.Address, ToPort: spec.Listen.Port})
+		fwd := plugin.RelayForward{ID: l.ID, Network: l.Network, Port: l.Port, ToHost: exit.Address, ToPort: spec.Listen.Port}
+		if bridgePathValid(n.BridgePath) && bridgePortValid(n.BridgePort) && reverseCarried(l, n.ID, caps) { // A bad endpoint cannot be carried as a reverse forward.
+			fwd.Mode, fwd.ExitNodeID = store.RelayModeReverse, l.ExitNodeID
+		}
+		out = append(out, fwd)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil
@@ -49,7 +55,20 @@ func (f *Fleet) relayForwards(ctx context.Context, n store.NodeRow) ([]plugin.Re
 // relaysApplied keeps what the entry reported for its forwards (RelayResult), and, when the node's inbounds were reported,
 // tells the other nodes to look again: a relay leading to one of them is forwarded only while that server is usable, which
 // the report may have changed.
-func (c *SessionCore) relaysApplied(ctx context.Context, nodeID string, r *agentv1.ApplyResult, inboundsReported bool, now time.Time) {
+func inboundRunStateChanged(previous []store.FleetInboundRow, applied []store.InboundApplied) bool {
+	before := make(map[string]string, len(previous))
+	for _, inbound := range previous {
+		before[inbound.ID] = inbound.State
+	}
+	for _, inbound := range applied {
+		if old, ok := before[inbound.ID]; ok && old != inbound.State {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *SessionCore) relaysApplied(ctx context.Context, nodeID string, r *agentv1.ApplyResult, inboundsReported, inboundStateChanged bool, now time.Time) {
 	if len(r.Relays) > 0 {
 		rs := make([]store.RelayApplied, 0, len(r.Relays))
 		for _, x := range r.Relays {
@@ -59,7 +78,7 @@ func (c *SessionCore) relaysApplied(ctx context.Context, nodeID string, r *agent
 			c.f.log.Warn("record relay results", "node", nodeID, "err", err)
 		}
 	}
-	if !inboundsReported {
+	if !inboundsReported || !inboundStateChanged {
 		return
 	}
 	if has, err := c.f.st.HasRelaysOnNode(ctx, nodeID); err != nil {

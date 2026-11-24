@@ -35,7 +35,8 @@ enum NodeStatus {
 // Codes: agent_silent {minutes}, host_blip {minutes}, enrollment_pending {expires_in_minutes, expires_unix},
 // enrollment_expired (PENDING without a usable install command), inbound_failed {inbound, error, profile, failed,
 // total} (failed of the node's total enabled profiles do not run), state_drift, clock_skew {seconds}, no_profiles
-// (ONLINE, nothing else wrong, but no enabled profile: nobody gets the node).
+// (ONLINE, nothing else wrong, but no enabled profile: nobody gets the node), inbound_no_way_in {profile, node, reason}
+// (hiding the direct server leaves no usable IPv6 twin, CDN host or relay; reason is "awg", "acme_ip" or "no_usable_relay").
 // The health checks add no_traffic {failed, total} (status NO_TRAFFIC: agent on, synthetic
 // checks failing) and doctor_fail {check} (status stays ONLINE, reason shows the worst FAIL of the doctor).
 message StatusReason {
@@ -49,6 +50,10 @@ enum App {
   APP_HAPP = 1;
   // AmneziaVPN / AmneziaWG apps.
   APP_AMNEZIA = 2;
+  // Telegram clients: MTProto proxy links (tg://proxy).
+  APP_TELEGRAM = 3;
+  // Official TrustTunnel apps: one tt:// key per person.
+  APP_TRUST_TUNNEL = 4;
 }
 
 // Online people on one protocol ("Online by protocol", "Hysteria2 n / AmneziaWG m").
@@ -96,6 +101,16 @@ message Inbound {
   string tls_server_name_override = 16;
   // Whether this inbound is enabled in the desired state.
   bool enabled = 17;
+  // Whether the server at the node's own address is included in subscriptions. The inbound keeps running when false.
+  bool direct_in_subscriptions = 18;
+  // Whether clients reach this inbound through its CDN host instead of the node's address.
+  bool cdn = 19;
+  // Protocol "vless", REALITY only: the target this node shows instead of the profile's, as "host:port" ("" = the profile's own; the
+  // host is also the one name REALITY accepts here, so it is the tls_server_name of this inbound).
+  string reality_target_override = 20;
+  // The target REALITY forwards strangers to as this inbound has it built: "self" (the node's own site), "host:port", or "" for an
+  // inbound that is not VLESS REALITY. The edit window and the neighbour card say what strangers see now and after a change.
+  string reality_target = 21;
 }
 
 // AmneziaWG interface state of one inbound (agent.v1.AwgHealth).
@@ -170,6 +185,20 @@ message PortCheck {
   string sender = 8;
   // verdict "": node_offline | agent_too_old | no_sender | busy | inconclusive | same_host | no_route | failed.
   string reason = 9;
+  // The first sender's verdict before comparison with a confirmation sender.
+  string sender_verdict = 10;
+  // "panel" or the name of the confirmation node; empty when there was no confirmation run.
+  string confirm_sender = 11;
+  // Packets sent by the confirmation sender for this port; 0 when there was no confirmation run.
+  uint32 confirm_sent = 12;
+  // Packets counted by the target from the confirmation sender; 0 when there was no confirmation run.
+  uint32 confirm_got = 13;
+  // The confirmation sender's verdict after the relative-loss rule; empty when there was no confirmation run.
+  string confirm_verdict = 14;
+  // "node" when both runs found loss, "path" when only one did, or empty when unconfirmed or both were clean.
+  string blame = 15;
+  // Unix time of the latest successful panel protocol probe through an enabled inbound on this port; 0 if its latest result failed or none is stored.
+  int64 protocol_ok_unix = 16 [jstype = JS_NUMBER];
 }
 
 // One TCP port of a node in the port check (design/vless.md section 7.4): does a connection reach Mistgate itself.
@@ -216,4 +245,85 @@ message LinkHour {
   uint32 loss_permille = 16;
   uint32 rtt_samples = 17;
   uint64 pkts_sent = 18 [jstype = JS_NUMBER];
+  // Agents that list "links/3" (see InboundConnections); device rows carry only the per-key ones (tcp_stalls,
+  // tcp_stalls_16k, initiations, responses, responses_unmatched).
+  uint32 hs_unfinished = 19;
+  uint32 tls_alerts_sent = 20;
+  uint32 tls_alerts_recv = 21;
+  uint32 tls_cert_refused = 22;
+  uint32 reality_fallback = 23;
+  uint32 auth_failed = 24;
+  uint32 tcp_stalls = 25;
+  uint32 tcp_stalls_16k = 26;
+  uint32 initiations = 27;
+  uint32 responses = 28;
+  uint32 responses_unmatched = 29;
+  // TrustTunnel agents with "trusttunnel-refusals/1", inbound rows (see InboundConnections).
+  uint32 tunnel_blocked = 30;
+  uint32 tunnel_no_ipv4 = 31;
+  uint32 tunnel_conn_refused = 32;
+  uint32 tunnel_conn_unreachable = 33;
+  uint32 tunnel_conn_dns = 34;
+  uint32 tunnel_conn_other = 35;
+  uint32 tunnel_timeout = 36;
+  uint32 tunnel_other_deadlines = 37;
+  uint32 tunnel_other_authority = 38;
+  uint32 tunnel_other_icmp = 39;
+  uint32 tunnel_other_dial = 40;
+  uint32 tunnel_stream_closed = 41;
+  uint32 tunnel_stream_cred_gone = 42;
+  uint32 tunnel_stream_conn_limit = 43;
+}
+
+// One device's ClientHello counts over the window (GetFleetConnectionsResponse.hello_kex_classic, GetUserConnectionResponse.hello_kex).
+// A device is pq in a window when every hello counted had an X25519MLKEM768 key share before any X25519 share (the condition a
+// strict REALITY library demands), classic when one lacked it: that library turns the device away. unknown ones could not be read
+// (cut short, spread over several records, malformed). Counted by the nodes on the current core, per connection.
+message HelloKexDevice {
+  string device_id = 1;
+  string user_id = 2;
+  string user_name = 3;
+  // The device as the panel knows it now (the app and platform of its last subscription fetch).
+  string client = 4;
+  string platform = 5;
+  uint32 hello_pq = 6;
+  uint32 hello_classic = 7;
+  uint32 hello_unknown = 8;
+  // Start of the newest hour with a hello counter.
+  int64 last_hour_unix = 9 [jstype = JS_NUMBER];
+}
+
+// How a node is handed out to groups. A group receives every node that is not on its disabled list (Group.disabled_node_ids).
+// A node the owner holds back is on that list of every group that was not given it, and a group made later starts with it
+// there too; so the mode is read off the node: ALL when nothing is held back, LISTED while some group receives it, NONE when
+// no group does. Set with GroupService.SetNodeSharing, or at the node's creation (CreateEnrollmentRequest.sharing,
+// StartNodeProvisionRequest.sharing); read in Node.sharing and, per group, in Group.disabled_node_ids.
+enum NodeShareMode {
+  // Only in a request that makes a node: the panel decides. The first node of the panel that is not retired goes to every group
+  // (ALL), each later one to no group (NONE). Never in a response.
+  NODE_SHARE_MODE_UNSPECIFIED = 0;
+  // Every group, groups made later too. A group can still turn the node off for itself (UpdateGroup.disabled_node_ids).
+  NODE_SHARE_MODE_ALL = 1;
+  // Only the listed groups; a group made later does not get the node.
+  NODE_SHARE_MODE_LISTED = 2;
+  // No group, and no group made later, until the owner gives the node to one. A legitimate state: nothing alerts on it.
+  NODE_SHARE_MODE_NONE = 3;
+}
+
+// A share asked for: the mode, and for LISTED the groups that receive the node (at least one; empty for ALL and NONE).
+message NodeSharing {
+  NodeShareMode mode = 1;
+  repeated string group_ids = 2;
+}
+
+// A QR code the panel draws itself: the server encodes (internal/qr) and says which modules are dark, the page makes the
+// shapes. The same data as the person's page gets (subs page_qr), so both draw the one code with the logo in the middle.
+message QrCode {
+  // Modules a side, 4*version+17.
+  uint32 n = 1;
+  // n*n modules row by row, eight to a byte, the first in the high bit, 1 = dark; the last byte is padded with zeros.
+  bytes bits = 2;
+  // Side, in modules, of the clear square in the middle for the logo; 0: no logo (the code is too small to spare the error
+  // correction). A multiple of 0.5.
+  double window = 3;
 }

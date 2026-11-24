@@ -6,12 +6,13 @@ import { ToastProvider } from "@/components/ui/toast";
 import { Role } from "@/gen/mistgate/admin/v1/auth_pb";
 import { App } from "@/gen/mistgate/admin/v1/common_pb";
 import type { Group } from "@/gen/mistgate/admin/v1/group_pb";
-import { defaultGroup, GroupsTab, wayOf } from "./groups";
+import { defaultGroup, GroupEditModal, GroupsTab, wayOf } from "./groups";
 
 const listGroups = vi.fn();
 const createGroup = vi.fn();
 const updateGroup = vi.fn();
 const deleteGroup = vi.fn();
+const navigate = vi.fn();
 let role = Role.OWNER;
 vi.mock("@/lib/api", async (orig) => ({
   ...(await orig<object>()),
@@ -31,11 +32,13 @@ vi.mock("@/lib/api", async (orig) => ({
       }),
     listProtocols: () => Promise.resolve({ protocols: [{ id: "hysteria2", apps: [App.HAPP] }, { id: "awg", apps: [App.AMNEZIA] }] }),
   },
+  nodes: { listNodes: () => Promise.resolve({ nodes: [] }) },
   dns: { listDnsPresets: () => Promise.resolve({ presets: [], providers: [], clientSupport: [] }) },
   auth: { me: () => Promise.resolve({ admin: { id: "adm_1", role } }) },
   subscriptions: { getSubscriptionSettings: () => Promise.resolve({ settings: { apps: [{ kind: App.HAPP, name: "Happ" }] }, effectiveTitle: "" }) },
 }));
 vi.mock("@tanstack/react-router", () => ({
+  useNavigate: () => navigate,
   Link: ({ children, to, params, search, className, ...rest }: { children?: ReactNode; to: string; params?: object; search?: object; className?: string }) => (
     <a href={to} data-params={JSON.stringify(params ?? {})} data-search={JSON.stringify(search ?? {})} className={className} aria-label={(rest as { "aria-label"?: string })["aria-label"]}>
       {children}
@@ -56,13 +59,13 @@ afterEach(() => {
   act(() => root?.unmount());
   host?.remove();
   root = host = null;
-  for (const m of [listGroups, createGroup, updateGroup, deleteGroup]) m.mockReset();
+  for (const m of [listGroups, createGroup, updateGroup, deleteGroup, navigate]) m.mockReset();
 });
 
 const group = (over: Record<string, unknown> = {}) =>
-  ({ id: "grp_all", name: "Everyone", profileIds: ["p_hy", "p_awg"], userCount: 5, dnsPresetId: "", happNodes: 2, amneziaNodes: 0, ...over }) as unknown as Group;
+  ({ id: "grp_all", name: "Everyone", profileIds: ["p_hy", "p_awg"], disabledNodeIds: [], userCount: 5, extraUserCount: 0, dnsPresetId: "", happNodes: 2, amneziaNodes: 0, ...over }) as unknown as Group;
 
-async function mount(groups: Group[], props: { creating?: boolean; focus?: string } = {}) {
+async function mount(groups: Group[], props: { creating?: boolean; focus?: string; query?: string; children?: ReactNode } = {}) {
   listGroups.mockResolvedValue({ groups });
   host = document.createElement("div");
   document.body.append(host);
@@ -71,9 +74,7 @@ async function mount(groups: Group[], props: { creating?: boolean; focus?: strin
   await act(async () =>
     root!.render(
       <QueryClientProvider client={qc}>
-        <ToastProvider>
-          <GroupsTab creating={props.creating ?? false} onCreatingChange={() => {}} focus={props.focus} />
-        </ToastProvider>
+        <ToastProvider>{props.children ?? <GroupsTab creating={props.creating ?? false} onCreatingChange={() => {}} focus={props.focus} query={props.query} />}</ToastProvider>
       </QueryClientProvider>,
     ),
   );
@@ -85,21 +86,54 @@ const settle = async () => {
 const text = () => document.body.textContent ?? "";
 const button = (label: string) => [...document.querySelectorAll("button")].find((b) => b.textContent?.trim() === label || b.getAttribute("aria-label") === label);
 const click = (b: Element | undefined | null) => act(async () => void b?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+const type = (el: HTMLInputElement, value: string) =>
+  act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(el, value);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  });
 const dialog = () => [...document.querySelectorAll("[role=dialog]")].at(-1)!;
+const tile = () => [...document.querySelectorAll("button")].find((b) => b.textContent?.startsWith("New group"));
+const card = (name: string) => [...document.querySelectorAll("h3")].find((h) => h.textContent === name)!.closest<HTMLElement>("div.relative")!;
 
 describe("the Groups tab", () => {
-  it("shows each group with its people, and its profiles in the two ways, with where each works now; every name is a link", async () => {
-    await mount([group(), group({ id: "grp_t", name: "test", profileIds: [], userCount: 0, happNodes: 0 })]);
-    const people = document.querySelector<HTMLAnchorElement>('a[aria-label="Users of group “Everyone”"]')!;
-    expect(people.textContent).toContain("5 people");
-    expect(people.dataset.search).toBe(JSON.stringify({ group: "grp_all" }));
-    expect(text()).toContain("Subscription (Happ) · 2 nodes");
-    // the AmneziaWG profile is in the group but runs on no node: said in the row, in warning colour
-    expect(text()).toContain("AmneziaVPN keys · no AmneziaWG of the group runs on a node");
-    const profile = [...document.querySelectorAll<HTMLAnchorElement>("a")].find((a) => a.textContent === "AWG 3.1")!;
-    expect(profile.getAttribute("href")).toBe("/profiles/$id");
-    expect(profile.dataset.params).toBe(JSON.stringify({ id: "p_awg" }));
-    expect(text()).toContain("No profiles: the group gives nothing");
+  it("shows each group as a card: its people, what it gives with the protocols and where it works, four facts, Open and Delete", async () => {
+    await mount([group(), group({ id: "grp_t", name: "test", profileIds: [], userCount: 0, extraUserCount: 0, happNodes: 0 })]);
+    const c = card("Everyone");
+    expect(c.textContent).toContain("5 people");
+    const open = [...c.querySelectorAll<HTMLAnchorElement>("a")].filter((a) => a.getAttribute("href") === "/users/groups/$id");
+    expect(open.length).toBe(2); // the head and "Open"
+    expect(JSON.parse(open[0]!.dataset.params!)).toEqual({ id: "grp_all" });
+    expect(open.some((a) => a.textContent === "Open")).toBe(true);
+    // the subscription works on two nodes; the AmneziaWG profile is in the group but runs on no node: said in warning colour
+    expect(c.textContent).toContain("Happ · 2 nodes");
+    expect(c.textContent).toContain("AmneziaVPN keys");
+    expect(c.textContent).toContain("no AmneziaWG of the group runs on an enabled node");
+    expect(c.textContent).toContain("Hysteria2");
+    expect(c.textContent).toContain("AmneziaWG");
+    // the facts: people, profiles, nodes, DNS
+    expect([...c.querySelectorAll("dt")].map((d) => d.textContent)).toEqual(["People", "Profiles", "Nodes", "DNS"]);
+    expect([...c.querySelectorAll("dd")].map((d) => d.textContent)[0]).toBe("5");
+    expect(card("test").textContent).toContain("No profiles: the group gives nothing");
+  });
+
+  it("offers a dashed tile for a new group, and a click on it opens the window", async () => {
+    const opened = vi.fn();
+    await mount([group()], { children: <GroupsTab creating={false} onCreatingChange={opened} /> });
+    await click(tile());
+    expect(opened).toHaveBeenCalledWith(true);
+    expect(text()).toContain("Its own set of profiles and nodes for several people at once");
+  });
+
+  it("filters by the name in the bar and says so when no group matches, with a way to make it", async () => {
+    await mount([group(), group({ id: "grp_f", name: "friends", userCount: 3 })], { query: "fri" });
+    expect(document.querySelectorAll("h3")).toHaveLength(1);
+    expect(text()).not.toContain("Everyone");
+    act(() => root?.unmount());
+    host?.remove();
+    await mount([group()], { query: "zzz" });
+    expect(text()).toContain("No such group");
+    expect(button("Create group")).toBeDefined();
+    expect(tile()).toBeUndefined(); // the tile is for the whole list, not for a search
   });
 
   it("starts an empty panel with “Everyone” and all the profiles in one click", async () => {
@@ -111,56 +145,122 @@ describe("the Groups tab", () => {
     expect(createGroup).toHaveBeenCalledWith({ name: "Everyone", profileIds: ["p_hy", "p_awg"] });
   });
 
-  it("shows no actions to a read-only admin", async () => {
+  it("shows no actions to a read-only admin: no Delete, no tile", async () => {
     role = Role.READONLY;
     await mount([group()]);
-    expect(button("Edit")).toBeUndefined();
     expect(button("Delete")).toBeUndefined();
+    expect(tile()).toBeUndefined();
+    expect(text()).toContain("Open");
+  });
+
+  it("takes an old link to a group (?group=<id>) to its page, once", async () => {
+    await mount([group()], { focus: "grp_all" });
+    expect(navigate).toHaveBeenCalledWith(expect.objectContaining({ to: "/users/groups/$id", params: { id: "grp_all" }, replace: true }));
+    expect(navigate).toHaveBeenCalledTimes(1);
   });
 });
 
-describe("deleting a group", () => {
-  it("asks and deletes an empty one", async () => {
+describe("the people of a group are of both kinds", () => {
+  it("adds the extra members to the count of the card, and says how many of them are extra", async () => {
+    await mount([group({ id: "grp_f", name: "friends", userCount: 3, extraUserCount: 2 }), group()]);
+    expect(card("friends").textContent).toContain("5 people · 2 extra");
+    expect(card("friends").textContent).toContain("5"); // the fact "People"
+    expect(card("Everyone").textContent).toContain("5 people");
+    expect(card("Everyone").textContent).not.toContain("extra");
+  });
+
+  it("lets a group that only has extra members be deleted: they just leave, and the link says so", async () => {
+    deleteGroup.mockResolvedValue({});
+    await mount([group({ id: "grp_t", name: "test", userCount: 0, extraUserCount: 2 }), group()]);
+    const del = () => [...card("test").querySelectorAll("button")].find((b) => b.textContent === "Delete" || b.textContent?.startsWith("Sure?"))!;
+    await click(del());
+    expect(del().textContent).toBe("Sure? The extra members leave");
+    await click(del());
+    await settle();
+    expect(deleteGroup).toHaveBeenCalledWith({ groupId: "grp_t" });
+  });
+});
+
+describe("deleting a group from the tab", () => {
+  it("asks once in the link itself, then deletes an empty group", async () => {
     deleteGroup.mockResolvedValue({});
     await mount([group({ id: "grp_t", name: "test", userCount: 0 }), group()]);
-    await click([...document.querySelectorAll("button")].find((b) => b.textContent === "Delete")); // the first row's
+    const del = () => [...card("test").querySelectorAll("button")].find((b) => b.textContent === "Delete" || b.textContent === "Really delete?")!;
+    await click(del());
+    expect(del().textContent).toBe("Really delete?");
+    expect(deleteGroup).not.toHaveBeenCalled();
+    await click(del());
     await settle();
-    expect(dialog().textContent).toContain("Delete the group “test”?");
-    expect(dialog().textContent).toContain("Nobody is in it");
-    await click(button("Delete group"));
-    await settle();
-    expect(deleteGroup).toHaveBeenCalledWith({ groupId: "grp_t", moveUsersTo: "" });
+    expect(deleteGroup).toHaveBeenCalledWith({ groupId: "grp_t" });
   });
 
-  it("asks where the people of a group go, “Everyone” first, and moves them in the same call", async () => {
-    deleteGroup.mockResolvedValue({});
-    await mount([group(), group({ id: "grp_f", name: "friends", userCount: 3 }), group({ id: "grp_x", name: "work", userCount: 0 })]);
-    const rows = [...document.querySelectorAll("button")].filter((b) => b.textContent === "Delete");
-    await click(rows[1]); // friends
-    await settle();
-    expect(dialog().textContent).toContain("3 people are in the group. Where to move them?");
-    await click(button("Move 3 people and delete"));
-    await settle();
-    expect(deleteGroup).toHaveBeenCalledWith({ groupId: "grp_f", moveUsersTo: "grp_all" });
-  });
-
-  it("says there is nowhere to move them when it is the only group", async () => {
-    await mount([group()]);
-    await click(button("Delete"));
-    await settle();
-    expect(dialog().textContent).toContain("Make another group first");
-    expect((button("Move 5 people and delete") as HTMLButtonElement).disabled).toBe(true);
+  it("says the people must be moved first for a group that has people, and deletes nothing", async () => {
+    await mount([group(), group({ id: "grp_f", name: "friends", userCount: 3 })]);
+    const del = () => [...card("friends").querySelectorAll("button")].at(-1)!;
+    await click(del());
+    expect(del().textContent).toBe("Move the people first");
+    await click(del());
+    expect(deleteGroup).not.toHaveBeenCalled();
   });
 });
 
-describe("editing a group", () => {
+describe("the window of a new group", () => {
+  it("names the group, takes the profiles by the ways, and sends the profiles and the colour", async () => {
+    createGroup.mockResolvedValue({ group: group({ id: "grp_n", name: "colleagues" }) });
+    await mount([group()], { creating: true });
+    const d = dialog();
+    expect(d.textContent).toContain("New group");
+    expect(d.textContent).toContain("What people get");
+    // the board's "Limits for each" is not here: a group has no limits
+    expect(d.textContent).not.toContain("Limits");
+    const create = () => [...d.querySelectorAll("button")].find((b) => b.textContent === "Create group")!;
+    expect(create().getAttribute("aria-disabled")).toBe("true");
+    await type(d.querySelector<HTMLInputElement>("input")!, "colleagues");
+    expect(create().getAttribute("aria-disabled")).toBe("false");
+    // both ways start on; switching the keys off takes the AmneziaWG profile out
+    const awg = [...d.querySelectorAll<HTMLElement>("[role=switch]")].find((s) => s.getAttribute("aria-label") === "AmneziaVPN")!;
+    expect(awg.getAttribute("aria-checked")).toBe("true");
+    await click(awg);
+    expect(awg.getAttribute("aria-checked")).toBe("false");
+    await click([...d.querySelectorAll("button")].find((b) => b.getAttribute("aria-label") === "Rose"));
+    await click(create());
+    await settle();
+    expect(createGroup).toHaveBeenCalledWith({ name: "colleagues", profileIds: ["p_hy"], dnsPresetId: "", color: "rose" });
+  });
+
+  it("refuses a name that is taken, and a group with no way on", async () => {
+    await mount([group()], { creating: true });
+    const d = dialog();
+    const create = () => [...d.querySelectorAll("button")].find((b) => b.textContent === "Create group")!;
+    await type(d.querySelector<HTMLInputElement>("input")!, "everyone");
+    expect(d.textContent).toContain("Such a group already exists");
+    expect(create().getAttribute("aria-disabled")).toBe("true");
+    await type(d.querySelector<HTMLInputElement>("input")!, "colleagues");
+    for (const s of d.querySelectorAll<HTMLElement>("[role=switch]")) if (s.getAttribute("aria-checked") === "true" && s.getAttribute("aria-label") !== "All nodes") await click(s);
+    expect(d.textContent).toContain("Turn on at least one method");
+    expect(create().getAttribute("aria-disabled")).toBe("true");
+  });
+
+  it("takes the settings of another group when asked, and the nodes it leaves off", async () => {
+    createGroup.mockResolvedValue({ group: group({ id: "grp_n", name: "copy" }) });
+    await mount([group({ profileIds: ["p_hy"], disabledNodeIds: ["nod_x"] })], { creating: true });
+    const d = dialog();
+    await type(d.querySelector<HTMLInputElement>("input")!, "copy");
+    await click([...d.querySelectorAll("[role=radio]")].find((r) => r.textContent === "Everyone"));
+    await click([...d.querySelectorAll("button")].find((b) => b.textContent === "Create group"));
+    await settle();
+    expect(createGroup).toHaveBeenCalledWith(expect.objectContaining({ name: "copy", profileIds: ["p_hy"], disabledNodeIds: ["nod_x"] }));
+  });
+});
+
+describe("editing a group in its window", () => {
   it("asks before taking a profile away from its people, with what they lose, and then saves", async () => {
     updateGroup.mockImplementation(async (r: { dryRun?: boolean }) =>
       r.dryRun
-        ? { group: group(), impact: { users: 5, lost: [{ id: "p_awg", name: "AWG 3.1", protocol: "awg", awgDevices: 2 }], gained: [] } }
+        ? { group: group(), impact: { users: 5, lost: [{ id: "p_awg", name: "AWG 3.1", protocol: "awg", awgDevices: 2 }], gained: [], gainedNodeIds: [], lostNodeIds: [] } }
         : { group: group({ profileIds: ["p_hy"] }) },
     );
-    await mount([group()], { focus: "grp_all" }); // "?group=" opens the editor
+    await mount([group()], { children: <GroupEditModal group={group()} open onOpenChange={() => {}} /> });
     expect(dialog().textContent).toContain("Edit group");
     await click(button("AWG 3.1"));
     await click(button("Save"));

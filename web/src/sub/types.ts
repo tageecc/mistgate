@@ -1,7 +1,7 @@
 // The page data the server embeds as <script type="application/json" id="mg-data">.
 // logic.ts reads it defensively: a field the server forgot must not blank the page.
 
-export type Lang = "ru" | "en" | "zh";
+export type Lang = "ru" | "en" | "zh" | "fa" | "tr";
 export type Platform = "ios" | "android" | "windows" | "macos" | "linux";
 export type Kind = "happ" | "amnezia";
 export type Status = "active" | "expired" | "limited" | "disabled";
@@ -13,6 +13,9 @@ export type AppEntry = { platform: Platform; kind: Kind; name: string; download_
 /** The mode of the device limit for the apps on the link: counted only, refused over the limit, or also refused without a device ID. */
 export type LinkMode = "track" | "enforce" | "strict";
 
+/** One tt:// link of the page: the server as the page names it (country, place), its marks, and the link itself ("" with a note). */
+export type TrustTunnelLink = { label: string; country_code: string; place: string; has_ipv6: boolean; relay: boolean; via: string; note: string; url: string; qr: Qr | null };
+
 export type Device = {
   id: string;
   platform: string;
@@ -21,8 +24,9 @@ export type Device = {
   app: string;
   last_seen_unix: number;
   online: boolean;
-  /** "link": an app that reports a device ID; "shared": the one place of the apps that report none; "key": an AmneziaVPN key. */
-  kind: "link" | "shared" | "key";
+  /** "link": an app that reports a device ID; "shared": the one place of the apps that report none; "key": an AmneziaVPN key;
+   * "telegram": the Telegram proxy key; "trusttunnel": the TrustTunnel key (the owner issues and revokes it). */
+  kind: "link" | "shared" | "key" | "telegram" | "trusttunnel";
   /** The person may remove or rename it on this page (never the shared place, never in the admin's preview). */
   can_remove: boolean;
   can_rename: boolean;
@@ -63,6 +67,8 @@ export type ServerEntry = {
   country_code: string;
   place: string;
   label: string;
+  /** The domain (or address) the person's own keys and links connect to; "" when the panel does not say (an older one). */
+  host: string;
   app_names: string[];
   connections: ServerConn[];
   online: boolean;
@@ -119,8 +125,19 @@ export type AmneziaData = {
   endpoints: string; // base URL of the self-service calls ("" = none)
 };
 /** One config of a device on one node, as the endpoints answer. */
+/**
+ * A QR code the server drew (internal/qr): `n` modules a side, `bits` the modules row by row (eight to a byte, the first in the high
+ * bit) as base64, `window` the side in modules of the clear square for the logo in the middle (0: no logo).
+ */
+export type Qr = { n: number; bits: string; window: number };
+
 export type AwgConfig = {
   node_id: string;
+  /** A config through an entry node (a relay): that node's id and country code ("" for the direct config, which shares node_id). */
+  via_node_id: string;
+  via_country: string;
+  /** A config to the node's IPv6 entry (a key of its own); the page names it by `label` ("Germany · IPv6"). */
+  ipv6: boolean;
   /** The server as the page names it ("Germany · Frankfurt", "Server"), never the panel's node name. It is also what the connection is called in the app. */
   label: string;
   country_code: string;
@@ -131,6 +148,8 @@ export type AwgConfig = {
   stale: boolean;
   warnings: string[];
   min_clients: MinClient[];
+  /** The code of `conf`; null when the text is too long for a QR code. */
+  qr: Qr | null;
 };
 
 export type MgData = {
@@ -139,6 +158,8 @@ export type MgData = {
   brand: { parts: [string, string]; logo_svg: string; accent: string };
   title: string;
   subscription_url: string;
+  /** The code of `subscription_url` (null when the owner has the QR code off, or there is no link). */
+  qr: Qr | null;
   /** Servers (nodes) the link carries ("all your servers (3) are already there"); 0 when unknown. */
   server_count: number;
   /** Nodes with a set capacity and a fresh sample, in subscription order: the level only. The old way to list servers. */
@@ -163,7 +184,14 @@ export type MgData = {
   support_url: string;
   options: { show_announcement: boolean; show_support: boolean; show_qr: boolean };
   apps: AppEntry[];
-  access: { happ: boolean; amnezia: boolean };
+  access: { happ: boolean; amnezia: boolean; telegram?: boolean; trust_tunnel?: boolean };
+  /** The tg://proxy links of the person, when Telegram is on; null when it is off. */
+  telegram?: { links: { label: string; country_code: string; place: string; ipv6: boolean; relay: boolean; via: string; url: string; qr: Qr | null }[] } | null;
+  /**
+   * The tt:// links of the person for the official TrustTunnel apps, when it is on; null when it is off. A server whose certificate
+   * is self-signed is a row with a `note` ("self_signed") and no url.
+   */
+  trust_tunnel?: { links: TrustTunnelLink[] } | null;
   devices: Device[];
   /** Where a device of the link is removed and renamed (POST <it>/<id>/revoke, /rename); "" in the admin's preview and with self-service off. */
   devices_endpoint: string;

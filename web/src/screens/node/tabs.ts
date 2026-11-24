@@ -8,17 +8,27 @@ export type NodeTab = (typeof nodeTabs)[number];
 export const historyViews = ["events", "journal", "logs"] as const;
 export type HistoryView = (typeof historyViews)[number];
 
-export type NodeSearch = { tab?: NodeTab; way?: WayId; add?: string; view?: Exclude<HistoryView, "events">; before?: number; size?: number };
+/** The sections of the Server tab, the menu on its left; the bare `?tab=server` is the first. */
+export const serverSections = ["node", "ch", "ag", "ssh", "site", "awg", "sys", "dbg", "del"] as const;
+export type ServerSection = (typeof serverSections)[number];
+
+/** The Ways in tab's view: the list or the graph (ADR 0016); the graph is the board's schematic, `map=1` its whole route map. */
+export type WaysView = "list" | "graph";
+export type NodeSearch = { tab?: NodeTab; sv?: Exclude<ServerSection, "node">; way?: WayId; add?: string; view?: Exclude<HistoryView, "events"> | WaysView; before?: number; size?: number; /** The graph of the Ways in tab, full screen. */ full?: "1"; /** The route map (the graph's canvas with drag and drop) in place of the schematic. */ map?: "1"; /** Came from the fleet map: the page shows its breadcrumb back. */ from?: "map" };
 
 /**
  * Search-param validation of /nodes/$id: only a known tab other than the first is kept in the URL. `add` (a profile id,
  * on the profiles tab) opens the add-profile dialog with that profile chosen: the profile page links here. On the ways
  * tab `way` is the open lane (direct, ipv6, via:<entry>, out:<exit>) and `add` the "New way in" dialog: "1", or
- * "via:<entry>" straight at that entry's servers. The history
+ * "via:<entry>" straight at that entry's servers ("via:<entry>/<server>" with that one server only), or "ipv6" the IPv6 entry's dialog (Reachability and the alerts link there). The history
  * tab keeps its part (`view`, the events without one) and, on the events, where their log is read from (`before`) and
  * the rows per page (`size`).
  */
 export const validateNodeSearch = (s: Record<string, unknown>): NodeSearch => {
+  const r = validateTab(s);
+  return s.from === "map" ? { ...r, from: "map" } : r;
+};
+const validateTab = (s: Record<string, unknown>): NodeSearch => {
   if (!nodeTabs.includes(s.tab as NodeTab) || s.tab === "overview") return {};
   const tab = s.tab as NodeTab;
   if (tab === "history") {
@@ -27,9 +37,10 @@ export const validateNodeSearch = (s: Record<string, unknown>): NodeSearch => {
     return { tab, ...(before ? { before } : {}), ...(size ? { size } : {}) };
   }
   if (tab === "ways") {
-    const add = s.add === "1" || s.add === 1 ? "1" : typeof s.add === "string" && /^via:[\w-]+$/.test(s.add) ? s.add : undefined;
-    return { tab, ...(isWayId(s.way) ? { way: s.way } : {}), ...(add ? { add } : {}) };
+    const add = s.add === "1" || s.add === 1 ? "1" : typeof s.add === "string" && (s.add === "ipv6" || /^via:[\w-]+(\/[\w-]+)?$/.test(s.add)) ? s.add : undefined;
+    return { tab, ...(isWayId(s.way) ? { way: s.way } : {}), ...(add ? { add } : {}), ...(s.view === "graph" || s.view === "list" ? { view: s.view } : {}), ...(s.map === "1" || s.map === 1 ? { map: "1" as const } : {}), ...(s.full === "1" || s.full === 1 ? { full: "1" as const } : {}) };
   }
+  if (tab === "server") return serverSections.includes(s.sv as ServerSection) && s.sv !== "node" ? { tab, sv: s.sv as Exclude<ServerSection, "node"> } : { tab };
   return tab === "profiles" && typeof s.add === "string" && s.add !== "" ? { tab, add: s.add } : { tab };
 };
 

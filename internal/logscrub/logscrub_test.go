@@ -10,6 +10,8 @@ func TestAddrs(t *testing.T) {
 	for _, c := range []struct{ in, want string }{
 		{"handshake from 203.0.113.7:51234 failed", "handshake from <ip>:port failed"},
 		{"peer 203.0.113.7 timed out.", "peer <ip> timed out."},
+		{"from [203.0.113.45]:443 closed", "from <ip>:port closed"},
+		{"from [203.0.113.45] closed", "from <ip> closed"},
 		{"dial [2001:db8::7]:443: i/o timeout", "dial <ip>:port: i/o timeout"},
 		{"from 2001:db8::7, retrying", "from <ip>, retrying"},
 		{"from fe80::1%eth0: no route", "from <ip>: no route"},
@@ -29,6 +31,11 @@ func TestAddrs(t *testing.T) {
 		{"cert for vpn.example.com expires", "cert for vpn.example.com expires"},
 		{"version 1.2.3.4567 ok", "version 1.2.3.4567 ok"},
 		{"build 10.2.3.4.5 and 1234.5.6.7", "build 10.2.3.4.5 and 1234.5.6.7"},
+		// a dot that ends a sentence (or a clause) is not one more number: the address goes
+		{"rejected handshake from 203.0.113.7.", "rejected handshake from <ip>."},
+		{"from 203.0.113.7. Retrying", "from <ip>. Retrying"},
+		{"peers 203.0.113.7.. 198.51.100.2.", "peers <ip>.. <ip>."},
+		{"see .203.0.113.7 here", "see .<ip> here"},
 		// glued to letters, or with a port netip refuses: still an address
 		{"remote203.0.113.7x said no", "remote<ip>x said no"},
 		{"peer 203.0.113.7:99999 and 198.51.100.2:123456 gone", "peer <ip>:port and <ip>:port gone"},
@@ -65,6 +72,25 @@ func TestClip(t *testing.T) {
 	}
 	if got := ClipRunes("abc", 3); got != "abc" {
 		t.Errorf("ClipRunes exact = %q", got)
+	}
+}
+
+func TestCredentials(t *testing.T) {
+	for in, want := range map[string]string{
+		"Proxy-Authorization: Basic YWxpY2U6c2VjcmV0cGFzc3dvcmQ=":    "[REDACTED]",
+		"request failed: proxy-authorization=Basic YWxpY2U6c2VjcmV0": "request failed: [REDACTED]",
+		`header "Authorization": "Bearer abc.def-ghi_jkl"`:           `header "[REDACTED]"`,
+		"got Basic YWxpY2U6c2VjcmV0 from a client":                   "got [REDACTED] from a client",
+		"code=trusttunnel_start_failed err=listen tcp 443":           "code=trusttunnel_start_failed err=listen tcp 443",
+		"basic setup is done, authorization failed":                  "basic setup is done, authorization failed",
+		"short": "short",
+	} {
+		if got := Credentials(in); got != want {
+			t.Errorf("Credentials(%q) = %q, want %q", in, got, want)
+		}
+		if again := Credentials(Credentials(in)); again != Credentials(in) {
+			t.Errorf("Credentials is not idempotent on %q: %q", in, again)
+		}
 	}
 }
 

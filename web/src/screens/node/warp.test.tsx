@@ -6,6 +6,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { ToastProvider } from "@/components/ui/toast";
 import { WarpSource, WarpState } from "@/gen/mistgate/admin/v1/common_pb";
 import { fill } from "@/i18n";
+import { setEffectsEnabled } from "@/lib/effects";
 import { en } from "@/i18n/en";
 import { describeWarpError } from "@/lib/warp-error";
 import { WarpCard } from "./warp";
@@ -14,12 +15,14 @@ const getWarp = vi.fn();
 const restartWarp = vi.fn();
 const setWarpEnabled = vi.fn();
 const registerWarp = vi.fn();
+const setWarpLicense = vi.fn();
 vi.mock("@/lib/api", () => ({
   warp: {
     getWarp: (...a: unknown[]) => getWarp(...a),
     restartWarp: (...a: unknown[]) => restartWarp(...a),
     setWarpEnabled: (...a: unknown[]) => setWarpEnabled(...a),
     registerWarp: (...a: unknown[]) => registerWarp(...a),
+    setWarpLicense: (...a: unknown[]) => setWarpLicense(...a),
   },
   auth: { me: () => Promise.resolve({ admin: { id: "adm_1", role: 1 } }) },
   fleet: {},
@@ -39,7 +42,7 @@ afterEach(() => {
   act(() => root?.unmount());
   host?.remove();
   root = host = null;
-  for (const f of [getWarp, restartWarp, setWarpEnabled, registerWarp]) f.mockReset();
+  for (const f of [getWarp, restartWarp, setWarpEnabled, registerWarp, setWarpLicense]) f.mockReset();
 });
 
 const nowS = () => Math.floor(Date.now() / 1000);
@@ -79,10 +82,7 @@ async function mount(d: unknown) {
 const text = () => document.body.textContent ?? "";
 const spinner = () => document.querySelector('[class*="mg-ui-spin"]');
 /** The class of the dot of one probe row ("Cloudflare", "Other site"). */
-const dotOf = (label: string) => {
-  const row = [...document.querySelectorAll("span.flex")].find((r) => r.children[1]?.textContent === label);
-  return row?.children[0]?.className ?? "";
-};
+const dotOf = (label: string) => [...document.querySelectorAll(".nx-cks > span")].find((r) => r.textContent?.startsWith(label))?.className ?? "";
 
 // The case the owner saw: Cloudflare's edge answers every request late, the probe times out, the other probe passes.
 const slowEdge = {
@@ -110,9 +110,9 @@ describe("the WARP card after a failed check", () => {
     await mount(data(slowEdge));
     expect(text()).toContain("Cloudflarefailed");
     expect(text()).toContain("Other siteok · 0.4 s");
-    expect(dotOf("Cloudflare")).toContain("tone-bad");
-    expect(dotOf("Cloudflare")).not.toContain("tone-ok");
-    expect(dotOf("Other site")).toContain("tone-ok");
+    expect(dotOf("Cloudflare")).toContain("crit");
+    expect(dotOf("Cloudflare")).not.toContain("ok");
+    expect(dotOf("Other site")).toContain("ok");
   });
 
   it("says how long ago the node checked", async () => {
@@ -139,7 +139,7 @@ describe("slow probes", () => {
   it("a probe that passes but takes over 2 s is 'slow' with a warn dot", async () => {
     await mount(data({ checkedUnix: nowS() - 1, probeCloudflare: { ok: true, latencyMs: 3200, atUnix: nowS() }, probeOther: { ok: true, latencyMs: 300, atUnix: nowS() } }));
     expect(text()).toContain("Cloudflareslow · 3.2 s");
-    expect(dotOf("Cloudflare")).toContain("tone-warn");
+    expect(dotOf("Cloudflare")).toContain("warn");
   });
 });
 
@@ -215,6 +215,22 @@ describe("what the owner can do with a node's WARP", () => {
     expect(registerWarp).toHaveBeenCalledWith(expect.objectContaining({ nodeId: "nod_1", acceptTos: true, replaceExisting: true }));
   });
 
+  it("a registration that went through lights the card (the board's nx-ok) and sends a wave and two glints over it, with the reveal animation on", async () => {
+    registerWarp.mockResolvedValue({});
+    setEffectsEnabled(true);
+    await mount(data({ state: WarpState.DOWN, lastError: "warp_flag_off" }, { needsAttention: true, attentionReason: "revoked" }));
+    await click(button("Register again"));
+    await click(dialog().querySelector('[role="checkbox"]'));
+    await click(button("Register again", dialog()));
+    expect(document.querySelector(".fl-wv")).toBeNull();
+    await act(async () => void (await new Promise((r) => setTimeout(r, 900))));
+    const card = document.querySelector(".nx-warp")!;
+    expect(card.classList.contains("just")).toBe(true);
+    expect(card.querySelector(".fl-wv")).not.toBeNull();
+    expect(card.querySelectorAll(".fl-eg")).toHaveLength(2);
+    setEffectsEnabled(false);
+  });
+
   it("a refused registration says what Cloudflare answered, and offers the import", async () => {
     registerWarp.mockRejectedValue(new ConnectError("cloudflare_rate_limited: status=429", Code.ResourceExhausted));
     await mount(data({ state: WarpState.DOWN, lastError: "warp_flag_off" }, { needsAttention: true, attentionReason: "revoked" }));
@@ -228,6 +244,7 @@ describe("what the owner can do with a node's WARP", () => {
   it("a working but slow account still offers «Register again» and «Restart WARP», neither as the main action", async () => {
     registerWarp.mockResolvedValue({});
     await mount(data({ state: WarpState.UP, lastHandshakeUnix: nowS() - 30 }));
+    await click(button("Details"));
     const again = button("Register again")!;
     const restart = button("Restart WARP")!;
     expect(again.className).not.toContain("bg-accent");
@@ -261,11 +278,31 @@ describe("what the owner can do with a node's WARP", () => {
   it("the backend, Cloudflare's flag and the reserved bytes sit under «Details»", async () => {
     const d = data({});
     await mount({ ...d, account: { ...d.account, useReserved: true } });
-    const details = document.querySelector("details")!;
-    expect(details.querySelector("summary")?.textContent).toContain("Details");
+    expect(text()).not.toContain("warp=on");
+    await click(button("Details"));
+    const details = document.querySelector(".nx-det")!;
     expect(details.textContent).toContain("kernel");
     expect(details.textContent).toContain("warp=on");
     expect(details.textContent).toContain("stamped");
+    expect(button("Delete account", details)).toBeDefined();
+    await click(button("Hide"));
+    expect(document.querySelector(".nx-det")).toBeNull();
+  });
+
+  it("shows the registration as four steps while the call is on, and the account when it is back", async () => {
+    let answer!: (v: unknown) => void;
+    registerWarp.mockReturnValue(new Promise((r) => (answer = r)));
+    await mount(data({ state: WarpState.DOWN, lastError: "warp_flag_off" }, { needsAttention: true, attentionReason: "revoked" }));
+    await click(button("Register again"));
+    await click(dialog().querySelector('[role="checkbox"]'));
+    await click(button("Register again", dialog()));
+    expect(document.querySelector(".nx-reg")).not.toBeNull();
+    expect(document.querySelectorAll(".nx-st2 li")).toHaveLength(4);
+    expect(document.querySelector(".nx-st2 li.now")?.textContent).toContain("Account");
+    expect(document.querySelector(".nx-ls")).toBeNull();
+    await act(async () => answer({}));
+    for (let i = 0; i < 3; i++) await act(async () => void (await new Promise((r) => setTimeout(r, 0))));
+    expect(document.querySelectorAll(".nx-st2 li.done")).toHaveLength(4);
   });
 });
 
@@ -305,5 +342,92 @@ describe("a node whose agent predates the per-probe results", () => {
     expect(text()).toContain("Other sitefailed");
     expect(text()).toContain("The other-site probe failed through WARP.");
     expect(text()).toMatch(/Checked \d+ s ago/);
+  });
+});
+
+// Placeholder, not a key of anyone.
+const plusKey = "TESTPLUS-AAAAAAAA-BBBBBBBB";
+async function typeInto(el: HTMLInputElement, value: string) {
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(el, value);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+const withAccount = (over: Record<string, unknown>) => {
+  const d = data({});
+  return { ...d, account: { ...d.account, ...over } };
+};
+
+describe("the WARP+ key", () => {
+  it("a Plus account wears the badge, and the card says whether a key is set", async () => {
+    await mount(withAccount({ accountType: "plus", hasLicense: true }));
+    expect(document.querySelector(".nx-ch .nd-wt")?.textContent).toContain("Plus");
+    await click(button("Details"));
+    expect(document.querySelector(".nx-det")?.textContent).toContain("WARP+ keyset");
+    expect(button("Change WARP+ key")).toBeDefined();
+  });
+
+  it("a free account has no badge and offers «Set WARP+ key»", async () => {
+    await mount(data({}));
+    expect(document.querySelector(".nx-ch .nd-wt")?.textContent).not.toContain("Plus");
+    await click(button("Details"));
+    expect(document.querySelector(".nx-det")?.textContent).toContain("WARP+ keynot set");
+    expect(button("Set WARP+ key")).toBeDefined();
+  });
+
+  it("binds a key typed into a hidden box, and keeps it out of the page afterwards", async () => {
+    setWarpLicense.mockResolvedValue({ account: { accountType: "plus", hasLicense: true } });
+    await mount(data({}));
+    await click(button("Details"));
+    await click(button("Set WARP+ key"));
+    const box = dialog().querySelector<HTMLInputElement>("input")!;
+    expect(box.type).toBe("password");
+    expect(box.autocomplete).toBe("off");
+    const go = button("Bind the key", dialog())!;
+    await typeInto(box, "short");
+    expect(go.hasAttribute("disabled") || go.getAttribute("data-disabled") !== null).toBe(true);
+    await typeInto(box, ` ${plusKey} `);
+    await click(go);
+    expect(setWarpLicense).toHaveBeenCalledTimes(1);
+    expect(setWarpLicense.mock.calls[0]![0]).toMatchObject({ nodeId: "nod_1" });
+    expect((setWarpLicense.mock.calls[0]![0] as { licenseKey: string }).licenseKey.trim()).toBe(plusKey);
+    expect(text()).toContain("WARP+ key bound: the account is Plus now");
+    expect(document.documentElement.outerHTML).not.toContain(plusKey);
+  });
+
+  it("says in words why Cloudflare refused, keeps the window open and does not echo the key", async () => {
+    setWarpLicense.mockRejectedValue(new ConnectError("license_device_limit", Code.FailedPrecondition));
+    await mount(data({}));
+    await click(button("Details"));
+    await click(button("Set WARP+ key"));
+    await typeInto(dialog().querySelector<HTMLInputElement>("input")!, plusKey);
+    await click(button("Bind the key", dialog()));
+    expect(dialog().textContent).toContain("already used on as many devices as it allows");
+    setWarpLicense.mockRejectedValue(new ConnectError("license_invalid", Code.InvalidArgument));
+    await click(button("Bind the key", dialog()));
+    expect(dialog().textContent).toContain("Cloudflare does not accept this key");
+    expect(dialog().textContent).not.toContain(plusKey);
+  });
+
+  it("clears what was typed when the window is closed", async () => {
+    await mount(data({}));
+    await click(button("Details"));
+    await click(button("Set WARP+ key"));
+    await typeInto(dialog().querySelector<HTMLInputElement>("input")!, plusKey);
+    await click(button("Cancel", dialog()));
+    await click(button("Set WARP+ key"));
+    expect(dialog().querySelector<HTMLInputElement>("input")!.value).toBe("");
+  });
+
+  it("a re-registration that could not bind the key says so, with the reason", async () => {
+    await mount(withAccount({ hasLicense: true, licenseError: "license_device_limit" }));
+    expect(text()).toContain("The WARP+ key was not applied to the new account, which stays free.");
+    expect(text()).toContain("already used on as many devices as it allows");
+  });
+
+  it("an account without a token cannot take a key", async () => {
+    await mount(withAccount({ hasToken: false }));
+    await click(button("Details"));
+    expect(button("Set WARP+ key")!.hasAttribute("disabled") || button("Set WARP+ key")!.getAttribute("data-disabled") !== null).toBe(true);
   });
 });

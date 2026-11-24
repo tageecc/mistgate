@@ -40,6 +40,21 @@ const written: [string, Record<string, unknown>, string?][] = [
   ["sessions_end_others", { count: 2 }],
   ["instance_update", {}],
   ["subscription_settings_update", {}],
+  // the desktop client API (internal/panel/clientapi/service.go, internal/panel/access/client_api.go)
+  ["client_api_update", { enabled: true }],
+  ["client_api_update", { enabled: false }],
+  ["client_device_enrolled", { user: "usr_1", device: "dev_1" }],
+  ["client_device_reenrolled", { user: "usr_1", device: "dev_1" }],
+  ["client_device_left", { user: "usr_1", device: "dev_1" }],
+  // logs for support (internal/panel/ops/client_debug.go, internal/panel/clientdebug/service.go)
+  ["client_debug_requested", { user: "usr_1", device: "dev_1", id: "dbr_1", level: "debug", expires: "1763337600" }],
+  ["client_debug_cancelled", { user: "usr_1", device: "dev_1", id: "dbr_1" }],
+  ["client_debug_received", { user: "usr_1", device: "dev_1", id: "dbr_1", lines: "18" }],
+  ["client_debug_received", { user: "usr_1", device: "dev_1", id: "dbr_1", lines: "18", unasked: "true" }],
+  ["client_debug_declined", { user: "usr_1", device: "dev_1", id: "dbr_1" }],
+  ["client_debug_read", { user: "usr_1", device: "dev_1", id: "dbr_1" }],
+  ["client_debug_downloaded", { user: "usr_1", device: "dev_1", id: "dbr_1", records: "18" }],
+  ["client_debug_deleted", { user: "usr_1", device: "dev_1", id: "dbr_1", state: "received", records: "18" }],
   ["page_unlock_lockout", { user: "usr_1", scope: "token" }, "locked"],
   ["node.create_enrollment", { node_id: "nod_1", name: "de1" }],
   ["node.update", { node_id: "nod_1" }],
@@ -68,6 +83,8 @@ const written: [string, Record<string, unknown>, string?][] = [
   ["inbound_update", { inbound: "inb_1", profile: "hy2 · 443", node: "de1", port: 8443, enabled: true }],
   ["inbound_update", { inbound: "inb_1", profile: "hy2 · 443", node: "de1", port: 443, enabled: false }],
   ["inbound_remove", { inbound: "inb_1", profile: "hy2 · 443", node: "de1" }],
+  ["inbounds_remove", { profile: "hy2 · 443", count: 3, nodes: "de1, nl1, fi1" }],
+  ["inbounds_remove", { profile: "hy2 · 443", count: 1, nodes: "de1" }],
   ["preset_create", { preset: "dns_1", name: "Дом" }],
   ["preset_update", { preset: "dns_1", name: "Дом" }],
   ["preset_delete", { preset: "dns_1", name: "Дом" }],
@@ -84,6 +101,8 @@ const written: [string, Record<string, unknown>, string?][] = [
   ["device_revoke", {}],
   ["user_reset_traffic", { user: "usr_1", was_bytes: 5 }],
   ["health.mute_alert", { alert_id: "alr_1" }],
+  ["health.dismiss_alert", { alert_id: "alr_1" }],
+  ["health.reopen_alert", { alert_id: "alr_1" }],
   ["health.fix_plan", { node_id: "nod_1" }],
   ["health.apply_fix", { node_id: "nod_1" }],
   ["update_rollout_start", { rollout_id: "rol_1", version: "v1.2", nodes: "3", batch_size: "1" }],
@@ -92,6 +111,12 @@ const written: [string, Record<string, unknown>, string?][] = [
   ["update_rollout_cancel", {}],
   ["update_rollback_node", { node_id: "nod_1", node: "de1" }],
   ["update_rescan", { status: "ok" }],
+  ["os_rollout_start", { rollout_id: "osr_1", node_id: "nod_1", node: "de1", mode: "security", reboot: "if_required" }],
+  ["os_rollout_start", { rollout_id: "osr_1", node_id: "nod_1", node: "de1", mode: "reboot_only", reboot: "always" }],
+  ["os_rollout_cancel", { rollout_id: "osr_1" }],
+  ["os_refresh", { nodes: "2" }],
+  ["update_download_sources", { sources: "github" }],
+  ["update_download_sources", { sources: "" }],
   ["warp_params", {}],
   ["warp_register", { node: "de1" }],
   ["warp_import", { node: "de1" }],
@@ -100,6 +125,14 @@ const written: [string, Record<string, unknown>, string?][] = [
   ["warp_refresh", { node_id: "nod_1" }],
   ["warp_delete", { node: "de1" }],
   ["warp_reregister", { node: "de1" }],
+  ["warp_license", { node: "de1" }],
+  ["node.debug_capture", { node_id: "nod_1", node: "de1", capture_id: "req_1", level: "debug", sources: "xray", duration_s: "300" }],
+  ["node.debug_capture_stop", { node_id: "nod_1", node: "de1", capture_id: "req_1" }],
+  ["log_level_set", { from: "info", to: "debug", req: "abc12345" }],
+  ["retention_set", { audit_days: "100", req: "abc12345" }],
+  ["metrics_set", { state: "on", token_rotated: "true" }],
+  ["warp_reach_settings", { customised: "true", domains: "example.com,example.org" }],
+  ["export_data", { since: "2026-11-06T00:00:00Z", until: "2026-11-07T00:00:00Z", rows: "12" }],
   ["token_create", { token_id: "tok_1", name: "ci", profile: "operator", ttl_days: 30 }],
   ["token_revoke", { token_id: "tok_1" }],
   ["approval_approve", { plan_id: "pln_1", tool: "node_fix", token_id: "tok_1" }],
@@ -134,6 +167,17 @@ describe("audit dictionary", () => {
         if (lang === "ru") expect(s, `ru ${action} ${result ?? ""}`).not.toMatch(/\b(fail|locked|rejected|denied|limited|error)\b/);
       }
     }
+  });
+  it("tells an OS update of a node from its reboot, and names the node", () => {
+    expect(describe2(tEn, "os_rollout_start", { node: "de1", mode: "security", reboot: "never" })).toBe("started an OS update of de1");
+    expect(describe2(tEn, "os_rollout_start", { node: "de1", mode: "reboot_only", reboot: "always" })).toBe("started a reboot of de1");
+    expect(describe2(tRu, "os_rollout_start", { node: "de1", mode: "reboot_only", reboot: "always" })).toBe("запустил(а) перезагрузку de1");
+    expect(describe2(tRu, "os_rollout_cancel", { rollout_id: "osr_1" })).toBe("закрыл(а) обновление ОС");
+  });
+  it("says GitHub was turned on or off as the fallback download of node updates", () => {
+    expect(describe2(tRu, "update_download_sources", { sources: "github" })).toBe("включил(а) запасную загрузку обновлений нод с GitHub");
+    expect(describe2(tRu, "update_download_sources", { sources: "" })).toBe("выключил(а) запасную загрузку обновлений нод с GitHub");
+    expect(describe2(tEn, "update_download_sources", { sources: "" })).toBe("turned off the GitHub fallback for node update downloads");
   });
   it("tells a sign-in by its method and a failed one by what was tried, never as a passkey sign-in", () => {
     expect(describe2(tRu, "login", { method: "passkey" })).toBe("вошёл(а) по passkey");
@@ -170,6 +214,30 @@ describe("audit dictionary", () => {
     expect(describe2(tEn, "relay.check", { ...r, ok: true, verified: true })).toBe("checked the relay msk1 → de1: it works");
     expect(describe2(tEn, "relay.check", { ...r, ok: true, verified: false })).toBe("checked the relay msk1 → de1");
     expect(describe2(tRu, "relay.check", { ...r, ok: false, verified: false })).toBe("проверил(а) ретрансляцию msk1 → de1: проверка не прошла");
+  });
+  it("tells the client API switched on or off, and a device of the Mistgate app coming, getting a new key and leaving", () => {
+    expect(describe2(tEn, "client_api_update", { enabled: true })).toBe("turned the client API on: the Mistgate app can connect to the panel directly");
+    expect(describe2(tRu, "client_api_update", { enabled: false })).toBe("выключил(а) API клиента: новые устройства через приложение Mistgate подключаться не смогут");
+    expect(describe2(tRu, "client_api_update", {})).toBe("изменил(а) настройку API клиента");
+    expect(describe2(tRu, "client_device_enrolled", { user: "usr_1", device: "dev_1" })).toBe("подключил(а) устройство через приложение Mistgate");
+    expect(describe2(tEn, "client_device_reenrolled", { user: "usr_1", device: "dev_1" })).toBe("got a new key for a device in the Mistgate app");
+    expect(describe2(tEn, "client_device_left", { user: "usr_1", device: "dev_1" })).toBe("removed a device through the Mistgate app");
+  });
+  it("tells the logs for support opened, downloaded and deleted", () => {
+    const p = { user: "usr_1", device: "dev_1", id: "dbr_1" };
+    expect(describe2(tEn, "client_debug_read", p)).toBe("opened the logs from a device");
+    expect(describe2(tRu, "client_debug_read", p)).toBe("открыл(а) журналы с устройства");
+    expect(describe2(tEn, "client_debug_downloaded", { ...p, records: "18" })).toBe("downloaded the logs from a device");
+    expect(describe2(tRu, "client_debug_downloaded", { ...p, records: "18" })).toBe("скачал(а) журналы с устройства");
+    expect(describe2(tRu, "client_debug_deleted", { ...p, state: "received", records: "18" })).toBe("удалил(а) журналы с устройства");
+  });
+  it("tells the logs for support asked for, withdrawn, sent and refused", () => {
+    const p = { user: "usr_1", device: "dev_1", id: "dbr_1" };
+    expect(describe2(tEn, "client_debug_requested", { ...p, level: "debug", expires: "1763337600" })).toBe("asked for the logs of a device");
+    expect(describe2(tRu, "client_debug_cancelled", p)).toBe("отозвал(а) запрос журналов устройства");
+    expect(describe2(tEn, "client_debug_received", { ...p, lines: "18" })).toBe("sent logs from the Mistgate app");
+    expect(describe2(tRu, "client_debug_received", { ...p, unasked: "true" })).toBe("отправил(а) журналы из приложения Mistgate");
+    expect(describe2(tRu, "client_debug_declined", p)).toBe("отказался(-лась) отправлять журналы из приложения Mistgate");
   });
   it("says what failed in the UI language, after the sentence, when the sentence itself does not", () => {
     expect(describe2(tRu, "mcp_apply", { tool: "user_enable" }, "fail")).toBe("выполнил(а) запланированное изменение: Включить пользователей — не удалось");

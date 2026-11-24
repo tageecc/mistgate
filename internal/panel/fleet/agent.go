@@ -15,21 +15,18 @@ import (
 	"connectrpc.com/connect"
 
 	agentv1 "github.com/mistgate/mistgate/gen/mistgate/agent/v1"
+	"github.com/mistgate/mistgate/internal/agentcap"
 	"github.com/mistgate/mistgate/internal/panel/store"
 )
 
 const (
-	helloTimeout    = 15 * time.Second
-	ackEvery        = time.Second
-	outQueue        = 256
-	maxFuture       = 5 * time.Minute // agent timestamps further ahead are clamped to the receive time
-	maxStatsAge     = 48 * time.Hour  // older batches are attributed to the receive hour
-	maxEventParam   = 16
-	maxEngines      = 32 // engines listed in one Hello
-	capTorrentGuard = "torrentguard/1"
-	capClientIPv6   = "client-ipv6/1" // NodeSettings.client_ipv6_disabled
-	capWSLink       = "ws-link/1"
-	capDecoy        = "decoy/1"
+	helloTimeout  = 15 * time.Second
+	ackEvery      = time.Second
+	outQueue      = 256
+	maxFuture     = 5 * time.Minute // agent timestamps further ahead are clamped to the receive time
+	maxStatsAge   = 48 * time.Hour  // older batches are attributed to the receive hour
+	maxEventParam = 16
+	maxEngines    = 32 // engines listed in one Hello
 )
 
 type agentService struct{ f *Fleet }
@@ -127,7 +124,7 @@ func (s *session) runDesiredPreparation(ctx context.Context) (Transition, error)
 	event.At = s.f.now()
 	tr, err := s.stepCore(ctx, event)
 	if prepareErr != nil && ctx.Err() == nil {
-		s.f.log.Warn("prepare desired state", "node", s.nodeID, "err", prepareErr)
+		s.f.log.Warn("prepare desired state", "code", "prepare_desired_state_failed", "node", s.nodeID, "err", prepareErr)
 	}
 	return tr, err
 }
@@ -146,7 +143,7 @@ func (s *session) startDesiredPreparation() {
 // background preparation would otherwise end it as a bare "stream closed").
 func (s *session) endOnError(err error) {
 	if s.ctx.Err() == nil {
-		s.f.log.Error("session step", "node", s.nodeID, "err", err)
+		s.f.log.Error("session step", "code", "session_step_failed", "node", s.nodeID, "err", err)
 	}
 	var ce *connect.Error
 	switch {
@@ -225,7 +222,7 @@ func (f *Fleet) runSharedEffect(ctx context.Context, nodeID string, effect Sessi
 	case EffectRecordAnswer:
 		if u := f.updates(); u != nil {
 			if err := u.RecordAnswer(ctx, nodeID, effect.RequestID, effect.Result); err != nil {
-				f.log.Warn("record update answer", "node", nodeID, "err", err)
+				f.log.Warn("record update answer", "code", "update_answer_store_failed", "node", nodeID, "err", err)
 			}
 		}
 	}
@@ -248,7 +245,7 @@ func (s *session) persistPoison(poison *PoisonBatch) {
 		delete(s.f.stuck, s.nodeID)
 		return
 	}
-	s.f.stuck[s.nodeID] = stuckSeq{instance: poison.Instance, seq: poison.Seq}
+	s.f.stuck[s.nodeID] = stuckSeq{instance: poison.Instance, seq: poison.Seq, firstFailureAt: poison.FirstFailureAt}
 }
 
 func resetSessionAlarm(timer *time.Timer, next *time.Time, now time.Time) {
@@ -270,7 +267,7 @@ func (f *Fleet) poisonFor(nodeID string) *PoisonBatch {
 	if !ok {
 		return nil
 	}
-	return &PoisonBatch{Instance: poison.instance, Seq: poison.seq}
+	return &PoisonBatch{Instance: poison.instance, Seq: poison.seq, FirstFailureAt: poison.firstFailureAt}
 }
 
 // enqueue queues a message for the stream goroutine. A full queue means the agent does not keep up: drop the stream
@@ -434,6 +431,7 @@ func (a agentService) runSession(ctx context.Context, id string, pc peerCert, ow
 		return connect.NewError(connect.CodeAborted, errors.New("superseded by a newer stream"))
 	}
 	helloAt := f.now()
+	f.own.heard(id, helloAt, f.keepaliveEvery()) // before the Step: a returning node's connectEvents asks about this gap
 	tr, stepErr := core.Step(sctx, &state, SessionEvent{Kind: EventHello, At: helloAt, Frame: first})
 	resetSessionAlarm(alarmTimer, tr.NextAlarm, helloAt)
 	if tr.Close != nil && state.InstanceID == "" {
@@ -463,14 +461,14 @@ func (a agentService) runSession(ctx context.Context, id string, pc peerCert, ow
 			// the end is written to the store (NodeDisconnected) before the waiters are released: bound it
 			dctx, dcancel := context.WithTimeout(context.Background(), 5*time.Second)
 			if _, err := s.stepCore(dctx, SessionEvent{Kind: EventDisconnected, At: f.now()}); err != nil {
-				f.log.Warn("disconnect session core", "node", id, "err", err)
+				f.log.Warn("disconnect session core", "code", "session_disconnect_failed", "node", id, "err", err)
 			}
 			dcancel()
 		}
 		close(s.done)
 	}()
 	if helloErr != nil {
-		f.log.Error("hello response", "node", id, "err", helloErr)
+		f.log.Error("hello response", "code", "hello_response_failed", "node", id, "err", helloErr)
 		return connect.NewError(connect.CodeInternal, errors.New("internal error"))
 	}
 	s.dispatchCoreEffects(sctx, tr.Effects)
@@ -484,6 +482,7 @@ func (a agentService) runSession(ctx context.Context, id string, pc peerCert, ow
 	}
 	f.scheduleDecoySync(id)
 
+	var frameBucket agentFrameBucket
 	for {
 		select {
 		case <-sctx.Done():
@@ -513,7 +512,27 @@ func (a agentService) runSession(ctx context.Context, id string, pc peerCert, ow
 			if !ok {
 				return endErr()
 			}
-			tr, err := s.stepCore(sctx, SessionEvent{Kind: EventAgentFrame, At: f.now(), Frame: m})
+			now := f.now()
+			f.own.heard(id, now, f.keepaliveEvery())
+			if !frameBucket.allow(now) {
+				if m.Seq != 0 {
+					// A reliable frame is never skipped: the ack of a later one would cover it and the batch would be lost.
+					// The agent reconnects and replays from the last ack.
+					f.log.Warn("agent reliable frames exceeded the per-session rate, session closed", "code", "agent_frames_rate_limited",
+						"node", id, "seq", m.Seq)
+					return connect.NewError(connect.CodeResourceExhausted, errors.New("agent exceeded the session frame rate"))
+				}
+				closeSession, report := frameBucket.drop(now)
+				if report {
+					f.log.Warn("agent frames exceeded the per-session rate and were dropped", "code", "agent_frames_rate_limited",
+						"node", id, "dropped", frameBucket.totalDrops, "closing", closeSession)
+				}
+				if closeSession {
+					return connect.NewError(connect.CodeResourceExhausted, errors.New("agent exceeded the session frame rate"))
+				}
+				continue
+			}
+			tr, err := s.stepCore(sctx, SessionEvent{Kind: EventAgentFrame, At: now, Frame: m})
 			if err != nil {
 				return errOrCause(sctx)
 			}
@@ -552,9 +571,12 @@ func sessionCloseError(close *SessionClose) error {
 
 // helloInfo takes what the node says about itself. Every string is bounded: they are stored and shown in the UI.
 func helloInfo(h *agentv1.Hello) store.HelloInfo {
-	info := store.HelloInfo{AgentVersion: clip(h.AgentVersion, 64), APIVersion: h.ApiVersion, Instance: h.InstanceId,
+	info := store.HelloInfo{AgentVersion: clipText(h.AgentVersion, 64), APIVersion: h.ApiVersion, Instance: h.InstanceId,
 		Built: h.Built, Caps: capabilities(h), LastUpdateJSON: lastUpdateJSON(h.LastUpdate)}
-	if slices.Contains(info.Caps, capDecoy) {
+	if slices.Contains(info.Caps, agentcap.Nets) {
+		info.NetworksDBSHA256 = validNetworksDigest(h.NetworksDbSha256)
+	}
+	if slices.Contains(info.Caps, agentcap.Decoy) {
 		switch h.DecoyMode {
 		case "builtin":
 			if h.DecoySha256 == "" {
@@ -572,14 +594,14 @@ func helloInfo(h *agentv1.Hello) store.HelloInfo {
 		if ft.BootUnix > 0 {
 			info.BootAt = time.Unix(ft.BootUnix, 0).UTC()
 		}
-		info.Facts = store.NodeFactsRow{Hostname: clip(ft.Hostname, 128), OS: clip(ft.Os, 128), Kernel: clip(ft.Kernel, 128), Arch: clip(ft.Arch, 32),
-			CPUCount: ft.CpuCount, RAMTotal: min(ft.RamTotalBytes, 1<<62), DiskTotal: min(ft.DiskTotalBytes, 1<<62), Virt: clip(ft.Virt, 64), HasIPv6: ft.HasIpv6}
+		info.Facts = store.NodeFactsRow{Hostname: clipText(ft.Hostname, 128), OS: clipText(ft.Os, 128), Kernel: clipText(ft.Kernel, 128), Arch: clipText(ft.Arch, 32),
+			CPUCount: ft.CpuCount, RAMTotal: min(ft.RamTotalBytes, 1<<62), DiskTotal: min(ft.DiskTotalBytes, 1<<62), Virt: clipText(ft.Virt, 64), HasIPv6: ft.HasIpv6}
 	}
 	for i, e := range h.Engines {
 		if i == maxEngines {
 			break
 		}
-		info.Facts.Engines = append(info.Facts.Engines, store.EngineRow{Protocol: clip(e.Protocol, 64), Version: clip(e.Version, 64)})
+		info.Facts.Engines = append(info.Facts.Engines, store.EngineRow{Protocol: clipText(e.Protocol, 64), Version: clipText(e.Version, 64)})
 	}
 	return info
 }
@@ -601,9 +623,20 @@ func (f *Fleet) connectEvents(ctx context.Context, id string, prev store.NodeRow
 		d := boot.Sub(prev.BootAt)
 		params["rebooted"] = fmt.Sprint(d > time.Minute || d < -time.Minute)
 	}
-	if code, _ := f.st.LastNodeEventCode(ctx, id, "node_down", "node_recovered"); code == "node_down" {
+	lastCode, err := f.st.LastNodeEventCode(ctx, id, "node_down", "node_recovered")
+	if err != nil { // read as "no node_down": the return is then told as a blip or a restart
+		f.log.Warn("read the last down event of a node", "code", "node_event_read_failed", "node", id, "err", err)
+	}
+	if lastCode == "node_down" {
 		f.event(ctx, 1, "node_recovered", id, params)
 	} else if gap >= time.Minute && gap < blipWindow {
+		if secs, hit, first := f.own.gapAt(prev.LastSeenAt, f.keepaliveEvery()); hit {
+			// The panel heard nobody for a while: that is its own silence, not a blip of this node. One event per silence, none per node.
+			if first {
+				f.event(ctx, 1, "panel_link_gap", "", map[string]string{"seconds": fmt.Sprint(secs)})
+			}
+			return
+		}
 		f.event(ctx, 1, "node_blip", id, params)
 		if h := f.hooks(); h != nil && params["rebooted"] != "true" {
 			h.NodeReturned(ctx, id, last, now) // the history record of the blip
@@ -628,6 +661,10 @@ func bucketHour(end, now time.Time) (hour int64, stale bool) {
 
 func clip(s string, n int) string { return store.Clip(s, n) }
 
+// clipText is clip for text an admin reads as a name or a version (host facts, engines, update results): direction
+// and invisible-space characters go first.
+func clipText(s string, n int) string { return store.Clip(store.CleanDisplayText(s, n), n) }
+
 func runState(s agentv1.InboundRunState) string {
 	switch s {
 	case agentv1.InboundRunState_INBOUND_RUN_STATE_RUNNING:
@@ -638,25 +675,44 @@ func runState(s agentv1.InboundRunState) string {
 	return "pending"
 }
 
-// nodeSettings is what the agent of a stream with these capabilities is told. The AWG, torrent blocker and client IPv6 settings
+// nodeSettings is what the agent of a stream with these capabilities is told. The AWG, torrent blocker, client IPv6 and own IPv6 address settings
 // are sent only to agents that advertise the capability, keeping old-agent settings signatures unchanged.
 // An empty resolver list stays empty: the node then uses the server's own resolver (some hosters allow only theirs);
 // country defaults are a preset the owner picks, never a silent substitute.
 func nodeSettings(n store.NodeRow, caps []string) *agentv1.NodeSettings {
+	return nodeSettingsFor(n, caps, true)
+}
+
+func nodeSettingsFor(n store.NodeRow, caps []string, allowOSStatus bool) *agentv1.NodeSettings {
 	s := &agentv1.NodeSettings{StatsIntervalS: defaultStatsIntervalS, KeepaliveIntervalS: defaultKeepaliveInterval,
 		KeepaliveTimeoutS: defaultKeepaliveTimeout, DialTimeoutS: uint32(n.DialTimeoutS), DnsResolvers: slices.Clone(n.DNSResolvers),
 		CountryCode: n.CountryCode}
-	if slices.Contains(caps, capAWG) {
+	if slices.Contains(caps, agentcap.AWG) {
 		s.AwgBackend = n.AwgBackend
 	}
-	if slices.Contains(caps, capTorrentGuard) {
+	if slices.Contains(caps, agentcap.TorrentGuard) {
 		s.TorrentBlockerEnabled = n.TorrentBlockerEnabled
 	}
-	if slices.Contains(caps, capClientIPv6) {
+	if slices.Contains(caps, agentcap.ClientIPv6) {
 		s.ClientIpv6Disabled = !n.ClientIPv6
+	}
+	if slices.Contains(caps, agentcap.IPv6Addr) {
+		// "managed" says the list is the truth, an empty one too; a settings message without it (an older panel) leaves the
+		// agent's addresses alone.
+		s.Ipv6AddressesManaged = true
+		s.Ipv6Addresses = ownedIPv6Addresses(n)
+	}
+	if allowOSStatus && slices.Contains(caps, agentcap.OSStatus) {
+		s.OsStatus = true
 	}
 	return s
 }
+
+// ownedIPv6Addresses are the addresses the node's agent holds on its uplink (NodeSettings.ipv6_addresses). Nothing puts one
+// there yet: the state machine of the address change fills the list from n.IPv6() (ipv6_json), so for now the list is
+// always empty (an agent with the capability is told it manages an empty list, which removes only what it added itself).
+// A variable so that the tests can stand in for that source.
+var ownedIPv6Addresses = func(n store.NodeRow) []string { return nil }
 
 func settingsSig(s *agentv1.NodeSettings) string {
 	sig := fmt.Sprint(s.StatsIntervalS, s.KeepaliveIntervalS, s.KeepaliveTimeoutS, s.DialTimeoutS, s.DnsResolvers, s.CountryCode, s.AwgBackend)
@@ -665,6 +721,21 @@ func settingsSig(s *agentv1.NodeSettings) string {
 	}
 	if s.ClientIpv6Disabled {
 		sig += "|client-ipv6=off"
+	}
+	if s.Ipv6AddressesManaged { // absent for an agent without ipv6-addr/1: its signature stays what it was
+		sig += "|ipv6-addr=" + strings.Join(s.Ipv6Addresses, ",")
+	}
+	if s.Networks != 0 {
+		sig += fmt.Sprintf("|networks=%d", s.Networks)
+	}
+	if s.NetworksDbName != "" {
+		sig += "|networks-db-name=" + s.NetworksDbName
+	}
+	if s.NetworksDbSha256 != "" {
+		sig += "|networks-db-sha256=" + s.NetworksDbSha256
+	}
+	if s.GetOsStatus() {
+		sig += "|os-status=1"
 	}
 	return sig
 }
@@ -742,6 +813,13 @@ func (f *Fleet) askWithLive(ctx context.Context, nodeID string, wait time.Durati
 	if build != nil {
 		frame = build(id)
 	}
+	return f.askFrame(ctx, nodeID, id, frame, wait, knownLive)
+}
+
+func (f *Fleet) askFrame(ctx context.Context, nodeID, id string, frame *agentv1.ConnectResponse, wait time.Duration, knownLive *store.NodeLiveRow) (*agentv1.ConnectRequest, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if requestKind(frame) == 0 {
 		return nil, errNoAnswer
 	}
@@ -787,6 +865,17 @@ func (f *Fleet) commandWithLive(ctx context.Context, nodeID string, wait time.Du
 	return nil, errLinkLost
 }
 
+func (f *Fleet) commandWithRequestID(ctx context.Context, nodeID, requestID string, wait time.Duration, frame *agentv1.ConnectResponse) (*agentv1.CommandResult, error) {
+	reply, err := f.askFrame(ctx, nodeID, requestID, frame, wait, nil)
+	if err != nil {
+		return nil, err
+	}
+	if result := reply.GetCommandResult(); result != nil {
+		return result, nil
+	}
+	return nil, errLinkLost
+}
+
 func requestOfflineError(frame *agentv1.ConnectResponse) error {
 	if frame != nil && (frame.GetUpdateAgent() != nil || frame.GetRollbackAgent() != nil) {
 		return connect.NewError(connect.CodeFailedPrecondition, errors.New("node is offline"))
@@ -795,29 +884,49 @@ func requestOfflineError(frame *agentv1.ConnectResponse) error {
 }
 
 func requestCapability(frame *agentv1.ConnectResponse, linkOnly bool) (capability, message string) {
-	updateCapability := capUpdate
+	updateCapability := agentcap.Update
 	if linkOnly {
-		updateCapability = capUpdateLink
+		updateCapability = agentcap.UpdateLink
 	}
 	switch {
 	case frame == nil:
 		return "", ""
 	case frame.GetRunDoctor() != nil, frame.GetApplyFix() != nil:
-		return capDoctor, "agent too old"
+		return agentcap.Doctor, "agent too old"
 	case frame.GetUpdateAgent() != nil, frame.GetRollbackAgent() != nil:
 		return updateCapability, "node cannot update itself"
 	case frame.GetMeasureBandwidth() != nil:
-		return capBandwidth, "agent too old"
+		return agentcap.Bandwidth, "agent too old"
 	case frame.GetPrepareAwgKernel() != nil:
-		return capAwgPrepare, "agent too old"
+		return agentcap.AWGPrepare, "agent too old"
+	case frame.GetUpdateOs() != nil:
+		return agentcap.OSUpdate, "agent too old"
 	case frame.GetUdpCount() != nil, frame.GetUdpSend() != nil:
-		return capUDPCheck, "agent too old"
+		return agentcap.UDPCheck, "agent too old"
 	case frame.GetHttpMark() != nil, frame.GetTcpProbe() != nil:
-		return capTCPCheck, "agent too old"
+		return agentcap.TCPCheck, "agent too old"
+	case frame.GetPathTrace() != nil:
+		return agentcap.Probe, "agent too old"
+	case frame.GetSpeedTest() != nil:
+		if frame.GetSpeedTest().GetSize() >= speedStepServeChannel {
+			return agentcap.SpeedChannel, "agent too old"
+		}
+		return agentcap.Speed, "agent too old"
+	case frame.GetDebugCapture() != nil:
+		for _, source := range frame.GetDebugCapture().GetSources() {
+			if source == "kernel" {
+				return agentcap.Debug2, "this node's agent is too old for the kernel source: update the node"
+			}
+		}
+		return agentcap.Debug, "agent too old"
 	case frame.GetCountryProbe() != nil:
-		return capCountryProbe, "agent too old"
+		return agentcap.CountryProbe, "agent too old"
 	case frame.GetSetDecoy() != nil:
-		return capDecoy, "agent too old"
+		return agentcap.Decoy, "agent too old"
+	case frame.GetWarpReach() != nil:
+		return agentcap.WarpReach, "agent too old"
+	case frame.GetSniScan() != nil:
+		return agentcap.SNIScan, "agent too old"
 	default:
 		return "", ""
 	}
@@ -840,7 +949,10 @@ func (f *Fleet) readyForRequest(ctx context.Context, nodeID string, frame *agent
 	if capability, message := requestCapability(frame, f.cfg.Remote != nil); capability != "" && !slices.Contains(live.AgentCaps, capability) {
 		return live, connect.NewError(connect.CodeFailedPrecondition, errors.New(message))
 	}
-	if fix := frame.GetApplyFix(); fix != nil && fix.GetFixId() == "refresh_unit" && !slices.Contains(live.AgentCaps, capUnitRefresh) {
+	if update := frame.GetUpdateAgent(); update != nil && len(update.Sources) > 0 && !slices.Contains(live.AgentCaps, agentcap.UpdateSources) {
+		update.Sources = nil
+	}
+	if fix := frame.GetApplyFix(); fix != nil && fix.GetFixId() == "refresh_unit" && !slices.Contains(live.AgentCaps, agentcap.UnitRefresh) {
 		return live, connect.NewError(connect.CodeFailedPrecondition, errors.New("agent too old"))
 	}
 	return live, nil

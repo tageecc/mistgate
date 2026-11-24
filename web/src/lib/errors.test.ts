@@ -17,13 +17,33 @@ describe("the panel's refusal codes", () => {
     }
   });
 
+  it("tell which node and which target stand in the way of a profile that goes to TLS, and what the target must not be", () => {
+    for (const lang of langs) {
+      const text = say("reality_target_unsupported: target=shop.example.com%3A443&node=de1", Code.InvalidArgument, lang);
+      expect(text, lang).toContain("de1");
+      expect(text, lang).toContain("shop.example.com:443");
+    }
+    expect(say("reality_target_unsupported: target=shop.example.com%3A443&node=de1", Code.InvalidArgument, "ru")).toContain("сначала сбрось цель на de1");
+    expect(say("reality_target_own: target=nl1.example.com%3A443&node=de1", Code.InvalidArgument, "ru")).toContain("«nl1.example.com:443»");
+  });
+
   it("read as our sentence, with the values the server put after the code", () => {
     expect(say("name_taken", Code.AlreadyExists, "ru")).toBe("Это имя уже занято — выбери другое.");
     expect(say("group_not_empty: users=3", Code.FailedPrecondition, "ru")).toBe("В группе ещё 3 чел. — перенеси их в другую группу, потом удаляй.");
     expect(say("profile_deployed: nodes=de1%2C+nl1", Code.FailedPrecondition, "ru")).toBe("Профиль стоит на нодах de1, nl1 — сначала убери его с них.");
     expect(say("stale_version", Code.Aborted)).toBe(en["err.stale_version"]);
+    for (const lang of langs) expect(say("stale_inbound", Code.Aborted, lang), lang).not.toBe("stale_inbound"); // the refusal of an inbound edit over a newer one reads in every language
+    for (const lang of langs) expect(say("stale_user", Code.Aborted, lang), lang).not.toBe("stale_user"); // the refusal of an edit of a person over a newer state
     expect(say("agent too old", Code.FailedPrecondition)).toBe(en["err.agent_too_old"]); // the older spelling of the code
     expect(errorVars("device_limit: 5/5").detail).toBe("5/5"); // the older "code: detail" keeps its detail
+  });
+
+  it("word a channel the root update policy does not allow, with a command built from the channel word only", () => {
+    const cmd = "sudo sh -c 'install -d -o root -g root -m 0755 /etc/mistgate && tmp=$(mktemp /etc/mistgate/.panel-update-channel.XXXXXX) && printf \"%s\\n\" testing > \"$tmp\" && chmod 0644 \"$tmp\" && mv -f \"$tmp\" /etc/mistgate/panel-update-channel'";
+    expect(say("panel_update_channel_not_allowed: allowed=stable&channel=testing", Code.FailedPrecondition)).toBe(`The update helper installs only from stable, but this panel follows testing. To allow testing, run on the server: ${cmd}`);
+    expect(say("panel_update_channel_not_allowed: allowed=stable&channel=testing", Code.FailedPrecondition, "ru")).toContain(cmd);
+    expect(say("panel_update_channel_not_allowed: allowed=stable&channel=%3B+rm+-rf", Code.FailedPrecondition)).not.toContain("rm -rf"); // an unknown word reads as stable
+    expect(say("panel_update_channel_config_invalid: x+must+be+owned+by+root", Code.FailedPrecondition)).toContain("/etc/mistgate/panel-update-channel");
   });
 
   it("word the relay refusals: a port a relay holds, a server that cannot be relayed, a check that is missing, old or failed", () => {
@@ -36,9 +56,20 @@ describe("the panel's refusal codes", () => {
     expect(say("relay_check_stale", Code.FailedPrecondition)).toBe(en["err.relay_check_stale"]);
     expect(say("relay_check_failed: code=timeout&stage=path", Code.FailedPrecondition, "ru")).toBe("Ретрансляция не прошла проверку (снаружи через вход). Почему — на странице ноды входа.");
     expect(say("relay_check_failed: code=refused&stage=leg", Code.FailedPrecondition)).toBe("The relay did not pass its check (from the entry to the exit). The entry node’s page says why.");
+    // a bridge for a server whose path cannot be proven: said plainly, not as a failed check
+    expect(say("relay_check_failed: code=unverifiable&stage=path", Code.FailedPrecondition)).toBe(en["err.relay_bridge_unverifiable"]);
+    expect(say("relay_check_failed: code=unverifiable&stage=path", Code.FailedPrecondition, "ru")).toBe("Для этого сервера мост недоступен: его путь нельзя проверить.");
     expect(say("relay_exists: exit=de1&node=msk1", Code.AlreadyExists, "ru")).toBe("msk1 уже ретранслирует этот сервер de1.");
     expect(say("agent_old: node=msk1", Code.FailedPrecondition)).toBe("The agent of msk1 is too old for relays. Update it on the Updates page.");
     expect(say("same_node: node=de1", Code.InvalidArgument, "ru")).toBe("Сервер стоит на самой de1: ретранслировать можно только сервер другой ноды.");
+  });
+
+  it("words why an OS update cannot start and why a node is being updated", () => {
+    expect(say("os_blocked: reason=node_busy", Code.FailedPrecondition)).toBe("The OS update cannot start: Another job is running on the server, for example a check for updates you have just started. Wait until it ends.");
+    expect(say("os_blocked: reason=offline", Code.FailedPrecondition, "ru")).toBe("Нельзя начать обновление ОС: Нода не в сети.");
+    expect(say("os_blocked: reason=from_the_future", Code.FailedPrecondition)).toBe("The OS update cannot start: from_the_future");
+    expect(say("node_updating", Code.FailedPrecondition, "ru")).toBe("На ноде идёт обновление, подожди его конца.");
+    for (const c of ["os_blocked", "node_updating"]) expect(errorCodes).toContain(c);
   });
 
   it("name the feature an edition cannot run, in the page's language", () => {
@@ -82,6 +113,10 @@ describe("the panel's refusal codes", () => {
     }
     expect(say("your role cannot do this", Code.PermissionDenied)).toBe(en["err.denied"]);
     expect(say("your role cannot do this", Code.PermissionDenied, "ru")).toBe(ru["err.denied"]);
+    expect(say("mihomo_templates_owner_only: only the owner can change the Mihomo templates", Code.PermissionDenied)).toBe(en["err.mihomo_templates_owner_only"]);
+    expect(say("mihomo_templates_owner_only: only the owner can change the Mihomo templates", Code.PermissionDenied, "ru")).toBe(ru["err.mihomo_templates_owner_only"]);
+    expect(say("routing_profiles_owner_only: only the owner can change the routing profiles", Code.PermissionDenied)).toBe(en["err.routing_profiles_owner_only"]);
+    expect(say("routing_profiles_owner_only: only the owner can change the routing profiles", Code.PermissionDenied, "ru")).toBe(ru["err.routing_profiles_owner_only"]);
     expect(say("unknown denial", Code.PermissionDenied)).toBe(en["err.permissionDenied"]);
     expect(say("unknown denial", Code.PermissionDenied, "ru")).toBe(ru["err.permissionDenied"]);
   });

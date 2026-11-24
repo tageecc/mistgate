@@ -1,6 +1,7 @@
 package access
 
 import (
+	"slices"
 	"testing"
 
 	"connectrpc.com/connect"
@@ -86,4 +87,139 @@ func TestGetUserConnection(t *testing.T) {
 	}
 	_, err = e.s.GetUserConnection(e.ctx, req(&adminv1.GetUserConnectionRequest{UserId: "usr_missing"}))
 	wantCode(t, err, connect.CodeNotFound)
+}
+
+// links/3 per key: an AmneziaWG key on the userspace backend has its handshake counts; on the kernel backend, or with an agent
+// without links/3, they are listed as unsupported (their zero means nothing).
+func TestGetUserConnectionLinks3(t *testing.T) {
+	f := newFixture(t)
+	e := f.e
+	e.sql(`UPDATE node SET agent_caps = 'links/1 links/2 links/3 awg/1' WHERE id = 'nod_de1'`)
+	e.sql(`UPDATE profile SET protocol = 'awg' WHERE id = ?`, f.profile)
+	e.sql(`UPDATE inbound SET awg_health_json = '{"backend":"userspace"}', awg_health_at = 1 WHERE id = ?`, f.inbound)
+	g := e.group("awg", f.profile)
+	alice := e.user("alice", g, nil).User
+	var cred string
+	if err := e.st.R.QueryRow(`SELECT id FROM device_credential WHERE user_id = ? ORDER BY id LIMIT 1`, alice.Id).Scan(&cred); err != nil {
+		t.Fatal(err)
+	}
+	e.sql(`UPDATE device_credential SET protocol = 'awg' WHERE id = ?`, cred)
+	hour := e.clock.Unix() / 3600 * 3600
+	e.sql(`INSERT INTO link_hour (node_id, hour_start, inbound_id, cred_id, user_id, initiations, responses, responses_unmatched)
+		VALUES ('nod_de1', ?, ?, ?, ?, 9, 8, 7)`, hour, f.inbound, cred, alice.Id)
+
+	read := func() *adminv1.DeviceConnection {
+		t.Helper()
+		resp, err := e.s.GetUserConnection(e.ctx, req(&adminv1.GetUserConnectionRequest{UserId: alice.Id, ByHour: true}))
+		if err != nil || len(resp.Msg.Rows) != 1 {
+			t.Fatalf("GetUserConnection = %+v, %v", resp, err)
+		}
+		return resp.Msg.Rows[0]
+	}
+	row := read()
+	if row.Initiations != 9 || row.Responses != 8 || row.ResponsesUnmatched != 7 || len(row.Hours) != 1 || row.Hours[0].ResponsesUnmatched != 7 {
+		t.Errorf("AWG key row = %+v", row)
+	}
+	for _, f := range []string{"initiations", "responses", "responses_unmatched"} {
+		if slices.Contains(row.Unsupported, f) {
+			t.Errorf("userspace backend: %s unsupported (%v)", f, row.Unsupported)
+		}
+	}
+	if !slices.Contains(row.Unsupported, "tcp_stalls") {
+		t.Errorf("AWG has no TCP stalls, unsupported = %v", row.Unsupported)
+	}
+	e.sql(`UPDATE inbound SET awg_health_json = '{"backend":"kernel"}' WHERE id = ?`, f.inbound)
+	if row = read(); !slices.Contains(row.Unsupported, "initiations") {
+		t.Errorf("kernel backend: unsupported = %v, want initiations", row.Unsupported)
+	}
+	e.sql(`UPDATE inbound SET awg_health_json = '{"backend":"userspace"}' WHERE id = ?`, f.inbound)
+	e.sql(`UPDATE node SET agent_caps = 'links/1 links/2 awg/1' WHERE id = 'nod_de1'`)
+	if row = read(); !slices.Contains(row.Unsupported, "responses_unmatched") {
+		t.Errorf("an agent without links/3: unsupported = %v, want responses_unmatched", row.Unsupported)
+	}
+}
+
+// vless-hello-kex/1 per device: the person's REALITY devices come back with their hello counts summed over nodes and hours, in the
+// response and not in the rows; another person's counts and a window that has ended are not in it.
+func TestGetUserConnectionHelloKex(t *testing.T) {
+	f := newFixture(t)
+	e := f.e
+	e.sql(`UPDATE node SET agent_caps = 'links/1 links/2 links/3 vless/1 vless-hello-kex/1' WHERE id = 'nod_de1'`)
+	e.sql(`UPDATE profile SET protocol = 'vless', settings_json = '{"security":"reality","transport":"tcp","reality":{"target":"www.example.com:443"}}' WHERE id = ?`, f.profile)
+	g := e.group("vless", f.profile)
+	alice := e.user("alice", g, nil).User
+	bob := e.user("bob", g, nil).User
+	cred := func(user string) string {
+		var id string
+		if err := e.st.R.QueryRow(`SELECT id FROM device_credential WHERE user_id = ? ORDER BY id LIMIT 1`, user).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	hour := e.clock.Unix() / 3600 * 3600
+	e.sql(`INSERT INTO link_hour (node_id, hour_start, inbound_id, cred_id, user_id, connects, hello_pq, hello_classic, hello_unknown)
+		VALUES ('nod_de1', ?, ?, ?, ?, 3, 6, 2, 1), ('nod_de1', ?, ?, ?, ?, 0, 1, 0, 0), ('nod_de1', ?, ?, ?, ?, 1, 0, 9, 0)`,
+		hour, f.inbound, cred(alice.Id), alice.Id, hour-3600, f.inbound, cred(alice.Id), alice.Id, hour, f.inbound, cred(bob.Id), bob.Id)
+	resp, err := e.s.GetUserConnection(e.ctx, req(&adminv1.GetUserConnectionRequest{UserId: alice.Id}))
+	if err != nil || len(resp.Msg.HelloKex) != 1 {
+		t.Fatalf("GetUserConnection = %+v, %v", resp, err)
+	}
+	if d := resp.Msg.HelloKex[0]; d.UserId != alice.Id || d.UserName != "alice" || d.HelloPq != 7 || d.HelloClassic != 2 || d.HelloUnknown != 1 || d.LastHourUnix != hour {
+		t.Errorf("alice's hello counts = %+v, want pq 7, classic 2, unknown 1 (two hours added up)", d)
+	}
+	// a one-hour window sees the current hour only (the bucket that holds the window's start counts whole)
+	resp, err = e.s.GetUserConnection(e.ctx, req(&adminv1.GetUserConnectionRequest{UserId: bob.Id, Hours: 1}))
+	if err != nil || len(resp.Msg.HelloKex) != 1 || resp.Msg.HelloKex[0].HelloClassic != 9 {
+		t.Errorf("bob's hello counts = %+v, %v", resp.Msg.GetHelloKex(), err)
+	}
+}
+
+// A person's card says when the nodes last counted a connection of each device (Device.last_online_unix): the newer of the
+// last session a node saw and the newest hour with connects or online time. The device's last_seen_unix (a link device's last
+// subscription fetch) and counters that are not a connection (rejects only) do not count.
+func TestGetUserDeviceLastOnline(t *testing.T) {
+	f := newFixture(t)
+	e := f.e
+	g := e.group("one", f.profile)
+	alice := e.user("alice", g, nil).User
+	var cred, device string
+	if err := e.st.R.QueryRow(`SELECT id, device_id FROM device_credential WHERE user_id = ? ORDER BY id LIMIT 1`, alice.Id).Scan(&cred, &device); err != nil {
+		t.Fatal(err)
+	}
+	lastOnline := func() int64 {
+		t.Helper()
+		for _, d := range must(e.s.GetUser(e.ctx, req(&adminv1.GetUserRequest{UserId: alice.Id}))).Msg.Devices {
+			if d.Id == device {
+				return d.LastOnlineUnix
+			}
+		}
+		t.Fatalf("device %s is not in the card", device)
+		return 0
+	}
+	hour := e.clock.Unix() / 3600 * 3600
+	counters := func(at int64, cols string) {
+		e.sql(`INSERT INTO link_hour (node_id, hour_start, inbound_id, cred_id, user_id, `+cols+`) VALUES ('nod_de1', ?, ?, ?, ?, 1)`, at, f.inbound, cred, alice.Id)
+	}
+
+	e.sql(`UPDATE device SET last_seen_at = ? WHERE id = ?`, e.clock.Unix(), device)
+	if got := lastOnline(); got != 0 {
+		t.Errorf("a fetch only: last_online = %d, want 0 (never counted)", got)
+	}
+	counters(hour-2*3600, "rejects")
+	if got := lastOnline(); got != 0 {
+		t.Errorf("a refused key only: last_online = %d, want 0", got)
+	}
+	counters(hour-3*3600, "online_s")
+	counters(hour-5*3600, "connects")
+	if got := lastOnline(); got != hour-3*3600 {
+		t.Errorf("counter hours: last_online = %d, want the newest hour with online time %d", got, hour-3*3600)
+	}
+	e.sql(`UPDATE device SET last_connected_at = ? WHERE id = ?`, hour-3600+120, device)
+	if got := lastOnline(); got != hour-3600+120 {
+		t.Errorf("a newer session: last_online = %d, want %d", got, hour-3600+120)
+	}
+	e.sql(`UPDATE device SET last_connected_at = ? WHERE id = ?`, hour-10*3600, device)
+	if got := lastOnline(); got != hour-3*3600 {
+		t.Errorf("an older session than the counters: last_online = %d, want %d", got, hour-3*3600)
+	}
 }

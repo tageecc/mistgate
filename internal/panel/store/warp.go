@@ -38,20 +38,22 @@ type WarpAccountRow struct {
 	Attention              string // reason code while the owner has to decide; "" = fine
 	HealthJSON             string // last agent.v1.WarpHealth (protojson); "" = never reported
 	HealthAt               time.Time
+	ReachJSON              string // the latest WARP reach result (migration 00144); "" = never
+	ReachAt                time.Time
 	CreatedAt, UpdatedAt   time.Time
 }
 
 const warpCols = `node_id, source, secret_enc, peer_public_key, endpoint_v4, endpoint_v6, ports_json, address_v4, address_v6,
 	mtu, client_id, use_reserved, account_type, enabled, tos_url, tos_accepted_by, tos_accepted_at, registered_with,
-	attention, health_json, health_at, created_at, updated_at`
+	attention, health_json, health_at, reach_json, reach_at, created_at, updated_at`
 
 func scanWarp(r rowScanner) (WarpAccountRow, error) {
 	var a WarpAccountRow
 	var ports string
-	var reserved, enabled, tosAt, healthAt, created, updated int64
+	var reserved, enabled, tosAt, healthAt, reachAt, created, updated int64
 	err := r.Scan(&a.NodeID, &a.Source, &a.SecretEnc, &a.PeerPublicKey, &a.EndpointV4, &a.EndpointV6, &ports, &a.AddressV4,
 		&a.AddressV6, &a.MTU, &a.ClientID, &reserved, &a.AccountType, &enabled, &a.TOSURL, &a.TOSAcceptedBy, &tosAt,
-		&a.RegisteredWith, &a.Attention, &a.HealthJSON, &healthAt, &created, &updated)
+		&a.RegisteredWith, &a.Attention, &a.HealthJSON, &healthAt, &a.ReachJSON, &reachAt, &created, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return WarpAccountRow{}, ErrNotFound
 	}
@@ -60,7 +62,7 @@ func scanWarp(r rowScanner) (WarpAccountRow, error) {
 	}
 	_ = json.Unmarshal([]byte(ports), &a.Ports)
 	a.UseReserved, a.Enabled = reserved == 1, enabled == 1
-	a.TOSAcceptedAt, a.HealthAt = fleetTime(tosAt), fleetTime(healthAt)
+	a.TOSAcceptedAt, a.HealthAt, a.ReachAt = fleetTime(tosAt), fleetTime(healthAt), fleetTime(reachAt)
 	a.CreatedAt, a.UpdatedAt = fromUnix(created), fromUnix(updated)
 	return a, nil
 }
@@ -117,10 +119,10 @@ func insertWarp(ctx context.Context, db execer, a WarpAccountRow) error {
 func warpAccountStmt(a WarpAccountRow) Stmt {
 	ports, _ := json.Marshal(a.Ports)
 	return Stmt{Query: `INSERT INTO warp_account (` + warpCols + `)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		Args: []any{a.NodeID, a.Source, a.SecretEnc, a.PeerPublicKey, a.EndpointV4, a.EndpointV6, string(ports), a.AddressV4, a.AddressV6,
 			int64(a.MTU), a.ClientID, int64(b2i(a.UseReserved)), a.AccountType, int64(b2i(a.Enabled)), a.TOSURL, a.TOSAcceptedBy, fleetUnix(a.TOSAcceptedAt),
-			a.RegisteredWith, a.Attention, a.HealthJSON, fleetUnix(a.HealthAt), unix(a.CreatedAt), unix(a.UpdatedAt)}}
+			a.RegisteredWith, a.Attention, a.HealthJSON, fleetUnix(a.HealthAt), a.ReachJSON, fleetUnix(a.ReachAt), unix(a.CreatedAt), unix(a.UpdatedAt)}}
 }
 
 func warpInsertError(err error) error {
@@ -154,6 +156,13 @@ func (s *Store) UpdateWarpRefresh(ctx context.Context, nodeID string, r WarpRefr
 		address_v4 = ?, address_v6 = ?, client_id = ?, use_reserved = ?, account_type = ?, attention = '', updated_at = ?
 		WHERE node_id = ?`, r.PeerPublicKey, r.EndpointV4, r.EndpointV6, string(ports), r.AddressV4, r.AddressV6, r.ClientID,
 		b2i(r.UseReserved), r.AccountType, unix(now), nodeID)
+}
+
+// SetWarpSecret replaces the sealed secrets of the account and its type (a WARP+ key was bound). ErrNotFound when the
+// node has no account.
+func (s *Store) SetWarpSecret(ctx context.Context, nodeID string, secretEnc []byte, accountType string, now time.Time) error {
+	return s.warpExec(ctx, `UPDATE warp_account SET secret_enc = ?, account_type = ?, updated_at = ? WHERE node_id = ?`,
+		secretEnc, accountType, unix(now), nodeID)
 }
 
 // SetWarpEnabled pauses or resumes the account. ErrNotFound when the node has no account.

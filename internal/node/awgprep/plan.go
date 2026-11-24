@@ -13,6 +13,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"path"
 	"strings"
 )
 
@@ -20,7 +21,7 @@ const (
 	// pinnedModuleTag and pinnedModuleCommit are the release of amneziawg-linux-kernel-module the Debian source build
 	// checks out. The commit is verified after the clone: a moved tag is not trusted.
 	pinnedModuleTag    = "v3.1.20260906"
-	pinnedModuleCommit = "4569c4c"
+	pinnedModuleCommit = "4569c4c67f3a57414969260cafbbd04694fbaae0"
 	moduleRepo         = "https://github.com/amnezia-vpn/amneziawg-linux-kernel-module"
 	modulesLoadFile    = "/etc/modules-load.d/amneziawg.conf"
 )
@@ -39,8 +40,10 @@ const (
 	CodeSourceMoved    = "source_moved"
 	CodeModuleNotLoad  = "module_not_loaded"
 	CodeModuleUnusable = "module_unusable"
+	CodeBuildFailed    = "module_build_failed" // the module does not compile for this kernel (an API it has no answer for yet)
 	CodeInterrupted    = "interrupted"
 	CodeLaunchFailed   = "launch_failed"
+	CodeBusy           = "busy"
 )
 
 // Unsupported says that the module cannot be put on this machine, and why. It is a fact about the host, not a failure.
@@ -55,10 +58,15 @@ func (u *Unsupported) Error() string { return u.Msg }
 type Env struct {
 	OSRelease  map[string]string // /etc/os-release
 	Kernel     string            // uname -r
+	NodePath   string            // the installed node binary, for the Ubuntu apt hook
+	StateDir   string            // the agent's state directory, for the Ubuntu apt hook
 	CPUs       int
 	Container  string // virtualisation of a container kind ("lxc", "openvz", "docker", ...), "" = none
 	SecureBoot bool
 	Systemd    bool // systemd-run is there and systemd is the init (the automatic run needs it)
+	// Leftover are the module's packages an earlier run left half-installed (dpkg unpacked or half-configured): apt
+	// refuses every install on the host until they are configured or gone.
+	Leftover []string
 }
 
 // FileOp is one file change in a plan. Remove deletes a file if it exists; otherwise Run writes Body atomically with
@@ -77,12 +85,33 @@ type Step struct {
 	Files []FileOp
 	Dir   string
 	Check func(out string) error
+	// Prep runs before the command, with the source directory ({src} replaced): the Debian recipe makes the module source
+	// right here (FixCompat) before the compiler sees it. An error fails the step.
+	Prep func(src string, w io.Writer) error
+	// Build marks the step that compiles the module: its failure is module_build_failed. An apt step is one too when its
+	// output shows the DKMS build of the module failing.
+	Build bool
+	// Undo runs when the step fails because the module did not build. A DKMS package whose build failed stays
+	// half-configured, and apt then refuses every later install on the host; Undo removes it again.
+	Undo []string
+	// RunKernel is the release of the running kernel the plan was made for. Undo only removes the module when the failed build
+	// was for that kernel: a build that fails for another (the new kernel's headers configured on the side) leaves the module
+	// that works for the running kernel alone. "" = not known, which keeps the removal.
+	RunKernel string
 }
 
 // aptInstall is `apt-get install` that never asks, waits for the dpkg lock and does not pull recommended packages (dkms
 // recommends linux-headers-generic, which is neither the running kernel nor small).
 func aptInstall(pkgs ...string) []string {
 	return append([]string{"apt-get", "-o", fmt.Sprintf("DPkg::Lock::Timeout=%d", aptLockTimeoutSeconds), "install", "-y", "--no-install-recommends"}, pkgs...)
+}
+
+// modulePackages are what the Ubuntu recipe installs for the module: amneziawg pulls amneziawg-dkms.
+var modulePackages = []string{"amneziawg", "amneziawg-dkms"}
+
+// aptPurge removes packages with their configuration; a package that is not installed is not an error.
+func aptPurge(pkgs ...string) []string {
+	return append([]string{"apt-get", "-o", fmt.Sprintf("DPkg::Lock::Timeout=%d", aptLockTimeoutSeconds), "purge", "-y"}, pkgs...)
 }
 
 // aptUpdate sets the same timeout for any dpkg lock apt may acquire while refreshing its package index. The explicit
@@ -111,14 +140,29 @@ func Plan(e Env) (steps []Step, notes []string, err error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		steps = []Step{
-			{Desc: "refresh the package index", Cmd: aptUpdate()},
-			{Desc: "install the headers of the running kernel", Cmd: aptInstall(headers)},
-			{Desc: "add the Amnezia PPA", Files: ppaFiles},
-			{Desc: "refresh the package index from the Amnezia PPA", Cmd: aptUpdate()},
-			{Desc: "install amneziawg", Cmd: aptInstall("amneziawg")},
+		// An install that leaves the module's DKMS package unbuilt (it does not compile for this kernel) is undone, and
+		// so are the leftovers of an earlier run: the host's apt must never stay broken because of this recipe.
+		undo := aptPurge(modulePackages...)
+		if len(e.Leftover) > 0 {
+			steps = append(steps, Step{Desc: "remove the module packages an earlier run left half-installed (" + strings.Join(e.Leftover, ", ") + ")", Cmd: undo})
 		}
-		notes = append(notes, "DKMS rebuilds the module after a kernel upgrade; the build takes about a minute on a small VPS and also rebuilds the initramfs")
+		hook, err := ubuntuKmodHook(e)
+		steps = append(steps,
+			Step{Desc: "refresh the package index", Cmd: aptUpdate()},
+		)
+		if err != nil {
+			notes = append(notes, "the apt hook for automatic AmneziaWG module rebuilds was skipped: "+err.Error())
+		} else {
+			steps = append(steps, Step{Desc: "install the apt hook for AmneziaWG module rebuilds", Files: []FileOp{{Path: KmodHookPath, Body: hook}}})
+		}
+		steps = append(steps,
+			Step{Desc: "install the headers of the running kernel", Cmd: aptInstall(headers), Undo: undo, RunKernel: e.Kernel},
+			Step{Desc: "add the Amnezia PPA", Files: ppaFiles},
+			Step{Desc: "refresh the package index from the Amnezia PPA", Cmd: aptUpdate()},
+			Step{Desc: "install amneziawg", Cmd: aptInstall("amneziawg"), Undo: undo, RunKernel: e.Kernel},
+		)
+		notes = append(notes, "DKMS rebuilds the module after a kernel upgrade; the build takes about a minute on a small VPS and also rebuilds the initramfs",
+			"if the module does not build for the running kernel, its packages are removed again (apt stays usable) and the node stays on userspace; a build that fails for another kernel (headers configured on the side) removes nothing")
 	case id == "debian" || (strings.Contains(like, "debian") && id != ""):
 		cpus := max(e.CPUs, 1)
 		steps = []Step{
@@ -126,12 +170,15 @@ func Plan(e Env) (steps []Step, notes []string, err error) {
 			{Desc: "install the build tools and the headers of the running kernel", Cmd: aptInstall("git", "make", "gcc", headers)},
 			{Desc: "fetch the pinned source " + pinnedModuleTag, Cmd: []string{"git", "clone", "--depth", "1", "--branch", pinnedModuleTag, moduleRepo, "{src}"}},
 			{Desc: "check the commit of the clone", Cmd: []string{"git", "-C", "{src}", "rev-parse", "HEAD"}, Check: func(out string) error {
-				if !strings.HasPrefix(strings.TrimSpace(out), pinnedModuleCommit) {
+				if strings.TrimSpace(out) != pinnedModuleCommit {
 					return &Failure{Code: CodeSourceMoved, Detail: fmt.Sprintf("the clone is at %q, the pinned commit is %s: the tag moved, nothing was built", strings.TrimSpace(out), pinnedModuleCommit)}
 				}
 				return nil
 			}},
-			{Desc: "build the module against the installed headers", Cmd: []string{"make", "-C", "{src}/src", "KERNELDIR=/lib/modules/" + e.Kernel + "/build", fmt.Sprintf("-j%d", cpus)}},
+			{Desc: "build the module against the installed headers", Cmd: []string{"make", "-C", "{src}/src", "KERNELDIR=/lib/modules/" + e.Kernel + "/build", fmt.Sprintf("-j%d", cpus)}, Build: true,
+				Prep: func(src string, w io.Writer) error {
+					return CompatErr(FixCompat(RealSys(), []string{path.Join(src, "src")}, false, w))
+				}},
 			{Desc: "install the module for the running kernel", Cmd: []string{"install", "-D", "-m", "0644", "{src}/src/amneziawg.ko", "/lib/modules/" + e.Kernel + "/updates/amneziawg.ko"}},
 			{Desc: "update the module dependency index", Cmd: []string{"depmod", "-a", e.Kernel}},
 		}
@@ -155,6 +202,19 @@ func PlanAuto(e Env) ([]Step, []string, error) {
 		return nil, nil, &Unsupported{CodeNoSystemd, "systemd-run is not available: the build runs as a separate systemd unit, run the command by hand"}
 	}
 	return Plan(e)
+}
+
+// leftoverPackages reads `dpkg-query -W -f '${Package} ${db:Status-Abbrev}\n'`: the packages dpkg left half-installed
+// (H), unpacked but not configured (U) or half-configured (F).
+func leftoverPackages(out string) []string {
+	var left []string
+	for _, line := range strings.Split(out, "\n") {
+		name, abbrev, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if ok && len(abbrev) >= 2 && strings.ContainsRune("HUF", rune(abbrev[1])) {
+			left = append(left, name)
+		}
+	}
+	return left
 }
 
 // ParseOSRelease reads KEY=value lines (values may be quoted).

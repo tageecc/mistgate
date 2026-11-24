@@ -28,8 +28,10 @@ import (
 )
 
 const (
-	// CookieName is the session cookie. The __Host- prefix forces Secure, Path=/ and no Domain.
+	// CookieName is the HTTPS session cookie. The __Host- prefix forces Secure, Path=/ and no Domain.
 	CookieName = "__Host-sid"
+	// PlainHTTPCookieName is used only by the panel's separate HTTP admin listener, where browsers reject Secure cookies.
+	PlainHTTPCookieName = "sid"
 
 	SetupTokenTTL    = 30 * time.Minute
 	RecoveryTokenTTL = 30 * time.Minute
@@ -42,16 +44,18 @@ const (
 	MaxSignInFailures = 5
 	FailureWindow     = time.Hour
 	LockDuration      = 15 * time.Minute
+	// One reserved attempt beyond the failure limit is needed because the last allowed proof may still be valid.
+	reservationLockHeadroom = 1
 	// MaxSourceFailures failed password sign-ins from one address (IPv4, or an IPv6 /64) within FailureWindow, for
 	// any logins, lock that address for LockDuration. Higher than the per-login limit: one address can be a whole
 	// office behind a NAT. The lock row is keyed "ip:<SourceKey>"; a login cannot contain a colon, so the two never meet.
 	MaxSourceFailures = 10
 	sourceLockPrefix  = "ip:"
 
-	maxCeremonies          = 2048
-	maxCeremoniesPerSource = 8  // pending ceremonies one client (IPv4 address or IPv6 /64) may hold
-	maxSetupCodeTries      = 5  // wrong TOTP codes tolerated on one password-setup ceremony
-	maxPasskeyName         = 64 // characters
+	maxCeremonies          = 2048 // separate pending budgets for anonymous and session-bound ceremonies
+	maxCeremoniesPerSource = 8    // pending ceremonies one client (IPv4 address or IPv6 /64) may hold
+	maxSetupCodeTries      = 5    // wrong TOTP codes tolerated on one password-setup ceremony
+	maxPasskeyName         = 64   // characters
 )
 
 // Config is the relying-party configuration and what the service needs from its host.
@@ -59,9 +63,11 @@ type Config struct {
 	RPID    string   // e.g. "localhost" or "example.com"
 	RPName  string   // shown by the authenticator; defaults to "Mistgate"
 	Origins []string // allowed browser origins, e.g. "https://k7q2x9.example.com"
+	// PlainHTTP is true only when the panel itself serves the admin on its separate HTTP listener; browsers drop Secure cookies there.
+	PlainHTTP bool
 	// Vault seals the TOTP secrets at rest. Without it password sign-in is unavailable.
 	Vault *vault.Vault
-	// TrustedProxies are the reverse proxies whose X-Forwarded-For / Forwarded headers are
+	// TrustedProxies are the reverse proxies whose X-Forwarded-For header is
 	// believed when working out the client address (rate limit, audit log, sessions).
 	TrustedProxies []netip.Prefix
 	// TurnstileURL is the Cloudflare siteverify endpoint; empty means SiteverifyURL. Tests point it at a fake.
@@ -77,14 +83,16 @@ type Config struct {
 
 // Service implements the admin AuthService.
 type Service struct {
-	st     *store.Store
-	wa     *webauthn.WebAuthn
-	vault  *vault.Vault
-	pepper []byte
-	log    *slog.Logger
-	lim    securitylimit.Limiter
-	trust  ProxyTrust
-	now    func() time.Time
+	st           *store.Store
+	wa           *webauthn.WebAuthn
+	vault        *vault.Vault
+	pepper       []byte
+	log          *slog.Logger
+	lim          securitylimit.Limiter
+	trust        ProxyTrust
+	now          func() time.Time
+	cookieName   string
+	cookieSecure bool
 
 	sourceURL string // where the source code is published (Config.SourceURL)
 
@@ -107,7 +115,7 @@ type ceremony struct {
 	kind      string // ceremonySetup, ceremonySetupPassword, ceremonyLogin or ceremonyAddPasskey
 	src       string // who started it (SourceKey), for the per-source cap
 	data      webauthn.SessionData
-	tokenHash []byte      // setup: the token the ceremony was started with
+	tokenHash []byte      // setup: the token the ceremony was started with; step-up, TOTP enrollment, add-passkey: the session's
 	admin     store.Admin // setup: the admin that will be created; add-passkey: the signed-in admin
 	name      string      // add-passkey: the label
 	login     string      // setup-password
@@ -152,7 +160,13 @@ func New(st *store.Store, cfg Config, log *slog.Logger) (*Service, error) {
 	if cfg.Limiter == nil {
 		cfg.Limiter = securitylimit.NewMemory(nil, 0)
 	}
+	cookieName, cookieSecure := CookieName, true
+	if cfg.PlainHTTP {
+		cookieName, cookieSecure = PlainHTTPCookieName, false
+	}
+	trust := NewProxyTrust(cfg.TrustedProxies)
 	s := &Service{
+		cookieName: cookieName, cookieSecure: cookieSecure,
 		sourceURL:  cfg.SourceURL,
 		tsURL:      cfg.TurnstileURL,
 		tsClient:   cfg.HTTPClient,
@@ -162,13 +176,17 @@ func New(st *store.Store, cfg Config, log *slog.Logger) (*Service, error) {
 		pepper:     passwordPepper(cfg.Vault),
 		log:        log,
 		lim:        cfg.Limiter,
-		trust:      NewProxyTrust(cfg.TrustedProxies),
+		trust:      trust,
 		now:        time.Now,
 		tokTouched: map[string]time.Time{},
 		tokAudited: map[string]time.Time{},
 	}
 	return s, nil
 }
+
+// SessionCookieName reports the one cookie name this service accepts and issues. The listener mode sets it at startup;
+// requests cannot choose or fall back between cookie names.
+func (s *Service) SessionCookieName() string { return s.cookieName }
 
 func hashToken(tok string) []byte {
 	h := sha256.Sum256([]byte(tok))
@@ -270,7 +288,8 @@ func (s *Service) failCeremony(ctx context.Context, id string) (bool, error) {
 	return s.st.FailAuthCeremony(ctx, id, maxSetupCodeTries)
 }
 
-func ceremonyTOTPRecordID(id string) string { return "auth_ceremony.totp:" + id }
+// AuthCeremonyTOTPRecordID is the vault AAD for a TOTP secret held by a pending auth ceremony.
+func AuthCeremonyTOTPRecordID(id string) string { return "auth_ceremony.totp:" + id }
 
 func (s *Service) ceremonyRow(id string, c *ceremony) (store.AuthCeremony, error) {
 	data, err := json.Marshal(c.data)
@@ -282,7 +301,7 @@ func (s *Service) ceremonyRow(id string, c *ceremony) (store.AuthCeremony, error
 		if s.vault == nil {
 			return store.AuthCeremony{}, errors.New("auth: cannot persist setup ceremony without a vault")
 		}
-		sealedTOTP = s.vault.Seal(c.totp, ceremonyTOTPRecordID(id))
+		sealedTOTP = s.vault.Seal(c.totp, AuthCeremonyTOTPRecordID(id))
 	}
 	name := c.name
 	if c.kind == ceremonySetup || c.kind == ceremonySetupPassword {
@@ -315,7 +334,7 @@ func (s *Service) ceremonyFromRow(row store.AuthCeremony) (*ceremony, error) {
 			return nil, errors.New("auth: cannot open setup ceremony without a vault")
 		}
 		var err error
-		if c.totp, err = s.vault.Open(row.TOTPEncrypted, ceremonyTOTPRecordID(row.ID)); err != nil {
+		if c.totp, err = s.vault.Open(row.TOTPEncrypted, AuthCeremonyTOTPRecordID(row.ID)); err != nil {
 			return nil, err
 		}
 	}
@@ -348,13 +367,13 @@ func (s *Service) newSession(ctx context.Context, adminID, ip, ua string, checke
 		s.log.Warn("purge sessions", "err", err)
 	}
 	return &http.Cookie{
-		Name: CookieName, Value: tok, Path: "/",
-		MaxAge: int(SessionMaxAge / time.Second), HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode,
+		Name: s.cookieName, Value: tok, Path: "/",
+		MaxAge: int(SessionMaxAge / time.Second), HttpOnly: true, Secure: s.cookieSecure, SameSite: http.SameSiteStrictMode,
 	}, nil
 }
 
-func clearedCookie() *http.Cookie {
-	return &http.Cookie{Name: CookieName, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode}
+func (s *Service) clearedCookie() *http.Cookie {
+	return &http.Cookie{Name: s.cookieName, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: s.cookieSecure, SameSite: http.SameSiteStrictMode}
 }
 
 // resolveSession returns the session and its admin for a session token, enforcing the idle and absolute limits.
