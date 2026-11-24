@@ -51,7 +51,7 @@ func New(c Config) *Service {
 	} else {
 		s.initErr = migrate(context.Background(), c.Store)
 		if s.initErr != nil {
-			c.Log.Error("cloud usage initialization failed", "err", s.initErr)
+			c.Log.Error("cloud usage initialization failed", "code", "cloud_usage_initialization_failed", "err", s.initErr)
 		}
 	}
 	return s
@@ -158,7 +158,7 @@ func (s *Service) audit(ctx context.Context, action, id string) {
 	a, _ := auth.AdminFrom(ctx)
 	p, _ := json.Marshal(map[string]string{"id": id})
 	if err := s.cfg.Store.Audit(ctx, s.cfg.Now(), store.AuditEntry{Actor: a.ID, Action: action, Params: string(p), Result: "ok"}); err != nil {
-		s.cfg.Log.Warn("cloud usage audit failed")
+		s.cfg.Log.Warn("cloud usage audit failed", "code", "cloud_usage_audit_failed")
 	}
 }
 

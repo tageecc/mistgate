@@ -32,7 +32,7 @@ func (s *Service) Run(ctx context.Context) {
 func (s *Service) collect(ctx context.Context) {
 	all, err := s.accounts(ctx)
 	if err != nil {
-		s.cfg.Log.Warn("cloud usage accounts unavailable")
+		s.cfg.Log.Warn("cloud usage accounts unavailable", "code", "cloud_usage_accounts_unavailable")
 		return
 	}
 	for _, a := range all {
