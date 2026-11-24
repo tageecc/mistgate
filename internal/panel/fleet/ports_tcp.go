@@ -86,7 +86,11 @@ func tcpTargets(specs []tcpSpec, pins map[string]string) []tcpTarget {
 		plain[i] = s.Spec
 	}
 	owners := plugin.TCPPortOwners(plain) // the node closes a Hysteria2 site on a TCP port another inbound holds
-	shares := plugin.TCPSharePlan(plain)  // services that share a port by SNI: the probe asks the default route
+	public := slices.Clone(plain)
+	for i, s := range sorted {
+		public[i].Listen.Port = protocols.ClientPort(s.Settings, s.Spec.Listen.Port)
+	}
+	shares := plugin.TCPSharePlan(public) // services that share a port by SNI: the probe asks the default route
 
 	byPort := make(map[uint16]tcpTarget)
 	add := func(t tcpTarget) {
@@ -104,7 +108,7 @@ func tcpTargets(specs []tcpSpec, pins map[string]string) []tcpTarget {
 	for _, s := range sorted {
 		spec := s.Spec
 		pin := pins[spec.ID]
-		if p := shares[spec.Listen.Port]; p.Front() && spec.Listen.Network == "tcp" && spec.ID != p.Default {
+		if p := shares[protocols.ClientPort(s.Settings, spec.Listen.Port)]; p.Front() && spec.Listen.Network == "tcp" && spec.ID != p.Default {
 			continue // one target per port: what answers there without a name is the default route's service
 		}
 		switch {
@@ -112,14 +116,9 @@ func tcpTargets(specs []tcpSpec, pins map[string]string) []tcpTarget {
 			sni, ownName := vlessProbeName(spec)
 			t := tcpTarget{Port: spec.Listen.Port, Role: tcpRoleVLESS, Profile: s.Profile, Kind: tcpcheck.KindTLS, SNI: sni, Pin: pin,
 				PublicCert: hasPublicCertificate(spec.TLS)}
-			var settings struct {
-				ClientPort uint16 `json:"client_port"`
-			}
-			if json.Unmarshal(s.Settings, &settings) == nil && settings.ClientPort != 0 {
-				t.Port = settings.ClientPort
-			}
+			t.Port = protocols.ClientPort(s.Settings, spec.Listen.Port)
 			if ownName {
-				t.ALPN = t.Port == 443 && alpn(spec.Listen.Port, spec.TLS)
+				t.ALPN = alpn(t.Port, spec.TLS)
 			}
 			if v, _ := plugin.VLESSOf(spec); !v.TLS() { // settings that name no security are REALITY
 				t.Inbound = spec.ID

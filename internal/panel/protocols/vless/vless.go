@@ -313,7 +313,7 @@ func validate(s Settings) []protocols.FieldError {
 	} else if s.ClientPort == 80 {
 		add("/client_port", "reserved", "port 80 is reserved for the Let's Encrypt HTTP check")
 	}
-	if s.ClientPort != 0 && s.CDN != nil {
+	if s.ClientPort != 0 && s.CDN != nil && strings.TrimSpace(s.CDN.Host) != "" {
 		add("/client_port", "unsupported", "use the CDN port when a CDN is configured")
 	}
 	switch s.Transport {
@@ -596,13 +596,13 @@ func effectiveServerNames(s RealitySettings) []string {
 // realityOverrideTarget cleans a target set on the node, "host:port", into the target as the node gets it and its host: a host name
 // with a dot (REALITY asks the site for that name, and an IP address has none), not this machine, and not the node's own address at
 // the listen port, which would loop.
-func realityOverrideTarget(target string, listenPort int, nodeAddress string) (clean, host string, err error) {
+func realityOverrideTarget(target string, listenPort, publicPort int, nodeAddress string) (clean, host string, err error) {
 	text := plugin.NormalizeRealityTarget(target) // a name written with its closing dot is the same name
 	host, port, perr := targetHostPort(text)
 	if perr != nil || net.ParseIP(strings.Trim(host, "[]")) != nil || !isHostname(host) || !strings.Contains(host, ".") || localTargetHost(host) {
 		return "", "", &protocols.RealityTargetError{Reason: "invalid", Target: target}
 	}
-	if port == uint64(listenPort) && sameTargetHost(host, nodeAddress) {
+	if (port == uint64(listenPort) || port == uint64(publicPort)) && sameTargetHost(host, nodeAddress) {
 		return "", "", &protocols.RealityTargetError{Reason: "same_node", Target: target}
 	}
 	return net.JoinHostPort(host, strconv.FormatUint(port, 10)), host, nil
@@ -687,8 +687,8 @@ func (*Protocol) BuildInbound(in protocols.InboundInput) (plugin.InboundSpec, er
 	}
 	if s.Security == "reality" && s.Reality.kind() == targetSite && in.RealityTargetOverride == "" {
 		targetHost, targetPort, targetErr := targetHostPort(s.Reality.Target)
-		if targetErr == nil && targetPort == uint64(port) && sameTargetHost(targetHost, in.Node.Address) {
-			return plugin.InboundSpec{}, errors.New("invalid profile settings: /reality/target same_node: target uses this node's address and listen port; choose this node's site instead")
+		if targetErr == nil && (targetPort == uint64(port) || targetPort == uint64(s.ClientPort)) && sameTargetHost(targetHost, in.Node.Address) {
+			return plugin.InboundSpec{}, errors.New("invalid profile settings: /reality/target same_node: target uses this node's address and entry port; choose this node's site instead")
 		}
 	}
 	var privateKey []byte
@@ -703,7 +703,7 @@ func (*Protocol) BuildInbound(in protocols.InboundInput) (plugin.InboundSpec, er
 		if in.RealityTargetOverride != "" {
 			// The site this node shows instead of the profile's target, whatever that is: the host is the one name REALITY accepts and
 			// rides in the TLS block (no certificate: mode 0) so that subscriptions and probes read it there.
-			clean, host, err := realityOverrideTarget(in.RealityTargetOverride, port, in.Node.Address)
+			clean, host, err := realityOverrideTarget(in.RealityTargetOverride, port, s.ClientPort, in.Node.Address)
 			if err != nil {
 				return plugin.InboundSpec{}, err
 			}
@@ -865,11 +865,8 @@ func ResolveClientParams(in protocols.RenderInput) (ClientParams, bool) {
 		return ClientParams{}, false
 	}
 	v := ClientParams{
-		Host: host, Port: in.Inbound.Port, UUID: in.Secret, Security: s.Security, Transport: s.Transport,
+		Host: host, Port: protocols.ClientPort(in.Settings, in.Inbound.Port), UUID: in.Secret, Security: s.Security, Transport: s.Transport,
 		Fingerprint: defaultString(s.Reality.Fingerprint, "chrome"),
-	}
-	if s.ClientPort != 0 {
-		v.Port = uint16(s.ClientPort)
 	}
 	if in.ClientPort != 0 {
 		v.Port = in.ClientPort
