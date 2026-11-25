@@ -43,9 +43,9 @@ export type Lane = {
 export type WaysInput = {
   node: { id: string; status: NodeStatus };
   /** cdn: people reach it through a CDN host; directInSubscriptions false: its plain server is not in subscriptions. */
-  inbounds: readonly { state: InboundState; cdn?: boolean; directInSubscriptions?: boolean }[];
+  inbounds: readonly { state: InboundState; profileName?: string; protocol?: string; cdn?: boolean; directInSubscriptions?: boolean }[];
   portChecks?: readonly { verdict: string; checkedUnix?: number; protocolOkUnix?: number }[];
-  tcpChecks?: readonly { verdict: string }[];
+  tcpChecks?: readonly { verdict: string; role?: string; profile?: string }[];
   /** The client-side checks of the node's profiles (Health). */
   cells?: readonly { deployed: boolean; last?: { status: CheckStatus } }[];
   /** The node seen from the audience country (IPv4). */
@@ -139,7 +139,11 @@ export function lanesOf(w: WaysInput): Ways {
   const failed = enabled.filter((i) => i.state === InboundState.FAILED).length;
   // a port whose test is blocked while the protocol through it works lets people in: it counts as a working port
   const udp = (w.portChecks ?? []).map((c) => (testBlocked(c) ? "ok" : c.verdict));
-  const tcp = (w.tcpChecks ?? []).map((c) => c.verdict);
+  // ACME and the Hysteria2 HTTPS decoy are auxiliary listeners, not client proxy ports. TrustTunnel also uses role
+  // "site", but its TCP listener carries the proxy itself and must still count when it fails.
+  const tcp = (w.tcpChecks ?? [])
+    .filter((c) => c.role !== "acme" && !(c.role === "site" && w.inbounds.some((i) => i.profileName === c.profile && i.protocol === "hysteria2")))
+    .map((c) => c.verdict);
   const cells = (w.cells ?? []).filter((c) => c.deployed && c.last);
   const cellsDown = cells.filter((c) => c.last!.status === CheckStatus.FAILED).length;
   // a port that gets nothing through: UDP under 70 %, TCP refused or silent. Some such ports make the lane warn, all of

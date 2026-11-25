@@ -134,6 +134,35 @@ describe("lanesOf", () => {
     expect(lanesOf(base({ portChecks: [{ verdict: "ok" }, { ...blocked, protocolOkUnix: 1000 - 16 * 60 }] })).lanes[0]).toMatchObject({ state: "warn", fault: true });
   });
 
+  it("auxiliary HTTPS and ACME failures do not mark a working proxy lane down", () => {
+    const input = base({
+      inbounds: [{ state: InboundState.ACTIVE, profileName: "hy2", protocol: "hysteria2" }],
+      tcpChecks: [{ role: "site", profile: "hy2", verdict: "timeout" }, { role: "acme", verdict: "refused" }],
+      cells: [{ deployed: true, last: { status: CheckStatus.OK } }],
+    });
+    const w = lanesOf(input);
+    expect(w.lanes[0]).toMatchObject({ state: "ok", fault: false });
+    expect(w.badge).toBe(0);
+    // Ignoring the decoy never masks a failing proxy port or a failed protocol check.
+    expect(lanesOf({ ...input, portChecks: [{ verdict: "broken" }] }).lanes[0]).toMatchObject({ state: "bad", fault: true });
+    expect(lanesOf({ ...input, cells: [{ deployed: true, last: { status: CheckStatus.FAILED } }] }).lanes[0]!.state).toBe("bad");
+  });
+
+  it("real TCP proxy listeners still fail, including TrustTunnel's site role beside a Hysteria2 decoy", () => {
+    for (const [protocol, role] of [["trusttunnel", "site"], ["vless", "vless"], ["mtproto", "mtproto"]]) {
+      for (const verdict of ["timeout", "refused"]) {
+        const w = lanesOf(base({
+          inbounds: [{ state: InboundState.ACTIVE, profileName: "hy2", protocol: "hysteria2" }, { state: InboundState.ACTIVE, profileName: "tcp", protocol }],
+          tcpChecks: [{ role: "site", profile: "hy2", verdict: "timeout" }, { role, profile: "tcp", verdict }],
+        }));
+        expect(w.lanes[0]).toMatchObject({ state: "bad", fault: true });
+        expect(w.badge).toBe(1);
+      }
+    }
+    // An unrecognized site's owner is not assumed to be an auxiliary decoy.
+    expect(lanesOf(base({ tcpChecks: [{ role: "site", profile: "unknown", verdict: "timeout" }] })).lanes[0]).toMatchObject({ state: "bad", fault: true });
+  });
+
   it("the IPv6 lane: shown, off, for a server with IPv6, seen by the IPv6 rounds", () => {
     expect(lanesOf(base({ ipv6: "none" })).lanes.map((l) => l.id)).toEqual(["direct"]);
     const w = lanesOf(base({ ipv6: "ok", country: country(CountryVerdict.PARTIAL, ["MTS"], { ipv6: country(CountryVerdict.OK) }) }));
