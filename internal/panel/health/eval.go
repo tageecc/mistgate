@@ -121,6 +121,7 @@ type derived struct {
 	recheck    []string        // nodes whose UDP profiles time out and have no fresh clean delivery check from another node
 	staleAfter time.Duration   // how old a check result may be and still count (the interval setting is read once per pass)
 	health     map[string]nodeHealth
+	doctorRows map[string][]store.DoctorRow // per-pass copies used to select the next failure when an alert is closed
 }
 
 func (d *derived) holds(a store.HealthAlert) bool {
@@ -261,13 +262,14 @@ func (s *Service) evaluateLocked(ctx context.Context) {
 	s.recheckUDPPorts(ctx, now, d.recheck)
 	addPathLossyConds(now, pathLosses, func(c cond) { d.conds[c.key] = c })
 	s.addRelayDownConds(ctx, now, sn, signals.RelayLinks, active, d)
+	if err := s.reconcile(ctx, now, d, active); err != nil {
+		s.log.Warn("health: reconcile alerts", "err", err)
+		return
+	}
 	s.nhMu.Lock()
 	s.nodeHealth = d.health
 	s.nhMu.Unlock()
 	s.storeNodeHealth(ctx, d.health)
-	if err := s.reconcile(ctx, now, d, active); err != nil {
-		s.log.Warn("health: reconcile alerts", "err", err)
-	}
 }
 
 func indexLiveRows(rows []store.NodeLiveRow) map[string]store.NodeLiveRow {
@@ -303,6 +305,7 @@ func (s *Service) derive(ctx context.Context, now time.Time, sn *snapshot, live 
 	d := &derived{conds: map[key]cond{}, accepted: map[key]bool{}, nodes: map[string]bool{}, holdNode: map[string]bool{}, holdDown: map[string]bool{},
 		holdDoctor: map[string]bool{}, holdKeys: map[key]bool{}, superseded: map[key]bool{}, health: map[string]nodeHealth{}}
 	docs := map[string][]store.DoctorRow{}
+	d.doctorRows = docs
 	for _, r := range rows {
 		docs[r.NodeID] = append(docs[r.NodeID], r)
 	}
@@ -1099,6 +1102,15 @@ func (s *Service) reconcile(ctx context.Context, now time.Time, d *derived, acti
 			return err
 		}
 		if !a.ResolvedAt.IsZero() {
+			if k.kind == kDoctorFail {
+				// Closing a host diagnostic must also remove its node/way fault banner. The stored doctor report
+				// stays intact; other failures and the real traffic checks still determine the node's status.
+				rows := slices.DeleteFunc(d.doctorRows[k.node], func(r store.DoctorRow) bool { return r.CheckID == k.subject })
+				d.doctorRows[k.node] = rows
+				h := d.health[k.node]
+				h.doctorFail = worstDoctorFail(rows, d.holdDoctor[k.node])
+				d.health[k.node] = h
+			}
 			continue // closed by an admin and the condition still holds: stays closed, nothing to announce
 		}
 		s.transition(a, false)

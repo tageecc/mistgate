@@ -295,6 +295,7 @@ func (r rpc) DismissAlert(ctx context.Context, req *connect.Request[adminv1.Dism
 		action = "health.reopen_alert"
 	}
 	s.audit(ctx, action, map[string]string{"alert_id": a.ID, "kind": a.Kind, "node_id": a.NodeID})
+	s.evaluateSoon()
 	names, _ := s.nodeNames(ctx)
 	fixable, err := s.fixOffers(ctx)
 	if err != nil {

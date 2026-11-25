@@ -2088,6 +2088,68 @@ func TestMutedAlertReopensWithItsMute(t *testing.T) {
 	}
 }
 
+func TestDismissedDoctorDoesNotDegradeNode(t *testing.T) {
+	for _, edge := range []bool{false, true} {
+		t.Run("edge="+strconv.FormatBool(edge), func(t *testing.T) {
+			e := newEnv(t, func(c *Config) { c.Edge = edge })
+			e.node("de1", "provider", true)
+			e.node("de2", "provider", true)
+			in := e.inbound("de1", 443)
+			e.pass(in)
+			e.report("de1", false, res("disk_space", dFail, ""), res("resolver", dFail, ""))
+			e.report("de2", false, res("disk_space", dFail, ""))
+			r := rpc{e.s}
+			assertFailure := func(node, want string) {
+				t.Helper()
+				if got := e.s.NodeHealthSummaries(e.ctx)[node].DoctorFail; got != want {
+					t.Fatalf("%s doctor failure = %q, want %q", node, got, want)
+				}
+			}
+			closeAlert := func(check string) string {
+				t.Helper()
+				id := e.active()["doctor_fail/de1/"+check].ID
+				if _, err := r.DismissAlert(e.ctx, req(&adminv1.DismissAlertRequest{AlertId: id})); err != nil {
+					t.Fatal(err)
+				}
+				e.evaluate()
+				return id
+			}
+			assertFailure("de1", "disk_space")
+			diskID := closeAlert("disk_space")
+			assertFailure("de1", "resolver")
+			assertFailure("de2", "disk_space")
+			closeAlert("resolver")
+			assertFailure("de1", "")
+			rows, err := e.st.DoctorResults(e.ctx, "de1")
+			if err != nil || len(rows) != 2 || rows[0].Status != int(dFail) || rows[1].Status != int(dFail) {
+				t.Fatalf("closing alerts changed the diagnostic evidence: %+v, %v", rows, err)
+			}
+			// New reports preserve the close, but real tunnel failures remain visible.
+			e.report("de1", false, res("disk_space", dFail, ""), res("resolver", dFail, ""))
+			assertFailure("de1", "")
+			e.fail(in, "timeout")
+			e.fail(in, "timeout")
+			if !e.s.NodeHealthSummaries(e.ctx)["de1"].NoTraffic {
+				t.Fatal("closing a diagnostic hid a traffic failure")
+			}
+			e.pass(in)
+			if _, err := r.DismissAlert(e.ctx, req(&adminv1.DismissAlertRequest{AlertId: diskID, Reopen: true})); err != nil {
+				t.Fatal(err)
+			}
+			e.evaluate()
+			assertFailure("de1", "disk_space")
+			closeAlert("disk_space")
+			e.report("de1", false, res("disk_space", dOK, ""))
+			e.clock.Advance(2 * time.Hour)
+			e.report("de1", false, res("disk_space", dFail, ""))
+			assertFailure("de1", "disk_space")
+			if id := e.active()["doctor_fail/de1/disk_space"].ID; id == "" || id == diskID {
+				t.Fatal("a new failure after recovery did not open a new alert")
+			}
+		})
+	}
+}
+
 // A closed alert stays closed while its condition holds: no new alert, no transition, no event. After the problem has gone
 // for longer than the re-open window and comes back, it alerts again.
 func TestDismissedAlertStaysClosedUntilTheProblemStops(t *testing.T) {
